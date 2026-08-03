@@ -1,0 +1,25 @@
+# Build output. The Visual Studio solution lives here -- it is generated from CMakeLists.txt by
+# `cmake --preset vs2022` (or tools\build\gen_vs.ps1), never checked in.
+build/
+build-*/
+out/
+
+# Visual Studio / editor local state.
+.vs/
+*.user
+CMakeUserPresets.json
+
+# Release packages, and the binaries that ship inside them. The EOS SDK runtime is redistributed as
+# a release asset rather than committed -- it is 17 MB and would dominate the repository.
+dist/*.zip
+dist/*.dll
+dist/*.exe
+dist/*.log
+
+# Per-run logs the two-process gates leave beside whatever directory they were run from.
+omp_*test_*.log
+
+# The live EOS product credentials. Tracked as eos_creds.h.template -- copy it to eos_creds.h and
+# fill in your own values. (The secret is in every shipped main.dll anyway; keeping it out of the
+# repo is about not handing it to credential scanners, not about it being truly secret.)
+src/transport/eos_creds.h

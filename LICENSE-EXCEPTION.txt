@@ -1,0 +1,57 @@
+SessionOpenMP -- ADDITIONAL PERMISSION UNDER GNU GPL VERSION 3 SECTION 7
+========================================================================
+
+WHY THIS FILE EXISTS
+--------------------
+SessionOpenMP is licensed under the GNU General Public License v3 (see LICENSE).
+It also links against, and redistributes, the Epic Online Services (EOS) SDK,
+which is proprietary and cannot be conveyed under the GPL.
+
+GPL section 12 says that if you cannot satisfy your obligations under the GPL and
+another pertinent obligation simultaneously, you may not convey the work at all.
+Without the permission below, that would make SessionOpenMP undistributable --
+including by its own author. GPL section 7 exists precisely to resolve this, by
+letting the copyright holder grant an additional permission.
+
+
+THE PERMISSION
+--------------
+Copyright (C) 2026 matsix
+
+Additional permission under GNU GPL version 3 section 7:
+
+If you modify this Program, or any covered work, by linking or combining it with
+the Epic Online Services SDK (or a modified version of that SDK), or with the
+proprietary game executable, engine, or runtime into which this Program is loaded
+(including Session by Creature Studios Inc.), the licensors of this Program grant
+you additional permission to convey the resulting work. Corresponding Source for a
+non-source form of such a combined work need not include the source for those
+proprietary components.
+
+This additional permission applies to the entire Program and is granted by the
+copyright holder named above. Under GPL section 7 you may remove it from your copy
+if you wish; the Program then remains available to you under the plain terms of the
+GPL, but you may find yourself unable to convey a build that links the EOS SDK.
+
+
+WHAT THIS DOES AND DOES NOT DO
+------------------------------
+It DOES let anyone build, use, modify, and distribute SessionOpenMP even though the
+resulting binary links proprietary EOS code and runs inside a proprietary game.
+
+It does NOT weaken the copyleft on SessionOpenMP's own code. If you distribute a
+modified SessionOpenMP -- source or binary -- you must still release your changes
+under the GPL and make the Corresponding Source available. The replication core,
+the transport seam, the proxy layer, and everything else in src/ stay free.
+
+It grants no rights whatsoever in the EOS SDK, in Session, or in any other
+third-party component. Those remain governed by their own terms; see
+THIRD-PARTY-NOTICES.txt.
+
+
+NOTE FOR ANYONE REPLACING THE TRANSPORT
+---------------------------------------
+The transport seam (src/transport/transport.h) exists so that EOS can be swapped for
+a different backend. A build that uses only GPL-compatible transports -- the shared
+memory backend, or a future direct-UDP one -- does not rely on this exception at all
+and is plain GPLv3.

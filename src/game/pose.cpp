@@ -1,0 +1,235 @@
+// SessionOpenMP -- co-op multiplayer for Session, as an overlay on N solo games.
+// Copyright (C) 2026 matsix
+//
+// This program is free software: you can redistribute it and/or modify it under the
+// terms of the GNU General Public License as published by the Free Software Foundation,
+// either version 3 of the License, or (at your option) any later version. It is
+// distributed WITHOUT ANY WARRANTY; see the GNU GPL (LICENSE) for details.
+//
+// Additional permission under GNU GPL version 3 section 7: you may link and convey this
+// work combined with the Epic Online Services SDK and the proprietary game runtime it
+// loads into. See LICENSE-EXCEPTION.txt.
+#include "pose.h"
+#include "game_syms.h"
+#include "../session/session.h"     // AnyPeerReplaying: who a pose is being served TO
+#include <cstring>
+#include <cstdio>
+#ifdef _WIN32
+  #include <windows.h>
+#endif
+
+namespace omp { namespace game { namespace pose {
+
+using namespace omp::repl;
+
+static Tuning g_tun;
+static Stats  g_st;
+Tuning& Tune() { return g_tun; }
+Stats   GetStats() { return g_st; }
+
+// The transported pose, keyed by the MESH that has to wear it -- the same shape as the anim post-pass
+// registry, and for the same reason: the hook sees a component, not a proxy.
+static const int kSlots = 8;
+struct Slot {
+    void*    mesh = nullptr;
+    uint8_t  n = 0;                       // TRANSPORTED pose (0 = none in hand)
+    uint64_t freshMs = 0;
+    float    rot[kPoseMaxBones][4];
+    float    pos[kPoseMaxBones][3];
+    // The LAST POSE THIS PROXY'S OWN GRAPH PRODUCED, snapshotted every frame of normal play. During a
+    // LOCAL replay nothing produces another one (see the header), so this is what the skeleton wears
+    // instead of collapsing. A slot exists for every proxy mesh, not only for one with a transported
+    // pose, so `n == 0` does not mean "no slot".
+    uint8_t  holdN = 0;
+    float    holdRot[kPoseMaxBones][4];
+    float    holdPos[kPoseMaxBones][3];
+};
+static Slot g_slots[kSlots];
+
+#ifdef _WIN32
+// ---- the component-space buffer that is CURRENTLY BEING BUILT (the editable one). Before the flip
+// this holds the finished pose; after it, it is the previous frame's. Which is why the seam matters.
+static uint8_t* compSpace(void* mesh, bool editable, int* numOut) {
+    __try {
+        const int idxOff = editable ? off::kMeshCompEditIdx : off::kMeshCompReadIdx;
+        const int idx = *(const int*)((const uint8_t*)mesh + idxOff);
+        if (idx != 0 && idx != 1) return nullptr;
+        uint8_t* base = (uint8_t*)mesh + off::kMeshCompSpaceArr + idx * off::kMeshCompSpaceStride;
+        uint8_t* data = *(uint8_t**)base;
+        const int num = *(const int*)(base + 8);
+        if (!data || num <= 0 || num > 512) return nullptr;
+        if (numOut) *numOut = num;
+        return data;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+}
+#else
+static uint8_t* compSpace(void*, bool, int*) { return nullptr; }
+#endif
+
+// =====================================================================================================
+// SENDER
+// =====================================================================================================
+bool Capture(void* mesh, State& s) {
+    s.poseN = 0;
+    if (!g_tun.enabled || !mesh) return false;
+    // TWO reasons to send the skeleton, and they are mirror images (replication.h has the argument):
+    //   * The LOCAL player is scrubbing -- the drivers are inert, so the pose is all there is.
+    //   * A PEER is scrubbing -- their machine will not evaluate our skeleton at all while the replay
+    //     is up, so however live and correct our drivers are, they cannot be turned into a pose over
+    //     there. A transported pose still can be.
+    const bool weScrub   = (LocalReplayMode() == g_tun.captureMode);
+    const bool theyScrub = g_tun.serveScrubbingPeers && session::AnyPeerReplaying();
+    if (!weScrub && !theyScrub) return false;                    // live skating uses the driver path
+#ifdef _WIN32
+    int num = 0;
+    // READ buffer here: the sender samples from outside the animation pipeline (the engine-tick
+    // anchor), so the published pose is the correct one to copy.
+    uint8_t* cs = compSpace(mesh, /*editable*/ false, &num);
+    if (!cs) return false;
+    const int n = num < kPoseMaxBones ? num : kPoseMaxBones;
+    __try {
+        for (int b = 0; b < n; b++) {
+            const uint8_t* t = cs + (size_t)b * off::kTransformStride;
+            memcpy(s.poseRot[b], t + off::kTransformRotOff, 16);
+            memcpy(s.posePos[b], t + off::kTransformPosOff, 12);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { g_st.faults++; s.poseN = 0; return false; }
+    s.poseN = (uint8_t)n;
+    g_st.captured++; g_st.bones = (uint8_t)n;
+    // The blob and the feet must be dropped: 700 B of bones + 273 B of drivers + feet + header
+    // overruns the 1024 B mailbox, so a packet carrying both would not ship at all. While the local
+    // player scrubs they are inert anyway (0/97 fields moving), so dropping them is free. While a PEER
+    // scrubs they are live, and this chooses results over drivers for everyone -- visually exact, but
+    // no extrapolation on loss. That trade is only affordable because audio comes off the transported
+    // funnel rather than receiver-side anim notifies.
+    s.animLen = 0;
+    s.feetOk = 0;
+    return true;
+#else
+    return false;
+#endif
+}
+
+// =====================================================================================================
+// RECEIVER
+// =====================================================================================================
+static Slot* slotFor(void* mesh) {
+    for (auto& sl : g_slots) if (sl.mesh == mesh) return &sl;
+    return nullptr;
+}
+void Note(void* mesh, const State& s, uint64_t nowMs) {
+    if (!g_tun.enabled || !mesh) return;
+    if (!s.poseN) {
+        // Back to live skating: release the TRANSPORTED pose so the proxy's own graph drives again.
+        // It must NOT release the SLOT: the slot also carries the held pose, and dropping it here
+        // would throw away the snapshot on the very frame the peer stops sending -- i.e. always,
+        // since a live peer never sends one.
+        Slot* sl = slotFor(mesh);
+        if (sl) { sl->n = 0; sl->freshMs = 0; }
+        return;
+    }
+    Slot* sl = slotFor(mesh);
+    if (!sl) {
+        for (auto& c : g_slots) if (!c.mesh) { sl = &c; break; }
+        if (!sl) return;
+        sl->mesh = mesh;
+    }
+    const int n = s.poseN < kPoseMaxBones ? s.poseN : kPoseMaxBones;
+    memcpy(sl->rot, s.poseRot, sizeof(float) * 4 * n);
+    memcpy(sl->pos, s.posePos, sizeof(float) * 3 * n);
+    sl->n = (uint8_t)n;
+    sl->freshMs = nowMs;
+    g_st.noted++;
+}
+void Forget(void* mesh) {
+    Slot* sl = slotFor(mesh);
+    if (sl) { sl->mesh = nullptr; sl->n = 0; sl->freshMs = 0; sl->holdN = 0; }
+}
+
+void OnFinalizeBones(void* mesh, uint64_t nowMs) {
+    if (!g_tun.enabled || !mesh) return;
+    Slot* sl = slotFor(mesh);
+    // Fast path for the thousands of meshes that are not ours. With the hold OFF it is one pointer
+    // scan and out; with it ON, one guarded deref per skeletal mesh per frame finds proxies with no
+    // slot yet, which is how a proxy's mesh is adopted at all given `Note` does not create a slot for
+    // a live peer.
+    if (!sl && !g_tun.holdInLocalReplay) return;
+    // A slot key is a POINTER, and UE recycles addresses. Before writing 70 transforms into something,
+    // confirm the mesh belongs to a LIVE proxy -- otherwise a released proxy whose address was reused
+    // means stamping a pose into an unrelated actor's skeleton. Never trust a cached handle; ask the
+    // resolver.
+    {
+        void* owner = nullptr;
+        __try { owner = *(void**)((uint8_t*)mesh + off::kCompOwner); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { owner = nullptr; }
+        if (!owner || !IsProxyActor(owner)) { if (sl) Forget(mesh); return; }
+    }
+    if (!sl) {
+        for (auto& c : g_slots) if (!c.mesh) { sl = &c; break; }
+        if (!sl) return;
+        sl->mesh = mesh; sl->n = 0; sl->freshMs = 0; sl->holdN = 0;
+    }
+    g_st.hookCalls++;
+#ifdef _WIN32
+    int num = 0;
+    uint8_t* cs = compSpace(mesh, /*editable*/ true, &num);
+    if (!cs) { g_st.faults++; return; }
+    // Bone COUNT must agree exactly. Both ends run the same skeleton asset, so a mismatch means this
+    // is a different mesh than expected -- write nothing rather than a scrambled pose.
+    g_st.meshBones = (uint8_t)(num > 255 ? 255 : num);
+
+    // ---- 1. A fresh TRANSPORTED pose always wins: it is the peer's actual skeleton, this instant.
+    // A stale one must NOT be re-stamped forever -- hand the skeleton back rather than freezing it
+    // mid-motion (the anim post-pass's freshness rule, same reasoning).
+    const bool haveFresh = sl->n && !(nowMs > sl->freshMs && nowMs - sl->freshMs > g_tun.freshMs);
+    if (sl->n && !haveFresh) g_st.stale++;
+    if (haveFresh) {
+        if (num != (int)sl->n) { g_st.skippedCount++; return; }
+        __try {
+            for (int b = 0; b < (int)sl->n; b++) {
+                uint8_t* t = cs + (size_t)b * off::kTransformStride;
+                memcpy(t + off::kTransformRotOff, sl->rot[b], 16);
+                memcpy(t + off::kTransformPosOff, sl->pos[b], 12);
+            }
+            g_st.applied++;
+        } __except (EXCEPTION_EXECUTE_HANDLER) { g_st.faults++; }
+        return;
+    }
+    if (!g_tun.holdInLocalReplay) return;
+
+    // ---- 2. Normal play: the proxy's own graph just finished this pose. Remember it.
+    if (LocalReplayMode() != 2) {
+        const int n = num < kPoseMaxBones ? num : kPoseMaxBones;
+        __try {
+            for (int b = 0; b < n; b++) {
+                const uint8_t* t = cs + (size_t)b * off::kTransformStride;
+                memcpy(sl->holdRot[b], t + off::kTransformRotOff, 16);
+                memcpy(sl->holdPos[b], t + off::kTransformPosOff, 12);
+            }
+            sl->holdN = (uint8_t)n;
+            g_st.held++;
+        } __except (EXCEPTION_EXECUTE_HANDLER) { g_st.faults++; }
+        return;
+    }
+
+    // ---- 3. A LOCAL replay, and no transported pose to wear. Nothing else will pose this skeleton
+    // this frame: unregistering the proxy's replay component removed the only writer the replay path
+    // had, and the anim graph does not drive a skater during playback. Left alone the buffer publishes
+    // degenerate transforms and the peer renders as a heap of clothes on the ground. Re-stamp the last
+    // live pose so they stand as they last stood.
+    // This is a HOLDING PATTERN: the full fix is a peer sending their pose while the LOCAL player is in
+    // replay, the mirror of the capture gate. `holdApplied` in the [pose] line reports whether this
+    // seam still fires during playback, which is the precondition for that.
+    if (!sl->holdN || (int)sl->holdN != num) { g_st.skippedCount++; return; }
+    __try {
+        for (int b = 0; b < (int)sl->holdN; b++) {
+            uint8_t* t = cs + (size_t)b * off::kTransformStride;
+            memcpy(t + off::kTransformRotOff, sl->holdRot[b], 16);
+            memcpy(t + off::kTransformPosOff, sl->holdPos[b], 12);
+        }
+        g_st.holdApplied++;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { g_st.faults++; }
+#endif
+}
+
+}}} // namespace omp::game::pose

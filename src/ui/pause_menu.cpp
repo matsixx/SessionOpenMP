@@ -1,0 +1,1581 @@
+// SessionOpenMP -- co-op multiplayer for Session, as an overlay on N solo games.
+// Copyright (C) 2026 matsix
+//
+// This program is free software: you can redistribute it and/or modify it under the
+// terms of the GNU General Public License as published by the Free Software Foundation,
+// either version 3 of the License, or (at your option) any later version. It is
+// distributed WITHOUT ANY WARRANTY; see the GNU GPL (LICENSE) for details.
+//
+// Additional permission under GNU GPL version 3 section 7: you may link and convey this
+// work combined with the Epic Online Services SDK and the proprietary game runtime it
+// loads into. See LICENSE-EXCEPTION.txt.
+// SessionOpenMP -- the in-game pause-menu integration. Design + the measured facts: pause_menu.h.
+#include "pause_menu.h"
+#include "../debug.h"
+#include "overlay.h"
+#include "menu_ext.h"
+#include "../game/game_syms.h"
+#include "../game/spectate.h"
+#include "../session/session.h"
+#include "../session/banlist.h"
+#include "../transport/transport.h"
+#include "mp_name.h"
+#include "mp_prefs.h"
+#include <cstdio>
+#include <cstring>
+#include <cstdint>
+#ifdef _WIN32
+#include <windows.h>
+#include "MinHook.h"
+#endif
+
+using namespace omp::game;
+
+PauseMenuTuning& PauseMenu_Tuning() { static PauseMenuTuning t; return t; }
+
+// ---- state ------------------------------------------------------------------------------------------
+// A fault anywhere in here disables the whole feature for the run and says so ONCE: the pause menu is
+// cosmetic, the session is not, and the F1 path (a separate TU with separate hooks) is unaffected.
+static bool  g_dead      = false;
+static bool  g_installed = false;
+static MpUiState g_state{};                 // published by the game thread, read while building rows
+static volatile LONG g_pending = OVA_NONE;  // same single-slot handoff shape as the overlay's
+
+// Which of OUR pages the pause menu is currently showing. This is a FAKE page: the engine's
+// `_activePageDefinition` stays the pause root the whole time -- we simply hand CreatePageItems a
+// different row array and re-run it. So the reset signal cannot be the page definition; it is
+// "CreatePageItems ran on the root page and WE did not ask for it" (see g_selfRefresh).
+enum Page { PG_ROOT = 0, PG_MP = 1, PG_BROWSE = 2, PG_PLAYERS = 3, PG_PLAYER = 4, PG_GUEST0 = 5 };
+static int  g_page        = PG_ROOT;
+static bool g_selfRefresh = false;          // true only across our own MenuRefreshItems call
+
+static void log(const char* s) { OvLog(s); }
+static void die(const char* why) {
+    if (g_dead) return;
+    g_dead = true;
+    char m[220]; snprintf(m, sizeof(m), "[menu] *** DISABLED for this run: %s (F1 menu is unaffected)", why);
+    log(m);
+}
+static void post(OvAction a) {
+#ifdef _WIN32
+    InterlockedExchange(&g_pending, (LONG)a);
+#else
+    g_pending = (LONG)a;
+#endif
+}
+
+// ---- FName -> string --------------------------------------------------------------------------------
+// Same helper (and the same deliberate leak) as audio.cpp's `fnameStr`: FName::ToString allocates the
+// FString buffer through the engine allocator and there is no Free symbol, so this is only ever called
+// on one-time / cached paths -- never per frame. Duplicated rather than shared because each TU owns its
+// own concern here; if a third copy appears, promote it to game_syms.
+static bool fnameStr(const void* fnamePtr, char* out, int cap) {
+    out[0] = 0;
+    const Syms& S = Get();
+    if (!S.FNameToString || !fnamePtr) return false;
+    __try {
+        struct FStr { wchar_t* d; int n; int max; } fs{};
+        S.FNameToString(fnamePtr, &fs);
+        if (!fs.d || fs.n <= 0) return false;
+        int k = 0;
+        for (; k < fs.n && k < cap - 1 && fs.d[k]; k++) out[k] = (char)(fs.d[k] < 128 ? fs.d[k] : '?');
+        out[k] = 0;
+        return k > 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { out[0] = 0; return false; }
+}
+
+// A UE TArray header, as the engine lays it out. We only ever READ the game's and WRITE our own.
+struct TArrayHdr { void* data; int32_t num; int32_t max; };
+
+// ---- text -------------------------------------------------------------------------------------------
+// An FText is 24 bytes and is treated as opaque here: built once, copied bitwise into the row blocks,
+// NEVER destructed. That is the ownership model -- see the note on g_rows below.
+struct FTextBlob { uint8_t bytes[24]; };
+
+static bool makeFName(const char* s, uint64_t* out) {
+    const Syms& S = Get();
+    if (!S.FNameCtor || !s || !*s) return false;
+    __try { *out = 0; S.FNameCtor(out, s, 1 /* FNAME_Add */); return *out != 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+// FText from a plain ASCII string, via FName. Deliberately NOT FromString/AsCultureInvariant: those
+// come in const-ref and rvalue-ref twins that no byte signature can tell apart, and picking the wrong
+// one means the engine either steals or double-frees a buffer we own. An FName argument is a POD 8
+// bytes -- there is no ownership question to get wrong. (Cost: FNames are interned forever, which is
+// exactly right for a fixed set of menu labels.)
+static bool makeText(const char* s, FTextBlob* out) {
+    const Syms& S = Get();
+    uint64_t fn = 0;
+    if (!S.TextFromName || !makeFName(s, &fn)) return false;
+    __try { memset(out, 0, sizeof(*out)); S.TextFromName(out, &fn); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// Status strings change (peer counts), so they are cached by STRING -- an FText is only ever built for
+// a string we have not shown before. Bounded by construction: at most kTextCache distinct strings for
+// the life of the process, so the "never destructed" rule stays affordable.
+static const int kTextCache = 24;
+static struct { char s[112]; FTextBlob t; bool used; } g_textCache[kTextCache];
+static const FTextBlob* cachedText(const char* s) {
+    if (!s || !*s) return nullptr;
+    for (int i = 0; i < kTextCache; i++) {
+        if (!g_textCache[i].used) break;
+        if (strcmp(g_textCache[i].s, s) == 0) return &g_textCache[i].t;
+    }
+    for (int i = 0; i < kTextCache; i++) {
+        if (g_textCache[i].used) continue;
+        if (!makeText(s, &g_textCache[i].t)) return nullptr;
+        strncpy_s(g_textCache[i].s, s, _TRUNCATE);
+        g_textCache[i].used = true;
+        return &g_textCache[i].t;
+    }
+    static bool warned = false;
+    if (!warned) { warned = true; log("[menu] text cache full -- status text will stop updating"); }
+    return nullptr;
+}
+
+// ---- the guest seam (menu_ext.h) --------------------------------------------------------------------
+// Other mod DLLs register a page of their own. Everything is COPIED at registration (the guest's
+// strings need not outlive the call) and every callback runs on the GAME thread inside SEH -- the
+// opposite thread contract from the ImGui seam, which is why it is a separate export.
+struct GuestItem {
+    // `desc` is the footer line, sized for a couple of sentences -- a shorter buffer silently
+    // truncates anything that explains a trade-off in both directions. This is the host's own copy,
+    // not the ABI struct (the seam passes `const char*`), so growing it costs guests nothing.
+    char  key[48]; char label[64]; char desc[192];
+    int   kind;                                  // OMP_ITEM_*
+    char  offLabel[32], onLabel[32];             // toggle
+    float minValue, maxValue, step;              // slider, in the guest's own units
+};
+struct GuestPage {
+    char title[64];
+    GuestItem items[OMP_PAGEITEM_MAX];
+    int  n;
+    OmpPageSelectFn onSelect;
+    OmpPageStatusFn onStatus;
+    OmpPageValueFn  onValue;
+    OmpPageGetFn    onGet;
+    void* user;
+    bool  used, dead;
+};
+static const int kMaxGuestPages = 4;
+static GuestPage g_guests[kMaxGuestPages];
+static int       g_nGuests = 0;
+#ifdef _WIN32
+static CRITICAL_SECTION g_guestMx;
+static bool             g_guestMxInit = false;
+#endif
+
+// SEH cannot live in a function with C++ unwind semantics, so the guarded calls are their own tiny
+// functions -- the same shape as overlay.cpp's extCallGuarded. A page that faults is marked dead and
+// never shown again this run.
+static bool guestSelectGuarded(GuestPage* g, const char* key) {
+    __try { g->onSelect(key, g->user); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+static const char* guestStatusGuarded(GuestPage* g, const char* key) {
+    __try { return g->onStatus(key, g->user); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+}
+static bool guestValueGuarded(GuestPage* g, const char* key, int iv, float fv) {
+    __try { g->onValue(key, iv, fv, g->user); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+static int guestGetGuarded(GuestPage* g, const char* key, int* oi, float* of) {
+    __try { return g->onGet(key, oi, of, g->user); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }      // -1 = faulted, distinct from 0 = declined
+}
+
+// The real registration. v1's export is a thin wrapper that fills in an all-action page.
+static int registerPage(const char* title, const OmpPageItem2* items, int nItems,
+                        OmpPageSelectFn onSelect, OmpPageValueFn onValue,
+                        OmpPageGetFn onGet, OmpPageStatusFn onStatus, void* user) {
+    if (!title || !items || nItems <= 0) return 0;
+#ifdef _WIN32
+    if (!g_guestMxInit) { InitializeCriticalSection(&g_guestMx); g_guestMxInit = true; }
+    EnterCriticalSection(&g_guestMx);
+#endif
+    int rc = 0;
+    if (g_nGuests < kMaxGuestPages) {
+        GuestPage& g = g_guests[g_nGuests];
+        memset(&g, 0, sizeof(g));
+        strncpy_s(g.title, title, _TRUNCATE);
+        g.n = (nItems < OMP_PAGEITEM_MAX) ? nItems : OMP_PAGEITEM_MAX;
+        for (int i = 0; i < g.n; i++) {
+            GuestItem& d = g.items[i];
+            strncpy_s(d.key,   items[i].key   ? items[i].key   : "", _TRUNCATE);
+            strncpy_s(d.label, items[i].label ? items[i].label : "", _TRUNCATE);
+            strncpy_s(d.desc,  items[i].desc  ? items[i].desc  : "", _TRUNCATE);
+            d.kind = items[i].kind;
+            strncpy_s(d.offLabel, (items[i].offLabel && *items[i].offLabel) ? items[i].offLabel : "Off", _TRUNCATE);
+            strncpy_s(d.onLabel,  (items[i].onLabel  && *items[i].onLabel)  ? items[i].onLabel  : "On",  _TRUNCATE);
+            d.minValue = items[i].minValue; d.maxValue = items[i].maxValue; d.step = items[i].step;
+            // A slider with a degenerate range would divide by zero mapping to the 0..1 bar.
+            if (d.kind == OMP_ITEM_SLIDER && !(d.maxValue > d.minValue)) { d.kind = OMP_ITEM_ACTION; }
+        }
+        g.onSelect = onSelect; g.onStatus = onStatus; g.onValue = onValue; g.onGet = onGet;
+        g.user = user; g.used = true;
+        g_nGuests++;
+        rc = 1;
+    }
+#ifdef _WIN32
+    LeaveCriticalSection(&g_guestMx);
+#endif
+    char m[160];
+    snprintf(m, sizeof(m), "[menu] guest page '%s' (%d items) %s", title, nItems,
+             rc ? "registered" : "REFUSED -- page table full");
+    log(m);
+    return rc;
+}
+
+extern "C" __declspec(dllexport)
+int OmpMenu_RegisterPage(const char* title, const OmpPageItem* items, int nItems,
+                         OmpPageSelectFn onSelect, OmpPageStatusFn onStatus, void* user) {
+    // v1 compatibility: every row is an action. Kept exact so a guest binary built before the
+    // toggle/slider seam existed keeps working unchanged.
+    if (!items || nItems <= 0 || !onSelect) return 0;
+    OmpPageItem2 conv[OMP_PAGEITEM_MAX] = {};
+    if (nItems > OMP_PAGEITEM_MAX) nItems = OMP_PAGEITEM_MAX;
+    for (int i = 0; i < nItems; i++) {
+        conv[i].kind = OMP_ITEM_ACTION;
+        conv[i].key = items[i].key; conv[i].label = items[i].label; conv[i].desc = items[i].desc;
+    }
+    return registerPage(title, conv, nItems, onSelect, nullptr, nullptr, onStatus, user);
+}
+
+extern "C" __declspec(dllexport)
+int OmpMenu_RegisterPage2(const char* title, const OmpPageItem2* items, int nItems,
+                          OmpPageSelectFn onSelect, OmpPageValueFn onValue,
+                          OmpPageGetFn onGet, OmpPageStatusFn onStatus, void* user) {
+    return registerPage(title, items, nItems, onSelect, onValue, onGet, onStatus, user);
+}
+
+// ---- our rows ---------------------------------------------------------------------------------------
+// OWNERSHIP, the single most important thing in this file. These blocks are 144-byte
+// FMenuPageItemDefinitions built here and NEVER destructed. That is safe -- and only safe -- because
+// the engine never takes ownership of them: `CreatePageItems` reads the array it is handed and
+// COPY-constructs each element into a widget (bumping the FText refcounts), so the permanent +1 held
+// here means the refcount can never reach zero when those widgets die. Do not "fix" this into a
+// destructor, and never let this storage reach the page's own `_pageItemDefinitions` -- the next page
+// activation destructs that array element-wise and then FMemory::Free()s its buffer.
+struct RowSpec { const char* key; const char* label; const char* desc; OvAction act; };
+
+// The multiplayer sub-page. Same five actions the F1 menu offers, in the same order, posting the same
+// OvAction values -- one behaviour, two surfaces.
+// The same-PC (shared-memory) rows are DELIBERATELY ABSENT. That wire is a development rig, not a
+// way to play: a player who found it in the pause menu would end up in a session with nobody, and
+// switching from it to online inside one session can stall the Epic sign-in. It lives in the F1
+// window under "Dev tools", with that warning beside it.
+static const RowSpec kMpRows[] = {
+    { "OmpHostOnline",  "Host online",         "Start a game anyone can find in the session list", OVA_HOST_ONLINE },
+    { "OmpHostPrivate", "Create private game", "Start a game only people with your code can join", OVA_HOST_PRIVATE },
+    { "OmpJoinPrivate", "Join private game",   "Enter a friend's 6-character code", OVA_JOIN_PRIVATE },
+    { "OmpLeave",       "Leave session",       "Disconnect and keep playing solo", OVA_LEAVE },
+    { "OmpBack",        "Back",                "Return to the pause menu", OVA_NONE },
+};
+static const int kMpRowCount = (int)(sizeof(kMpRows) / sizeof(kMpRows[0]));
+// "Join online" opens the browser rather than acting, so it is inserted rather than listed -- right
+// under "Host online", where the public pair belongs.
+static const int kMpBrowseAfter = 0;
+// "Players" goes after "Join private game" -- the moderation tools belong next to the session
+// controls, not up with the ways of starting one.
+static const int kMpPlayersAfter = 2;
+
+// The row array we substitute. Sized for the stock page plus everything we could ever add.
+static const int kRowCap = 96;
+static uint8_t   g_rowBuf[kRowCap * 0x90];
+// Our own row templates, built once on the game thread the first time a page is built.
+static uint8_t   g_mpRows[(kMpRowCount) * 0x90];
+static uint8_t   g_rootRow[0x90];                       // the "Multiplayer" entry on the pause page
+static uint8_t   g_guestRootRows[kMaxGuestPages * 0x90];
+static uint8_t   g_guestRows[kMaxGuestPages][OMP_PAGEITEM_MAX * 0x90];
+static uint64_t  g_mpRowKeys[kMpRowCount];
+static uint64_t  g_rootRowKey = 0;
+// ---- the privacy toggle. A native MultiOption row of the mod's own on the multiplayer page, so it
+// is built and tracked here rather than through the guest seam -- the seam exists for other DLLs, and
+// routing a first-party row through it would mean inventing a fake guest.
+// It goes right after the join rows: it is a property of how you connect, so it belongs beside the
+// buttons that connect, not buried somewhere else.
+// ---- YOUR NAME. An INFO row showing the name you currently go by; selecting it opens the typing box
+// (a menu page cannot take free text -- see overlay.h). Rebuilt every page build so it always shows
+// the live value, including right after the box has changed it.
+static uint8_t   g_nameRow[0x90];
+static FTextBlob g_nameOpt;
+static uint64_t  g_nameKey = 0;
+static const int kMpNameAfter = 0;       // first thing on the page: it is who you ARE in the session
+static uint8_t   g_privacyRow[0x90];
+static FTextBlob g_privacyOpt[2];
+static uint64_t  g_privacyKey = 0;
+static int       g_privacyAt  = -1;      // widget index within the LAST build; -1 = not on this page
+static const int kMpPrivacyAfter = 2;    // after "Join private game", before "Leave session"
+// ---- the posture row. An INFO row (label + right-hand value) rebuilt on every page build, like the
+// lobby rows, so it reports the LIVE configuration rather than whatever was true at startup. Its
+// strings come from the transport, so a future backend describes itself and this code does not grow a
+// case per wire. Descriptive only -- it states what you chose, it does not argue with it.
+static uint8_t   g_postureRow[0x90];
+static FTextBlob g_postureOpt;
+static uint64_t  g_postureKey = 0;
+// ---- the lobby browser page -------------------------------------------------------------------------
+// Rows are rebuilt from the transport's result list every time the page is built, so they are storage
+// we own like every other row: a "Join online" opener, a Refresh, one row per lobby, and Back.
+static const int kMaxLobbyRows = 12;
+static uint8_t   g_browseOpenRow[0x90];                       // the "Join online" row on the MP page
+// ---- MODERATION. Your session, your rules -- and only your session, because that is the only lobby
+// EOS lets you remove anyone from.
+static uint8_t   g_playersOpenRow[0x90];                      // "Players" on the MP page
+static uint8_t   g_playerRows[kMaxLobbyRows * 0x90];          // one per peer in YOUR session
+static FTextBlob g_playerOptText[kMaxLobbyRows];
+static uint64_t  g_playersOpenKey = 0;
+static uint64_t  g_playerRowKeys[kMaxLobbyRows];
+static int       g_playerRowCount = 0;
+static char      g_playerRowIds[kMaxLobbyRows][80];
+static char      g_playerRowNames[kMaxLobbyRows][40];
+static uint8_t   g_kickRow[0x90], g_banRow[0x90];
+static uint64_t  g_kickKey = 0, g_banKey = 0;
+static char      g_selPeerId[80] = {0}, g_selPeerName[40] = {0};
+static volatile LONG g_havePeerAction = 0;
+static char      g_actPeerId[80] = {0}, g_actPeerName[40] = {0};
+static uint8_t   g_refreshRow  [0x90];
+static uint8_t   g_lobbyRows   [kMaxLobbyRows * 0x90];
+static FTextBlob g_lobbyOptText[kMaxLobbyRows];               // the right-hand "3/8" column
+static uint64_t  g_browseOpenKey = 0, g_refreshKey = 0;
+static uint64_t  g_lobbyRowKeys[kMaxLobbyRows];
+static int       g_lobbyRowCount = 0;                         // rows built on the LAST page build
+static int       g_lobbyRowIdx[kMaxLobbyRows];                // row -> transport browse index
+static int       g_lastBrowseState = -99;                     // to notice "results arrived"
+static void*     g_lastPage = nullptr;                        // the pause page, as of the last build
+static int       g_browsePolls = 0;                           // rebuilds still owed to a live search
+static uint32_t  g_lastSig = 0xffffffffu;                     // last session state the page showed
+static volatile LONG g_pendingJoinIdx = -1;
+static uint64_t  g_guestRootKeys[kMaxGuestPages];
+static uint64_t  g_guestItemKeys[kMaxGuestPages][OMP_PAGEITEM_MAX];
+static bool      g_rowsBuilt = false;
+static uint64_t  g_pauseKey  = 0;                       // FName("PauseMenuPage")
+
+// A ZERO-INITIALISED FText IS NOT AN EMPTY FText -- it is a null pointer with a crash attached.
+// `UMenuPageContainer::HandlePageItemSelectionChanged` takes the item's `_longDescription`
+// (params+0x48) and hands it to `UTRXUtilities::FindLocalizedTextForPlatformFromText`, whose FIRST
+// act is to dereference `TextData`; the `_shortDescription` reaches the footer text block by the same
+// path. Navigating onto a row with zeroed descriptions therefore dies in
+// `FTextInspector::GetTableIdAndKey` reading address 0. A real default-constructed FText points at
+// the shared empty text data and memset does not produce one. RULE: every FText field in a definition
+// built here gets a REAL FText, always -- there is no such thing as "leave it blank".
+static bool buildRow(uint8_t* dst, const char* key, const char* label, const char* desc, uint64_t* keyOut) {
+    memset(dst, 0, off::kItemSize);
+    uint64_t fn = 0;
+    if (!makeFName(key, &fn)) return false;
+    *(uint64_t*)(dst + off::kItemKey) = fn;
+    if (keyOut) *keyOut = fn;
+    *(dst + off::kItemType) = 1;                        // EMenuPageItemType::Selection
+    FTextBlob t;
+    if (!makeText(label, &t)) return false;
+    memcpy(dst + off::kItemLabel, &t, sizeof(t));
+    // Both descriptions, unconditionally. Falling back to the label keeps the field valid when a row
+    // has nothing to say; sharing one blob between the two fields is fine because the engine's copy
+    // and destroy are balanced per field and our own construction reference is never released.
+    const char* d = (desc && *desc) ? desc : label;
+    if (!makeText(d, &t)) return false;
+    memcpy(dst + off::kItemShortDesc, &t, sizeof(t));
+    memcpy(dst + off::kItemLongDesc,  &t, sizeof(t));
+    return true;
+}
+
+// ---- the native control row types (toggle / slider) -------------------------------------------------
+// A TOGGLE is the game's MultiOption row. Everything it needs lives on the DEFINITION -- the option
+// texts (+0x68, a TArray<FText>) and the current index (+0x78) -- so it needs no widget poking at all;
+// we just rebuild the row with the guest's live value each time the page is built. The option-text
+// array points at OUR static FText pairs: CreatePageItems copy-constructs from it (ResizeForCopy +
+// per-element copy), so, exactly like the row array itself, the engine never owns our storage.
+static FTextBlob g_optTexts[kMaxGuestPages][OMP_PAGEITEM_MAX][2];
+
+static bool buildToggleRow(uint8_t* dst, const GuestItem& it, uint64_t* keyOut, FTextBlob* opts) {
+    if (!buildRow(dst, it.key, it.label, it.desc, keyOut)) return false;
+    if (!makeText(it.offLabel, &opts[0]) || !makeText(it.onLabel, &opts[1])) return false;
+    *(dst + off::kItemType) = 2;                        // EMenuPageItemType::MultiOption
+    // A TArray header we own, pointing at storage we own and never free.
+    *(void**)  (dst + off::kItemMultiTexts)        = opts;
+    *(int32_t*)(dst + off::kItemMultiTexts + 0x08) = 2;   // Num
+    *(int32_t*)(dst + off::kItemMultiTexts + 0x0c) = 2;   // Max
+    return true;
+}
+// An INFO row: a Selection-looking row that ALSO gets the right-hand value column. It is a
+// MultiOption row with exactly ONE option, which is the only way the game draws a value beside a
+// label -- the arrows have nowhere to go (MultiOptionSetSelectedItemIndex bounds-checks against
+// option count - 1 = 0) and confirming still fires OnSelectionConfirmed like any other row. That is
+// what turns a flat list into a server browser: "Brooklyn Banks        3/8".
+static bool buildInfoRow(uint8_t* dst, const char* key, const char* label, const char* desc,
+                         const char* value, uint64_t* keyOut, FTextBlob* opt) {
+    if (!buildRow(dst, key, label, desc, keyOut)) return false;
+    if (!makeText((value && *value) ? value : " ", opt)) return false;
+    *(dst + off::kItemType) = 2;                        // MultiOption
+    *(void**)  (dst + off::kItemMultiTexts)        = opt;
+    *(int32_t*)(dst + off::kItemMultiTexts + 0x08) = 1;
+    *(int32_t*)(dst + off::kItemMultiTexts + 0x0c) = 1;
+    return true;
+}
+
+static bool buildSliderRow(uint8_t* dst, const GuestItem& it, uint64_t* keyOut) {
+    if (!buildRow(dst, it.key, it.label, it.desc, keyOut)) return false;
+    *(dst + off::kItemType) = 3;                        // EMenuPageItemType::ProgressBar
+    *(float*)(dst + off::kItemProgMin)       = it.minValue;
+    *(float*)(dst + off::kItemProgMax)       = it.maxValue;
+    *(float*)(dst + off::kItemProgIncrement) = (it.step > 0.0f) ? it.step : 1.0f;
+    return true;
+}
+
+// The three non-text fields whose right value is the STOCK page's, not a guess: platform flags, the
+// editor-only bit and the per-item input delay (which the container copies into `_inputDelayedMax`).
+// Captured from a real row on the pause page rather than invented -- the stock rows demonstrably work
+// on whatever platform this build is.
+// Row values to stamp onto the widgets once the rebuild is complete (see stampValues). Filled by the
+// guest-page branch of chooseArray. `g_valSet` is a separate flag rather than a sentinel value,
+// because a guest's range is allowed to include zero and negatives.
+static int   g_sliderPage = -1;
+static float g_sliderRow[OMP_PAGEITEM_MAX];
+static bool  g_valSet    [OMP_PAGEITEM_MAX];
+static int   g_sliderAt  [OMP_PAGEITEM_MAX];
+
+// ---- the replay-editor "Look At" row. A MultiOption cycling the players in the session; choosing one
+// aims the replay camera at them (src/game/spectate.cpp). Scrubbing is untouched -- it still drives
+// only your own replay. This row lives on a page the mod does not own, so it carries none of the
+// g_page sub-page machinery: it is appended to whatever the game built and read back by key.
+static const int kSpecMax = 9;                      // "Me" + 8 peers, which is the lobby cap in practice
+static uint64_t  g_replayPageKey = 0;
+static uint8_t   g_spectateRow[0x90];
+static uint64_t  g_spectateKey  = 0;
+static FTextBlob g_spectateOpts[kSpecMax];
+static char      g_spectateNames[kSpecMax][64];
+// ---- Rows are identified by PEER ID, never by name or position.
+// The name is a LABEL and nothing else -- two players can choose the same one, so two identical rows
+// must still be two different people. And the roster is rebuilt from the live session every time the
+// page opens, so a row POSITION is not an identity either: one join or leave and the remembered index
+// is quietly pointing at somebody else.
+// The actor pointer is not an identity that survives time: it is only valid this instant, so it is
+// resolved from the id at the moment of use (session::PeerActorById) and never cached across frames.
+static int       g_spectatePeerIds[kSpecMax];       // -1 = "Me"
+static int       g_spectateCount = 1;               // always at least "Me"
+static int       g_spectateSel   = 0;               // row position, display only -- derived from the id
+static int       g_spectateSelPeer = -1;            // THE selection. -1 = your own skater.
+static const LONG kSpecNoPending = 0x7FFFFFFF;
+static volatile LONG g_spectatePending = kSpecNoPending;   // a PEER ID, posted by the menu callback
+
+static uint32_t g_tmplPlatforms  = 0xFFFFFFFFu;
+static uint8_t  g_tmplEditorOnly = 0;
+static float    g_tmplInputDelay = 0.0f;
+static bool     g_tmplCaptured   = false;
+
+static void captureTemplate(const TArrayHdr* items) {
+    if (g_tmplCaptured || !items || !items->data || items->num <= 0) return;
+    const uint8_t* it = (const uint8_t*)items->data;
+    g_tmplPlatforms  = *(const uint32_t*)(it + 0x08);
+    g_tmplEditorOnly = *(it + 0x0c);
+    g_tmplInputDelay = *(const float*)(it + 0x60);
+    g_tmplCaptured   = true;
+    char m[160];
+    snprintf(m, sizeof(m), "[menu] row template from the stock page: platforms=0x%08x inputDelay=%.3f",
+             g_tmplPlatforms, g_tmplInputDelay);
+    log(m);
+}
+static void stampTemplate(uint8_t* row) {
+    *(uint32_t*)(row + 0x08) = g_tmplPlatforms;
+    *(row + 0x0c)            = g_tmplEditorOnly;
+    *(float*)(row + 0x60)    = g_tmplInputDelay;
+}
+
+static void buildRows() {
+    if (g_rowsBuilt) return;
+    g_rowsBuilt = true;                                  // one attempt; a failure disables, never retries
+    if (!makeFName("PauseMenuPage", &g_pauseKey)) { die("could not intern the pause page key"); return; }
+    if (!buildRow(g_rootRow, "OmpMultiplayer", "Multiplayer", "Play with friends", &g_rootRowKey)) {
+        die("could not build the Multiplayer row"); return;
+    }
+    for (int i = 0; i < kMpRowCount; i++) {
+        if (!buildRow(g_mpRows + (size_t)i * off::kItemSize, kMpRows[i].key, kMpRows[i].label,
+                      kMpRows[i].desc, &g_mpRowKeys[i])) { die("could not build a multiplayer row"); return; }
+    }
+    // The privacy toggle. A failure disables ONLY this row (g_privacyKey stays 0 and it is never
+    // added), exactly like the replay row below -- the connect buttons must not depend on it.
+    {
+        GuestItem it{};
+        strncpy_s(it.key,      "OmpHideAddr", _TRUNCATE);
+        strncpy_s(it.label,    "Hide my IP address", _TRUNCATE);
+        // Both sides of the trade, because there IS a reason to turn it off: relays add a hop, and a
+        // direct link is faster. Saying only the privacy half makes "Off" look like a mistake.
+        strncpy_s(it.desc,     "On: traffic goes through Epic's relays, so nobody sees your IP. "
+                               "Off: players connect directly -- faster, but they can see it. "
+                               "Applies to new connections.", _TRUNCATE);
+        strncpy_s(it.offLabel, "Off", _TRUNCATE);
+        strncpy_s(it.onLabel,  "On",  _TRUNCATE);
+        if (!buildToggleRow(g_privacyRow, it, &g_privacyKey, g_privacyOpt)) {
+            g_privacyKey = 0;
+            log("[menu] could not build the privacy row -- the toggle is F1-only this run");
+        }
+    }
+    // The replay-editor row. A failure here disables only this row: the page key not interning, or
+    // the row not building, must never take the multiplayer menu down with it.
+    if (makeFName("ReplayEditors", &g_replayPageKey)) {
+        if (buildRow(g_spectateRow, "OmpLookAt", "Look At",
+                     "Point the replay camera at another player in your session", &g_spectateKey)) {
+            *(g_spectateRow + off::kItemType) = 2;                       // MultiOption
+            *(void**)  (g_spectateRow + off::kItemMultiTexts)        = g_spectateOpts;
+            *(int32_t*)(g_spectateRow + off::kItemMultiTexts + 0x08) = 1;
+            *(int32_t*)(g_spectateRow + off::kItemMultiTexts + 0x0c) = kSpecMax;
+            *(int32_t*)(g_spectateRow + off::kItemMultiStart)        = 0;
+        } else {
+            g_replayPageKey = 0;
+            log("[menu] could not build the replay Look At row -- skipped");
+        }
+    }
+    if (!buildRow(g_playersOpenRow, "OmpPlayers", "Players",
+                  "Kick or ban someone from the game you are hosting", &g_playersOpenKey) ||
+        !buildRow(g_kickRow, "OmpKick", "Kick from this session",
+                  "Remove them now. They can join again afterwards.", &g_kickKey) ||
+        !buildRow(g_banRow, "OmpBan", "Ban from your sessions",
+                  "Remove them now and never host them again", &g_banKey)) {
+        die("could not build the moderation rows"); return;
+    }
+    if (!buildRow(g_browseOpenRow, "OmpJoinOnline", "Join online",
+                  "Browse the sessions people are hosting right now", &g_browseOpenKey) ||
+        !buildRow(g_refreshRow, "OmpRefresh", "Refresh", "Search again for open sessions", &g_refreshKey)) {
+        die("could not build the browser rows"); return;
+    }
+    for (int p = 0; p < g_nGuests; p++) {
+        GuestPage& g = g_guests[p];
+        if (!buildRow(g_guestRootRows + (size_t)p * off::kItemSize, g.title, g.title,
+                      "Settings for this mod", &g_guestRootKeys[p])) { g.dead = true; continue; }
+        for (int i = 0; i < g.n; i++) {
+            uint8_t* row = g_guestRows[p] + (size_t)i * off::kItemSize;
+            const GuestItem& it = g.items[i];
+            bool ok;
+            if      (it.kind == OMP_ITEM_TOGGLE) ok = buildToggleRow(row, it, &g_guestItemKeys[p][i], g_optTexts[p][i]);
+            else if (it.kind == OMP_ITEM_SLIDER) ok = buildSliderRow(row, it, &g_guestItemKeys[p][i]);
+            else                                 ok = buildRow(row, it.key, it.label, it.desc, &g_guestItemKeys[p][i]);
+            if (!ok) { g.dead = true; break; }
+        }
+    }
+    char m[120];
+    snprintf(m, sizeof(m), "[menu] rows built (multiplayer + %d guest page(s))", g_nGuests);
+    log(m);
+}
+
+// ---- the roster panel -------------------------------------------------------------------------------
+// The wide empty area on the right of a menu page is the container's `_longDescriptionTextBlock` (a
+// URichTextBlock at +0x2b8) -- it renders the SELECTED row's `_longDescription`. So showing who is in
+// the lobby needs no new widget at all: the list is written into that field on every row of the
+// multiplayer page, and the game draws it wherever it normally draws help text.
+// Its FTexts do NOT go through cachedText: the roster string changes as people join and leave, and
+// that cache is a fixed table which would fill up and stop updating. This owns one blob and rebuilds
+// it only when the text actually changes (the old one is left alone -- see the ownership note above).
+static char      g_rosterStr[512] = {0};
+static FTextBlob g_rosterText{};
+static bool      g_rosterHave = false;
+
+static void buildRosterText() {
+    const MpUiState& s = g_state;
+    char buf[512];
+    int n = 0;
+    // A private game's whole point is the code, so it leads -- spaced out, because it gets read
+    // aloud and typed by hand.
+    const char* code = omp::LobbyCode();
+    if (code && code[0]) {
+        n += snprintf(buf + n, sizeof(buf) - n, "PRIVATE GAME\n\nJOIN CODE:  ");
+        for (const char* c = code; *c && n < (int)sizeof(buf) - 8; c++)
+            n += snprintf(buf + n, sizeof(buf) - n, "%c ", *c);
+        n += snprintf(buf + n, sizeof(buf) - n, "\n\nGive this to whoever you want to play with.\n\n");
+    }
+    n += snprintf(buf + n, sizeof(buf) - n, "IN THIS SESSION\n\n");
+    // The local location comes straight from the world; a peer's rides their cosmetics packet.
+    char myMap[64] = {0}, myLabel[64] = {0};
+    strncpy_s(myMap, s.myMap, _TRUNCATE);
+    if (myMap[0]) PrettyMapName(myMap, myLabel, sizeof(myLabel));
+    // Who is running this session. Ownership migrates, so it is asked of the transport every rebuild
+    // rather than inferred from who pressed Host -- and it is an IDENTITY, because two players can
+    // pick the same name.
+    const char* ownerId = omp::LobbyOwnerId();
+    n += snprintf(buf + n, sizeof(buf) - n, "%s  (you)%s\n", MpName_Get(),
+                  omp::LobbyIsHost() ? "  (host)" : "");
+    if (myLabel[0]) n += snprintf(buf + n, sizeof(buf) - n, "   %s\n", myLabel);
+    int shown = 0;
+    for (int i = 0; i < omp::session::PeerSlots() && n < (int)sizeof(buf) - 64; i++) {
+        char who[48] = {0};
+        void* actor = nullptr;
+        int pid = -1;
+        if (!omp::session::PeerAt(i, who, sizeof(who), &actor, &pid)) continue;
+        const char* peerId = (pid >= 0) ? omp::PeerIdStr(pid) : "";
+        const bool peerIsHost = ownerId[0] && peerId[0] && _stricmp(ownerId, peerId) == 0;
+        // A peer whose cosmetics have not landed yet has no name to show -- say so rather than
+        // printing a blank line, so "connected but silent" is visibly different from "not there".
+        n += snprintf(buf + n, sizeof(buf) - n, "%s%s%s\n",
+                      who[0] ? who : "(connecting...)", peerIsHost ? "  (host)" : "",
+                      actor ? "" : "   [no skater yet]");
+        // Their map, on its own indented line. A DIFFERENT map from yours is the single most useful
+        // thing this panel can tell you: the session is fine, you simply cannot see each other.
+        char theirMap[64] = {0}, theirLabel[64] = {0};
+        if (omp::session::PeerMap(i, theirMap, sizeof(theirMap)) && theirMap[0]) {
+            PrettyMapName(theirMap, theirLabel, sizeof(theirLabel));
+            const bool elsewhere = (myMap[0] && _stricmp(theirMap, myMap) != 0);
+            n += snprintf(buf + n, sizeof(buf) - n, "   %s%s\n",
+                          theirLabel[0] ? theirLabel : theirMap, elsewhere ? "   (different map)" : "");
+        }
+        shown++;
+    }
+    if (!shown) {
+        n += snprintf(buf + n, sizeof(buf) - n, "\nNobody else yet.\n%s",
+                      s.armed ? "Waiting for someone to join." : "Host or join to start a session.");
+    } else {
+        n += snprintf(buf + n, sizeof(buf) - n, "\n%d skater%s in the session.", shown + 1,
+                      shown ? "s" : "");
+    }
+    if (strcmp(buf, g_rosterStr) == 0) return;          // unchanged: keep the FText we already built
+    strncpy_s(g_rosterStr, buf, _TRUNCATE);
+    FTextBlob t;
+    if (makeText(g_rosterStr, &t)) { g_rosterText = t; g_rosterHave = true; }
+}
+// Paste the roster into a row's long description -- the field the right-hand panel renders.
+static void setRowRoster(uint8_t* row) {
+    if (g_rosterHave) memcpy(row + off::kItemLongDesc, &g_rosterText, sizeof(g_rosterText));
+}
+
+// The multiplayer page's HEADING, which is where the "connecting..." acknowledgement lives. It has
+// to be able to say "and now you are connected" too, or the acknowledgement is a promise that never
+// resolves.
+static const char* mpTitle() {
+    static char buf[64];
+    const MpUiState& s = g_state;
+    if (s.armed) {
+        if (s.peers <= 0) snprintf(buf, sizeof(buf), "Multiplayer - waiting for players");
+        else              snprintf(buf, sizeof(buf), "Multiplayer - %d connected", s.peers);
+        return buf;
+    }
+    if (s.tpState == 1) return "Multiplayer - signing in...";
+    if (s.tpState == 3) return "Multiplayer - connection failed";
+    if (s.lobby  == -1) return "Multiplayer - nobody hosting";
+    return "Multiplayer";
+}
+// One number that changes whenever anything the page displays changes. Cheaper and more honest than
+// comparing the rendered strings: if this is equal, nothing on screen could differ.
+static uint32_t sessionSig() {
+    const MpUiState& s = g_state;
+    // The join code is part of what the page DISPLAYS, so it has to be part of what decides a
+    // rebuild -- otherwise a code that arrives without any other state moving would never show.
+    uint32_t txt = 0;
+    for (const char* c = omp::LobbyCode(); c && *c; c++) txt = txt * 31u + (uint32_t)*c;
+    // WHO is the host is on screen too (the roster's "(host)" tag), and ownership can migrate without
+    // any other displayed field moving -- so it belongs in here for the same reason the code does. A
+    // field that is rendered but not signed is a field that silently goes stale.
+    for (const char* c = omp::LobbyOwnerId(); c && *c; c++) txt = txt * 31u + (uint32_t)*c;
+    for (const char* c = MpName_Get(); c && *c; c++) txt = txt * 31u + (uint32_t)*c;
+    return (uint32_t)(s.armed ? 1 : 0) | ((uint32_t)(s.tpState & 3) << 1)
+         | ((uint32_t)(s.lobby & 7) << 3) | ((uint32_t)(s.peers & 31) << 6)
+         | ((uint32_t)(s.proxies & 31) << 11) | ((txt & 0xffffu) << 16);
+}
+
+// The live session line. Mirrors what the F1 menu says, so the two surfaces never disagree.
+static const char* statusLine() {
+    static char buf[112];
+    const MpUiState& s = g_state;
+    if (s.armed) {
+        snprintf(buf, sizeof(buf), "Session active - %d player%s connected, %d skater%s drawn",
+                 s.peers, s.peers == 1 ? "" : "s", s.proxies, s.proxies == 1 ? "" : "s");
+        return buf;
+    }
+    if (s.tpState == 1) return "Signing in to Epic Online Services";
+    if (s.tpState == 3) return "Connection failed - choose Host or Join to retry";
+    if (s.lobby == -1)  return "Last attempt failed - is anyone hosting?";
+    if (s.backend != 0) return "Ready - choose Host or Join";
+    return "Not connected";
+}
+// Point a row's footer description at the current status. Writing an FText field is a plain 24-byte
+// copy of a cached blob -- no allocation unless the STRING itself is new (see cachedText).
+static void setRowStatus(uint8_t* row, const char* text) {
+    const FTextBlob* t = cachedText(text);
+    if (t) memcpy(row + off::kItemShortDesc, t, sizeof(*t));
+}
+
+// ---- one-time page dump -----------------------------------------------------------------------------
+// Proves which page is which, how many rows it really has and what `_maxVisibleItems` is -- the cap
+// that decides whether an appended row is even built. De-duplicated by page key so a menu that
+// rebuilds on every scroll cannot spam the log.
+static const int kMaxLoggedPages = 12;
+static uint64_t  g_loggedPages[kMaxLoggedPages] = {};
+static int       g_nLoggedPages = 0;
+
+static void dumpPage(void* page, const TArrayHdr* items, uint64_t key, const char* keyName) {
+    if (!omp::debug::Get().menuPages || g_nLoggedPages >= kMaxLoggedPages) return;
+    for (int i = 0; i < g_nLoggedPages; i++) if (g_loggedPages[i] == key) return;
+    g_loggedPages[g_nLoggedPages++] = key;
+    const uint8_t* p = (const uint8_t*)page;
+    char m[300];
+    snprintf(m, sizeof(m), "[menu] page '%s' items=%d maxVisible=%d headerIndex=%d",
+             keyName[0] ? keyName : "?", items ? items->num : -1,
+             *(const int32_t*)(p + off::kPageMaxVisible), *(const int32_t*)(p + off::kPageHeaderIndex));
+    log(m);
+    if (!items || !items->data) return;
+    for (int i = 0; i < items->num && i < 32; i++) {
+        const uint8_t* it = (const uint8_t*)items->data + (size_t)i * off::kItemSize;
+        char itemName[96]; fnameStr(it + off::kItemKey, itemName, sizeof(itemName));
+        snprintf(m, sizeof(m), "[menu]   [%d] '%s' type=%u", i, itemName[0] ? itemName : "?",
+                 (unsigned)*(it + off::kItemType));
+        log(m);
+    }
+}
+
+// ---- the injection ----------------------------------------------------------------------------------
+// Returns the array CreatePageItems should build from: either the caller's (untouched) or ours.
+// `bumpVisible` is set when the substituted list is longer than the page's visible-row cap, because
+// CreatePageItems only builds rows [headerIndex, headerIndex + _maxVisibleItems) -- an appended row past
+// that cap is silently never created, which would look exactly like "the injection did not work".
+static const TArrayHdr* chooseArray(void* page, const TArrayHdr* items, TArrayHdr* ours) {
+    const uint8_t* p = (const uint8_t*)page;
+    void* def = *(void* const*)(p + off::kPageActiveDef);
+    if (!def) return items;
+    const uint64_t key = *(const uint64_t*)((const uint8_t*)def + off::kPageDefKey);
+    char keyName[96]; keyName[0] = 0;
+    if (omp::debug::Get().menuPages) fnameStr(&key, keyName, sizeof(keyName));
+    dumpPage(page, items, key, keyName);
+
+    // ---- the replay editor's own page gets ONE appended row. Handled before the pause page so the
+    // two paths never interact; this page has no sub-page state of the mod's to maintain.
+    if (g_replayPageKey && key == g_replayPageKey) {
+        if (!PauseMenu_Tuning().injectRow || !items || !items->data || items->num < 0) return items;
+        if (items) captureTemplate(items);
+        // Rebuild the option list from the LIVE roster every time the page is built -- opening the
+        // menu is exactly when "who is in this session" should be re-read.
+        g_spectateCount = 0;
+        snprintf(g_spectateNames[0], sizeof(g_spectateNames[0]), "%s", "Me");
+        g_spectatePeerIds[0] = -1;                           // -1 = hand the camera back to us
+        g_spectateCount = 1;
+        for (int s2 = 0; s2 < omp::session::PeerSlots() && g_spectateCount < kSpecMax; s2++) {
+            char nm[64] = {0}; void* actor = nullptr; int pid = -1;
+            if (!omp::session::PeerAt(s2, nm, sizeof(nm), &actor, &pid) || !actor) continue;
+            // Duplicate names are deliberately left duplicated: the list shows what people called
+            // themselves, and the id underneath keeps two "Skater"s apart.
+            snprintf(g_spectateNames[g_spectateCount], sizeof(g_spectateNames[0]), "%s",
+                     nm[0] ? nm : "Player");
+            g_spectatePeerIds[g_spectateCount] = pid;
+            g_spectateCount++;
+        }
+        for (int o = 0; o < g_spectateCount; o++) {
+            const FTextBlob* t = cachedText(g_spectateNames[o]);
+            if (t) g_spectateOpts[o] = *t; else { g_spectateCount = o; break; }
+        }
+        if (g_spectateCount < 1) return items;
+        // Re-derive the highlighted ROW from the remembered IDENTITY. Whoever you picked keeps being
+        // the selection even if peers joined or left and moved them up or down the list; if they have
+        // gone, it falls back to "Me" rather than silently landing on whoever inherited their row.
+        g_spectateSel = 0;
+        for (int o = 0; o < g_spectateCount; o++)
+            if (g_spectatePeerIds[o] == g_spectateSelPeer) { g_spectateSel = o; break; }
+        if (g_spectateSel == 0) g_spectateSelPeer = -1;
+        *(int32_t*)(g_spectateRow + off::kItemMultiTexts + 0x08) = g_spectateCount;
+        *(int32_t*)(g_spectateRow + off::kItemMultiStart)        = g_spectateSel;
+        if (items->num + 1 > PauseMenu_Tuning().maxItems || items->num + 1 > kRowCap) return items;
+        uint8_t* out2 = g_rowBuf;
+        for (int i = 0; i < items->num; i++)
+            memcpy(out2 + (size_t)i * off::kItemSize,
+                   (const uint8_t*)items->data + (size_t)i * off::kItemSize, off::kItemSize);
+        memcpy(out2 + (size_t)items->num * off::kItemSize, g_spectateRow, off::kItemSize);
+        stampTemplate(out2 + (size_t)items->num * off::kItemSize);
+        ours->data = out2; ours->num = items->num + 1; ours->max = ours->num;
+        return ours;
+    }
+
+    if (key != g_pauseKey) return items;                 // not the pause menu: never touched
+    g_lastPage = page;                                   // only ever used by the bounded browse poll
+    // A rebuild of the root page that this code did not ask for means the game re-activated it (the
+    // menu was opened, or navigation returned here) -- so the fake sub-page is no longer on screen.
+    if (!g_selfRefresh && g_page != PG_ROOT) { g_page = PG_ROOT; g_browsePolls = 0; }
+    if (!PauseMenu_Tuning().injectRow) return items;
+
+    // Capture the stock row template BEFORE we build anything, so even the very first injected row
+    // carries the page's own platform flags and input delay rather than our defaults.
+    if (items) captureTemplate(items);
+
+    uint8_t* out = g_rowBuf;
+    int n = 0;
+    // `ours` = stamp the captured template over it. Stock rows are copied verbatim, untouched.
+    auto add = [&](const uint8_t* src, bool ours) {
+        if (n >= kRowCap) return;
+        uint8_t* dst = out + (size_t)n * off::kItemSize;
+        memcpy(dst, src, off::kItemSize);
+        if (ours) stampTemplate(dst);
+        n++;
+    };
+    if (g_page == PG_ROOT) {
+        if (!items || !items->data || items->num < 0) return items;
+        if (items->num + 1 + g_nGuests > PauseMenu_Tuning().maxItems || items->num + 1 + g_nGuests > kRowCap) {
+            static bool warned = false;
+            if (!warned) { warned = true; log("[menu] pause page too long -- injection skipped, not truncated"); }
+            return items;
+        }
+        // Stock rows are copied BITWISE and only read for the duration of this call: the page still
+        // owns them and we never destruct our copy, so no refcount is touched either way.
+        for (int i = 0; i < items->num; i++)
+            add((const uint8_t*)items->data + (size_t)i * off::kItemSize, false);
+        if (PauseMenu_Tuning().statusText) setRowStatus(g_rootRow, statusLine());
+        add(g_rootRow, true);
+        for (int p2 = 0; p2 < g_nGuests; p2++)
+            if (!g_guests[p2].dead) add(g_guestRootRows + (size_t)p2 * off::kItemSize, true);
+    } else if (g_page == PG_MP) {
+        // The roster goes on EVERY row of this page, so the right-hand panel keeps showing it no
+        // matter which row the player happens to be sitting on.
+        buildRosterText();
+        g_privacyAt = -1;
+        for (int i = 0; i < kMpRowCount; i++) {
+            uint8_t* row = g_mpRows + (size_t)i * off::kItemSize;
+            setRowRoster(row);
+            add(row, true);
+            if (i == kMpNameAfter) {
+                // Value column = the live name, so the row answers "who am I?" without being opened.
+                if (buildInfoRow(g_nameRow, "OmpName", "Your name",
+                                 "Everyone in the session sees this", MpName_Get(),
+                                 &g_nameKey, &g_nameOpt)) {
+                    setRowRoster(g_nameRow);
+                    add(g_nameRow, true);
+                }
+            }
+            if (i == kMpBrowseAfter) { setRowRoster(g_browseOpenRow); add(g_browseOpenRow, true); }
+            // "Players" sits with the session actions, and only means anything while hosting.
+            if (i == kMpPlayersAfter) { setRowRoster(g_playersOpenRow); add(g_playersOpenRow, true); }
+            if (i == kMpPrivacyAfter && g_privacyKey) {
+                setRowRoster(g_privacyRow);
+                g_privacyAt = n;                 // `n` is the index this row is about to take
+                add(g_privacyRow, true);
+                // ...and the posture, right under the switch that changes half of it.
+                char posture[192], value[32];
+                omp::Posture(posture, sizeof(posture));
+                const omp::Backend bk = omp::Current();
+                snprintf(value, sizeof(value), "%s",
+                         (bk == omp::BK_SHM) ? "This PC"
+                       : (bk == omp::BK_EOS) ? (omp::RelaysForced() ? "Relayed" : "Direct")
+                       : "Not connected");
+                if (buildInfoRow(g_postureRow, "OmpPosture", "Connection", posture, value,
+                                 &g_postureKey, &g_postureOpt)) {
+                    add(g_postureRow, true);
+                }
+            }
+        }
+    } else if (g_page == PG_PLAYERS) {
+        // Everyone in YOUR session. Kick is only offered for a session you host, so say plainly when
+        // you do not -- "the button is missing" is never a good explanation.
+        g_playerRowCount = 0;
+        const bool hosting = omp::LobbyIsHost();
+        for (int i = 0; i < omp::session::PeerSlots() && g_playerRowCount < kMaxLobbyRows; i++) {
+            char who[48] = {0}; void* actor = nullptr; int pid = -1;
+            if (!omp::session::PeerAt(i, who, sizeof(who), &actor, &pid)) continue;
+            const char* id = (pid >= 0) ? omp::PeerIdStr(pid) : "";
+            if (!id || !*id) continue;                       // no identity yet: nothing to act on
+            const int r = g_playerRowCount;
+            strncpy_s(g_playerRowIds[r], id, _TRUNCATE);
+            strncpy_s(g_playerRowNames[r], who[0] ? who : "(connecting...)", _TRUNCATE);
+            // Value column = where they are, the same fact the roster panel reports -- a banned
+            // player overrides it, since that is the one thing you came to this page to check.
+            char key[48], desc[112], value[64], theirMap[64] = {0}, label[64] = {0};
+            snprintf(key, sizeof(key), "OmpPlayer%d", i);
+            if (omp::session::PeerMap(i, theirMap, sizeof(theirMap)) && theirMap[0])
+                PrettyMapName(theirMap, label, sizeof(label));
+            snprintf(value, sizeof(value), "%s",
+                     Ban_Is(id) ? "BANNED" : (label[0] ? label : (theirMap[0] ? theirMap : " ")));
+            snprintf(desc, sizeof(desc), "%s", hosting ? "Select to kick or ban this player"
+                                                       : "Only the host of a session can remove anyone");
+            uint8_t* row = g_playerRows + (size_t)r * off::kItemSize;
+            if (!buildInfoRow(row, key, g_playerRowNames[r], desc, value,
+                              &g_playerRowKeys[r], &g_playerOptText[r])) continue;
+            g_playerRowCount++;
+            add(row, true);
+        }
+        if (!g_playerRowCount) {
+            setRowStatus(g_playersOpenRow, g_state.armed ? "Nobody else is in your session yet."
+                                                         : "You are not in a session.");
+            add(g_playersOpenRow, true);
+        }
+        add(g_mpRows + (size_t)(kMpRowCount - 1) * off::kItemSize, true);   // Back
+    } else if (g_page == PG_PLAYER) {
+        const bool hosting   = omp::LobbyIsHost();
+        const bool banned    = Ban_Is(g_selPeerId);
+        // Say WHY a row will not do anything, on the row itself. A button that silently declines is
+        // indistinguishable from a broken one. The only reason left is "you are not the host" -- no
+        // player is exempt from either action (banlist.h).
+        setRowStatus(g_kickRow, hosting ? "Remove them from your session now"
+                                        : "You are not the host of this session");
+        setRowStatus(g_banRow,  banned ? "Already on your ban list"
+                                       : (hosting ? "Remove them and never host them again"
+                                                  : "Adds them to your ban list for sessions you host"));
+        add(g_kickRow, true);
+        add(g_banRow, true);
+        add(g_mpRows + (size_t)(kMpRowCount - 1) * off::kItemSize, true);   // Back
+    } else if (g_page == PG_BROWSE) {
+        add(g_refreshRow, true);
+        g_lobbyRowCount = 0;
+        const int st = omp::BrowseStatus();
+        const int n  = (st == 2) ? omp::BrowseCount() : 0;
+        for (int i = 0; i < n && g_lobbyRowCount < kMaxLobbyRows; i++) {
+            omp::LobbyInfo L{};
+            if (!omp::BrowseAt(i, &L)) continue;
+            const int r = g_lobbyRowCount;
+            char key[48], label[64], value[32], desc[112];
+            snprintf(key,   sizeof(key),   "OmpLobby%d", i);
+            // WHO and WHERE, both on the row, because both decide whether you want it: the host is
+            // who you would be skating with, the map is where. The lobby advertises the INTERNAL
+            // level name and each client resolves it against its own map data, rather than the host
+            // advertising a pretty one. A map this install does not have simply shows the raw name,
+            // which is still informative.
+            char lobbyLabel[64] = {0};
+            if (L.map[0]) PrettyMapName(L.map, lobbyLabel, sizeof(lobbyLabel));
+            const char* mapText  = lobbyLabel[0] ? lobbyLabel : (L.map[0] ? L.map : "");
+            const char* hostText = L.host[0] ? L.host : "";
+            if (hostText[0] && mapText[0])      snprintf(label, sizeof(label), "%s  -  %s", hostText, mapText);
+            else if (hostText[0])               snprintf(label, sizeof(label), "%s", hostText);
+            else if (mapText[0])                snprintf(label, sizeof(label), "%s", mapText);
+            else                                snprintf(label, sizeof(label), "Session");   // advertises neither
+            snprintf(value, sizeof(value), "%d/%d", L.players, L.maxPlayers > 0 ? L.maxPlayers : 16);
+            const bool full = (L.maxPlayers > 0 && L.players >= L.maxPlayers);
+            snprintf(desc,  sizeof(desc),  "%s%d player%s on %s%s", full ? "FULL - " : "",
+                     L.players, L.players == 1 ? "" : "s", mapText[0] ? mapText : "an unknown map",
+                     full ? "" : " - press to join");
+            uint8_t* row = g_lobbyRows + (size_t)r * off::kItemSize;
+            if (!buildInfoRow(row, key, label, desc, value, &g_lobbyRowKeys[r], &g_lobbyOptText[r])) continue;
+            g_lobbyRowIdx[r] = i;
+            g_lobbyRowCount++;
+            add(row, true);
+        }
+        // Nothing to show yet: say WHICH nothing. A browser that is merely empty while it is still
+        // signing in reads as broken.
+        if (n == 0) {
+            const char* why = (st == 1) ? "Searching for sessions..."
+                            : (st == -1) ? "Search failed - press Refresh to try again"
+                            : (g_state.tpState == 1) ? "Signing in to Epic Online Services..."
+                            : (st == 2) ? "No sessions found - press Refresh, or Host online yourself"
+                            : "Starting up...";
+            setRowStatus(g_refreshRow, why);
+        }
+        add(g_mpRows + (size_t)(kMpRowCount - 1) * off::kItemSize, true);   // the shared "Back" row
+    } else {
+        const int gi = g_page - PG_GUEST0;
+        if (gi < 0 || gi >= g_nGuests || g_guests[gi].dead) { g_page = PG_ROOT; return items; }
+        GuestPage& g = g_guests[gi];
+        g_sliderPage = gi;                                 // so the post-build pass can find the sliders
+        for (int i = 0; i < g.n; i++) {
+            uint8_t* row = g_guestRows[gi] + (size_t)i * off::kItemSize;
+            const GuestItem& it = g.items[i];
+            if (g.onStatus) {
+                const char* st = guestStatusGuarded(&g, it.key);
+                if (st && *st) setRowStatus(row, st);      // null = leave it alone, per the seam contract
+            }
+            // Ask the guest what the row is currently set to, so it opens showing the truth. A toggle
+            // carries its value on the definition (index at +0x78); a slider's has to be stamped on
+            // the WIDGET after it exists, so remember where this one lands.
+            g_sliderRow[i] = 0.0f; g_valSet[i] = false;
+            if (g.onGet && it.kind != OMP_ITEM_ACTION) {
+                int iv = 0; float fv = 0.0f;
+                const int got = guestGetGuarded(&g, it.key, &iv, &fv);
+                if (got < 0) { g.dead = true; log("[menu] guest onGet FAULTED -- page disabled"); break; }
+                if (got > 0) {
+                    // The definition's starting index is the row's opening look; the widget stamp
+                    // after the rebuild is what actually survives DeserializePage. Both are set.
+                    if (it.kind == OMP_ITEM_TOGGLE) {
+                        *(int32_t*)(row + off::kItemMultiStart) = (iv != 0) ? 1 : 0;
+                        g_sliderRow[i] = (iv != 0) ? 1.0f : 0.0f;
+                    } else {
+                        g_sliderRow[i] = fv;
+                    }
+                    g_valSet[i] = true;
+                }
+            }
+            g_sliderAt[i] = n;                             // the index this row will occupy
+            add(row, true);
+        }
+        // A guest page always gets a way out, even if the guest forgot one.
+        add(g_mpRows + (size_t)(kMpRowCount - 1) * off::kItemSize, true);   // the shared "Back" row
+    }
+    if (n <= 0) return items;
+    ours->data = g_rowBuf; ours->num = n; ours->max = n;
+    return ours;
+}
+
+// A ROW'S DISPLAYED VALUE MUST BE STAMPED AFTER THE *WHOLE* REBUILD, NOT INSIDE THE CreatePageItems
+// HOOK. `RefreshItemsPanel` is SerializePage -> clear -> CreatePageItems -> DeserializePage, and
+// DeserializePage restores per-row values by calling these very setters
+// (`ProgressBarSetPercent` at 0x1072d31, `MultiOptionSetSelectedItemIndex` at 0x1072daa). Stamping
+// inside the CreatePageItems hook therefore lands one step too early and is overwritten -- a slider
+// stamped there always draws empty.
+// A slider's value can ONLY live on the widget (the definition has just min/max/increment). A toggle's
+// could ride the definition's _multiOptionStartingIndex, but DeserializePage can stomp that too, so
+// both are stamped here for one rule instead of two.
+//
+// AND NOTHING THAT HAPPENS DURING A REBUILD IS USER INPUT. Both display setters BROADCAST the change
+// exactly as a controller press would (`ProgressBarSetPercent` ends in a Broadcast of
+// _onProgressBarValueChanged; `MultiOptionSetSelectedItemIndex` likewise) -- and DeserializePage
+// calls them with whatever the page's serialize map holds, which for an injected key is nothing,
+// i.e. zero. Unguarded, every page build reports "the user just dragged this to the minimum" and
+// writes it into the guest's settings, so sliders reset to their minimum on every trip through the
+// menu. The guard therefore spans the WHOLE rebuild, not just the mod's own stamp -- the engine's
+// writes are no more user input than the mod's are.
+static bool g_rebuilding = false;
+
+static void stampValues(void* page) {
+    const Syms& S = Get();
+    // The privacy row first -- it is not a guest row, and it must show the CURRENT preference
+    // whenever the page opens. The definition's starting index does not survive DeserializePage, so
+    // the value has to be stamped on the WIDGET after the whole rebuild.
+    if (g_privacyAt >= 0 && S.MenuMultiSetIndex) {
+        const TArrayHdr* pw = (const TArrayHdr*)((uint8_t*)page + off::kPageItemWidgets);
+        if (pw->data && g_privacyAt < pw->num) {
+            if (void* widget = ((void**)pw->data)[g_privacyAt])
+                S.MenuMultiSetIndex(widget, MpPrefs_HideAddress() ? 1 : 0);
+        }
+        g_privacyAt = -1;                                 // one shot per build, like the guest pass
+    }
+    if (g_sliderPage < 0) return;
+    const int gi = g_sliderPage;
+    g_sliderPage = -1;                                    // one shot per build
+    if (gi >= g_nGuests || g_guests[gi].dead) return;
+    GuestPage& g = g_guests[gi];
+    const TArrayHdr* w = (const TArrayHdr*)((uint8_t*)page + off::kPageItemWidgets);
+    if (!w->data) return;
+    for (int i = 0; i < g.n; i++) {
+        const GuestItem& it = g.items[i];
+        if (it.kind == OMP_ITEM_ACTION || !g_valSet[i]) continue;
+        const int idx = g_sliderAt[i];
+        if (idx < 0 || idx >= w->num) continue;           // scrolled out of the built window
+        void* widget = ((void**)w->data)[idx];
+        if (!widget) continue;
+        if (it.kind == OMP_ITEM_SLIDER) {
+            if (!S.MenuProgressSetPct) continue;
+            float pct = (g_sliderRow[i] - it.minValue) / (it.maxValue - it.minValue);
+            if (pct < 0.0f) pct = 0.0f; else if (pct > 1.0f) pct = 1.0f;
+            S.MenuProgressSetPct(widget, pct);
+        } else {
+            if (!S.MenuMultiSetIndex) continue;
+            S.MenuMultiSetIndex(widget, (g_sliderRow[i] >= 0.5f) ? 1 : 0);
+        }
+    }
+}
+
+// ---- the hooks --------------------------------------------------------------------------------------
+static MenuCreateItemsFn o_CreateItems    = nullptr;
+static MenuSelConfirmFn  o_SelConfirm     = nullptr;
+static MenuSelConfirmFn  o_MultiChanged   = nullptr;   // same (page, params) shape as the confirm
+static MenuSelConfirmFn  o_ProgressChanged = nullptr;
+
+// UMenuPage::CreatePageItems -- the injection point (pre-hook: the rows must exist before the widgets
+// are made). Every deref is inside SEH; on any fault the feature dies quietly and the game's own menu
+// carries on with its own array.
+static void hkCreateItems(void* page, void* itemsArray, bool flag) {
+    const TArrayHdr* use = (const TArrayHdr*)itemsArray;
+    TArrayHdr ours{};
+    int32_t savedVisible = 0;
+    uint8_t* p = (uint8_t*)page;
+    bool bumped = false;
+    if (!g_dead && PauseMenu_Tuning().enabled && page && itemsArray) {
+        __try {
+            buildRows();
+            if (!g_dead) {
+                use = chooseArray(page, (const TArrayHdr*)itemsArray, &ours);
+                if (use == &ours) {
+                    savedVisible = *(int32_t*)(p + off::kPageMaxVisible);
+                    const int32_t need = *(int32_t*)(p + off::kPageHeaderIndex) + ours.num;
+                    if (savedVisible < need) { *(int32_t*)(p + off::kPageMaxVisible) = need; bumped = true; }
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            die("faulted while building menu rows");
+            use = (const TArrayHdr*)itemsArray;
+        }
+    }
+    o_CreateItems(page, (void*)use, flag);
+    if (bumped) {
+        __try { *(int32_t*)(p + off::kPageMaxVisible) = savedVisible; }
+        __except (EXCEPTION_EXECUTE_HANDLER) { die("faulted restoring _maxVisibleItems"); }
+    }
+    // NOTE: row VALUES are deliberately not stamped here -- DeserializePage runs afterwards inside
+    // RefreshItemsPanel and would overwrite them. See stampValues.
+}
+
+// Re-run the page's row build so the substituted array takes effect. RefreshItemsPanel is the game's
+// OWN "rebuild the rows" (it is what scrolling calls), so this is the engine walking its own path --
+// only the array it reads is different.
+//
+// NEVER CALL THIS FROM INSIDE THE CONFIRM CALLBACK. `UMenuPageContainer::OnConfirmAction` broadcasts
+// the confirm from the MIDDLE of itself, then carries on using the widget pointers it captured BEFORE
+// the broadcast -- and finishes by calling `PlaySoundOnConfirm`, which re-reads
+// `_pageItemWidgets[_selectedIndex]` guarded by nothing but a `Num <= 0` test. Rebuilding the rows
+// underneath it destroys those widgets and shrinks the array while `_selectedIndex` still points past
+// the new end: a use-after-free plus an out-of-bounds read. A page swap is therefore QUEUED and
+// performed from the engine-tick pump one frame later -- `UGameEngine::Tick` runs the mod's frame
+// BEFORE the engine's, and Slate (hence NativeTick -> OnConfirmAction) runs inside the engine's, so
+// the confirm always completes on intact widgets and the rebuild happens before anything touches them
+// again. The general rule: do not mutate a structure the caller above you is still walking.
+static void refreshPage(void* page) {
+    const Syms& S = Get();
+    if (!S.MenuRefreshItems) return;
+    g_selfRefresh = true;
+    // Everything from here to the end of the stamp is the mod rebuilding the page. Any value-change
+    // event that arrives in that window -- the mod's own OR the engine's DeserializePage restoring a
+    // row -- is not the user touching anything, and must never reach the guest.
+    g_rebuilding  = true;
+    __try {
+        S.MenuRefreshItems(page);
+        // The rebuilt list is a DIFFERENT length, so the old selection index is meaningless and, left
+        // alone, is an out-of-bounds read for everything that indexes by it (RefreshItemsPanel's own
+        // DeserializePage restores the saved one, which is exactly the stale value). -1 first so
+        // SetSelectedIndex's deselect-the-old-row branch is skipped, then select the top row properly
+        // -- through the game's own setter, so the footer/description broadcast happens as normal.
+        *(int32_t*)((uint8_t*)page + off::kPageSelectedIndex) = -1;
+        if (S.MenuSetSelIndex) S.MenuSetSelIndex(page, 0, false);
+        // ...and only NOW are the row values safe to write: MenuRefreshItems has finished, which
+        // means DeserializePage (which drives these same setters) is behind us.
+        stampValues(page);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { die("faulted refreshing the page"); }
+    g_rebuilding  = false;
+    g_selfRefresh = false;
+}
+
+// The queued page swap. `page` is only ever a pointer the engine handed over on the previous frame,
+// and every use is inside SEH.
+static void* g_pendingPage  = nullptr;
+static bool  g_pendingRefresh = false;
+static char  g_pendingTitle[112] = {0};
+static bool  g_pendingTitleRoot = false;     // true = restore the root definition's own display name
+// AN FText ARGUMENT PASSED BY VALUE IS CONSUMED -- BUMP THE REFCOUNT BEFORE HANDING IT OVER.
+// `UMenuPage::SetTitle(this, FText*)` takes its text BY VALUE: MSVC passes such a struct as a pointer
+// to a caller-owned temporary, and the callee destroys it. SetTitle copies-with-a-`lock inc` into the
+// text block and then runs `lock xadd [refctrl+8], -1` on the argument, calling the destructor if it
+// reaches zero. Passing a pointer to storage that was never incremented is therefore a decrement of
+// somebody else's reference every single time -- for a sub-page heading the mod's own cached blob,
+// and for the "restore the root heading" path the pause page ASSET'S `_displayName`, whose shared
+// text data is then destroyed underneath the still-live title widget (it surfaces as a crash in
+// `FText::Rebuild` under `STextBlock::ComputeDesiredSize`). The game's own caller does exactly what
+// passOwned does (SetActivePageDefinition at +0x117: copy the 24 bytes, `lock inc` the controller,
+// pass the copy).
+// RULE: FText is a refcounted handle, not a POD. Copying its bytes does not make a reference.
+static void passOwned(const void* src, FTextBlob* out) {
+    memcpy(out, src, sizeof(FTextBlob));
+    void* refCtrl = *(void**)((uint8_t*)out + 8);
+    if (refCtrl) InterlockedIncrement((volatile LONG*)((uint8_t*)refCtrl + 8));
+}
+
+// The fake sub-page never re-activates a definition, so the heading would still read "PAUSE MENU".
+// SetTitle is the game's own setter; passing null restores the root definition's own display name.
+static void setTitle(void* page, const char* text) {
+    const Syms& S = Get();
+    if (!S.MenuSetTitle) return;
+    __try {
+        const void* src = nullptr;
+        if (text) {
+            src = cachedText(text);
+        } else {
+            void* def = *(void**)((uint8_t*)page + off::kPageActiveDef);
+            if (def) src = (const uint8_t*)def + 0x38;                   // _displayName
+        }
+        if (!src) return;
+        FTextBlob owned;
+        passOwned(src, &owned);          // the callee destroys this copy; the source is left intact
+        S.MenuSetTitle(page, &owned);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { /* cosmetic only -- never worth dying for */ }
+}
+
+// Queue a swap/title change for the next frame instead of doing it under the engine's feet.
+static void queueSwap(void* page, const char* title, bool rootTitle, bool refresh) {
+    g_pendingPage      = page;
+    g_pendingRefresh   = refresh;
+    g_pendingTitleRoot = rootTitle;
+    if (title) strncpy_s(g_pendingTitle, title, _TRUNCATE); else g_pendingTitle[0] = 0;
+}
+
+void PauseMenu_Pump() {
+    if (g_dead) return;
+    // Apply a pending Look At selection here -- on the game thread, outside the engine's menu
+    // callbacks.
+    {
+        const LONG want = InterlockedExchange(&g_spectatePending, kSpecNoPending);
+        if (want != kSpecNoPending) {
+            // Resolve the identity to an actor HERE, at the moment of use. Between the click and this
+            // frame that peer may have left; PeerActorById then returns null and the camera goes back
+            // to the local skater instead of a freed pointer reaching the engine.
+            void* target = (want < 0) ? nullptr : omp::session::PeerActorById((int)want);
+            if (want >= 0 && !target) {
+                g_spectateSelPeer = -1;
+                log("[menu] the player you selected is no longer in the session -- staying on your"
+                    " own skater");
+            }
+            omp::game::spectate::SetLookTarget(target, &log);
+        }
+    }
+    // A search FINISHING is the one thing that changes a page of ours without a button press, so it
+    // is polled (an int compare) and turned into a rebuild through the same queue as every other
+    // swap -- still outside the engine's menu callbacks.
+    // This is the only place a page pointer handed over on an EARLIER frame is touched. It is bounded
+    // on purpose: polling stops the moment the search reaches a terminal state, so the pointer is
+    // only ever used within the second or two while the user is sitting in the browser they just
+    // opened. (Closing and reopening the menu rebuilds the ROOT page, which resets g_page and stops
+    // this anyway.) A proper liveness signal would be a hook on the container's menu-close, but its
+    // body has a byte-identical twin in the exe and cannot be signatured.
+    // Refreshing from this pump is what makes the multiplayer page follow the session in real time --
+    // heading, footer status AND the roster panel, so "connecting..." actually resolves and the other
+    // skater is visibly seen to arrive. It is safe because `IsPauseMenuDisplayed` gates it: the widget
+    // cannot be gone while the game says its menu is on screen.
+    if (g_page == PG_MP && !g_pendingPage && g_lastPage && PauseMenuOpen()) {
+        const uint32_t sig = sessionSig();
+        if (sig != g_lastSig) {
+            g_lastSig = sig;
+            queueSwap(g_lastPage, mpTitle(), false, true);
+        }
+    }
+    if (g_page == PG_BROWSE && !g_pendingPage && g_lastPage && g_browsePolls > 0) {
+        const int st = omp::BrowseStatus();
+        if (st != g_lastBrowseState) {
+            g_lastBrowseState = st;
+            if (st != 1) g_browsePolls = 0;             // terminal: this is the last rebuild we owe
+            else         g_browsePolls--;
+            queueSwap(g_lastPage, "Online sessions", false, true);
+        }
+    }
+    if (!g_pendingPage) return;
+    void* page = g_pendingPage;
+    g_pendingPage = nullptr;                    // one shot, whatever happens below
+    if (g_pendingRefresh) refreshPage(page);
+    if (g_pendingTitleRoot)   setTitle(page, nullptr);
+    else if (g_pendingTitle[0]) setTitle(page, g_pendingTitle);
+    g_pendingRefresh = false; g_pendingTitle[0] = 0; g_pendingTitleRoot = false;
+}
+
+// UMenuPage::OnSelectionConfirmed -- the page-level funnel every confirm passes through. A row of ours
+// is handled here and the trampoline is NOT called, which suppresses the stock chain entirely; anything
+// else falls straight through untouched.
+static bool handleConfirm(void* page, void* params) {
+    if (g_dead || !PauseMenu_Tuning().enabled || !page || !params) return false;
+    const uint64_t itemKey = *(const uint64_t*)((const uint8_t*)params + off::kSelParamsItem + off::kItemKey);
+    if (!itemKey) return false;
+
+    if (g_page == PG_ROOT) {
+        if (itemKey == g_rootRowKey && PauseMenu_Tuning().subPage) {
+            g_page = PG_MP;
+            g_lastSig = sessionSig();
+            queueSwap(page, mpTitle(), false, true);
+            log("[menu] pause: entered the multiplayer page");
+            return true;
+        }
+        for (int p = 0; p < g_nGuests; p++) {
+            if (g_guests[p].dead || itemKey != g_guestRootKeys[p]) continue;
+            g_page = PG_GUEST0 + p;
+            queueSwap(page, g_guests[p].title, false, true);
+            char m[160];
+            snprintf(m, sizeof(m), "[menu] pause: entered the guest page '%s'", g_guests[p].title);
+            log(m);
+            return true;
+        }
+        return false;
+    }
+
+    // "Back" is shared by every one of our pages -- from the browser it steps back to Multiplayer,
+    // from anywhere else to the pause menu proper.
+    if (itemKey == g_mpRowKeys[kMpRowCount - 1]) {
+        g_browsePolls = 0;
+        if (g_page == PG_PLAYER)  { g_page = PG_PLAYERS; queueSwap(page, "Players", false, true); return true; }
+        const bool toMp = (g_page == PG_BROWSE || g_page == PG_PLAYERS);
+        g_page = toMp ? PG_MP : PG_ROOT;
+        if (toMp) g_lastSig = sessionSig();
+        queueSwap(page, toMp ? mpTitle() : nullptr, !toMp, true);
+        return true;
+    }
+    if (g_page == PG_MP && itemKey == g_browseOpenKey) {
+        g_page = PG_BROWSE;
+        post(OVA_BROWSE);                       // MpPump brings EOS up if needed, then searches
+        g_lastBrowseState = -99;                // force the next poll to notice whatever happens
+        g_browsePolls = 8;                      // bounded: sign-in -> searching -> results
+        queueSwap(page, "Online sessions", false, true);
+        log("[menu] pause: opened the lobby browser");
+        return true;
+    }
+    if (g_page == PG_MP && g_nameKey && itemKey == g_nameKey) {
+        post(OVA_SET_NAME);              // the loader opens the box; the box saves and closes itself
+        log("[menu] pause: opening the name box");
+        return true;
+    }
+    if (g_page == PG_MP && itemKey == g_playersOpenKey) {
+        g_page = PG_PLAYERS;
+        queueSwap(page, "Players", false, true);
+        log("[menu] pause: opened the player list");
+        return true;
+    }
+    if (g_page == PG_PLAYERS) {
+        for (int r = 0; r < g_playerRowCount; r++) {
+            if (itemKey != g_playerRowKeys[r]) continue;
+            // Remember WHO by identity, not by row: the list rebuilds live.
+            strncpy_s(g_selPeerId,   g_playerRowIds[r],   _TRUNCATE);
+            strncpy_s(g_selPeerName, g_playerRowNames[r], _TRUNCATE);
+            g_page = PG_PLAYER;
+            queueSwap(page, g_selPeerName, false, true);
+            return true;
+        }
+        return true;
+    }
+    if (g_page == PG_PLAYER) {
+        const bool kick = (itemKey == g_kickKey), ban = (itemKey == g_banKey);
+        if (kick || ban) {
+            strncpy_s(g_actPeerId,   g_selPeerId,   _TRUNCATE);
+            strncpy_s(g_actPeerName, g_selPeerName, _TRUNCATE);
+            InterlockedExchange(&g_havePeerAction, 1);
+            post(ban ? OVA_BAN : OVA_KICK);
+            char m[200];
+            snprintf(m, sizeof(m), "[menu] pause: %s '%s'", ban ? "BAN" : "KICK", g_selPeerName);
+            log(m);
+            g_page = PG_PLAYERS;
+            queueSwap(page, "Players", false, true);
+            return true;
+        }
+        return true;
+    }
+    if (g_page == PG_BROWSE) {
+        if (itemKey == g_refreshKey) {
+            post(OVA_BROWSE);
+            g_lastBrowseState = -99;
+            g_browsePolls = 8;
+            queueSwap(page, "Online sessions", false, true);
+            return true;
+        }
+        for (int r = 0; r < g_lobbyRowCount; r++) {
+            if (itemKey != g_lobbyRowKeys[r]) continue;
+            g_browsePolls = 0;                  // leaving the list; stop rebuilding it
+            InterlockedExchange(&g_pendingJoinIdx, g_lobbyRowIdx[r]);
+            post(OVA_JOIN_INDEX);
+            // HAND OFF TO THE MULTIPLAYER PAGE rather than sitting on the browser saying "Joining...".
+            // The browse page has no live refresh once its poll budget is spent, so a heading written
+            // there is never updated and a successful join looks identical to a hung one. The MP page
+            // follows the session in real time (the block in PauseMenu_Pump above: heading, footer and
+            // roster all re-render on a state change), which is the acknowledgement a join needs.
+            g_page = PG_MP;
+            g_lastSig = 0xffffffffu;            // unequal to anything: force the first live refresh
+            queueSwap(page, "Joining...", false, true);
+            return true;
+        }
+        return true;                            // any other row on our page: swallow, never fall through
+    }
+    if (g_page == PG_MP) {
+        for (int i = 0; i < kMpRowCount - 1; i++) {
+            if (itemKey != g_mpRowKeys[i]) continue;
+            post(kMpRows[i].act);        // performed by MpPump on this same thread, next frame
+            char m[160];
+            snprintf(m, sizeof(m), "[menu] pause: '%s' selected", kMpRows[i].label);
+            log(m);
+            // ACKNOWLEDGE IMMEDIATELY: a click that looks like nothing happened is the worst possible
+            // outcome, and the real status cannot appear yet because the action itself does not run
+            // until MpPump drains it next frame. The heading therefore states what was just accepted,
+            // from a value already known, and the live poll in PauseMenu_Pump replaces it with the
+            // real state a moment later.
+            char ack[128];
+            snprintf(ack, sizeof(ack), "Multiplayer - %s...",
+                     (kMpRows[i].act == OVA_LEAVE) ? "leaving" : "connecting");
+            queueSwap(page, ack, false, false);      // title only -- no rebuild, so no index churn
+            g_lastSig = 0xffffffffu;                 // force the next poll to publish the real state
+            return true;
+        }
+        return false;
+    }
+    const int gi = g_page - PG_GUEST0;
+    if (gi >= 0 && gi < g_nGuests && !g_guests[gi].dead) {
+        GuestPage& g = g_guests[gi];
+        for (int i = 0; i < g.n; i++) {
+            if (itemKey != g_guestItemKeys[gi][i]) continue;
+            // Only ACTION rows are "pressed" -- a confirm landing on a toggle or slider is the engine
+            // acknowledging the row, not a command, and onSelect may legitimately be null for a page
+            // made entirely of controls.
+            if (g.items[i].kind != OMP_ITEM_ACTION || !g.onSelect) return true;
+            if (!guestSelectGuarded(&g, g.items[i].key)) {
+                g.dead = true;
+                char m[160];
+                snprintf(m, sizeof(m), "[menu] guest page '%s' FAULTED -- disabled for this run", g.title);
+                log(m);
+                g_page = PG_ROOT;
+            }
+            // Rebuild next frame so the guest's status text updates on the rows.
+            queueSwap(page, nullptr, g_page == PG_ROOT, true);
+            return true;
+        }
+    }
+    return false;
+}
+
+static void hkSelConfirm(void* page, void* params) {
+    bool handled = false;
+    __try { handled = handleConfirm(page, params); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { die("faulted handling a confirm"); handled = false; }
+    if (!handled) o_SelConfirm(page, params);
+}
+
+// ---- value changes (toggle / slider) ----------------------------------------------------------------
+// Both funnels are the confirm's twins: (page, params) with the item definition inline at +0x08 and
+// old/new in the two trailing slots. The change is only ever REPORTED to the guest -- the engine has
+// already updated the row's own state, so nothing here rebuilds anything, which is what keeps this
+// clear of the "do not mutate what the caller is still walking" rule.
+static bool handleValueChange(void* params, bool isSlider) {
+    // See the note on g_rebuilding: during a rebuild these events are the display being restored, not
+    // the user changing anything. Reporting them writes the MINIMUM into every slider on every menu
+    // open.
+    if (g_rebuilding) return false;
+    if (g_dead || !PauseMenu_Tuning().enabled || !params) return false;
+    // The replay-editor row is on a FOREIGN page, so it is matched by key before any guest-page
+    // logic. The work is POSTED, not done here: aiming calls into the replay camera, and the engine
+    // is still walking its own widgets underneath at this point.
+    {
+        const uint64_t k = *(const uint64_t*)((const uint8_t*)params + off::kSelParamsItem + off::kItemKey);
+        // The privacy toggle. Matched by key before any guest-page logic, same as the replay row --
+        // it is a first-party row, not a guest's. The write is pure storage; the game thread's pump
+        // turns it into the SDK call (mp_prefs.h), so nothing here touches EOS.
+        if (g_privacyKey && k == g_privacyKey && !isSlider) {
+            const int idx = *(const int32_t*)((const uint8_t*)params + off::kChangeParamsNew);
+            // An engine echo of the value just stamped is not a user action. MpPrefs_SetHideAddress
+            // already early-outs on a no-op write, so this is belt and braces.
+            if ((idx != 0) != MpPrefs_HideAddress()) {
+                MpPrefs_SetHideAddress(idx != 0);
+                char m[96];
+                snprintf(m, sizeof(m), "[menu] 'hide my address' -> %s", idx ? "On" : "Off");
+                log(m);
+            }
+            return true;
+        }
+        if (g_spectateKey && k == g_spectateKey && !isSlider) {
+            const int idx = *(const int32_t*)((const uint8_t*)params + off::kChangeParamsNew);
+            // BUILDING the row fires a change event reporting its initial index, and `g_rebuilding`
+            // does not cover it -- that flag wraps the mod's OWN page rebuilds, and this row lives on
+            // a page the game builds. Without this guard, merely opening the pause menu in the replay
+            // editor reads as "the user selected Me" and re-aims the camera moments after the page
+            // appears, throwing away wherever they had it. A selection that does not CHANGE the
+            // selection is not a user action: ignore it (still consumed, so the engine sees it
+            // handled). The same rule holds for guest-page rows -- never treat an engine-generated
+            // echo of the current value as input.
+            if (idx == g_spectateSel) return true;
+            if (idx >= 0 && idx < g_spectateCount) {
+                // Post the IDENTITY, not the row. The pump runs on a later frame, by which time the
+                // roster may have changed underneath this index -- and posting a row number would
+                // then aim at whoever now occupies it.
+                g_spectateSel     = idx;
+                g_spectateSelPeer = g_spectatePeerIds[idx];
+                InterlockedExchange(&g_spectatePending, (LONG)g_spectateSelPeer);
+            }
+            return true;
+        }
+    }
+    const int gi = g_page - PG_GUEST0;
+    if (gi < 0 || gi >= g_nGuests || g_guests[gi].dead) return false;
+    GuestPage& g = g_guests[gi];
+    if (!g.onValue) return false;
+    const uint64_t itemKey = *(const uint64_t*)((const uint8_t*)params + off::kSelParamsItem + off::kItemKey);
+    for (int i = 0; i < g.n; i++) {
+        if (itemKey != g_guestItemKeys[gi][i]) continue;
+        const GuestItem& it = g.items[i];
+        int   iv = 0;
+        float fv = 0.0f;
+        if (isSlider) {
+            // NewPercent is the normalised bar position; hand the guest its own units back.
+            const float pct = *(const float*)((const uint8_t*)params + off::kChangeParamsNew);
+            fv = it.minValue + pct * (it.maxValue - it.minValue);
+            iv = (int)fv;
+        } else {
+            iv = *(const int32_t*)((const uint8_t*)params + off::kChangeParamsNew);
+            fv = (float)iv;
+        }
+        if (!guestValueGuarded(&g, it.key, iv, fv)) {
+            g.dead = true;
+            log("[menu] guest onValue FAULTED -- page disabled for this run");
+        } else {
+            // Capped, but ON by default: a phantom change looks exactly like a real one in the
+            // guest's settings file, so this log is the only way to see one happening.
+            static int logged = 0;
+            if (logged < 12) {
+                logged++;
+                char m[200];
+                snprintf(m, sizeof(m), "[menu] '%s' changed -> %s%d", it.key, isSlider ? "" : "index ",
+                         isSlider ? (int)fv : iv);
+                log(m);
+            }
+        }
+        return true;
+    }
+    return false;
+}
+static void hkMultiChanged(void* page, void* params) {
+    __try { handleValueChange(params, false); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { die("faulted handling a toggle change"); }
+    o_MultiChanged(page, params);      // always through: the engine still has to update the row
+}
+static void hkProgressChanged(void* page, void* params) {
+    __try { handleValueChange(params, true); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { die("faulted handling a slider change"); }
+    o_ProgressChanged(page, params);
+}
+
+// ---- install ----------------------------------------------------------------------------------------
+void PauseMenu_Install() {
+    if (g_installed) return;
+    g_installed = true;
+    const Syms& S = Get();
+    // Readiness ENUMERATES its dependencies: "menu disabled" must name the missing symbol, never
+    // leave the reader to guess which of seven it was.
+    struct Dep { const char* name; const void* p; };
+    const Dep deps[] = {
+        { "MenuCreateItems",  (const void*)S.MenuCreateItems },
+        { "MenuSelConfirmed", (const void*)S.MenuSelConfirmed },
+        { "MenuRefreshItems", (const void*)S.MenuRefreshItems },
+        { "MenuSetSelIndex",  (const void*)S.MenuSetSelIndex },
+        { "FText::FromName",  (const void*)S.TextFromName },
+        { "FNameCtor",        (const void*)S.FNameCtor },
+        { "FNameToString",    (const void*)S.FNameToString },
+    };
+    char missing[220] = {0};
+    for (const Dep& d : deps) {
+        if (d.p) continue;
+        if (missing[0]) strncat_s(missing, ", ", _TRUNCATE);
+        strncat_s(missing, d.name, _TRUNCATE);
+    }
+    if (missing[0]) {
+        char m[300]; snprintf(m, sizeof(m), "unresolved: %s", missing);
+        die(m);
+        return;
+    }
+    const MH_STATUS ms = MH_Initialize();
+    if (ms != MH_OK && ms != MH_ERROR_ALREADY_INITIALIZED) { die("MinHook init failed"); return; }
+    if (MH_CreateHook(S.MenuCreateItems, (void*)&hkCreateItems, (void**)&o_CreateItems) != MH_OK ||
+        MH_EnableHook(S.MenuCreateItems) != MH_OK) { die("CreatePageItems hook failed"); return; }
+    if (MH_CreateHook(S.MenuSelConfirmed, (void*)&hkSelConfirm, (void**)&o_SelConfirm) != MH_OK ||
+        MH_EnableHook(S.MenuSelConfirmed) != MH_OK) { die("OnSelectionConfirmed hook failed"); return; }
+    // The two value-change funnels are OPTIONAL: without them a guest page still works, it just
+    // cannot own toggles or sliders. Announce the loss rather than dying for it.
+    bool values = false;
+    if (S.MenuMultiChanged && S.MenuProgressChanged &&
+        MH_CreateHook(S.MenuMultiChanged, (void*)&hkMultiChanged, (void**)&o_MultiChanged) == MH_OK &&
+        MH_EnableHook(S.MenuMultiChanged) == MH_OK &&
+        MH_CreateHook(S.MenuProgressChanged, (void*)&hkProgressChanged, (void**)&o_ProgressChanged) == MH_OK &&
+        MH_EnableHook(S.MenuProgressChanged) == MH_OK)
+        values = true;
+    char m[200];
+    snprintf(m, sizeof(m), "[menu] pause-menu integration armed (a 'Multiplayer' row joins the pause menu%s)",
+             values ? "; toggle/slider rows available to guest pages" : "; NO toggle/slider rows -- change funnels unresolved");
+    log(m);
+}
+
+void PauseMenu_Publish(const MpUiState* s) { if (s) g_state = *s; }
+
+bool PauseMenu_TakePeerId(char* idOut, int idCap, char* nameOut, int nameCap) {
+    if (!InterlockedExchange(&g_havePeerAction, 0)) return false;
+    if (idOut   && idCap   > 0) strncpy_s(idOut,   (size_t)idCap,   g_actPeerId,   _TRUNCATE);
+    if (nameOut && nameCap > 0) strncpy_s(nameOut, (size_t)nameCap, g_actPeerName, _TRUNCATE);
+    return idOut ? (idOut[0] != 0) : true;
+}
+
+int PauseMenu_TakeJoinIndex() {
+#ifdef _WIN32
+    return (int)InterlockedExchange(&g_pendingJoinIdx, -1);
+#else
+    const int i = (int)g_pendingJoinIdx; g_pendingJoinIdx = -1; return i;
+#endif
+}
+
+int PauseMenu_TakeAction() {
+#ifdef _WIN32
+    return (int)InterlockedExchange(&g_pending, OVA_NONE);
+#else
+    const int a = (int)g_pending; g_pending = OVA_NONE; return a;
+#endif
+}

@@ -1,0 +1,37 @@
+# Normalise line endings in the repository, check out native on Windows.
+#
+# Worth setting before the first commit rather than after: the working tree grew with mixed LF and
+# CRLF, and introducing normalisation later rewrites whole files and buries real changes under
+# whole-file diffs. Doing it here means nobody ever sees that churn.
+* text=auto
+
+# Explicit for the file types this project actually contains, so a tool that guesses wrongly cannot
+# corrupt one.
+*.c      text
+*.cpp    text
+*.h      text
+*.hpp    text
+*.txt    text
+*.md     text
+*.json   text
+*.cmake  text
+CMakeLists.txt text
+
+# Scripts that Windows runs. CRLF is the safe choice for PowerShell and batch.
+*.ps1    text eol=crlf
+*.bat    text eol=crlf
+*.cmd    text eol=crlf
+
+# Binaries: never touched, never diffed as text.
+*.dll    binary
+*.lib    binary
+*.exp    binary
+*.exe    binary
+*.pdb    binary
+*.zip    binary
+*.ttf    binary
+*.png    binary
+
+# The import library and its definition file are generated artefacts; keep them out of diffs.
+third_party/ue4ss/UE4SS.lib binary
+third_party/ue4ss/UE4SS.exp binary

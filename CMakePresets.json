@@ -1,0 +1,18 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "vs2022",
+      "displayName": "Visual Studio 2022 (x64)",
+      "description": "Generates build/SessionOpenMP.sln with every target and four configurations. Visual Studio picks this up automatically on File > Open > Folder.",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build"
+    }
+  ],
+  "buildPresets": [
+    { "name": "release", "configurePreset": "vs2022", "configuration": "Release" },
+    { "name": "debug", "configurePreset": "vs2022", "configuration": "Debug" }
+  ]
+}

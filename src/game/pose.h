@@ -1,0 +1,84 @@
+// SessionOpenMP -- co-op multiplayer for Session, as an overlay on N solo games.
+// Copyright (C) 2026 matsix
+//
+// This program is free software: you can redistribute it and/or modify it under the
+// terms of the GNU General Public License as published by the Free Software Foundation,
+// either version 3 of the License, or (at your option) any later version. It is
+// distributed WITHOUT ANY WARRANTY; see the GNU GPL (LICENSE) for details.
+//
+// Additional permission under GNU GPL version 3 section 7: you may link and convey this
+// work combined with the Epic Online Services SDK and the proprietary game runtime it
+// loads into. See LICENSE-EXCEPTION.txt.
+// =====================================================================================================
+// SessionOpenMP -- POSE TRANSPORT: the RESULT lane.
+//
+// Everything else in this project transports the DRIVERS of an animation and lets the receiver's own
+// anim graph derive the pose. That is the right default -- the graph fires anim notifies (which is
+// where a peer's board-catch sound comes from), foot IK adapts locally, and drivers EXTRAPOLATE, so a
+// dropped packet leaves a running skater still running instead of freezing mid-stride.
+//
+// It has exactly one failure mode, and the replay editor is it: when there are no drivers, there is
+// nothing to send. Measured: while a peer scrubs their replay, 0 of 97 anim-instance fields change
+// across 30 s, yet 58 of 70 BONES change every second. The pose being played exists only in the
+// skeleton. Position and rotation replicate through all of this because they are transforms; the
+// skater does not because it is a skeleton.
+//
+// So this is a narrow, GATED second lane: while a peer is in replay playback the mod sends their
+// skeleton and stops sending the (inert) driver blob. Normal skating never touches this path and keeps
+// every property above -- transport the result only for the one thing that cannot be derived.
+//
+// THE SEAM (why FinalizeBoneTransform and nothing else):
+//   PostAnimEvaluation COPIES the evaluated pose into BoneSpaceTransforms and only then fills
+//   component space, so anything written before it is overwritten. USkeletalMeshComponent::
+//   FinalizeBoneTransform begins with the buffer FLIP, so at pre-hook time the EDITABLE component-
+//   space array holds this frame's finished pose and is about to be published. That is the last
+//   honest moment to replace it -- the same rule as the anim post-pass.
+// =====================================================================================================
+#pragma once
+#include "../replication/replication.h"
+#include <cstdint>
+
+namespace omp { namespace game { namespace pose {
+
+struct Tuning {
+    bool enabled = true;        // master: false = no pose is captured or applied
+    // Capture only while the local player is in replay PLAYBACK. Gating this tightly is the whole
+    // point: live skating keeps the cheap driver path, its notifies and its extrapolation.
+    uint8_t captureMode = 2;
+    uint32_t freshMs = 500;     // a pose older than this is ignored, so a quiet stream hands the
+                                // skeleton back to the proxy's own graph rather than freezing it
+    // The replay system does not record proxies, and during a LOCAL replay the anim graph does not
+    // drive a skater either, so nothing would pose a peer's skeleton and it would collapse into a heap.
+    // Re-stamp the last pose their own graph produced instead: a peer standing still beats a peer in a
+    // puddle. (A peer sending us their pose while WE scrub is the mirror of `captureMode` and needs a
+    // wire change.)
+    bool holdInLocalReplay = true;
+    // Also capture while a PEER is scrubbing, so they see us skating live instead of the frozen pose
+    // the hold above gives them. Costs a pose lane (and the driver blob, which does not fit alongside
+    // it) for as long as somebody has the replay editor open.
+    bool serveScrubbingPeers = true;
+};
+Tuning& Tune();
+
+struct Stats {
+    uint32_t captured = 0, applied = 0, skippedCount = 0, faults = 0;
+    uint32_t hookCalls = 0, noted = 0, stale = 0;
+    // held        = frames a proxy's own finished pose was snapshotted (normal play)
+    // holdApplied = frames that snapshot was re-stamped during a local replay
+    uint32_t held = 0, holdApplied = 0;
+    uint8_t  bones = 0, meshBones = 0;
+};
+Stats GetStats();
+
+// ---- sender: fill s.poseN/poseRot/posePos from this mesh's finished pose. Returns false (and leaves
+// the pose empty) whenever the driver path should be used instead.
+bool Capture(void* mesh, repl::State& s);
+
+// ---- receiver: remember a proxy's transported pose, keyed by the mesh that must wear it.
+void Note(void* mesh, const repl::State& s, uint64_t nowMs);
+void Forget(void* mesh);
+// Called from the FinalizeBoneTransform pre-hook for EVERY skeletal mesh in the game; cheap and
+// silent unless the mesh is a proxy we have a fresh pose for.
+void OnFinalizeBones(void* mesh, uint64_t nowMs);
+
+}}} // namespace omp::game::pose
