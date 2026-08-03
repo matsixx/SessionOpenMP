@@ -1,5 +1,9 @@
 # SessionOpenMP
 
+**NOTE FROM DEV: This is a vibecoded project through and through. I won't sugarcoat it. This would be an
+incredibly massive undertaking for a solo developer. So, I used AI with the experience I have using it
+for many other very complex projects**
+
 Multiplayer for **Session: Skate Sim** — skate with other people in the same world, cross-play
 between the Epic and Steam builds.
 
