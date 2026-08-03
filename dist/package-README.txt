@@ -71,6 +71,16 @@ this is why. To turn it off, open Mods\mods.txt in the Win64 folder and
 change "SessionTweaks : 1" to "SessionTweaks : 0", then restart the game.
 Multiplayer is unaffected either way.
 
+WANT ONLY SESSIONTWEAKS, NOT THE MULTIPLAYER?
+You can install it by itself. Copy everything EXCEPT the Mods\SessionOpenMP
+folder, then delete the "SessionOpenMP : 1" line from Mods\mods.txt. It needs
+no account and does no networking at all.
+
+Without the multiplayer mod there is no F1 or pause menu for it, so it reads
+its settings from SessionTweaks.ini in the Win64 folder. That file is created
+for you the first time you launch, listing every setting at its default --
+edit it and restart the game.
+
 PRIVACY
 -------
 "Hide my address" is ON by default. Your traffic goes through Epic's relays,

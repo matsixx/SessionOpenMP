@@ -15,6 +15,14 @@ They are two separate DLLs rather than one because they do different jobs: Sessi
 *your own* skating feels and works with or without multiplayer, so it can be switched off on its own
 line in `mods.txt` without disturbing the session. Bundled, not merged.
 
+**SessionTweaks on its own, without the multiplayer mod:** copy only `Mods\SessionTweaks\` out of the
+package onto a UE4SS install and list it in `mods.txt`. It shares no code with SessionOpenMP — no
+networking, no EOS, no account, nothing to sign into. The only thing you give up is the in-game
+menus: SessionTweaks finds its UI by asking the loaded modules whether any of them hosts the menu
+seam, and with SessionOpenMP absent nothing answers, so it configures itself from
+`SessionTweaks.ini` instead. That file is written for you on first launch with every setting at its
+default, so there is nothing to author by hand.
+
 > Status: working and in testing. Sessions of five players have run without trouble. Expect rough
 > edges, and please report them with a log.
 

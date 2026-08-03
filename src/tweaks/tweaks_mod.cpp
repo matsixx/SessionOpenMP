@@ -86,12 +86,11 @@ static void readConfig(const char* dir) {
     // worse than one that refuses.
     static char buf[16384]; buf[0] = 0;
     FILE* f = fopen(p, "r");
+    const bool existed = (f != nullptr);
     if (f) {
         size_t n = fread(buf, 1, sizeof(buf) - 1, f); buf[n] = 0;
         fclose(f);
         if (n == sizeof(buf) - 1) TwkLog("[tweaks] WARNING: SessionTweaks.ini exceeds 16 KB and was truncated -- settings past the cut are IGNORED");
-    } else {
-        TwkLog("[tweaks] no SessionTweaks.ini -- using built-in defaults");
     }
     // Each module parses its own keys and echoes every one, so a value that failed to parse is
     // visible at load time.
@@ -100,6 +99,15 @@ static void readConfig(const char* dir) {
     RunOut_ReadConfig(buf);
     CatchLevel_ReadConfig(buf);
     CatchSound_ReadConfig(buf);
+    // No ini yet: write one holding the defaults just loaded. Without the multiplayer mod there is
+    // no menu to change a setting through, so the file IS the interface -- and a file that lists
+    // every key at its current value is the only way to discover what can be configured. Writing it
+    // from the live values also means it can never drift from the code the way a hand-kept sample
+    // would. (TwkIniSetInt appends any key it does not find, so an empty buffer yields a full file.)
+    if (!existed) {
+        TwkLog("[tweaks] no SessionTweaks.ini -- writing one with the built-in defaults");
+        saveSettings();
+    }
 }
 
 // ------------------------------------------------------------------ F1 menu (host seam)
