@@ -46,7 +46,12 @@ $required = @("LICENSE", "LICENSE-EXCEPTION.txt", "THIRD-PARTY-NOTICES.txt", "EO
 # while the install steps or the shipped mods change underneath it. It also carries the GPL section 6b
 # written offer, which makes it a licensing document, not just instructions.
 $rootData = @(
-    @{ From = Join-Path $Root "dist\package-README.txt"; To = "README.txt" }
+    @{ From = Join-Path $Root "dist\package-README.txt"; To = "README.txt" },
+    # The updater ships WITH the package so an existing install can pull the next release itself.
+    # Both files are plain text by design -- being readable is the whole trust argument for asking
+    # someone to run a script that writes into their game folder.
+    @{ From = Join-Path $Root "dist\update\update.ps1";  To = "update.ps1" },
+    @{ From = Join-Path $Root "dist\update\update.bat";  To = "update.bat" }
 )
 
 # Mods\ is an ALLOWLIST: only the folders in $mods survive, and inside each one only dlls\.

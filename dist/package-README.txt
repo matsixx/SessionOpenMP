@@ -22,6 +22,22 @@ INSTALL
    file integrity" it will restore the old one; just copy it in again.)
 3. Launch the game normally.
 
+UPDATING
+--------
+Double-click update.bat in this folder. It checks GitHub for a newer release,
+downloads it, and installs it over this one.
+
+Your settings are kept: SessionOpenMP_prefs.txt, SessionOpenMP_bans.txt,
+SessionTweaks.ini and UE4SS-settings.ini are never overwritten, and if you
+disabled a mod in Mods\mods.txt it stays disabled.
+
+It is a plain text script, not a program -- open update.ps1 in Notepad and
+read it first if you like. It only contacts github.com, and it only writes
+inside this folder. Close the game before running it.
+
+   update.bat                 install the latest release
+   update.ps1 -Check          just tell me if there is one, change nothing
+
 PLAY
 ----
 1. Both players get in-game (skating around in a level, not in a menu).

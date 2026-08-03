@@ -62,6 +62,18 @@ Three transports sit behind one interface:
 The release package contains all of this laid out correctly, including the EOS runtime that the
 networking needs — start there rather than assembling it by hand.
 
+### Updating
+
+Double-click `update.bat` in the game's `Win64` folder. It asks GitHub for the latest release,
+downloads it and installs it over the existing copy, keeping your settings — `SessionOpenMP_prefs.txt`,
+`SessionOpenMP_bans.txt`, `SessionTweaks.ini` and `UE4SS-settings.ini` are never overwritten, and a mod
+you disabled in `Mods\mods.txt` stays disabled.
+
+It's a readable PowerShell script rather than an executable, deliberately: it lives at
+[`dist/update/update.ps1`](dist/update/update.ps1), talks to no host but GitHub, and writes nothing
+outside the game folder. `update.ps1 -Check` reports without changing anything, and
+`update.ps1 -ZipPath <file>` installs a package you already have.
+
 ---
 
 ## Building
