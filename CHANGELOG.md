@@ -2,6 +2,24 @@
 
 ## SessionOpenMP
 
+### 0.7.0b
+- **Player nameplates.** Each peer's name floats above their skater, drawn from the mod's own overlay
+  so it needs no widget blueprint or font asset from the game. Only other players get a plate.
+- **Chat appears over the speaker** as a speech bubble, keyed by connection rather than by name, so a
+  message can never end up attached to the wrong person.
+- **Version mismatches are now visible.** A host advertises which version they are running, so the
+  session browser warns you *before* you join rather than leaving you in a session where the other
+  player never appears. If a mismatched packet does arrive, the chat box says so once.
+- **Fixed: the browser kept showing the old host's name** after they left and the session passed to
+  someone else. The new host now re-advertises, including when the service is briefly slower to agree
+  that they are the host than their own game is.
+- **A self-service updater** (`update.bat`) ships in the package: it checks GitHub for a newer
+  release, installs it, and keeps your settings and your enabled/disabled mods.
+- **SessionTweaks writes its settings file on first run**, so it can be configured when installed on
+  its own without the multiplayer mod (and therefore without its menus).
+- Added a read-only probe for the grind-exit pop, to settle whether it is limited by per-trick data
+  or by the crank-ratio formula. It changes nothing in game.
+
 ### 0.6.0b
 - First open-source release.
 - Builds from a clean clone: Dear ImGui and MinHook are fetched at pinned revisions instead of being
