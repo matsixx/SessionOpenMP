@@ -43,6 +43,9 @@ using GetCustomItemFn   = void* (*)(const void* fname);
 // simply never worn.
 using TryLoadFn         = void* (*)(void* softObjectPath, void* loadContext);
 using SetHiddenFn       = void  (*)(void* actor, bool hidden);
+// AActor::SetActorEnableCollision(bool). Hiding an actor is PURELY VISUAL -- its components keep
+// colliding, which is why a retired proxy left an invisible obstacle behind.
+using SetCollisionFn    = void  (*)(void* actor, bool enable);
 using SetActorTickFn    = void  (*)(void* actor, bool enabled);
 using SetReplicatesFn   = void  (*)(void* actor, bool replicates);
 using SetActorLocRotFn  = void  (*)(void* actor, const float* loc, const float* quat4, bool sweep,
@@ -197,6 +200,7 @@ struct Syms {
     GetCustomItemFn  GetCustomizationItem = nullptr;
     TryLoadFn        SoftPathTryLoad   = nullptr;
     SetHiddenFn      SetActorHidden    = nullptr;
+    SetCollisionFn   SetActorCollision = nullptr;
     SetActorTickFn   SetActorTick      = nullptr;
     SetReplicatesFn  SetReplicates     = nullptr;
     SetActorLocRotFn SetActorLocRot    = nullptr;

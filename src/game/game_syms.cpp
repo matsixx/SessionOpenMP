@@ -38,6 +38,8 @@ static const SigEntry kSigs[] = {
     // rebuild only RESOLVES, so a peer's garments must be loaded here or the null mesh crashes it.
     { "SoftPathTryLoad",      "48 89 5C 24 08 57 48 83 EC 70 48 8B 01 33 DB 48 8B F9 48 85 C0 0F 84 ?? ?? ?? ?? 83 79 10 01 ?? ?? 48 8D 4C 24 50 48 89 44 24 50", false },
     { "SetActorHidden",       "44 0F B6 41 58 41 0F B6 C0 C0 E8 05 24 01 3A C2 74 13 41 80 E0 DF C0 E2 05 44 0A C2 44 88 41 58 E9 ?? ?? ?? ?? C3", true },
+    // Hiding is visual only; a retired proxy keeps its capsule and the camera still collides with it.
+    { "SetActorCollision",    "4C 8B DC 55 48 81 EC 00 01 00 00 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 84 24 F0 00 00 00 48 8B E9 0F B6 49 5C 0F B6 C1 C0 E8 03 24 01 3A C2 0F 84 ?? ?? ?? ??", false },
     { "SetActorTick",         "48 89 5C 24 08 57 48 83 EC 20 F6 41 32 02 0F B6 FA 48 8B D9 74 1B BA 30 00 00 00 E8 ?? ?? ?? ?? 84 C0", true },
     // Non-negotiable in overlay mode: without this a host's proxy replicates to every client and lands
     // inside the player it mirrors.
@@ -406,6 +408,7 @@ const Syms& Resolve(void (*logf)(const char*)) {
     g_syms.GetCustomizationItem = (GetCustomItemFn) found[i++];
     g_syms.SoftPathTryLoad    = (TryLoadFn)         found[i++];
     g_syms.SetActorHidden     = (SetHiddenFn)       found[i++];
+    g_syms.SetActorCollision  = (SetCollisionFn)    found[i++];
     g_syms.SetActorTick       = (SetActorTickFn)    found[i++];
     g_syms.SetReplicates      = (SetReplicatesFn)   found[i++];
     g_syms.SetActorLocRot     = (SetActorLocRotFn)  found[i++];

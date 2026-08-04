@@ -1009,18 +1009,24 @@ void Proxy::Retire(void (*logf)(const char*)) {
     OnQuiet(logf);                       // stops the board simulating and silences their loops
     AudioStopAll();
     const Syms& S = Get();
-    if (S.SetActorHidden) {
+    // HIDING IS PURELY VISUAL -- the components keep their collision. A retired proxy that is only
+    // hidden leaves an invisible obstacle exactly where it was standing: you cannot see it, but the
+    // camera still collides with the skater's capsule, which reads as the game snagging on nothing.
+    // The actor is never destroyed (destroying one mid-session crashes the client), so its collision
+    // has to be turned off explicitly. Nothing re-uses a retired actor -- a returning peer spawns a
+    // fresh one -- so this is permanent by design.
+    auto retire = [&](void* a) {
+        if (!a) return;
 #ifdef _WIN32
-        __try { S.SetActorHidden(actor_, true); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        if (S.SetActorCollision) { __try { S.SetActorCollision(a, false); } __except (EXCEPTION_EXECUTE_HANDLER) {} }
+        if (S.SetActorHidden)    { __try { S.SetActorHidden(a, true); }     __except (EXCEPTION_EXECUTE_HANDLER) {} }
 #endif
-    }
-    void* bd = OwnBoard();
-    if (bd && S.SetActorHidden) {
-#ifdef _WIN32
-        __try { S.SetActorHidden(bd, true); } __except (EXCEPTION_EXECUTE_HANDLER) {}
-#endif
-    }
-    if (logf) logf("[proxy] peer left -- their skater and board hidden (no frozen statue, no runaway board)");
+    };
+    retire(actor_);
+    retire(OwnBoard());
+    if (logf) logf(S.SetActorCollision
+        ? "[proxy] peer left -- their skater and board hidden and decollided"
+        : "[proxy] peer left -- their skater and board hidden (no collision symbol: they will still block the camera)");
 }
 
 void Proxy::OnQuiet(void (*logf)(const char*)) {
