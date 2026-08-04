@@ -65,6 +65,13 @@ Three transports sit behind one interface:
 
 ## Installing (players)
 
+**Easy install**
+1. Go to releases and download the latest .zip
+2. Extract everything into SessionGame\Binaries\Win64
+3. Open game and press pause or F1 to use MP and adjust Tweaks settings
+
+**Manual Install**
+
 1. Install [RE-UE4SS](https://github.com/UE4SS-RE/RE-UE4SS) 3.0.1 into the game.
 2. Copy the mod folders into `SessionGame\Binaries\Win64\Mods\`, so you have
    `Mods\SessionOpenMP\dlls\main.dll` and `Mods\SessionTweaks\dlls\main.dll`.
