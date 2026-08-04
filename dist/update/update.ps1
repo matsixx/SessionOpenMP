@@ -203,9 +203,27 @@ try {
         Good "downloaded"
     }
 
+    # ---- integrity. GitHub computes a SHA-256 for every release asset and serves it as `digest`, so
+    # the download can be checked against what the service says it published rather than against a
+    # number a human is asked to compare by eye. A mismatch means the bytes are not the ones that
+    # were released -- corrupted, truncated, or substituted -- and none of those should be unzipped
+    # over somebody's game, so it is refused rather than reported.
     $sha = (Get-FileHash $zip -Algorithm SHA256).Hash
-    Say  "  SHA-256: $sha"
-    Say  "  (the release page lists this too -- compare them if you want to be sure)"
+    if ($localZip -ne "") {
+        Say "  SHA-256: $sha"
+    } elseif ($asset.digest -and $asset.digest -like "sha256:*") {
+        $want = ($asset.digest -replace '^sha256:', '')
+        if ($want -ieq $sha) {
+            Good "checksum verified against GitHub ($($sha.Substring(0,16))...)"
+        } else {
+            throw ("the download does not match the checksum GitHub published for it" +
+                   "`n    expected $want`n    got      $sha`nNothing was changed.")
+        }
+    } else {
+        # Older assets predate the digest field; the TLS connection to GitHub is still the real
+        # boundary, so say what was and was not checked rather than implying a verification.
+        Say "  SHA-256: $sha  (GitHub published no checksum for this asset to compare against)"
+    }
 
     # ------------------------------------------------------------ 6. sanity-check the package
     Step "Checking the package..."

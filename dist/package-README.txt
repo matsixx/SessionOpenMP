@@ -35,6 +35,9 @@ It is a plain text script, not a program -- open update.ps1 in Notepad and
 read it first if you like. It only contacts github.com, and it only writes
 inside this folder. Close the game before running it.
 
+The download is checked against the checksum GitHub publishes for the release;
+if it does not match, nothing is installed.
+
    update.bat                 install the latest release
    update.ps1 -Check          just tell me if there is one, change nothing
 
