@@ -4,6 +4,11 @@
 incredibly massive undertaking for a solo developer. So, I used AI with the experience I have using it
 for many other very complex projects. This is 1-2 weeks of work day and night.**
 
+**License notice: This project is licensed under GPL-3.0. You are free to fork, modify, and redistribute it, 
+provided your version remains licensed under GPL-3.0 and its complete corresponding source is made available. 
+Incorporating this code into a closed-source or proprietary distributed product is a license violation. 
+Violations will be pursued, including DMCA takedown requests where applicable.**
+
 Multiplayer for **Session: Skate Sim** — skate with other people in the same world, cross-play
 between the Epic and Steam builds.
 
