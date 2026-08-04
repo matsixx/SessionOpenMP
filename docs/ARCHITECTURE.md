@@ -59,8 +59,12 @@ Compression is by construction rather than by a general-purpose compressor:
 - The pose lane (a full skeleton) is sent **only** when it is the only thing that can work — see
   below.
 
-Each packet begins with a four-character magic identifying the wire version. Peers on different
-versions are rejected with a message rather than being allowed to misparse each other.
+Each packet begins with a four-character magic identifying the wire version, so a peer on a different
+build is rejected rather than allowed to misparse. That rejection is otherwise invisible — the lobby
+join and the P2P link both succeed regardless of version, and only the snapshots fail, so the symptom
+is a player who connects and then never appears. Two things make it legible instead: the host's
+version rides the lobby advertisement, so the browser can flag a mismatch *before* anyone joins, and
+the first unreadable packet from a peer announces itself once (`Config::onVersionMismatch`).
 
 ### Drivers, not results
 

@@ -35,8 +35,26 @@ void MpPrefs_Init(const char* dir, void (*logf)(const char*));
 bool MpPrefs_HideAddress();
 void MpPrefs_SetHideAddress(bool on);
 
-// Bumped by every setter. The game thread applies preferences when this changes, so a menu can write
-// from any thread without ever calling into the SDK itself.
+// ---- FLOATING PLAYER NAMES + SPEECH BUBBLES (ui/nameplates.h).
+// Stored here because they are the player's own settings and have to survive a restart; the
+// game-thread publish copies them into the live tuning every frame, so a change from either menu
+// takes effect immediately and there is exactly one source of truth.
+// Distances are in METRES, not centimetres, because the pause menu draws them on a slider and the
+// game prints a slider's value with "%d" -- the units have to be ones whose integers mean something.
+enum { MPNAME_OFF = 0, MPNAME_OFFBOARD = 1, MPNAME_ALWAYS = 2 };
+int  MpPrefs_NameMode();                 // MPNAME_* -- default MPNAME_OFFBOARD
+void MpPrefs_SetNameMode(int mode);
+int  MpPrefs_NameDistM();                // how far away a name is still drawn
+void MpPrefs_SetNameDistM(int metres);
+int  MpPrefs_BubbleDistM();              // ...and a chat bubble, which is deliberately much shorter
+void MpPrefs_SetBubbleDistM(int metres);
+// The slider limits, so the menu row and the setter's clamp cannot drift apart.
+enum { MPNAME_DIST_MIN = 10, MPNAME_DIST_MAX = 250, MPBUBBLE_DIST_MIN = 5, MPBUBBLE_DIST_MAX = 100 };
+
+// Bumped by the setters whose value the TRANSPORT has to be told about. The game thread applies
+// those when this changes, so a menu can write from any thread without ever calling into the SDK
+// itself. The nameplate settings above deliberately do NOT bump it: nothing about them reaches EOS,
+// and a spurious bump would re-issue a relay-control call for a change that has nothing to do with it.
 unsigned MpPrefs_Generation();
 
 // ---- This install's PERMANENT peer identity: 32 lowercase hex characters (128 random bits),

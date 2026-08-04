@@ -160,6 +160,15 @@ entry, though — it cannot add a row to an arbitrary game page.
 7. **`_maxVisibleItems` (`+0x290`) caps row creation** to `[headerIndex, headerIndex + maxVisible)`.
    An appended row past the cap is silently never built, which looks exactly like "the injection
    didn't work". Raise it for the duration of the call and restore after.
+   **Measured: `PauseMenuPage` is `items=8 maxVisible=14`** — 14 rows is what the panel is laid out
+   for. Past that, rows still build but crowd the screen, because raising `_maxVisibleItems` is also
+   precisely what hides the native scrollbar: the scroll math triggers on
+   `_pageItemDefinitions.Num > _maxVisibleItems`, and forcing the cap up guarantees the opposite.
+   **To scroll instead of crowd:** leave `_maxVisibleItems` alone and publish the real row count in
+   `_pageItemDefinitions` — but that array is destructed element-wise and freed by the engine on the
+   next activation, so its storage must come from the engine's own allocator (`MemMalloc`/`MemFree`
+   are already resolved) and its `FText`s must each hold their own reference. Inflating `Num` over
+   our static buffer instead would make the engine destruct 144-byte definitions that do not exist.
 8. **A ProgressBar's readout is an integer** — `display = (int)(2*min + 2*pct*(max-min) + 0.5) >> 1`,
    printed `%d`. Choose units whose integers mean something (cm, deg, percent), never "0.5 to 6.0
    metres".

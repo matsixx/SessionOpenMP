@@ -73,7 +73,20 @@ typedef void (*OmpMenuDrawFn)(const OmpMenuApi* api, void* user);
 // faults is marked dead and never shown again for the rest of the run (it can never take the game
 // down with it). Discovery is the same rule as above -- probe every loaded module for the export.
 // =====================================================================================================
-enum { OMP_PAGEITEM_MAX = 12 };
+// The host's per-page row cap. It sizes fixed arrays here and in pause_menu.cpp, and the host clamps
+// a guest's count to it, so raising it is host-side only: a guest DLL built against a smaller value
+// still registers correctly (it simply never offers more rows than it knew about).
+// This is OUR limit, not the game's -- the page's own `_maxVisibleItems` is raised for the duration
+// of the row build so every row gets created.
+//
+// Measured: `PauseMenuPage` reports items=8 maxVisible=14, so 14 rows is what the panel is actually
+// laid out for. Beyond that the rows still build (the cap is raised) but they crowd the screen,
+// because forcing `_maxVisibleItems` up is also exactly what suppresses the native scrollbar --
+// the scroll math triggers on `_pageItemDefinitions.Num > _maxVisibleItems`. A page wanting more
+// than 14 rows should get scrolling rather than a higher cap: leave `_maxVisibleItems` alone and
+// publish the real count instead, with the row storage allocated through the engine's own allocator
+// so its element-wise destruct and free on the next activation stay legitimate.
+enum { OMP_PAGEITEM_MAX = 20 };
 
 struct OmpPageItem {
     const char* key;      // stable ASCII id, unique within the page; becomes the row's FName

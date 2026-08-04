@@ -35,7 +35,15 @@ struct Config {
     // A chat line arrived. Called on the GAME thread, from OnPacket, with the SENDER'S OWN name (it
     // travels with the message so a line keeps the name it was said under). A callback rather than a
     // queue because the session layer must not know the UI exists.
-    void (*onChat)(const char* name, const char* text) = nullptr;
+    // `peerId` is the sender's TRANSPORT INDEX -- the identity a slot is keyed by, and the only one of
+    // the three (name / row / actor pointer) that a caller may hold on to. Anything that has to attach
+    // the line to the person who said it -- a speech bubble over their skater -- keys on this; the
+    // name is a label two people can share.
+    void (*onChat)(int peerId, const char* name, const char* text) = nullptr;
+    // A peer sent a packet this build cannot parse -- in practice, a different mod version. Fired
+    // ONCE per peer, so it is safe to put in front of the player. Optional: the session already logs
+    // it, and this exists so the UI can say it where the player is actually looking.
+    void (*onVersionMismatch)(int peerId) = nullptr;
 };
 
 struct Stats {

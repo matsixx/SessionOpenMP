@@ -27,7 +27,16 @@ static bool     g_hideAddress = true;
 static unsigned g_gen = 0;
 static char     g_peerId[33] = {0};      // 32 hex chars + terminator; empty until Init
 
+// Floating names: on while you are off your board, which is when you are looking around rather than
+// skating. Bubble range is far shorter than name range because a sentence needs much more screen than
+// a name does, and one you cannot read is just clutter.
+static int      g_nameMode    = MPNAME_OFFBOARD;
+static int      g_nameDistM   = 120;
+static int      g_bubbleDistM = 35;
+
 static void say(const char* s) { if (g_log) g_log(s); }
+
+static int clampI(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
 
 static void saveAll() {
     if (!g_path[0]) return;
@@ -38,6 +47,10 @@ static void saveAll() {
     }
     fprintf(f, "# SessionOpenMP preferences. Delete a line to return it to its default.\n");
     fprintf(f, "HideAddress=%d\n", g_hideAddress ? 1 : 0);
+    fprintf(f, "# Player names above heads: 0 off, 1 only while off your board, 2 always.\n");
+    fprintf(f, "NameMode=%d\n", g_nameMode);
+    fprintf(f, "NameDistM=%d\n", g_nameDistM);
+    fprintf(f, "BubbleDistM=%d\n", g_bubbleDistM);
     // PeerId is an IDENTITY, not a preference: deleting the line makes this install a different
     // person to everyone who has played with it. Written last, with a warning above it.
     fprintf(f, "# PeerId identifies this install to peers on non-EOS transports. Deleting it is\n"
@@ -75,6 +88,38 @@ void MpPrefs_SetHideAddress(bool on) {
     say(m);
 }
 
+// The nameplate settings. No generation bump: nothing about them reaches the transport, and the
+// game-thread publish reads them straight out of here every frame. Each one clamps, so a hand-edited
+// or corrupt file can never produce a slider position the menu could not have produced.
+int  MpPrefs_NameMode()    { return g_nameMode; }
+int  MpPrefs_NameDistM()   { return g_nameDistM; }
+int  MpPrefs_BubbleDistM() { return g_bubbleDistM; }
+
+void MpPrefs_SetNameMode(int mode) {
+    mode = clampI(mode, MPNAME_OFF, MPNAME_ALWAYS);
+    if (mode == g_nameMode) return;                 // a no-op write must not churn the file
+    g_nameMode = mode;
+    saveAll();
+    char m[120];
+    snprintf(m, sizeof(m), "[prefs] player names: %s",
+             (mode == MPNAME_OFF) ? "off" : (mode == MPNAME_ALWAYS) ? "always" : "off board only");
+    say(m);
+}
+void MpPrefs_SetNameDistM(int metres) {
+    metres = clampI(metres, MPNAME_DIST_MIN, MPNAME_DIST_MAX);
+    if (metres == g_nameDistM) return;
+    g_nameDistM = metres;
+    saveAll();
+    char m[96]; snprintf(m, sizeof(m), "[prefs] name distance: %d m", metres); say(m);
+}
+void MpPrefs_SetBubbleDistM(int metres) {
+    metres = clampI(metres, MPBUBBLE_DIST_MIN, MPBUBBLE_DIST_MAX);
+    if (metres == g_bubbleDistM) return;
+    g_bubbleDistM = metres;
+    saveAll();
+    char m[96]; snprintf(m, sizeof(m), "[prefs] bubble distance: %d m", metres); say(m);
+}
+
 void MpPrefs_Init(const char* dir, void (*logf)(const char*)) {
     g_log = logf;
     if (!dir || !*dir) return;
@@ -96,6 +141,9 @@ void MpPrefs_Init(const char* dir, void (*logf)(const char*)) {
             // for this preference zero is the LESS safe value, so "corrupt file" must not silently
             // mean "stop hiding my address".
             if (!_stricmp(key, "HideAddress")) g_hideAddress = (val[0] != '0');
+            else if (!_stricmp(key, "NameMode"))    g_nameMode    = clampI(atoi(val), MPNAME_OFF, MPNAME_ALWAYS);
+            else if (!_stricmp(key, "NameDistM"))   g_nameDistM   = clampI(atoi(val), MPNAME_DIST_MIN, MPNAME_DIST_MAX);
+            else if (!_stricmp(key, "BubbleDistM")) g_bubbleDistM = clampI(atoi(val), MPBUBBLE_DIST_MIN, MPBUBBLE_DIST_MAX);
             else if (!_stricmp(key, "PeerId")) {
                 // Only accept a well-formed one. A truncated or hand-edited id would still "work"
                 // right up until it collided with somebody, which is the worst time to find out.

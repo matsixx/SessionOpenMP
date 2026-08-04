@@ -172,6 +172,23 @@ using MemFreeFn         = void  (*)(void* p);
 // exes. A unique CALL SITE is sig'd instead and the target decoded from its `E8 rel32` -- reading the
 // displacement rather than wildcarding it, the same identity rule pointed the other way.
 using TextFromNameFn    = void* (*)(void* outFText, const void* fname);
+// ---- WORLD -> SCREEN, for the floating player names (nameplates.h) ---------------------------------
+// APlayerController::ProjectWorldLocationToScreenWithDistance(this, const FVector* world,
+//   FVector* outScreenXY_and_Distance, bool bViewportRelative) -> bool.
+// The `WithDistance` overload rather than the plain one for two reasons: it hands back the distance to
+// the point for free (which is what sizes and range-limits a plate), and the plain one is a 14-byte
+// forwarding stub -- exactly the shape MSVC folds with any other identical stub, so the name at that
+// address is not evidence of what lives there. This one is a real 0x1bc-byte body.
+// It cannot be called at a bad moment: it returns false on a null ULocalPlayer, a null ViewportClient,
+// a failed GetProjectionData, and a point behind the camera (FSceneView::ProjectWorldToScreen's W<=0).
+using ProjectToScreenFn = bool  (*)(void* playerController, const float* world, float* outXYDist,
+                                    bool viewportRelative);
+// APlayerController::GetViewportSize(this, int32* x, int32* y). Zeroes both outs first and leaves them
+// at zero on any failure, so 0 IS the "unknown" answer and needs no separate return value.
+// Needed because the projection above answers in the GAME's viewport pixels, which are not the window's
+// client pixels whenever a resolution scale is set -- so the screen position has to be normalised here
+// and un-normalised against whatever the render thread's display size turns out to be.
+using ViewportSizeFn    = void  (*)(void* playerController, int* outX, int* outY);
 
 struct Syms {
     SpawnActorFn     SpawnActor        = nullptr;
@@ -302,6 +319,9 @@ struct Syms {
     void*            RenameObj         = nullptr;   // UObject::Rename -- hooked, never called directly
     void*            AnimUpdate        = nullptr;   // USkaterAnimInstance::NativeUpdateAnimation --
                                                     // POST-hooked; the pose blob applies there
+    // ---- the floating player names. Optional: missing = no nameplates, nothing else changes.
+    ProjectToScreenFn ProjectToScreen  = nullptr;
+    ViewportSizeFn    GetViewportSize  = nullptr;
     int  resolved = 0, total = 0;
 };
 
@@ -366,6 +386,10 @@ bool PrettyMapName(const char* internalName, char* out, int cap);
 namespace off {
     constexpr int kActorRole          = 0xf0;    // AActor::Role  (1 SimulatedProxy, 2 Autonomous, 3 Authority)
     constexpr int kActorRootComp      = 0x130;   // AActor::RootComponent
+    // UCapsuleComponent::CapsuleHalfHeight -- a full PDB type layout (2 members, class size 0x470, so
+    // these two ARE its tail), not an accessor. A Character's root component IS its capsule, which is
+    // what makes "half-height above the origin" the top of the skater's head.
+    constexpr int kCapsuleHalfHeight  = 0x468;
     // AActor::Tags (TArray<FName>), read out of AActor::ActorHasTag's own loop:
     //   `mov rax,[rdi+0x170]` (Data) / `movsxd rcx,[rdi+0x178]` (Num) / 8-byte stride.
     // Actors also opt into the replay system BY TAG -- AReplayManager::AddReplayComponents calls
@@ -699,6 +723,17 @@ namespace off {
 // SEH-guarded; a stale controller resolves to "no crank" and the gates keep protecting.
 void  SetLocalController(void* pc);
 bool  PauseMenuOpen();                     // the game's own "is the pause menu up"
+
+// ---- WORLD -> SCREEN. Both go through the local controller set above, and both are SEH-guarded.
+// The game's viewport in pixels. False (and untouched outputs) when it cannot be known yet.
+bool  ViewportSize(int* outW, int* outH);
+// A world point in VIEWPORT pixels, plus its distance from the camera in cm. False when the point is
+// behind the camera or the view cannot be resolved -- the caller draws nothing rather than guessing.
+bool  ProjectWorldToViewport(const float world[3], float outPx[2], float* outDistCm);
+// How high above an actor's origin its head is: the root capsule's own half-height (UCapsuleComponent
+// +0x468) plus `headroomCm`. Measured rather than assumed, so it is right for whatever capsule the
+// skater actually has -- with a plain fallback if the root is not a capsule or reads implausibly.
+bool  ActorHeadPoint(void* actor, float headroomCm, float out[3]);
 int   CrankIndexFromPtr(void* crankDef);   // -1 = not resolvable (no controller/DB, out of list, misaligned)
 void* CrankPtrFromIndex(int idx);          // nullptr = not resolvable
 

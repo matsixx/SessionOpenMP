@@ -39,6 +39,7 @@ int PeerCount() { return g_roster; }
 }
 
 static int   g_fails = 0;
+static int   g_mismatches = 0;   // version-skew announcements seen by the test callback
 static void  check(bool ok, const char* what) {
     printf("  %-58s %s\n", what, ok ? "PASS" : "*** FAIL");
     if (!ok) g_fails++;
@@ -153,6 +154,22 @@ int main() {
     session::OnPacket(0, junk, sizeof(junk), us);                  // bad magic
     session::OnPacket(0, junk, 3, us);                             // too short
     check(session::GetStats().received == before, "malformed packets rejected, not counted");
+
+    // ---- VERSION SKEW. A peer on a different build sends packets whose magic this one rejects. That
+    // must be ANNOUNCED (it is otherwise invisible: the lobby and the P2P link both still succeed, so
+    // the only symptom is a player who never appears) and announced exactly ONCE -- a mismatched peer
+    // rejects at the send rate, and a warning that repeats 60 times a second is a flood.
+    printf("\nversion skew\n");
+    {
+        session::Config vc = session::GetConfig();
+        vc.onVersionMismatch = [](int) { g_mismatches++; };
+        session::SetConfig(vc);
+        g_mismatches = 0;
+        for (int i = 0; i < 120; i++) session::OnPacket(3, junk, sizeof(junk), us);
+        check(g_mismatches == 1, "unreadable packets from a peer announce ONCE, not per packet");
+        for (int i = 0; i < 60; i++) session::OnPacket(9, junk, sizeof(junk), us);
+        check(g_mismatches == 2, "a DIFFERENT peer announces on its own");
+    }
 
     printf("\n%s\n", g_fails ? "*** SESSION TEST FAILURES ***" : "SESSION TEST PASS");
     return g_fails ? 1 : 0;

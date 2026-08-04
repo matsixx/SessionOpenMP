@@ -194,6 +194,11 @@ static const SigEntry kSigs[] = {
     // trailing E8's displacement to get the real address; verified from disk to land on Epic 0x126d3f0
     // and Steam 0x122ded0.  Site: Epic 0x108949b / Steam 0x104981b.
     { "MenuTextSite",         "49 8B CD E8 ?? ?? ?? ?? 48 8B C8 49 8D 56 08 E8 ?? ?? ?? ?? 48 85 C0 ?? ?? 0F B6 90 B0 00 00 00 48 8B 4D D7 E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ?? 49 8B D6 48 8D 4D 0F E8 ?? ?? ?? ??", false },
+    // --- THE FLOATING PLAYER NAMES. Both optional: without them no nameplate is ever drawn.
+    // APlayerController::ProjectWorldLocationToScreenWithDistance  Epic 0x2ed3c00 / Steam 0x2e966e0
+    { "ProjectToScreen",      "48 89 5C 24 10 48 89 6C 24 18 56 57 41 56 48 81 EC 20 01 00 00 48 8B 99 98 02 00 00 41 0F B6 F1 49 8B E8 48 8B FA", false },
+    // APlayerController::GetViewportSize                           Epic 0x2ecd8a0 / Steam 0x2e90380
+    { "GetViewportSize",      "48 89 5C 24 10 48 89 74 24 18 57 48 83 EC 20 33 C0 49 8B F8 89 02 48 8B F2 41 89 00 48 8B 99 98 02 00 00", false },
 };
 static const int kSigN = (int)(sizeof(kSigs) / sizeof(kSigs[0]));
 
@@ -477,6 +482,10 @@ const Syms& Resolve(void (*logf)(const char*)) {
                  g_syms.TextFromName ? (void*)((uint8_t*)g_syms.TextFromName - base) : nullptr);
         say(m);
     }
+    // Appended AFTER the MenuTextSite block on purpose: that block consumes its own slot with
+    // `found[i++]`, so the positional run continues here and the table stays append-only.
+    g_syms.ProjectToScreen    = (ProjectToScreenFn) found[i++];
+    g_syms.GetViewportSize    = (ViewportSizeFn)    found[i++];
 
     // LOCKSTEP CHECK. The block above is POSITIONAL, and a table entry added without its assignment --
     // or vice versa -- shifts every later symbol onto the wrong address SILENTLY: sigs still resolve
@@ -618,6 +627,52 @@ bool PauseMenuOpen() {
     if (!g_syms.PauseMenuShown || !g_localController) return false;
     __try { return g_syms.PauseMenuShown(g_localController); }
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// =====================================================================================================
+// WORLD -> SCREEN. Everything the floating player names need to know about the camera, asked of the
+// engine rather than reconstructed: a hand-rolled projection would have to reproduce the game's FOV,
+// aspect handling and any constrained view rect, and would be wrong the first time one of them changed.
+// =====================================================================================================
+bool ViewportSize(int* outW, int* outH) {
+    if (!g_syms.GetViewportSize || !g_localController) return false;
+    int x = 0, y = 0;
+    __try { g_syms.GetViewportSize(g_localController, &x, &y); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    if (x <= 0 || y <= 0) return false;                 // the function's own "cannot know yet"
+    if (outW) *outW = x;
+    if (outH) *outH = y;
+    return true;
+}
+
+bool ProjectWorldToViewport(const float world[3], float outPx[2], float* outDistCm) {
+    if (!g_syms.ProjectToScreen || !g_localController || !world) return false;
+    float xyd[3] = {0, 0, 0};
+    bool ok = false;
+    // viewportRelative = false: the answer wanted is a position in the viewport the game is actually
+    // rendering, which is what the caller normalises against the viewport SIZE above.
+    __try { ok = g_syms.ProjectToScreen(g_localController, world, xyd, false); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    if (!ok) return false;                              // behind the camera, or no view to project into
+    if (outPx) { outPx[0] = xyd[0]; outPx[1] = xyd[1]; }
+    if (outDistCm) *outDistCm = xyd[2];
+    return true;
+}
+
+bool ActorHeadPoint(void* actor, float headroomCm, float out[3]) {
+    if (!actor || !out) return false;
+    __try {
+        void* root = *(void**)((uint8_t*)actor + off::kActorRootComp);
+        if (!root) return false;
+        memcpy(out, (uint8_t*)root + off::kCompPos, 12);
+        float half = *(float*)((uint8_t*)root + off::kCapsuleHalfHeight);
+        // A skater capsule is on the order of a metre. Anything else means the root is not a capsule
+        // (or the read went somewhere it should not have), so fall back rather than trust it -- the
+        // plate ends up in roughly the right place either way.
+        if (!(half > 20.0f && half < 300.0f)) half = 90.0f;
+        out[2] += half + headroomCm;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
 #ifdef _WIN32

@@ -165,6 +165,8 @@ if(EXISTS "${UE4SS_LIB}")
             # font hunt, whose only consumer is the chat atlas.
             src/ui/theme.cpp
             src/ui/chat.cpp
+            # Floating player names. ImGui like the chat, and drawn from the same Present hook.
+            src/ui/nameplates.cpp
             src/game/game_font.cpp
             ${IMGUI_SRC}/imgui.cpp
             ${IMGUI_SRC}/imgui_draw.cpp
@@ -212,6 +214,7 @@ if(EXISTS "${UE4SS_LIB}")
             src/tweaks/run_out.cpp
             src/tweaks/catch_level.cpp
             src/tweaks/catch_sound.cpp
+            src/tweaks/grind_pop.cpp
             ${MINHOOK_SRC}/src/buffer.c
             ${MINHOOK_SRC}/src/hook.c
             ${MINHOOK_SRC}/src/trampoline.c

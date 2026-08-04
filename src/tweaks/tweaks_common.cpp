@@ -60,6 +60,10 @@ uint8_t* TwkScanExe(const char* sig) {
 int TwkIniSetInt(char* text, size_t cap, const char* key, int value) {
     char val[32];
     snprintf(val, sizeof(val), "%d", value);
+    return TwkIniSetStr(text, cap, key, val);
+}
+
+int TwkIniSetStr(char* text, size_t cap, const char* key, const char* val) {
     const size_t klen = strlen(key), vlen = strlen(val);
     for (char* line = text; *line; ) {
         char* eol = strpbrk(line, "\r\n");
@@ -85,6 +89,32 @@ int TwkIniSetInt(char* text, size_t cap, const char* key, int value) {
     if (len + klen + vlen + 4 > cap) return 0;         // key not present: append a fresh line
     snprintf(text + len, cap - len, "%s%s=%s\n", (len && text[len - 1] != '\n') ? "\n" : "", key, val);
     return 1;
+}
+
+void TwkIniStr(const char* text, const char* key, char* out, size_t cap, const char* def) {
+    snprintf(out, cap, "%s", def ? def : "");
+    const size_t klen = strlen(key);
+    for (const char* line = text; *line; ) {
+        const char* eol = strpbrk(line, "\r\n");
+        const char* end = eol ? eol : line + strlen(line);
+        const char* p = line;
+        while (p < end && (*p == ' ' || *p == '\t')) p++;
+        if (p < end && *p != ';' && *p != '#' && *p != '[' &&
+            (size_t)(end - p) > klen && _strnicmp(p, key, klen) == 0) {
+            const char* q = p + klen;
+            while (q < end && (*q == ' ' || *q == '\t')) q++;
+            if (q < end && *q == '=') {
+                q++;
+                while (q < end && (*q == ' ' || *q == '\t')) q++;
+                while (end > q && (end[-1] == ' ' || end[-1] == '\t')) end--;
+                size_t n = (size_t)(end - q);
+                if (n >= cap) n = cap - 1;
+                memcpy(out, q, n); out[n] = 0;
+                return;
+            }
+        }
+        line = eol ? eol + 1 : end;
+    }
 }
 
 int TwkIniInt(const char* text, const char* key, int def) {

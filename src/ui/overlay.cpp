@@ -44,6 +44,7 @@
 #include "mp_name.h"
 #include "mp_prefs.h"
 #include "chat.h"
+#include "nameplates.h"
 #include "theme.h"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
@@ -414,6 +415,38 @@ static void buildUI() {
             ImGui::TextDisabled("Applies to new connections -- it does not re-route a session already up.");
         }
 
+        // ---- PLAYER NAMES. The same three settings as the pause menu's "Player names" page: one
+        // setting, two surfaces, one store (mp_prefs.h). Collapsed by default so it does not push the
+        // connect buttons down the panel -- this is a preference, not something you come here to do.
+        // A SLIDER IS COMMITTED ON RELEASE, NOT WHILE DRAGGING: every setter call rewrites the
+        // preferences file, and a drag crosses a few hundred integer values. While the widget is
+        // active the local copy is authoritative; the rest of the time it mirrors the store, so a
+        // change made in the pause menu shows up here without any plumbing between them.
+        if (ImGui::CollapsingHeader("Player names")) {
+            ImGui::Indent();
+            int mode = MpPrefs_NameMode();
+            ImGui::SetNextItemWidth(220.0f);
+            if (ImGui::Combo("Show names", &mode, "Off\0Off board only\0Always\0"))
+                MpPrefs_SetNameMode(mode);
+            ImGui::TextDisabled("Off board only keeps your screen clear while you skate.");
+
+            static int  nameD = 0;   static bool nameActive = false;
+            static int  bubD  = 0;   static bool bubActive  = false;
+            if (!nameActive) nameD = MpPrefs_NameDistM();
+            ImGui::SetNextItemWidth(220.0f);
+            ImGui::SliderInt("Name distance", &nameD, MPNAME_DIST_MIN, MPNAME_DIST_MAX, "%d m");
+            nameActive = ImGui::IsItemActive();
+            if (ImGui::IsItemDeactivatedAfterEdit()) MpPrefs_SetNameDistM(nameD);
+
+            if (!bubActive) bubD = MpPrefs_BubbleDistM();
+            ImGui::SetNextItemWidth(220.0f);
+            ImGui::SliderInt("Chat bubble distance", &bubD, MPBUBBLE_DIST_MIN, MPBUBBLE_DIST_MAX, "%d m");
+            bubActive = ImGui::IsItemActive();
+            if (ImGui::IsItemDeactivatedAfterEdit()) MpPrefs_SetBubbleDistM(bubD);
+            ImGui::TextDisabled("Bubbles are shown whether you are on your board or not.");
+            ImGui::Unindent();
+        }
+
         ImGui::Separator();
         const bool busy = (st.tpState == 1);
         const bool live = st.armed;
@@ -509,6 +542,15 @@ static void buildUI() {
     Theme_Pop();
 }
 
+// An ImGui frame is now rendered for PASSIVE surfaces too -- chat lines fading with the box shut, and
+// the nameplates -- and `ImGui::Render` paints the software cursor on every frame the flag is set. Left
+// on, that puts a pointer over the game permanently. It is set here, per frame, to exactly the
+// condition under which the WndProc takes the mouse: we draw a cursor when, and only when, we have
+// taken the one the game would have drawn.
+static void frameCursorPolicy() {
+    ImGui::GetIO().MouseDrawCursor = g_visible.load() || Overlay_PromptOpen() || Chat_IsOpen();
+}
+
 // ------------------------------------------------------------------ D3D11 render
 static void renderD3D11(IDXGISwapChain* sc) {
     if (!g_rtv11) {
@@ -522,10 +564,12 @@ static void renderD3D11(IDXGISwapChain* sc) {
     // atlas, which may only happen BETWEEN frames -- hence here, and hence the backend's
     // device objects going with it so the new texture is uploaded.
     if (Theme_ConsumePendingFont()) ImGui_ImplDX11_InvalidateDeviceObjects();
+    frameCursorPolicy();
     ImGui_ImplDX11_NewFrame(); ImGui_ImplWin32_NewFrame(); ImGui::NewFrame();
     buildUI();
     buildPrompt();
     Chat_Draw();
+    Nameplates_Draw();
     ImGui::Render();
     g_ctx11->OMSetRenderTargets(1, &g_rtv11, nullptr);
     ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
@@ -555,10 +599,12 @@ static void renderD3D12(IDXGISwapChain* sc) {
     // atlas, which may only happen BETWEEN frames -- hence here, and hence the backend's
     // device objects going with it so the new texture is uploaded.
     if (Theme_ConsumePendingFont()) ImGui_ImplDX12_InvalidateDeviceObjects();
+    frameCursorPolicy();
     ImGui_ImplDX12_NewFrame(); ImGui_ImplWin32_NewFrame(); ImGui::NewFrame();
     buildUI();
     buildPrompt();
     Chat_Draw();
+    Nameplates_Draw();
     ImGui::Render();
     // by the time buffer idx comes around again its previous frame is done (Present-throttled)
     g_alloc12[idx]->Reset();
@@ -586,7 +632,8 @@ static void bindCommon(HWND hwnd) {
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;
-    io.MouseDrawCursor = true;    // the game may keep the HW cursor hidden; draw our own
+    io.MouseDrawCursor = true;    // the game may keep the HW cursor hidden; draw our own.
+                                  // Re-decided every frame -- see frameCursorPolicy().
     ImGui::StyleColorsDark();
     ImGui::GetStyle().ScaleAllSizes(1.3f); io.FontGlobalScale = 1.3f;
     ImGui_ImplWin32_Init(hwnd);
@@ -656,7 +703,8 @@ static HRESULT WINAPI hkPresent(IDXGISwapChain* sc, UINT sync, UINT flags) {
                 bool now = (GetAsyncKeyState(VK_F1) & 0x8000) && GetForegroundWindow() == g_gameHwnd;
                 if (now && !f1Held) g_visible = !g_visible.load();
                 f1Held = now;
-                if (g_visible.load() || Overlay_PromptOpen() || Chat_HasVisible()) {
+                if (g_visible.load() || Overlay_PromptOpen() || Chat_HasVisible()
+                    || Nameplates_HasVisible()) {
                     if (g_isD3D12) renderD3D12(sc); else renderD3D11(sc);
                 }
             }

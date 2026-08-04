@@ -20,6 +20,9 @@
 //     not a workaround for one release.
 #include "transport.h"
 #include "eos_creds.h"
+// Macro-only, no dependencies: the mod version is written in exactly one place and the lobby ad
+// advertises that same string rather than keeping a second copy in step.
+#include "../ui/version_tag.h"
 #include <eos_sdk.h>
 #include <eos_init.h>
 #include <eos_version.h>
@@ -267,6 +270,11 @@ static void EOS_CALL onJoinLobby(const EOS_Lobby_JoinLobbyCallbackInfo* d) {
 static const char* kAttrHost = "OMPHOST";
 static const char* kAttrMap  = "OMPMAP";
 static const char* kAttrCode = "OMPCODE";   // present = a PRIVATE game; the browser skips these
+// The host's mod version, so the browser can warn about a mismatch BEFORE anyone joins. Version skew
+// is otherwise invisible: the lobby and the P2P connection both succeed regardless, and only the
+// snapshots fail to parse, so the symptom is a peer who is simply never there. A build too old to
+// advertise this reports blank, which the browser shows as "unknown" rather than as a mismatch.
+static const char* kAttrVer  = "OMPVER";
 
 static char  g_adHost[40] = {0};
 static char  g_adMap [40] = {0};
@@ -417,6 +425,7 @@ static void publishAd() {
     add(kAttrHost, g_adHost);
     add(kAttrMap,  g_adMap);
     add(kAttrCode, g_adCode);          // absent for a public game -- `add` skips empty values
+    add(kAttrVer,  OMP_VERSION_STRING);
     EOS_Lobby_UpdateLobbyOptions uo{};
     uo.ApiVersion = EOS_LOBBY_UPDATELOBBY_API_LATEST;
     uo.LobbyModificationHandle = mod;
@@ -506,6 +515,7 @@ static void EOS_CALL onFind(const EOS_LobbySearch_FindCallbackInfo* d) {
             }
             readAttr(det, kAttrHost, L.host, sizeof(L.host));
             readAttr(det, kAttrMap,  L.map,  sizeof(L.map));
+            readAttr(det, kAttrVer,  L.version, sizeof(L.version));
             char code[16] = {0};
             readAttr(det, kAttrCode, code, sizeof(code));
             EOS_LobbyDetails_Release(det);
@@ -513,8 +523,10 @@ static void EOS_CALL onFind(const EOS_LobbySearch_FindCallbackInfo* d) {
             // would protect nothing. (It is still publicly advertised -- that is what lets a search
             // by code find it at all -- so the filter has to be here, on the browsing side.)
             if (code[0]) continue;
-            Log("[lobby] browse[%d]: '%s' on '%s' %d/%d", g_nBrowse,
-                L.host[0] ? L.host : "?", L.map[0] ? L.map : "?", L.players, L.maxPlayers);
+            Log("[lobby] browse[%d]: '%s' on '%s' %d/%d v%s%s", g_nBrowse,
+                L.host[0] ? L.host : "?", L.map[0] ? L.map : "?", L.players, L.maxPlayers,
+                L.version[0] ? L.version : "?",
+                (L.version[0] && strcmp(L.version, OMP_VERSION_STRING) != 0) ? " *** DIFFERENT VERSION" : "");
             g_nBrowse++;
         }
         InterlockedExchange(&g_browseState, 2);

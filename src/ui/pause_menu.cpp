@@ -21,6 +21,7 @@
 #include "../transport/transport.h"
 #include "mp_name.h"
 #include "mp_prefs.h"
+#include "version_tag.h"
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
@@ -45,7 +46,8 @@ static volatile LONG g_pending = OVA_NONE;  // same single-slot handoff shape as
 // `_activePageDefinition` stays the pause root the whole time -- we simply hand CreatePageItems a
 // different row array and re-run it. So the reset signal cannot be the page definition; it is
 // "CreatePageItems ran on the root page and WE did not ask for it" (see g_selfRefresh).
-enum Page { PG_ROOT = 0, PG_MP = 1, PG_BROWSE = 2, PG_PLAYERS = 3, PG_PLAYER = 4, PG_GUEST0 = 5 };
+enum Page { PG_ROOT = 0, PG_MP = 1, PG_BROWSE = 2, PG_PLAYERS = 3, PG_PLAYER = 4, PG_NAMES = 5,
+            PG_GUEST0 = 6 };
 static int  g_page        = PG_ROOT;
 static bool g_selfRefresh = false;          // true only across our own MenuRefreshItems call
 
@@ -308,6 +310,21 @@ static FTextBlob g_privacyOpt[2];
 static uint64_t  g_privacyKey = 0;
 static int       g_privacyAt  = -1;      // widget index within the LAST build; -1 = not on this page
 static const int kMpPrivacyAfter = 2;    // after "Join private game", before "Leave session"
+// ---- PLAYER NAMES. A sub-page of the multiplayer page, because "how the names look" is a set of
+// preferences and the multiplayer page is a list of things to DO -- mixing the two makes both harder
+// to read. Its rows are the game's own native controls (one MultiOption, two ProgressBars), first-party
+// like the privacy toggle rather than routed through the guest seam.
+static uint8_t   g_namesOpenRow[0x90];                  // "Player names" on the MP page
+static uint64_t  g_namesOpenKey = 0;
+static uint8_t   g_nameModeRow[0x90];
+static FTextBlob g_nameModeOpts[3];
+static uint64_t  g_nameModeKey = 0;
+static uint8_t   g_nameDistRow[0x90], g_bubbleDistRow[0x90];
+static uint64_t  g_nameDistKey = 0, g_bubbleDistKey = 0;
+// Widget indices within the LAST build, so the current values can be stamped once the whole rebuild
+// is finished (they cannot be stamped any earlier -- see stampValues). -1 = not on this page.
+static int       g_nameModeAt = -1, g_nameDistAt = -1, g_bubbleDistAt = -1;
+static const int kMpNamesAfter = 0;      // directly under "Your name": both are about who you see
 // ---- the posture row. An INFO row (label + right-hand value) rebuilt on every page build, like the
 // lobby rows, so it reports the LIVE configuration rather than whatever was true at startup. Its
 // strings come from the transport, so a future backend describes itself and this code does not grow a
@@ -396,6 +413,19 @@ static bool buildToggleRow(uint8_t* dst, const GuestItem& it, uint64_t* keyOut, 
     *(void**)  (dst + off::kItemMultiTexts)        = opts;
     *(int32_t*)(dst + off::kItemMultiTexts + 0x08) = 2;   // Num
     *(int32_t*)(dst + off::kItemMultiTexts + 0x0c) = 2;   // Max
+    return true;
+}
+// The same row with N options instead of two. A setting with three states (off / off board only /
+// always) is not a toggle, and forcing it into one would cost the player a row to say it.
+static bool buildOptionRow(uint8_t* dst, const char* key, const char* label, const char* desc,
+                           const char* const* opts, int nOpts, uint64_t* keyOut, FTextBlob* blobs) {
+    if (!opts || nOpts < 1 || nOpts > 8) return false;
+    if (!buildRow(dst, key, label, desc, keyOut)) return false;
+    for (int i = 0; i < nOpts; i++) if (!makeText(opts[i], &blobs[i])) return false;
+    *(dst + off::kItemType) = 2;                        // MultiOption
+    *(void**)  (dst + off::kItemMultiTexts)        = blobs;
+    *(int32_t*)(dst + off::kItemMultiTexts + 0x08) = nOpts;
+    *(int32_t*)(dst + off::kItemMultiTexts + 0x0c) = nOpts;
     return true;
 }
 // An INFO row: a Selection-looking row that ALSO gets the right-hand value column. It is a
@@ -510,6 +540,37 @@ static void buildRows() {
             g_privacyKey = 0;
             log("[menu] could not build the privacy row -- the toggle is F1-only this run");
         }
+    }
+    // The player-names page. Every row here fails INDEPENDENTLY -- a key left at 0 is simply never
+    // added, so a page with one broken control still offers the other two, and the connect buttons
+    // never depend on any of it.
+    {
+        if (!buildRow(g_namesOpenRow, "OmpNames", "Player names",
+                      "Names and chat bubbles above the other players", &g_namesOpenKey))
+            g_namesOpenKey = 0;
+        static const char* kModeOpts[3] = { "Off", "Off board only", "Always" };
+        if (!buildOptionRow(g_nameModeRow, "OmpNameMode", "Show names",
+                            "When to show a player's name above their head. Off board only keeps "
+                            "your screen clear while you skate. Chat bubbles are not affected.",
+                            kModeOpts, 3, &g_nameModeKey, g_nameModeOpts))
+            g_nameModeKey = 0;
+        // Sliders are built through the same helper the guest seam uses -- the item struct is just
+        // the parameter list. Units are METRES: the game prints a slider with "%d", so a range has to
+        // be one whose integers mean something.
+        GuestItem it{};
+        strncpy_s(it.key,   "OmpNameDist", _TRUNCATE);
+        strncpy_s(it.label, "Name distance", _TRUNCATE);
+        strncpy_s(it.desc,  "How far away a player's name is still shown, in metres", _TRUNCATE);
+        it.minValue = (float)MPNAME_DIST_MIN; it.maxValue = (float)MPNAME_DIST_MAX; it.step = 5.0f;
+        if (!buildSliderRow(g_nameDistRow, it, &g_nameDistKey)) g_nameDistKey = 0;
+
+        GuestItem b{};
+        strncpy_s(b.key,   "OmpBubbleDist", _TRUNCATE);
+        strncpy_s(b.label, "Chat bubble distance", _TRUNCATE);
+        strncpy_s(b.desc,  "How far away a chat bubble is still shown, in metres. Shorter than names "
+                           "on purpose -- a sentence needs far more room to read than a name.", _TRUNCATE);
+        b.minValue = (float)MPBUBBLE_DIST_MIN; b.maxValue = (float)MPBUBBLE_DIST_MAX; b.step = 5.0f;
+        if (!buildSliderRow(g_bubbleDistRow, b, &g_bubbleDistKey)) g_bubbleDistKey = 0;
     }
     // The replay-editor row. A failure here disables only this row: the page key not interning, or
     // the row not building, must never take the multiplayer menu down with it.
@@ -834,6 +895,10 @@ static const TArrayHdr* chooseArray(void* page, const TArrayHdr* items, TArrayHd
                     add(g_nameRow, true);
                 }
             }
+            if (i == kMpNamesAfter && g_namesOpenKey) {
+                setRowRoster(g_namesOpenRow);
+                add(g_namesOpenRow, true);
+            }
             if (i == kMpBrowseAfter) { setRowRoster(g_browseOpenRow); add(g_browseOpenRow, true); }
             // "Players" sits with the session actions, and only means anything while hosting.
             if (i == kMpPlayersAfter) { setRowRoster(g_playersOpenRow); add(g_playersOpenRow, true); }
@@ -855,6 +920,19 @@ static const TArrayHdr* chooseArray(void* page, const TArrayHdr* items, TArrayHd
                 }
             }
         }
+    } else if (g_page == PG_NAMES) {
+        // Three settings and a way out. The rows carry their CURRENT values twice over: the option
+        // index goes on the definition here (so the row is right even if the stamp is skipped), and
+        // stampValues writes both it and the slider positions onto the widgets after the whole
+        // rebuild, which is the only point at which they survive (see the note there).
+        g_nameModeAt = g_nameDistAt = g_bubbleDistAt = -1;
+        if (g_nameModeKey) {
+            *(int32_t*)(g_nameModeRow + off::kItemMultiStart) = MpPrefs_NameMode();
+            g_nameModeAt = n; add(g_nameModeRow, true);
+        }
+        if (g_nameDistKey)   { g_nameDistAt   = n; add(g_nameDistRow, true); }
+        if (g_bubbleDistKey) { g_bubbleDistAt = n; add(g_bubbleDistRow, true); }
+        add(g_mpRows + (size_t)(kMpRowCount - 1) * off::kItemSize, true);       // the shared Back row
     } else if (g_page == PG_PLAYERS) {
         // Everyone in YOUR session. Kick is only offered for a session you host, so say plainly when
         // you do not -- "the button is missing" is never a good explanation.
@@ -930,9 +1008,19 @@ static const TArrayHdr* chooseArray(void* page, const TArrayHdr* items, TArrayHd
             else                                snprintf(label, sizeof(label), "Session");   // advertises neither
             snprintf(value, sizeof(value), "%d/%d", L.players, L.maxPlayers > 0 ? L.maxPlayers : 16);
             const bool full = (L.maxPlayers > 0 && L.players >= L.maxPlayers);
-            snprintf(desc,  sizeof(desc),  "%s%d player%s on %s%s", full ? "FULL - " : "",
-                     L.players, L.players == 1 ? "" : "s", mapText[0] ? mapText : "an unknown map",
-                     full ? "" : " - press to join");
+            // A different mod version is worth more of this line than anything else on it. Joining
+            // still works and still looks like it worked -- the lobby and the P2P link both succeed
+            // -- but the snapshots may not parse, and then the other player never appears. Say it
+            // here, where the choice is being made. A blank version is a build too old to advertise
+            // one, which is itself a mismatch worth flagging rather than treating as unknown.
+            const bool verOld  = (L.version[0] == 0);
+            const bool verDiff = (!verOld && strcmp(L.version, OMP_VERSION_STRING) != 0);
+            if (verDiff)     snprintf(desc, sizeof(desc), "DIFFERENT VERSION (theirs %s, yours %s) - you may not see each other",
+                                      L.version, OMP_VERSION_STRING);
+            else if (verOld) snprintf(desc, sizeof(desc), "OLDER VERSION - they may not see you. Yours is %s", OMP_VERSION_STRING);
+            else             snprintf(desc, sizeof(desc), "%s%d player%s on %s%s", full ? "FULL - " : "",
+                                      L.players, L.players == 1 ? "" : "s", mapText[0] ? mapText : "an unknown map",
+                                      full ? "" : " - press to join");
             uint8_t* row = g_lobbyRows + (size_t)r * off::kItemSize;
             if (!buildInfoRow(row, key, label, desc, value, &g_lobbyRowKeys[r], &g_lobbyOptText[r])) continue;
             g_lobbyRowIdx[r] = i;
@@ -1025,6 +1113,27 @@ static void stampValues(void* page) {
                 S.MenuMultiSetIndex(widget, MpPrefs_HideAddress() ? 1 : 0);
         }
         g_privacyAt = -1;                                 // one shot per build, like the guest pass
+    }
+    // The player-names page, same argument: a slider's value can ONLY live on the widget, and the
+    // definition's option index does not survive DeserializePage.
+    if (g_nameModeAt >= 0 || g_nameDistAt >= 0 || g_bubbleDistAt >= 0) {
+        const TArrayHdr* pw = (const TArrayHdr*)((uint8_t*)page + off::kPageItemWidgets);
+        auto widgetAt = [&](int i) -> void* {
+            return (pw->data && i >= 0 && i < pw->num) ? ((void**)pw->data)[i] : nullptr;
+        };
+        auto pct = [](int v, int lo, int hi) {
+            const float f = (hi > lo) ? (float)(v - lo) / (float)(hi - lo) : 0.0f;
+            return f < 0.0f ? 0.0f : (f > 1.0f ? 1.0f : f);
+        };
+        if (S.MenuMultiSetIndex)
+            if (void* w = widgetAt(g_nameModeAt)) S.MenuMultiSetIndex(w, MpPrefs_NameMode());
+        if (S.MenuProgressSetPct) {
+            if (void* w = widgetAt(g_nameDistAt))
+                S.MenuProgressSetPct(w, pct(MpPrefs_NameDistM(), MPNAME_DIST_MIN, MPNAME_DIST_MAX));
+            if (void* w = widgetAt(g_bubbleDistAt))
+                S.MenuProgressSetPct(w, pct(MpPrefs_BubbleDistM(), MPBUBBLE_DIST_MIN, MPBUBBLE_DIST_MAX));
+        }
+        g_nameModeAt = g_nameDistAt = g_bubbleDistAt = -1;   // one shot per build
     }
     if (g_sliderPage < 0) return;
     const int gi = g_sliderPage;
@@ -1273,7 +1382,7 @@ static bool handleConfirm(void* page, void* params) {
     if (itemKey == g_mpRowKeys[kMpRowCount - 1]) {
         g_browsePolls = 0;
         if (g_page == PG_PLAYER)  { g_page = PG_PLAYERS; queueSwap(page, "Players", false, true); return true; }
-        const bool toMp = (g_page == PG_BROWSE || g_page == PG_PLAYERS);
+        const bool toMp = (g_page == PG_BROWSE || g_page == PG_PLAYERS || g_page == PG_NAMES);
         g_page = toMp ? PG_MP : PG_ROOT;
         if (toMp) g_lastSig = sessionSig();
         queueSwap(page, toMp ? mpTitle() : nullptr, !toMp, true);
@@ -1293,6 +1402,15 @@ static bool handleConfirm(void* page, void* params) {
         log("[menu] pause: opening the name box");
         return true;
     }
+    if (g_page == PG_MP && g_namesOpenKey && itemKey == g_namesOpenKey) {
+        g_page = PG_NAMES;
+        queueSwap(page, "Player names", false, true);
+        log("[menu] pause: opened the player-names settings");
+        return true;
+    }
+    // Every other row on this page is a toggle or a slider: the confirm is the engine acknowledging
+    // the row, not a command. Swallow it rather than letting it fall through to the stock chain.
+    if (g_page == PG_NAMES) return true;
     if (g_page == PG_MP && itemKey == g_playersOpenKey) {
         g_page = PG_PLAYERS;
         queueSwap(page, "Players", false, true);
@@ -1432,6 +1550,27 @@ static bool handleValueChange(void* params, bool isSlider) {
                 char m[96];
                 snprintf(m, sizeof(m), "[menu] 'hide my address' -> %s", idx ? "On" : "Off");
                 log(m);
+            }
+            return true;
+        }
+        // The player-names page. First-party rows, matched by key like the privacy toggle. The
+        // setters no-op on an unchanged value, so an engine echo that slips past g_rebuilding
+        // (round 380's lesson) cannot churn the file either.
+        if (g_nameModeKey && k == g_nameModeKey && !isSlider) {
+            MpPrefs_SetNameMode(*(const int32_t*)((const uint8_t*)params + off::kChangeParamsNew));
+            return true;
+        }
+        if (isSlider && (k == g_nameDistKey || k == g_bubbleDistKey)) {
+            // NewPercent is the normalised bar position; the displayed number -- and the value the
+            // player thinks they chose -- is min + pct*(max-min) rounded, which is exactly what the
+            // game prints.
+            const float pct = *(const float*)((const uint8_t*)params + off::kChangeParamsNew);
+            if (k == g_nameDistKey && g_nameDistKey) {
+                const float v = MPNAME_DIST_MIN + pct * (float)(MPNAME_DIST_MAX - MPNAME_DIST_MIN);
+                MpPrefs_SetNameDistM((int)(v + 0.5f));
+            } else if (g_bubbleDistKey) {
+                const float v = MPBUBBLE_DIST_MIN + pct * (float)(MPBUBBLE_DIST_MAX - MPBUBBLE_DIST_MIN);
+                MpPrefs_SetBubbleDistM((int)(v + 0.5f));
             }
             return true;
         }

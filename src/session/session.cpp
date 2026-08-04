@@ -45,6 +45,9 @@ struct Slot {
     // ---- chat: the last message id seen from this peer, so a redelivery cannot print twice.
     uint32_t    lastChatId = 0;
     bool        haveChatId = false;
+    // Said once per peer: an unreadable packet repeats at the send rate, and a warning that
+    // repeats 60 times a second is a log flood, not a warning.
+    bool        rejectedSpoken = false;
 };
 
 // Unsigned timestamps must never be subtracted raw: a sample stamped slightly in the future (clock
@@ -149,11 +152,31 @@ void OnPacket(int peerIdx, const uint8_t* data, int len, uint64_t nowUs) {
         if (!cs) return;
         if (cs->haveChatId && cm.id == cs->lastChatId) return;
         cs->lastChatId = cm.id; cs->haveChatId = true;
-        if (g_cfg.onChat) g_cfg.onChat(cm.name, cm.text);
+        if (g_cfg.onChat) g_cfg.onChat(peerIdx, cm.name, cm.text);
         return;
     }
     repl::State s; uint64_t senderUs = 0;
-    if (!repl::Unpack(data, len, s, &senderUs)) return;   // validated: magic, finiteness, unit quat
+    if (!repl::Unpack(data, len, s, &senderUs)) {          // validated: magic, finiteness, unit quat
+        // Dropping this silently is how version skew becomes unexplainable. The lobby join and the
+        // P2P link both succeed no matter what build the peer runs; only the snapshot fails to
+        // parse. The visible result is a player who connects and is then simply never there, which
+        // reads as a broken mod rather than as a mismatch. So the FIRST rejection from a peer says
+        // so, once, naming the likely cause. Not per-packet: a mismatched peer rejects 60 a second.
+        Slot* bad = slotFor(peerIdx, nowUs);
+        if (bad && !bad->rejectedSpoken) {
+            bad->rejectedSpoken = true;
+            if (g_logf) {
+                char m[200];
+                snprintf(m, sizeof(m),
+                         "[session] peer %d sent %d byte(s) this build cannot read -- almost certainly a "
+                         "different SessionOpenMP version. One of you needs to update; until then you "
+                         "will not see each other.", peerIdx, len);
+                g_logf(m);
+            }
+            if (g_cfg.onVersionMismatch) g_cfg.onVersionMismatch(peerIdx);
+        }
+        return;
+    }
     Slot* sl = slotFor(peerIdx, nowUs);
     if (!sl) return;
     sl->stream.Push(s, senderUs, nowUs);

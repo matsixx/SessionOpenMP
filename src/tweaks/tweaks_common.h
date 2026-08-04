@@ -69,5 +69,10 @@ int TwkIniInt(const char* text, const char* key, int def);
 // overflow cap.
 int TwkIniSetInt(char* text, size_t cap, const char* key, int value);
 
+// The same line splicing for a text value, and the matching reader. A list-valued setting has to be
+// editable by hand, so it must survive the auto-save like every other key.
+int  TwkIniSetStr(char* text, size_t cap, const char* key, const char* val);
+void TwkIniStr(const char* text, const char* key, char* out, size_t cap, const char* def);
+
 // F1-menu changes call this (render thread); the shell auto-saves the ini once things go quiet.
 void TwkMarkDirty();

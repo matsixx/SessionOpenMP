@@ -129,6 +129,11 @@ struct LobbyInfo {
     char map[40];       // the map they are on, ditto
     int  players;       // members right now (from the search result, no join required)
     int  maxPlayers;
+    // The host's mod version, empty if they are too old to advertise one. Compare against
+    // OMP_VERSION_STRING: a mismatch means the wire formats may differ, and joining anyway produces a
+    // session where the other player never appears rather than an error -- so it is worth saying
+    // before the join, not after.
+    char version[16];
 };
 // What WE advertise while hosting. Call before LobbyHost(); the attributes are attached to the lobby
 // immediately after it is created (EOS_Lobby_CreateLobby takes no attributes of its own). Safe to call

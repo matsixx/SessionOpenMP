@@ -39,6 +39,7 @@
 #include "ui/version_tag.h"
 #include "ui/mp_name.h"
 #include "ui/chat.h"
+#include "ui/nameplates.h"
 #include "game/game_font.h"
 #include "session/banlist.h"
 #include "ui/mp_prefs.h"
@@ -95,6 +96,9 @@ static bool g_armed = false;
 // =====================================================================================================
 static bool ownPawnStillValid();
 static void discoverOwnPawn();
+// Speech bubbles are keyed by transport peer index, so they must be dropped wherever the SLOTS are:
+// a released index can be handed to a different human, and a line must never survive onto them.
+static void clearChatBubbles();
 
 // =====================================================================================================
 // SESSION LIFECYCLE: F8 = HOST, F9 = JOIN, F6 = LEAVE. (F10 belongs to ConsoleEnabler.)
@@ -141,6 +145,7 @@ static void MpBegin(omp::Backend bk, bool asHost, const char* origin) {
                  (bk == omp::BK_EOS) ? "EOS (online)" : "shared memory (this PC)");
         logLine(m);
         session::ResetAll();
+        clearChatBubbles();
         omp::Deactivate();
         g_lobbyRequested = false;
         InterlockedExchange(&g_tpState, 0);
@@ -447,6 +452,7 @@ static void MpPump() {
         // skating with standing in your now single-player world until the next map load. This is the
         // game thread, which is the only place allowed to hide an actor.
         session::ResetAll();
+        clearChatBubbles();
         g_armed = false;
         logLine("[mp] leave -> left the lobby; session DISARMED");
     }
@@ -508,9 +514,127 @@ static void MpPump() {
               snprintf(m, sizeof(m), "[mp] posture: %s", p);
               logLine(m); }
         }
-        else if (ls == 0 && g_armed) { g_armed = false; logLine("[mp] lobby gone -- session DISARMED"); }
+        else if (ls == 0 && g_armed) { g_armed = false; clearChatBubbles(); logLine("[mp] lobby gone -- session DISARMED"); }
         else if (ls == -1) logLine("[mp] lobby op FAILED (retry from the menu)");
     }
+}
+
+// ---- THE FLOATING PLAYER NAMES: the GAME-thread half (ui/nameplates.h owns the drawing).
+// Everything here has to happen on this thread -- the roster, each proxy's head position, and the
+// world-to-screen projection all read game state -- and what crosses to the render thread is plain
+// numbers. Positions leave NORMALISED against the game's own viewport, because the viewport and the
+// window are different sizes whenever a resolution scale is set and only the render thread knows the
+// second one.
+static const int kMaxNameplates = 16;            // the lobby cap: one plate per peer is the maximum
+// ---- SPEECH BUBBLES. What each peer last said, keyed by their TRANSPORT INDEX -- the name is a label
+// two people can share and an actor pointer is valid only for the instant it is read, so the peer
+// index is the one identity a store is allowed to hold on to.
+struct ChatBubble { int peerId = -1; char text[160] = {0}; uint64_t atMs = 0; };
+static ChatBubble g_bubbles[kMaxNameplates];
+static void clearChatBubbles() { for (auto& b : g_bubbles) { b.peerId = -1; b.text[0] = 0; b.atMs = 0; } }
+static void noteChatBubble(int peerId, const char* text) {
+    if (peerId < 0 || !text || !*text) return;
+    ChatBubble* slot = nullptr;
+    for (auto& b : g_bubbles) if (b.peerId == peerId) { slot = &b; break; }
+    if (!slot) for (auto& b : g_bubbles) if (b.peerId < 0) { slot = &b; break; }
+    if (!slot) { slot = &g_bubbles[0]; for (auto& b : g_bubbles) if (b.atMs < slot->atMs) slot = &b; }
+    slot->peerId = peerId;
+    strncpy_s(slot->text, text, _TRUNCATE);
+    slot->atMs = GetTickCount64();
+}
+// Their live line, or null. Expired entries are cleared here rather than on a timer -- this runs every
+// frame anyway, and a line that has finished fading has no reason to still exist.
+static const char* liveChatBubble(int peerId, uint64_t ms, uint32_t* ageOut) {
+    const NameplateTuning& T = Nameplates_Tuning();
+    const uint64_t life = (uint64_t)((T.bubbleHoldSec + T.bubbleFadeSec) * 1000.0f);
+    for (auto& b : g_bubbles) {
+        if (b.peerId != peerId || !b.text[0]) continue;
+        const uint64_t age = ms - b.atMs;
+        if (age > life) { b.text[0] = 0; return nullptr; }
+        if (ageOut) *ageOut = (uint32_t)age;
+        return b.text;
+    }
+    return nullptr;
+}
+// Last frame's outcome, for the heartbeat. "No names appeared" has several possible causes that look
+// identical on screen, so each is counted separately rather than left to be guessed at.
+static int  g_npPlated = 0, g_npNoName = 0, g_npOffScreen = 0, g_npVw = 0, g_npVh = 0;
+static bool g_npShow = false;
+static void publishNameplates() {
+    NameplateItem items[kMaxNameplates];
+    int  n = 0;
+    bool show = false;
+    // The player's own settings are the source of truth for the two ranges, pushed into the live
+    // tuning here rather than copied at startup -- a change from either menu then takes effect on the
+    // next frame with no apply step and no second copy to keep in sync.
+    NameplateTuning& T = Nameplates_Tuning();
+    T.maxDistCm       = (float)MpPrefs_NameDistM()   * 100.0f;
+    T.bubbleMaxDistCm = (float)MpPrefs_BubbleDistM() * 100.0f;
+    int vw = 0, vh = 0;
+    g_npNoName = g_npOffScreen = 0;
+    // A permanent early-out announces itself once: without these two symbols there is no projection
+    // and no plate will ever be drawn, and that must not present as a silent nothing.
+    {
+        static bool warned = false;
+        if (!warned && (!game::Get().ProjectToScreen || !game::Get().GetViewportSize)) {
+            warned = true;
+            logLine("[names] no world-to-screen symbol -- floating player names are OFF for this build");
+        }
+    }
+    if (T.enabled && g_ownPawn && game::ViewportSize(&vw, &vh)) {
+        // The fade follows OUR board, not theirs: names are for looking around on foot, and a clean
+        // screen is for skating.
+        bool onBoard = false;
+        __try {
+            void* mv = *(void**)((uint8_t*)g_ownPawn + game::off::kSkaterMoveComp);
+            if (mv) onBoard = *(uint8_t*)((uint8_t*)mv + game::off::kMoveOnBoard) > 0;
+        } __except (EXCEPTION_EXECUTE_HANDLER) { onBoard = false; }
+
+        const uint64_t ms = GetTickCount64();
+        const int slots = session::PeerSlots();
+        bool anyPeer = false;
+        for (int s = 0; s < slots && n < kMaxNameplates; s++) {
+            char  nm[32] = {0};
+            void* actor = nullptr;
+            int   peerId = -1;
+            if (!session::PeerAt(s, nm, sizeof(nm), &actor, &peerId)) continue;
+            anyPeer = true;
+            // An empty name means their cosmetics packet (which is what carries it) has not landed
+            // yet; it arrives within a second, and a blank plate in the meantime helps nobody.
+            if (!nm[0] || !actor) { if (actor) g_npNoName++; continue; }
+            float head[3], px[2], dist = 0.0f;
+            if (!game::ActorHeadPoint(actor, T.headroomCm, head)) continue;
+            // Behind the camera, out of view, or too far: all normal, and all indistinguishable from a
+            // broken feature unless they are counted.
+            if (!game::ProjectWorldToViewport(head, px, &dist)) { g_npOffScreen++; continue; }
+            if (dist > T.maxDistCm) { g_npOffScreen++; continue; }
+            NameplateItem& it = items[n++];
+            memset(&it, 0, sizeof(it));
+            strncpy_s(it.name, nm, _TRUNCATE);
+            it.x = px[0] / (float)vw;
+            it.y = px[1] / (float)vh;
+            it.distCm = dist;
+            uint32_t age = 0;
+            if (const char* said = liveChatBubble(peerId, ms, &age)) {
+                strncpy_s(it.msg, said, _TRUNCATE);
+                it.msgAgeMs = age;
+            }
+        }
+        // Whose board decides, and whether it decides at all, is the player's setting. The default
+        // follows OUR board, not theirs: names are for looking around on foot, and a clean screen is
+        // for skating. Gated on there being SOMEBODY here as well -- alone in a session the answer
+        // can never be visible, and the render thread only pays for a frame while this is true.
+        // Deliberately the ROSTER and not the plate count: a peer stepping behind you empties the
+        // list for a moment and must not restart the fade.
+        // Names OFF does not mean plates off: the bubbles ride the same list and are a separate
+        // setting, so the items are still published and only the fade target is held down.
+        const int mode = MpPrefs_NameMode();
+        show = anyPeer && (mode == MPNAME_ALWAYS || (mode == MPNAME_OFFBOARD && !onBoard));
+    }
+    // Published every frame, empty list included -- that is what makes the plates go away when the
+    // session does, instead of hanging over a world that has moved on.
+    Nameplates_Publish(items, n, show);
+    g_npPlated = n; g_npShow = show; g_npVw = vw; g_npVh = vh;
 }
 
 static void GameThreadFrame() {
@@ -589,6 +713,9 @@ static void GameThreadFrame() {
     // the wire was already pumped in MpPump (same thread, same run); just drive the frame.
     session::Frame(g_ownPawn, us, ms, &game::GatherOwnState);
 
+    // After the frame, so a plate is placed on where its skater was just put rather than a frame behind.
+    publishNameplates();
+
     // 1 Hz heartbeat: peers, proxies, publish rate. One line, so a dead channel is visible without
     // turning on anything special.
     static uint64_t lastLog = 0;
@@ -609,6 +736,13 @@ static void GameThreadFrame() {
                      " played=%u started=%u stopped=%u nfyMuted=%u noCue=%u faults=%u",
                      a.captured, a.loopsStarted, a.liveLoops, a.oneShots, a.rejected, a.notifySkipped,
                      a.played, a.playStarted, a.playStopped, a.notifyMuted, a.unresolved, a.faults);
+            logLine(m);
+            // The floating names. `show` is the local on/off-board fade target; `plated` is how many
+            // reached the render thread. plated=0 with peers alive says which step lost them:
+            // viewport 0x0 = no view resolved, noName = their cosmetics packet has not landed,
+            // offScreen = behind the camera or past maxDistCm (both normal).
+            snprintf(m, sizeof(m), "[names] show=%d plated=%d noName=%d offScreen=%d viewport=%dx%d",
+                     g_npShow ? 1 : 0, g_npPlated, g_npNoName, g_npOffScreen, g_npVw, g_npVh);
             logLine(m);
             // The pose lane, both ends. `noted` climbing with `applied` flat means the seam is not
             // firing for that mesh; a `skipCnt` means the wire and the mesh disagree on bone count,
@@ -881,7 +1015,18 @@ public:
         {   // Incoming chat -> the box. The session layer holds a function pointer so it never has to
             // know a UI exists (same seam shape as the log callback).
             session::Config sc = session::GetConfig();
-            sc.onChat = [](const char* name, const char* text) { Chat_Push(name, text, false); };
+            // Two consumers, one event: the chat window gets the line, and the speaker's own skater
+            // gets a bubble. Keyed by the peer index, not the name -- see noteChatBubble.
+            sc.onChat = [](int peerId, const char* name, const char* text) {
+                Chat_Push(name, text, false);
+                noteChatBubble(peerId, text);
+            };
+            // Version skew has no other symptom than a player who never appears, so it is said in the
+            // chat box -- the one surface already on screen during play. Fires once per peer.
+            sc.onVersionMismatch = [](int) {
+                Chat_System("A player here is running a different SessionOpenMP version, so you will not "
+                            "see each other. Run update.bat in the game folder to get the latest.");
+            };
             session::SetConfig(sc);
         }
         // The transport comes up lazily: EOS login costs ~1 s and must not block the game's first frames.
