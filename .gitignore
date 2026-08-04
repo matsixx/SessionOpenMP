@@ -19,6 +19,10 @@ dist/*.log
 # Per-run logs the two-process gates leave beside whatever directory they were run from.
 omp_*test_*.log
 
+# Kept locally, deliberately not published: it is working notes for what changed, from which the
+# author writes the release notes by hand. The releases themselves are the public record.
+CHANGELOG.md
+
 # The live EOS product credentials. Tracked as eos_creds.h.template -- copy it to eos_creds.h and
 # fill in your own values. (The secret is in every shipped main.dll anyway; keeping it out of the
 # repo is about not handing it to credential scanners, not about it being truly secret.)

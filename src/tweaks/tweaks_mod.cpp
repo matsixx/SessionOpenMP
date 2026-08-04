@@ -310,7 +310,7 @@ class SessionTweaks : public RC::CppUserModBase
 public:
     SessionTweaks() {
         ModName = STR("SessionTweaks");
-        // Version history: see CHANGELOG.md.
+        // Version history is kept with the releases, not in the source.
         ModVersion = STR("2.12.0");
         ModDescription = STR("Gameplay fixes: real-stick-sweep scoop speed, wider manual catch window, darkslide-aware catch fix, run out on missed tricks");
         ModAuthors = STR("matsix");
