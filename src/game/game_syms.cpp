@@ -763,11 +763,20 @@ static bool flipTrickList(void*** dataOut, int* numOut) {
 bool FlipTrickListAvailable() { void** d; int n; return flipTrickList(&d, &n); }
 
 // ---- the self-check registry. Tiny and fixed: one entry per expectation the mod holds.
-static struct GateState { const char* what; bool trusted; bool checked; } g_gates[] = {
-    { "FlipTrickDefinition",    true, false },
-    { "GrindOrSlideDefinition", true, false },
-    { "SoundBase",              true, false },
+//
+// A SUCCESS is final: the expectation is proven and nothing later can un-prove it. A FAILURE is not,
+// and must not be, because the sample can be meaningless through no fault of the expectation --
+// `_currentGrindDef` and `_targetGrindDef` only hold a real definition WHILE GRINDING, and outside a
+// grind they keep a stale pointer to a destroyed object. Reading its class gives garbage, and
+// condemning the gate on that one read disabled grind-name checking for the entire session, every
+// session. So a failure only counts once it has repeated: a wrong expectation fails every time and
+// still gets caught, while one stale read costs nothing.
+static struct GateState { const char* what; bool trusted; bool checked; int fails; } g_gates[] = {
+    { "FlipTrickDefinition",    true, false, 0 },
+    { "GrindOrSlideDefinition", true, false, 0 },
+    { "SoundBase",              true, false, 0 },
 };
+static const int kGateFailsToCondemn = 4;
 static GateState* gateFind(const char* what) {
     if (!what) return nullptr;
     for (auto& g : g_gates) if (!strcmp(g.what, what)) return &g;
@@ -779,16 +788,20 @@ bool GateTrusted(const char* what) {
 }
 void GateSelfCheck(const char* what, bool localPassed, void (*logf)(const char*)) {
     GateState* g = gateFind(what);
-    if (!g || g->checked) return;            // first verdict decides; this runs on a hot path
+    if (!g || g->checked) return;            // already settled; this runs on a hot path
+    if (localPassed) {                       // proven -- final, and say nothing
+        g->checked = true;
+        return;
+    }
+    if (++g->fails < kGateFailsToCondemn) return;   // one bad sample is not evidence
     g->checked = true;
-    if (localPassed) return;                 // the expectation holds; say nothing
     g->trusted = false;
     if (logf) {
-        char m[300];
+        char m[320];
         snprintf(m, sizeof(m),
-                 "[gate] *** '%s' REJECTED THE LOCAL PLAYER'S OWN OBJECT -- the expectation is wrong, "
-                 "not the peer. Gate DISABLED for this run (peer names of this kind go unchecked). "
-                 "Fix the class name or the lookup before shipping.", what);
+                 "[gate] *** '%s' REJECTED THE LOCAL PLAYER'S OWN OBJECT %d times -- the expectation is "
+                 "wrong, not the peer. Gate DISABLED for this run (peer names of this kind go "
+                 "unchecked). Fix the class name or the lookup.", what, g->fails);
         logf(m);
     }
 }

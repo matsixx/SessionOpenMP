@@ -1555,7 +1555,7 @@ static bool handleValueChange(void* params, bool isSlider) {
         }
         // The player-names page. First-party rows, matched by key like the privacy toggle. The
         // setters no-op on an unchanged value, so an engine echo that slips past g_rebuilding
-        // (round 380's lesson) cannot churn the file either.
+        // cannot churn the settings file either.
         if (g_nameModeKey && k == g_nameModeKey && !isSlider) {
             MpPrefs_SetNameMode(*(const int32_t*)((const uint8_t*)params + off::kChangeParamsNew));
             return true;
