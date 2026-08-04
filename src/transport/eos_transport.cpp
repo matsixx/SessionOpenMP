@@ -298,6 +298,12 @@ static const uint64_t kBrowseTimeoutMs = 15000;   // generous: a cold search ove
 static uint32_t      g_searchGen   = 0;     // bumped by every startSearch; rides in the Find ClientData
 static uint64_t      g_browseStartMs = 0;   // when the live browse began (0 = none) -- for the timeout
 static char          g_lobbyOwner[64] = {0};  // the lobby owner's PUID, refreshed with ownership
+// Re-examine ownership after the backend refuses a publish we believed we were entitled to make.
+// See onUpdateLobby: migration is a race, and membership events are the only other trigger.
+static uint64_t      g_ownerRecheckAtMs = 0;
+static int           g_ownerRechecksLeft = 0;
+static const uint64_t kOwnerRecheckMs = 2000;
+static const int      kOwnerRechecks  = 5;    // ~10 s of chances, then stop asking
 
 void SetLobbyAd(const char* hostName, const char* mapName) {
     if (hostName) strncpy_s(g_adHost, hostName, _TRUNCATE);
@@ -377,6 +383,11 @@ static void refreshOwnership() {
         InterlockedExchange(&g_lobbyStatus, 2);
         Log("[lobby] WE ARE NOW THE HOST of %s%s%s", g_lobbyId,
             g_myCode[0] ? " -- join code carried over: " : "", g_myCode);
+        // Re-advertise as soon as we hold the lobby, rather than waiting for the caller to notice the
+        // promotion: until this lands the browser is offering our session under the departed host's
+        // name. `g_adHost` is only empty if nothing has ever set it, and `add()` skips empty values,
+        // so this can never blank a good advert -- at worst it republishes what is already there.
+        if (g_adHost[0] || g_adMap[0]) publishAd();
     } else if (!mine && st != 3) {
         InterlockedExchange(&g_lobbyStatus, 3);
         Log("[lobby] host is now %s", id[0] ? id : "someone else");
@@ -398,6 +409,16 @@ static void EOS_CALL onUpdateLobby(const EOS_Lobby_UpdateLobbyCallbackInfo* d) {
     if (d->ResultCode == EOS_EResult::EOS_Lobby_NotOwner && g_lobbyStatus == 2) {
         InterlockedExchange(&g_lobbyStatus, 3);
         Log("[lobby] ...so we are NOT the host after all -- back to guest");
+        // ...but ASK AGAIN SHORTLY, because this refusal is usually a RACE, not a verdict. Host
+        // migration promotes us in the local cache before the backend agrees, so the first publish
+        // after inheriting a lobby is refused and the demotion above is correct only for that
+        // instant. Ownership is otherwise re-examined ONLY when a membership event arrives -- and
+        // after the previous host walks out there may never be another one. Without this the new
+        // host stays a "guest" of their own lobby forever and the browser keeps advertising the
+        // session under the name of somebody who left, which looks like a live game and is not.
+        // Bounded and self-cancelling: a few spaced re-checks, not a poll.
+        g_ownerRecheckAtMs = nowMs() + kOwnerRecheckMs;
+        g_ownerRechecksLeft = kOwnerRechecks;
     }
     NoteAuthResult(d->ResultCode, "attribute update");
 }
@@ -1088,6 +1109,13 @@ void Tick(RecvFn onRecv, void* user) {
         g_browseStartMs = 0;
         Log("[lobby] browse timed out after %llums -- no answer from the service",
             (unsigned long long)kBrowseTimeoutMs);
+    }
+    // The bounded ownership re-check armed by a refused publish (see onUpdateLobby). Costs one lobby
+    // details copy per attempt, only after a refusal, and stops on its own either way.
+    if (g_ownerRechecksLeft > 0 && g_ownerRecheckAtMs && nowMs() >= g_ownerRecheckAtMs) {
+        g_ownerRechecksLeft--;
+        g_ownerRecheckAtMs = g_ownerRechecksLeft > 0 ? nowMs() + kOwnerRecheckMs : 0;
+        refreshOwnership();
     }
     uint8_t buf[EOS_P2P_MAX_PACKET_SIZE];
     for (;;) {
