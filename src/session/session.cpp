@@ -48,6 +48,8 @@ struct Slot {
     // Said once per peer: an unreadable packet repeats at the send rate, and a warning that
     // repeats 60 times a second is a log flood, not a warning.
     bool        rejectedSpoken = false;
+    // Said once per peer per world: the map gate is evaluated every frame.
+    bool        mapSkipSpoken = false;
 };
 
 // Unsigned timestamps must never be subtracted raw: a sample stamped slightly in the future (clock
@@ -235,12 +237,15 @@ bool IsProxyActor(void* actor) {
 // second of invisibility; spawning early costs the player their character.
 static uint64_t g_settleUntilMs = 0;
 static void*    g_lastOwnPawn   = nullptr;
+static char     g_ownMap[40]    = {0};   // the level WE are in, for the peer-is-elsewhere gate
 static const uint64_t kWorldSettleMs = 2000;
 
 void ForgetProxies() {
     for (auto& s : g_slots) if (s.used) s.proxy.Forget();
     g_settleUntilMs = 0;                 // re-armed by Frame, which owns the clock
     g_lastOwnPawn   = nullptr;
+    g_ownMap[0]     = 0;
+    for (auto& s : g_slots) s.mapSkipSpoken = false;   // a new world is a new question
     if (g_logf) g_logf("[session] world changed -- all proxy pointers dropped, spawning held until the world settles");
 }
 
@@ -257,6 +262,15 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
     if (ownPawn != g_lastOwnPawn) {
         g_lastOwnPawn   = ownPawn;
         g_settleUntilMs = nowMs + kWorldSettleMs;
+        g_ownMap[0] = 0;
+        if (ownPawn) {
+            game::LocalMapName(ownPawn, g_ownMap, sizeof(g_ownMap));
+            for (auto& s : g_slots) s.mapSkipSpoken = false;
+            // Name the level we landed in. Without this a level-specific problem is only ever
+            // describable as "the apartment" -- the log should say which world that is.
+            if (g_logf) { char m[140]; snprintf(m, sizeof(m), "[session] now in world '%s'",
+                          g_ownMap[0] ? g_ownMap : "(unknown)"); g_logf(m); }
+        }
     }
 
     // ---- how many peers are live right now (receive-based; drives the stats line + proxy retiring)
@@ -425,6 +439,23 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
             if (!ownPawn) continue;
             // ...and a world that has finished deciding whose pawn is whose. See kWorldSettleMs.
             if (nowMs < g_settleUntilMs) continue;
+            // ...and a peer who is actually HERE. Their map travels with their cosmetics, so once
+            // both names are known a difference is decisive: a peer in another level has nothing to
+            // show in this one, and spawning them anyway is how a skater ends up standing in your
+            // apartment. It is also the only defence against levels where the game possesses a
+            // freshly spawned skater -- there the spawn itself is the damage, whatever the timing,
+            // and not spawning is the only thing that helps. Unknown either side = spawn as before,
+            // so a peer whose cosmetics have not landed yet is never permanently invisible.
+            if (s.haveCosmetics && s.cosmetics.mapName[0] && g_ownMap[0] &&
+                _stricmp(s.cosmetics.mapName, g_ownMap) != 0) {
+                if (!s.mapSkipSpoken) {
+                    s.mapSkipSpoken = true;
+                    if (g_logf) { char m[190]; snprintf(m, sizeof(m),
+                        "[session] peer %d is on '%s' and we are on '%s' -- not spawning them here",
+                        s.peerIdx, s.cosmetics.mapName, g_ownMap); g_logf(m); }
+                }
+                continue;
+            }
             if (!s.proxy.EnsureSpawned(ownPawn, out, nowMs, g_logf)) continue;
         }
         s.proxy.Apply(out, nowMs, nowUs, g_logf);
