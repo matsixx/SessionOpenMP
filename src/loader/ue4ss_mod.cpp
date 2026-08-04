@@ -779,6 +779,23 @@ static void discoverOwnPawn() {
     void* pawn = nullptr;
     __try { pawn = *(void**)((uint8_t*)pc + kControllerPawn); } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
     if (!pawnIsOurs(pawn)) return;                   // engine's own test, never a guess
+    // ...but "the engine says this is the local pawn" is not enough on its own, because a proxy is a
+    // real actor of the local player's own skater class. If the controller ever possesses one, the
+    // engine's test passes and every downstream consumer -- publishing, spawning, the world handle --
+    // starts working from a remote player's body. Refusing here keeps the last good pawn instead,
+    // which is recoverable; adopting a proxy is not. This should now be unreachable (spawning is held
+    // until the world settles), so it says so loudly rather than papering over it silently.
+    if (session::IsProxyActor(pawn)) {
+        static void* moaned = nullptr;
+        if (moaned != pawn) {
+            moaned = pawn;
+            char m[190];
+            snprintf(m, sizeof(m), "[mod] *** the player controller is possessing PROXY %p -- refusing to treat it "
+                                   "as our pawn (keeping %p)", pawn, g_ownPawn);
+            logLine(m);
+        }
+        return;
+    }
     g_ownPawn = pawn;
     game::SetLocalController(pc);                    // crank defs resolve through the local
                                                      // controller's tricks DB on both ends

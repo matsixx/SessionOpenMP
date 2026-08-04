@@ -99,5 +99,9 @@ bool PeerMap(int slot, char* out, int cap);
 // dangling pointer as soon as that peer drops, and handing one to the engine (e.g. the replay
 // camera's _lookAtTarget) is a crash with our DLL nowhere in the stack.
 void* PeerActorById(int peerId);
+// True if this actor is one of OUR proxies. The local pawn discovery uses it as a veto: a proxy
+// is a real actor of the player's own skater class, so the engine's own "is this locally
+// controlled" test cannot tell them apart if a controller ever possesses one.
+bool  IsProxyActor(void* actor);
 
 }} // namespace omp::session

@@ -217,9 +217,31 @@ void* PeerActorById(int peerId) {
     return nullptr;                       // they left, or the slot was reused by somebody else
 }
 
+bool IsProxyActor(void* actor) {
+    if (!actor) return false;
+    for (auto& s : g_slots) if (s.used && s.proxy.actor() == actor) return true;
+    return false;
+}
+
+// A world change starts a settle window during which NOTHING is spawned. Loading a level does not
+// hand the player their pawn instantly: the game destroys the old one, builds the new level, spawns a
+// character and possesses it. Spawning a proxy inside that window put an actor of the LOCAL PLAYER'S
+// OWN SKATER CLASS into a world that had not yet chosen a pawn -- and the controller possessed OURS.
+// The player then owns a remote peer's skater, standing wherever the proxy was placed, and the level
+// they asked for appears not to have loaded at all.
+//
+// The window is measured from the world change and re-armed by any change of own pawn, so it ends
+// only once the game's own pawn has been stable for the whole period. Spawning late costs a peer a
+// second of invisibility; spawning early costs the player their character.
+static uint64_t g_settleUntilMs = 0;
+static void*    g_lastOwnPawn   = nullptr;
+static const uint64_t kWorldSettleMs = 2000;
+
 void ForgetProxies() {
     for (auto& s : g_slots) if (s.used) s.proxy.Forget();
-    if (g_logf) g_logf("[session] world changed -- all proxy pointers dropped");
+    g_settleUntilMs = 0;                 // re-armed by Frame, which owns the clock
+    g_lastOwnPawn   = nullptr;
+    if (g_logf) g_logf("[session] world changed -- all proxy pointers dropped, spawning held until the world settles");
 }
 
 void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
@@ -228,6 +250,14 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
     // `nowMs` is passed through to the PROXY only (its own spawn/visual timers are self-consistent).
     const uint64_t quietUs = (uint64_t)(g_cfg.quietMs * 1000.0f);
     const uint64_t dropUs  = (uint64_t)(g_cfg.dropMs  * 1000.0f);
+
+    // Hold spawning until the game's own pawn has stopped moving around. Any change re-arms the
+    // window, so a level load -- which swaps the pawn at least once -- is covered from whichever end
+    // it is observed, and a settled world costs one pointer compare per frame.
+    if (ownPawn != g_lastOwnPawn) {
+        g_lastOwnPawn   = ownPawn;
+        g_settleUntilMs = nowMs + kWorldSettleMs;
+    }
 
     // ---- how many peers are live right now (receive-based; drives the stats line + proxy retiring)
     int live = 0;
@@ -393,6 +423,8 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
         if (!s.proxy.actor()) {
             // Spawn needs a world handle, which only our own pawn provides.
             if (!ownPawn) continue;
+            // ...and a world that has finished deciding whose pawn is whose. See kWorldSettleMs.
+            if (nowMs < g_settleUntilMs) continue;
             if (!s.proxy.EnsureSpawned(ownPawn, out, nowMs, g_logf)) continue;
         }
         s.proxy.Apply(out, nowMs, nowUs, g_logf);
