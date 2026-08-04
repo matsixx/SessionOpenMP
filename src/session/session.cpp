@@ -238,6 +238,27 @@ bool IsProxyActor(void* actor) {
 static uint64_t g_settleUntilMs = 0;
 static void*    g_lastOwnPawn   = nullptr;
 static char     g_ownMap[40]    = {0};   // the level WE are in, for the peer-is-elsewhere gate
+
+// Levels where a proxy must never be spawned, matched as a case-insensitive prefix on the world name.
+//
+// "HUB_" is the apartment. Two players there are not in a shared place -- each is in their own copy
+// of it -- so a peer has nothing to show there in the first place, and the transported coordinates
+// belong to a different world entirely (one observed spawn landed at 39146,-5319,7097).
+//
+// It is also actively harmful: spawning a skater in the hub gets it POSSESSED by the local player
+// controller within ~20 ms, whenever it happens. That is not a load-timing race and no delay avoids
+// it -- the spawn itself is the damage, and the player loses their character to a remote peer's body.
+// Not spawning is the only thing that helps.
+static const char* kNoProxyWorlds[] = { "HUB_" };
+
+static bool worldTakesProxies(const char* world) {
+    if (!world || !world[0]) return true;            // unknown: behave as before rather than block
+    for (const char* p : kNoProxyWorlds) {
+        const size_t n = strlen(p);
+        if (_strnicmp(world, p, n) == 0) return false;
+    }
+    return true;
+}
 static const uint64_t kWorldSettleMs = 2000;
 
 void ForgetProxies() {
@@ -439,6 +460,18 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
             if (!ownPawn) continue;
             // ...and a world that has finished deciding whose pawn is whose. See kWorldSettleMs.
             if (nowMs < g_settleUntilMs) continue;
+            // ...and a world that tolerates one at all. Checked before the map comparison because
+            // this holds even when the peer is standing in "the same" level: two people in the hub
+            // are in two different copies of it.
+            if (!worldTakesProxies(g_ownMap)) {
+                if (!s.mapSkipSpoken) {
+                    s.mapSkipSpoken = true;
+                    if (g_logf) { char m[170]; snprintf(m, sizeof(m),
+                        "[session] '%s' does not take proxies -- peer %d stays unspawned while we are here",
+                        g_ownMap, s.peerIdx); g_logf(m); }
+                }
+                continue;
+            }
             // ...and a peer who is actually HERE. Their map travels with their cosmetics, so once
             // both names are known a difference is decisive: a peer in another level has nothing to
             // show in this one, and spawning them anyway is how a skater ends up standing in your
