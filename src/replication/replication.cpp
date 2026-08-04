@@ -932,6 +932,19 @@ bool Stream::Sample(uint64_t localUs, State& out) {
             if (sane && mag2 <= (double)tun_.extrapMaxCm * tun_.extrapMaxCm) {
                 for (int i = 0; i < 3; i++) out.deckPos[i] += d[i];
                 if (out.bodyPosOk) for (int i = 0; i < 3; i++) out.bodyPos[i] += d[i];
+                // The IK targets travel in WORLD space, so they have to come along or the body flies
+                // out from under its own feet. Leaving them behind is what makes a projected ollie
+                // look like the skater stretching upward while their feet and board stay put: the
+                // limbs are not lagging, they are anchored to a position the body has already left.
+                // This is NOT guessing pose -- every target moves by the SAME rigid displacement as
+                // the body, so the pose RELATIVE to the skater is exactly what was received. Only the
+                // anchor moves, which is the same reason the deck is displaced above.
+                if (out.feetOk && out.feetWorld) {
+                    for (int i = 0; i < 3; i++) { out.lFootPos[i] += d[i]; out.rFootPos[i] += d[i]; }
+                }
+                if (out.handOk && out.handWorld) {
+                    for (int i = 0; i < 3; i++) { out.lHandPos[i] += d[i]; out.rHandPos[i] += d[i]; }
+                }
                 st_.extrap++;
             }
         }

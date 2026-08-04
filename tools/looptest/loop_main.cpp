@@ -715,12 +715,72 @@ static bool audioEventCheck() {
     return bad == 0;
 }
 
+
+// ---- EXTRAPOLATION COHERENCE. When the sender goes quiet the stream projects position forward, and
+// every world-space part of the skater must move by the SAME displacement. The deck and body always
+// did; the world-space IK targets did not, so a projected ollie rendered as the body rising out of
+// its own feet -- the limbs were not lagging, they were anchored to a position the body had left.
+// The invariant is rigid: foot-to-deck and hand-to-deck offsets are whatever was last RECEIVED, and
+// extrapolation may not change them by so much as a millimetre.
+static bool extrapCoherenceCheck() {
+    Stream st;
+    State a{}; State b{};
+    auto fill = [](State& s, float x) {
+        s.bodyPosOk = 1; s.feetOk = 1; s.feetWorld = 1; s.handOk = 1; s.handWorld = 1;
+        s.deckPos[0] = x;        s.deckPos[1] = 0; s.deckPos[2] = 0;
+        s.bodyPos[0] = x;        s.bodyPos[1] = 0; s.bodyPos[2] = 90.f;
+        s.lFootPos[0] = x - 15;  s.lFootPos[1] = 0; s.lFootPos[2] = 5.f;
+        s.rFootPos[0] = x + 15;  s.rFootPos[1] = 0; s.rFootPos[2] = 5.f;
+        s.lHandPos[0] = x - 25;  s.lHandPos[1] = 0; s.lHandPos[2] = 60.f;
+        s.rHandPos[0] = x + 25;  s.rHandPos[1] = 0; s.rHandPos[2] = 60.f;
+        s.deckQuat[3] = 1; s.bodyQuat[3] = 1;
+    };
+    fill(a, 0.f); fill(b, 100.f);                    // 100 cm in 100 ms = 10 m/s, a real skating speed
+    st.Push(a,      0, 0);
+    st.Push(b, 100000, 100000);
+
+    // Sample far enough past the newest packet that the stream must project rather than interpolate.
+    State out{};
+    bool sawExtrap = false;
+    for (int i = 0; i < 400 && !sawExtrap; i++) {
+        st.Sample(200000 + (uint64_t)i * 5000, out);
+        sawExtrap = st.stats().extrap > 0;
+    }
+    if (!sawExtrap) { printf("  extrap coherence: stream never extrapolated -- test is not exercising it\n"); return false; }
+
+    struct Pair { const char* what; const float* p; };
+    const Pair parts[] = {
+        { "bodyPos", out.bodyPos }, { "lFootPos", out.lFootPos }, { "rFootPos", out.rFootPos },
+        { "lHandPos", out.lHandPos }, { "rHandPos", out.rHandPos },
+    };
+    const Pair truth[] = {
+        { "bodyPos", b.bodyPos }, { "lFootPos", b.lFootPos }, { "rFootPos", b.rFootPos },
+        { "lHandPos", b.lHandPos }, { "rHandPos", b.rHandPos },
+    };
+    int bad = 0;
+    for (int k = 0; k < 5; k++) {
+        for (int i = 0; i < 3; i++) {
+            const float wantOff = truth[k].p[i] - b.deckPos[i];   // offset as last RECEIVED
+            const float gotOff  = parts[k].p[i] - out.deckPos[i]; // offset after projection
+            if (fabsf(gotOff - wantOff) > 0.01f) {
+                printf("  extrap coherence: %s[%d] offset drifted %.2f cm from the deck "
+                       "(extrapolation moved the deck without it)\n",
+                       parts[k].what, i, (double)(gotOff - wantOff));
+                bad++;
+            }
+        }
+    }
+    if (!bad) printf("  extrap coherence: deck, body, feet and hands project as one rigid body  PASS\n");
+    return bad == 0;
+}
+
 int main(int argc, char**) {
     const bool dbg = argc > 1;                      // any arg = per-second clock internals, clean profile
     printf("SessionOpenMP replication loop test\n");
     if (!codecCheck()) { printf("\nCODEC FAIL\n"); return 1; }
     if (!audioEventCheck()) { printf("\nAUDIO EVENT FAIL\n"); return 1; }
     if (!pushQueueCheck())  { printf("\nPUSH QUEUE FAIL\n");  return 1; }
+    if (!extrapCoherenceCheck()) { printf("\nEXTRAP COHERENCE FAIL\n"); return 1; }
     printf("%-13s %8s %8s %8s %6s %7s %7s %7s %7s\n",
            "profile", "outEwma", "outMax", "delay", "alpha", "starve", "resync", "extrap", "verdict");
     bool allPass = true;
