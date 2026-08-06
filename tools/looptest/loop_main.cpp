@@ -860,9 +860,11 @@ static bool syncTransferCheck() {
     State src{}; src.deckQuat[3] = src.bodyQuat[3] = 1; src.bodyPosOk = 1;
     uint8_t pkt[1024];
     const int N = 600;
+    src.poseN = 2; src.poseRot[0][3] = 1; src.poseRot[1][3] = 1;
     for (int i = 0; i < N; i++) {
         src.deckPos[0] = (float)i;
         src.bodyPos[0] = (float)i * 2;
+        src.posePos[1][0] = (float)i * 3;    // a bone rides the index too: asserts the pose BLENDS
         const uint64_t us = 1000000ull + (uint64_t)i * 16667;
         const int n = Pack(src, us, pkt, sizeof(pkt));
         if (n <= 0) { printf("  sync: Pack failed at %d\n", i); return false; }
@@ -900,6 +902,11 @@ static bool syncTransferCheck() {
         out.bodyPos[0] < 200.8f || out.bodyPos[0] > 201.2f) {
         printf("  sync: midpoint sample wrong (deckX %.3f want ~100.5, bodyX %.3f want ~201)\n",
                (double)out.deckPos[0], (double)out.bodyPos[0]);
+        return false;
+    }
+    if (out.poseN != 2 || out.posePos[1][0] < 301.2f || out.posePos[1][0] > 301.8f) {
+        printf("  sync: midpoint BONE wrong (poseN %d, x %.3f want ~301.5 -- stepped bones judder)\n",
+               (int)out.poseN, (double)out.posePos[1][0]);
         return false;
     }
     // clamped ends: before the window holds the oldest state

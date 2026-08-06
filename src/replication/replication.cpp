@@ -809,6 +809,18 @@ void InterpStates(const State& a, const State& b, float t, State& out) {
             qLerp(a.truckF, b.truckF, t, out.truckF);
             if (a.artOk >= 2 && b.artOk >= 2) qLerp(a.wheelBL, b.wheelBL, t, out.wheelBL);
         }
+        // The pose lane: blend each bone when both snapshots carry the same skeleton. A stepped
+        // 60 Hz skeleton sampled at a ~60 fps render BEATS against it -- some frames repeat a
+        // snapshot, some skip one -- which reads as a low-refresh skater while the lerped deck and
+        // body glide (the replay-sync field symptom). Mismatched counts step from `a` (out = a
+        // already), the all-or-nothing rule the codec applies on the wire.
+        if (a.poseN && a.poseN == b.poseN) {
+            const int n = a.poseN < kPoseMaxBones ? a.poseN : kPoseMaxBones;
+            for (int bn = 0; bn < n; bn++) {
+                qLerp(a.poseRot[bn], b.poseRot[bn], t, out.poseRot[bn]);
+                lerp3(a.posePos[bn], b.posePos[bn], t, out.posePos[bn]);
+            }
+        }
         // The pose blob: whitelisted continuous floats blend between the bracketing snapshots; every
         // bool/enum/state byte comes from `a` unblended, which copying `a` already did.
         // Unequal lengths = the sender changed mid-stream (build boundary); step, never mis-align.
