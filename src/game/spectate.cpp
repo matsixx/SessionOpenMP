@@ -97,11 +97,12 @@ static void* replayCamera() { return nullptr; }
 // =====================================================================================================
 // ---- per-peer registration surgery ------------------------------------------------------------------
 // A recorded peer can be flipped to LIVE view (and back) during playback by removing (re-adding)
-// their components from the manager's array. Removal stashes the entries per skater-owner -- every
-// component a peer registers, the board's included, reads its owner as the SKATER actor (log-proven
-// by the prune's own class dump) -- and the append only ever writes into slack: entries go back into
-// the same array they were pruned from, so Num < Max holds by construction, and if it ever does not,
-// the append refuses rather than growing an engine-owned allocation.
+// their components from the manager's array. A peer registers components on TWO actors -- six on the
+// skater, two on the board (the field counts: 8 parked, 6 restored, board left behind) -- so stash
+// buckets are keyed by the CANONICAL owner, the skater, via ProxyOwnerOf: a board and its rider are
+// one player, and the append must restore both together. The append only ever writes into slack:
+// entries go back into the same array they were pruned from, so Num < Max holds by construction, and
+// if it ever does not, the append refuses rather than growing an engine-owned allocation.
 struct CompStash { void* owner; void* entries[12]; int n; };
 static CompStash g_stash[24];
 
@@ -152,14 +153,19 @@ static int pruneCore(void* onlyOwner, bool stash, void (*logf)(const char*)) {
                 // wrong removal.
                 uint8_t* comp  = entry - off::kReplayIfaceToComp;
                 void*    owner = *(void**)(comp + off::kCompOwner);
-                if (owner && IsProxyActor(owner) && (!onlyOwner || owner == onlyOwner)) {
+                void*    canon = ProxyOwnerOf(owner);   // the skater, whichever actor owns the component
+                if (canon && (!onlyOwner || canon == onlyOwner)) {
                     drop = true;
                     if (removed < 8) removedComp[removed] = comp;
                     removed++;
                     if (stash) {
-                        CompStash* b = stashFor(owner, true);
-                        if (b && b->n < (int)(sizeof(b->entries)/sizeof(b->entries[0])))
-                            b->entries[b->n++] = entry;             // the INTERFACE pointer, as stored
+                        CompStash* b = stashFor(canon, true);
+                        if (b) {
+                            bool have = false;
+                            for (int e = 0; e < b->n && !have; e++) have = (b->entries[e] == entry);
+                            if (!have && b->n < (int)(sizeof(b->entries)/sizeof(b->entries[0])))
+                                b->entries[b->n++] = entry;         // the INTERFACE pointer, as stored
+                        }
                     }
                 }
             }

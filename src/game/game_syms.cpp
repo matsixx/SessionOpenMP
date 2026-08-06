@@ -607,6 +607,14 @@ bool IsProxyActor(void* a) {
         if (p.actor && (p.actor == a || (p.board && p.board == a))) return true;
     return false;
 }
+// The SKATER an actor belongs to: itself, or the rider if `a` is a proxy's board. The canonical key
+// for anything stored per peer -- a board and its rider are one player.
+void* ProxyOwnerOf(void* a) {
+    if (!a) return nullptr;
+    for (const auto& p : g_proxyRefs)
+        if (p.actor && (p.actor == a || (p.board && p.board == a))) return p.actor;
+    return nullptr;
+}
 int ProxyRefCount() { return kProxyRefs; }
 bool ProxyRefAt(int i, void** actor, void** board) {
     if (i < 0 || i >= kProxyRefs) return false;

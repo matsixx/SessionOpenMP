@@ -360,6 +360,7 @@ uint8_t LocalReplayMode();
 void NoteProxyActor(void* actor, void* board);  // spawn + per-frame refresh (idempotent)
 void DropProxyActor(void* actor);               // Forget: the actor is gone or no longer ours
 bool IsProxyActor(void* actorOrBoard);          // true for the proxy skater OR its board
+void* ProxyOwnerOf(void* actorOrBoard);         // ...and WHICH skater that is (null = not ours)
 int  ProxyRefCount();                           // iteration, for hooks that need proxy POSITIONS
 bool ProxyRefAt(int i, void** actor, void** board);
 
