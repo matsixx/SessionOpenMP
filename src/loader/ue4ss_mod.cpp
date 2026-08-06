@@ -581,7 +581,10 @@ static void publishNameplates() {
             logLine("[names] no world-to-screen symbol -- floating player names are OFF for this build");
         }
     }
-    if (T.enabled && g_ownPawn && game::ViewportSize(&vw, &vh)) {
+    // No plates inside the replay editor (playback): a floating name over a replay -- yours or a
+    // synced peer's -- is clutter in what is essentially a camera shot. Publishing the empty list
+    // fades them out; live play resumes them the frame the editor closes.
+    if (T.enabled && game::LocalReplayMode() != 2 && g_ownPawn && game::ViewportSize(&vw, &vh)) {
         // The fade follows OUR board, not theirs: names are for looking around on foot, and a clean
         // screen is for skating.
         bool onBoard = false;
