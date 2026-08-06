@@ -848,21 +848,22 @@ void Proxy::Apply(const repl::State& s, uint64_t nowMs, uint64_t nowUs, void (*l
         else if (!VelocityDrive(s, nowUs)) StampBoard(s);
     }
 
-    // ---- offscreen anim throttle, once per actor. OnlyTickPoseWhenRendered (3): an unrendered
-    // proxy (shadow passes count as rendered) skips anim update and evaluation, the largest
-    // per-proxy CPU cost. Transported state keeps arriving and the driver stamp lives in the anim
-    // update itself, so the pose is current again the frame they re-enter view. One byte, engine's
+    // ---- offscreen anim throttle, once per actor. AlwaysTickPose (1): the graph updates every
+    // frame -- the replay records anim fields and playback advances them, so the graph must never
+    // be visibility-gated (OnlyTickPoseWhenRendered froze peers' replay tracks in every stretch
+    // they were offscreen) -- but the bone evaluation/refresh, the expensive half of anim cost, is
+    // skipped while the mesh is not rendered (shadow passes count as rendered). One byte, engine's
     // own mechanism, no per-frame cost.
     if (g_tun.offscreenAnimThrottle && !animThrottled_) {
         void* mesh = safePtr(actor_, off::kSkaterMesh);
         if (mesh) {
 #ifdef _WIN32
             __try {
-                *(uint8_t*)((uint8_t*)mesh + off::kMeshAnimTickOption) = 3;
+                *(uint8_t*)((uint8_t*)mesh + off::kMeshAnimTickOption) = 1;
                 animThrottled_ = true;
                 static bool said = false;
                 if (!said && logf) { said = true;
-                    logf("[proxy] offscreen anim throttle ON (OnlyTickPoseWhenRendered for proxy meshes)"); }
+                    logf("[proxy] offscreen anim throttle ON (AlwaysTickPose: offscreen bone refresh skipped)"); }
             } __except (EXCEPTION_EXECUTE_HANDLER) { animThrottled_ = true; }
 #endif
         }

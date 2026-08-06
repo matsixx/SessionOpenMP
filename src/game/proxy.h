@@ -46,11 +46,13 @@ struct ProxyTuning {
                                           // and ResetRagDoll on the falling edge to recover
     // ---- SCALING. What N players cost is dominated by the game simulating N real skaters; these
     // two shed the cost where it cannot be seen or felt.
-    bool  offscreenAnimThrottle = true;   // proxy meshes get OnlyTickPoseWhenRendered: a peer you
-                                          // cannot see (shadow included) skips anim update+eval,
-                                          // the largest per-proxy CPU cost. Their transported state
-                                          // keeps arriving, so the pose is current again the frame
-                                          // they re-enter view.
+    bool  offscreenAnimThrottle = true;   // proxy meshes get AlwaysTickPose (NOT OnlyTickPoseWhen-
+                                          // Rendered): the graph still updates every frame -- the
+                                          // replay RECORDS anim fields and playback ADVANCES them,
+                                          // so a visibility-gated graph froze peers' replay tracks
+                                          // in stretches ("randomly on and off") -- but the bone
+                                          // evaluation/refresh, the expensive half, is skipped
+                                          // while the mesh is not rendered (shadow included).
     float boardSimMaxDistM = 25.0f;       // beyond this the peer's board stops SIMULATING and is
                                           // stamped instead: collision response only matters at
                                           // contact range, and by the time you can reach a board it
