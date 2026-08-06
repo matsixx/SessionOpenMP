@@ -484,6 +484,16 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
         s.peerReplaying = out.replaying != 0;
         if (out.replaying) anyPeerReplaying = true;
 
+        // Recorded peers: while the LOCAL player is in replay playback, the replay system is the
+        // only author of every proxy -- it is replaying what it recorded of them. Applying live
+        // state on top is the two-writer fight that made recorded peers thrash. So the live lane
+        // only BUFFERS here (Push in OnPacket keeps running); the moment playback ends, Apply
+        // resumes from the stream's current head as if nothing happened.
+        if (game::Proxy::Tuning().recordPeers && game::LocalReplayMode() == 2) {
+            if (s.proxy.actor()) alive++;
+            continue;
+        }
+
         if (!s.proxy.actor()) {
             // Spawn needs a world handle, which only our own pawn provides.
             if (!ownPawn) continue;

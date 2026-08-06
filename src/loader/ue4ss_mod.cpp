@@ -708,7 +708,10 @@ static void GameThreadFrame() {
     // hold continuously, or each appearance writes some of a peer's skating into your replay. The
     // pass is a scan of a couple of dozen pointers and, once the +0xb8 latch is set, removes nothing
     // -- cheaper than the check that would decide whether to run it.
-    game::spectate::PruneProxyComponents(&logLine);
+    // ...unless peers are being RECORDED (the default): then their components stay registered and
+    // the replay system captures everyone. The old prune remains the kill-switch path.
+    if (!game::Proxy::Tuning().recordPeers)
+        game::spectate::PruneProxyComponents(&logLine);
 
     // the wire was already pumped in MpPump (same thread, same run); just drive the frame.
     session::Frame(g_ownPawn, us, ms, &game::GatherOwnState);

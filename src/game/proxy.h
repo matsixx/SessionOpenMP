@@ -44,6 +44,15 @@ struct ProxyTuning {
                                           // query-collidable board at the dismount point.
     bool  bailSync        = true;         // owner's ragdoll edge -> execute Bail locally on the proxy,
                                           // and ResetRagDoll on the falling edge to recover
+    // Record peers into the local replay. Their replay components self-register at BeginPlay (a
+    // proxy is a real skater); with this on they are left registered, so the game records everyone
+    // and a replay scrubs through the whole session, not just you. The fight that used to make a
+    // recorded peer thrash -- live replication and replay playback both writing the same actor --
+    // is resolved by the OTHER half of this feature: while the local player is in replay playback,
+    // every live writer for proxies goes quiet (session skips Apply, the anim post-pass and the
+    // pose stamp skip), so the recording is the only author. false = the old behaviour: peers are
+    // pruned from the recording and shown LIVE while you scrub, served by the unicast pose lane.
+    bool  recordPeers     = true;
     // ---- TYPE GATES. A peer chooses the NAME we resolve, and StaticFindObject with ANY_PACKAGE
     // returns the first object of ANY class bearing it -- so without these the peer also chooses the
     // TYPE, and the resulting wrong-typed pointer is read by engine code where our SEH is no help.

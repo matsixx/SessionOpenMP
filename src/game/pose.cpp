@@ -11,6 +11,7 @@
 // loads into. See LICENSE-EXCEPTION.txt.
 #include "pose.h"
 #include "game_syms.h"
+#include "proxy.h"
 #include "../session/session.h"
 #include "../debug.h"
 #include <cstring>
@@ -198,6 +199,10 @@ void OnFinalizeBones(void* mesh, uint64_t nowMs) {
     // Measurement round: adopt the slot (the probe reads flags off its mesh) but write NOTHING --
     // no stamp, no hold. What renders is the graph's own evaluation, which is the question.
     if (debug::Get().replayDriverTest) return;
+    // Recorded peers: during playback the replay system poses this skeleton from its recording, and
+    // both the transported-pose stamp and the hold would overwrite it -- the two-writer fight again,
+    // one layer down. Outside playback nothing changes.
+    if (game::Proxy::Tuning().recordPeers && LocalReplayMode() == 2) return;
 #ifdef _WIN32
     int num = 0;
     uint8_t* cs = compSpace(mesh, /*editable*/ true, &num);
