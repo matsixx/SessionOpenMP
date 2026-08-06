@@ -66,12 +66,8 @@ void OnActorGone(void* actor, void (*logf)(const char*));
 // pointers, and once the latch is set it removes nothing. Returns how many were removed.
 // Full derivation of the array layout is in the .cpp.
 int PruneProxyComponents(void (*logf)(const char*));
-// Playback transitions for RECORDED peers (ProxyTuning::recordPeers): entering playback parks every
-// peer's replay components (stashed per owner) so everyone shows LIVE; exiting restores them so
-// recording resumes. SetPeerPlayback flips one peer between recording-driven and live during
-// playback. All three are no-ops when there is nothing to move.
-void EnterReplayPlayback(void (*logf)(const char*));
-void ExitReplayPlayback(void (*logf)(const char*));
-void SetPeerPlayback(void* skaterActor, bool recorded, void (*logf)(const char*));
+// Per-peer visibility in the LOCAL player's replay: hiding parks the peer's components (stashed)
+// and conceals the actor + board; showing re-appends and unhides. No-ops when nothing has to move.
+void SetPeerShownInReplay(void* skaterActor, bool shown, void (*logf)(const char*));
 
 }}} // namespace omp::game::spectate

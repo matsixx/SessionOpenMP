@@ -53,10 +53,10 @@ struct Tuning {
     // puddle. (A peer sending us their pose while WE scrub is the mirror of `captureMode` and needs a
     // wire change.)
     bool holdInLocalReplay = true;
-    // Serve results to a PEER who is scrubbing, so they see us skating live instead of a frozen pose.
-    // The session builds that as a SEPARATE packet and unicasts it to the scrubbing peers alone --
-    // everyone else keeps the driver lane, so one player's replay session costs nobody else anything.
-    bool serveScrubbingPeers = true;
+    // Serve live results to a PEER who is scrubbing. OFF: the replay editor shows recordings only,
+    // so a scrubbing peer applies no live poses and sending them is pure bandwidth. The machinery
+    // stays because a future spectate mode outside the editor is exactly this lane switched on.
+    bool serveScrubbingPeers = false;
 };
 Tuning& Tune();
 

@@ -308,10 +308,10 @@ void AnimPostApply(void* ai) {
     for (auto& s : g_animSlots) {
         if (s.ai != ai || !s.owner) continue;
         InterlockedIncrement(&g_animUpdCalls);
-        // A peer toggled to their RECORDING during playback: the replay system owns the anim state,
-        // and the slot going stale in 500 ms is not fast enough to stop the first half-second of
-        // fresh blobs stamping over it. Live-viewed peers keep the stamp.
-        if (LocalReplayMode() == 2 && session::PeerViewRecorded(s.owner)) return;
+        // The replay editor shows recordings only: during playback the replay system owns every
+        // proxy's anim state, and the slot going stale in 500 ms is not fast enough to stop the
+        // first half-second of fresh blobs stamping over it.
+        if (Proxy::Tuning().recordPeers && LocalReplayMode() == 2) return;
         if (GetTickCount64() - s.freshMs > 500) return;      // stale stream: let the local graph run
 #ifdef _WIN32
         __try {

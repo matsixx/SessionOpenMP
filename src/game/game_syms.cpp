@@ -633,6 +633,11 @@ void* ProxyOwnerOf(void* a) {
         if (p.actor && (p.actor == a || (p.board && p.board == a))) return p.actor;
     return nullptr;
 }
+void* ProxyBoardOf(void* skater) {
+    if (!skater) return nullptr;
+    for (const auto& p : g_proxyRefs) if (p.actor == skater) return p.board;
+    return nullptr;
+}
 int ProxyRefCount() { return kProxyRefs; }
 bool ProxyRefAt(int i, void** actor, void** board) {
     if (i < 0 || i >= kProxyRefs) return false;

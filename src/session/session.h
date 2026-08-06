@@ -103,16 +103,11 @@ void* PeerActorById(int peerId);
 // is a real actor of the player's own skater class, so the engine's own "is this locally
 // controlled" test cannot tell them apart if a controller ever possesses one.
 bool  IsProxyActor(void* actor);
-// The per-peer replay view (ProxyTuning::recordPeers): during the LOCAL player's playback a peer
-// either shows LIVE (default) or is driven by the recording. Set by the pause menu, read by the
-// live writers, reset by the loader when playback ends.
-void  SetPeerViewRecorded(int peerId, bool recorded);
-bool  PeerViewRecorded(void* actor);
-void  ResetPeerViews();
-// A proxy the playback machinery drove and has not yet released -- the mesh's anim rate is zeroed
-// until the game's own transition restores it. Read by the replay-mode guard to decide which exit
-// broadcasts must pass; cleared where the restore runs.
-bool  PeerPlaybackTouched(void* actor);
-void  ClearPlaybackTouched(void* actor);
+// Per-peer visibility in the LOCAL player's replay (ProxyTuning::recordPeers): a hidden peer is
+// parked out of playback and concealed until the editor closes. Set by the pause menu; the loader
+// calls RestoreHiddenAfterReplay at the playback-exit edge.
+void  SetPeerReplayHidden(int peerId, bool hidden);
+bool  PeerReplayHidden(void* actor);
+void  RestoreHiddenAfterReplay(void (*logf)(const char*));
 
 }} // namespace omp::session

@@ -713,18 +713,14 @@ static void GameThreadFrame() {
     if (!game::Proxy::Tuning().recordPeers) {
         game::spectate::PruneProxyComponents(&logLine);
     } else {
-        // Playback edges. Entering parks every peer's components so they all show LIVE (the default
-        // view); the pause menu's per-player toggle re-registers one to watch their recording.
-        // Exiting restores everyone and resets the toggles, so recording resumes for the whole
-        // session and the next scrub starts predictable.
+        // Peers stay registered through playback -- the replay editor shows recordings, and the
+        // manager's own end-of-playback pass restores whatever is registered when it ends. The one
+        // edge that needs help is a peer HIDDEN at that moment: parked components miss the restore,
+        // so the exit handler re-registers them, runs the game's per-skater transition, and unhides.
         static uint8_t lastReplayMode = 0;
         const uint8_t rm = game::LocalReplayMode();
         if (rm != lastReplayMode) {
-            if (rm == 2)                 game::spectate::EnterReplayPlayback(&logLine);
-            else if (lastReplayMode == 2) {
-                game::spectate::ExitReplayPlayback(&logLine);
-                session::ResetPeerViews();
-            }
+            if (lastReplayMode == 2) session::RestoreHiddenAfterReplay(&logLine);
             lastReplayMode = rm;
         }
     }
@@ -925,20 +921,6 @@ static void hkSkaterReplayMode(void* skater, uint8_t mode) {
         // the peer's animation parked in replay state after the editor closes, which is exactly the
         // stuck-drivers symptom it caused. The view flag is read at broadcast time, before the
         // frame-edge reset clears it.
-        if (mode != 2) {
-            // Keyed on the DEBT, not the current view: a peer toggled back to live still owes the
-            // restore if the toggle-time call was unavailable, and the current view says nothing
-            // about whether playback ever zeroed their anim rate.
-            bool owed = false;
-            __try { owed = session::PeerPlaybackTouched(skater); }
-            __except (EXCEPTION_EXECUTE_HANDLER) { owed = false; }
-            if (owed) {
-                logLine("[mod] replay-exit restore passed through to a playback-touched proxy");
-                o_SkaterReplayMode(skater, mode);
-                session::ClearPlaybackTouched(skater);
-                return;
-            }
-        }
         static long announced = 0;
         if (InterlockedIncrement(&announced) <= 3)
             logLine("[mod] replay mode change IGNORED for a proxy (it is not part of your replay)");

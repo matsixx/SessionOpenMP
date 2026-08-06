@@ -247,48 +247,38 @@ static int appendFor(void* owner, void (*logf)(const char*)) {
 #endif
 }
 
-// ---- playback transitions and the per-peer view switch ----------------------------------------------
-// Entering playback prunes every peer WITH stash: the replay system then drives nobody of ours, the
-// live lane keeps applying, and every peer appears LIVE -- the default view. Toggling one peer to
-// "recording" re-appends their components (playback picks them up from its recorded tracks) and the
-// live writers yield for that actor alone. Exiting playback restores everyone, so recording resumes
-// for the whole session the moment live play does.
-void EnterReplayPlayback(void (*logf)(const char*)) {
-    const int n = pruneCore(nullptr, /*stash*/ true, logf);
-    if (n && logf) {
-        char m[160];
-        snprintf(m, sizeof(m), "[replay] playback: %d peer component(s) parked -- peers show LIVE; "
-                               "toggle a player to watch their recording", n);
-        logf(m);
-    }
-}
-void ExitReplayPlayback(void (*logf)(const char*)) {
-    int n = 0;
-    for (auto& b : g_stash) if (b.owner) n += appendFor(b.owner, logf);
-    if (n && logf) {
-        char m[120];
-        snprintf(m, sizeof(m), "[replay] playback over: %d peer component(s) re-registered -- "
-                               "recording everyone again", n);
-        logf(m);
-    }
-}
-void SetPeerPlayback(void* skaterActor, bool recorded, void (*logf)(const char*)) {
+// ---- per-peer visibility in the replay --------------------------------------------------------------
+// The replay editor shows recordings; this decides WHOSE. Hiding a peer parks their components
+// (stashed) so playback stops driving them, and conceals the actor and board so no frozen statue is
+// left standing in the shot. Showing them re-appends the components -- playback picks the tracks
+// back up -- and unhides them. The session's exit handler shows everyone again and settles the
+// game's own per-skater transition for peers that were parked when playback ended, because the
+// replay manager's end-of-playback restore only reaches components that are REGISTERED at that
+// moment; a parked peer misses it and their mesh's anim rate stays zeroed.
+void SetPeerShownInReplay(void* skaterActor, bool shown, void (*logf)(const char*)) {
     if (!skaterActor) return;
-    if (recorded) {
+    const Syms& S = Get();
+    void* board = ProxyBoardOf(skaterActor);
+    if (shown) {
         const int n = appendFor(skaterActor, logf);
+#ifdef _WIN32
+        if (S.SetActorHidden) {
+            __try { S.SetActorHidden(skaterActor, false); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+            if (board) { __try { S.SetActorHidden(board, false); } __except (EXCEPTION_EXECUTE_HANDLER) {} }
+        }
+#endif
         if (logf) { char m[140]; snprintf(m, sizeof(m),
-            "[replay] peer %p -> RECORDING view (%d component(s) re-registered)", skaterActor, n); logf(m); }
+            "[replay] peer %p SHOWN in replay (%d component(s) re-registered)", skaterActor, n); logf(m); }
     } else {
         const int n = pruneCore(skaterActor, /*stash*/ true, logf);
-        // Being playback-driven zeroed this skater's mesh anim rate; parking the components stops
-        // the driving but restores nothing. Run the game's own transition now, so live view after
-        // the toggle is genuinely live -- not a frozen graph masked by pose stamps until the next
-        // exit happens to repair it.
-        const bool restored = game::CallSkaterReplayMode(skaterActor, game::LastLiveReplayMode());
-        if (restored) session::ClearPlaybackTouched(skaterActor);
-        if (logf) { char m[180]; snprintf(m, sizeof(m),
-            "[replay] peer %p -> LIVE view (%d component(s) parked, game restore %s)",
-            skaterActor, n, restored ? "ran" : "UNAVAILABLE"); logf(m); }
+#ifdef _WIN32
+        if (S.SetActorHidden) {
+            __try { S.SetActorHidden(skaterActor, true); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+            if (board) { __try { S.SetActorHidden(board, true); } __except (EXCEPTION_EXECUTE_HANDLER) {} }
+        }
+#endif
+        if (logf) { char m[140]; snprintf(m, sizeof(m),
+            "[replay] peer %p HIDDEN from replay (%d component(s) parked)", skaterActor, n); logf(m); }
     }
 }
 

@@ -199,10 +199,10 @@ void OnFinalizeBones(void* mesh, uint64_t nowMs) {
     // Measurement round: adopt the slot (the probe reads flags off its mesh) but write NOTHING --
     // no stamp, no hold. What renders is the graph's own evaluation, which is the question.
     if (debug::Get().replayDriverTest) return;
-    // A peer toggled to their RECORDING during playback: the replay system poses this skeleton, and
-    // both the transported-pose stamp and the hold would overwrite it -- the two-writer fight again,
-    // one layer down. Live-viewed peers keep the stamp and the hold exactly as before.
-    if (LocalReplayMode() == 2 && session::PeerViewRecorded(owner)) return;
+    // The replay editor shows recordings only: during playback the replay system poses every proxy
+    // skeleton, and both the transported-pose stamp and the hold would overwrite it -- the
+    // two-writer fight, one layer down.
+    if (game::Proxy::Tuning().recordPeers && LocalReplayMode() == 2) return;
 #ifdef _WIN32
     int num = 0;
     uint8_t* cs = compSpace(mesh, /*editable*/ true, &num);

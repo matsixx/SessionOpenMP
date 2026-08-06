@@ -488,10 +488,10 @@ static int       g_spectateSel   = 0;               // row position, display onl
 static int       g_spectateSelPeer = -1;            // THE selection. -1 = your own skater.
 static const LONG kSpecNoPending = 0x7FFFFFFF;
 static volatile LONG g_spectatePending = kSpecNoPending;   // a PEER ID, posted by the menu callback
-// ---- the per-player replay view row ("Their Skater: Live / Recording"). Applies to whoever the
-// Look At row selects; with "Me" selected it refuses (your own skater IS the replay). The posted
-// value is (peerId << 1) | recorded, so the pump applies the choice to the player it was made for
-// even if the Look At selection moves before the game thread runs.
+// ---- the per-player replay visibility row ("Show in Replay: On / Off"). Applies to whoever the
+// Look At row selects; with "Me" selected it refuses (hiding your own skater is not a replay). The
+// posted value is (peerId << 1) | hidden, so the pump applies the choice to the player it was made
+// for even if the Look At selection moves before the game thread runs.
 static uint8_t   g_viewRow[0x90];
 static uint64_t  g_viewKey = 0;
 static FTextBlob g_viewOpts[2];
@@ -597,11 +597,11 @@ static void buildRows() {
         }
         // The view row fails independently: no Look At page, no view row, but never the reverse.
         if (g_replayPageKey &&
-            buildRow(g_viewRow, "OmpPeerReplay", "Their Skater",
-                     "For the Look At player: Live shows them as they are right now; Recording plays "
-                     "back what you recorded of them on this replay's timeline", &g_viewKey)) {
-            const FTextBlob* live = cachedText("Live");
-            const FTextBlob* rec  = cachedText("Recording");
+            buildRow(g_viewRow, "OmpPeerReplay", "Show in Replay",
+                     "Whether the Look At player's recording appears in your replay. Off hides them "
+                     "until you leave the editor.", &g_viewKey)) {
+            const FTextBlob* live = cachedText("On");
+            const FTextBlob* rec  = cachedText("Off");
             if (live && rec) {
                 g_viewOpts[0] = *live; g_viewOpts[1] = *rec;
                 *(g_viewRow + off::kItemType) = 2;                       // MultiOption
@@ -868,7 +868,7 @@ static const TArrayHdr* chooseArray(void* page, const TArrayHdr* items, TArrayHd
             // menu is when "what am I looking at" gets refreshed, same as the roster above.
             void* selActor = (g_spectateSelPeer >= 0)
                            ? omp::session::PeerActorById(g_spectateSelPeer) : nullptr;
-            g_viewSel = (selActor && omp::session::PeerViewRecorded(selActor)) ? 1 : 0;
+            g_viewSel = (selActor && omp::session::PeerReplayHidden(selActor)) ? 1 : 0;
             *(int32_t*)(g_viewRow + off::kItemMultiStart) = g_viewSel;
             memcpy(out2 + (size_t)(items->num + 1) * off::kItemSize, g_viewRow, off::kItemSize);
             stampTemplate(out2 + (size_t)(items->num + 1) * off::kItemSize);
@@ -1350,18 +1350,18 @@ void PauseMenu_Pump() {
     {
         const LONG want = InterlockedExchange(&g_viewPending, kSpecNoPending);
         if (want != kSpecNoPending) {
-            const int  peer     = (int)(want >> 1);
-            const bool recorded = (want & 1) != 0;
+            const int  peer   = (int)(want >> 1);
+            const bool hidden = (want & 1) != 0;
             void* actor = omp::session::PeerActorById(peer);
             if (!actor) {
-                log("[menu] that player is no longer in the session -- view unchanged");
+                log("[menu] that player is no longer in the session -- nothing changed");
             } else if (omp::game::LocalReplayMode() != 2) {
-                // Outside playback the toggle has nothing to act on: entry parks everyone and the
-                // views reset on exit, so the choice would be silently discarded. Say so instead.
-                log("[menu] Their Skater applies while you are in a replay -- open one and toggle there");
+                // Outside playback there is nothing to hide from: visibility resets when the editor
+                // closes, so the choice would be silently discarded. Say so instead.
+                log("[menu] Show in Replay applies while you are in a replay -- open one and toggle there");
             } else {
-                omp::session::SetPeerViewRecorded(peer, recorded);
-                omp::game::spectate::SetPeerPlayback(actor, recorded, &log);
+                omp::session::SetPeerReplayHidden(peer, hidden);
+                omp::game::spectate::SetPeerShownInReplay(actor, !hidden, &log);
             }
         }
     }
@@ -1633,7 +1633,7 @@ static bool handleValueChange(void* params, bool isSlider) {
             if (idx == g_viewSel) return true;               // engine echo of the current value
             g_viewSel = idx;
             if (g_spectateSelPeer < 0) {
-                log("[menu] pick a player in Look At first -- Their Skater applies to them");
+                log("[menu] pick a player in Look At first -- Show in Replay applies to them");
                 return true;
             }
             InterlockedExchange(&g_viewPending, (LONG)((g_spectateSelPeer << 1) | (idx ? 1 : 0)));
