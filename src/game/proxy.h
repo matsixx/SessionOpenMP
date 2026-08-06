@@ -63,15 +63,17 @@ struct ProxyTuning {
                                           // contact range, and by the time you can reach a board it
                                           // is simulating again.
     float boardSimHystM    = 5.0f;        // re-enter band, so the boundary cannot flap sim on/off
-    // Record peers into the local replay. Their replay components self-register at BeginPlay (a
-    // proxy is a real skater); with this on they are left registered, so the game records everyone
-    // and a replay scrubs through the whole session, not just you. The fight that used to make a
-    // recorded peer thrash -- live replication and replay playback both writing the same actor --
-    // is resolved by the OTHER half of this feature: while the local player is in replay playback,
-    // every live writer for proxies goes quiet (session skips Apply, the anim post-pass and the
-    // pose stamp skip), so the recording is the only author. false = the old behaviour: peers are
-    // pruned from the recording and shown LIVE while you scrub, served by the unicast pose lane.
-    bool  recordPeers     = true;
+    // Record peers into the local replay via the game's own replay components. RETIRED as a
+    // default after a week of field-broken edge cases: a peer's components register at their spawn,
+    // so their tracks are SHORTER than the manager's timeline (index overruns -- one crashed), the
+    // recording captures whatever the local client happened to render (visibility-gated anim froze
+    // tricks recorded while looking away), and every mode transition had to be mirrored exactly.
+    // The replay editor is now the LOCAL player's own instance: proxies never touch the replay
+    // system (pruned continuously), and during playback they are concealed -- still driven live
+    // underneath, current the frame you exit. Peer replays come back as TRANSFERRED data (the
+    // owner's own state history over the wire) driven through the live pipeline, not through the
+    // game's recorder. true = the retired recorded-peers mode, kept for comparison only.
+    bool  recordPeers     = false;
     // ---- TYPE GATES. A peer chooses the NAME we resolve, and StaticFindObject with ANY_PACKAGE
     // returns the first object of ANY class bearing it -- so without these the peer also chooses the
     // TYPE, and the resulting wrong-typed pointer is read by engine code where our SEH is no help.

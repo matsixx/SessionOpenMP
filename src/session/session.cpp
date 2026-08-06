@@ -62,6 +62,11 @@ struct Slot {
     // Within board-sim range of the local player (hysteresis lives here, where the distance is
     // measured). Starts near so a board simulates until proven far.
     bool        boardNear = true;
+    // Non-null = this actor is concealed because the LOCAL player is in replay playback. The replay
+    // editor is your own instance: peers stay fully live underneath (driven, buffered, current the
+    // frame you exit) but invisible. Keyed on the ACTOR, wornForActor-style, so a respawn mid-
+    // playback gets hidden too and a world change cannot leave the flag pointing at a dead actor.
+    void*       replayConcealedActor = nullptr;
 };
 
 // Unsigned timestamps must never be subtracted raw: a sample stamped slightly in the future (clock
@@ -113,7 +118,7 @@ static Slot* slotFor(int peerIdx, uint64_t nowUs) {
         s.used = true; s.peerIdx = peerIdx; s.lastPacketUs = nowUs; s.quietHandled = false;
         memset(&s.cosmetics, 0, sizeof(s.cosmetics));   // padding too -- it is memcmp'd for changes
         s.haveCosmetics = false; s.wornForActor = nullptr; s.peerReplaying = false;
-        s.replayHidden = false; s.boardNear = true;
+        s.replayHidden = false; s.boardNear = true; s.replayConcealedActor = nullptr;
         g_cosResend = true;                          // they need OUR look too, now rather than in 10 s
         if (g_logf) { char m[120]; snprintf(m, sizeof(m), "[session] stream opened for peer %d", peerIdx); g_logf(m); }
         return &s;
@@ -510,6 +515,24 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
             if (s.proxy.actor()) alive++;
             continue;
         }
+        // Conceal every peer while the local player is in replay playback; reveal on exit. Runs
+        // before the stream gates so a quiet peer is concealed too. SetPeerShownInReplay hides the
+        // skater AND the board (its component park/append halves are no-ops here -- proxies are
+        // never registered with the replay manager).
+        {
+            void* actor = s.proxy.actor();
+            if (game::LocalReplayMode() == 2) {
+                if (actor && s.replayConcealedActor != actor) {
+                    game::spectate::SetPeerShownInReplay(actor, false, g_logf);
+                    s.replayConcealedActor = actor;
+                }
+            } else if (s.replayConcealedActor) {
+                if (actor == s.replayConcealedActor)   // a dead actor needs (and can take) no unhide
+                    game::spectate::SetPeerShownInReplay(actor, true, g_logf);
+                s.replayConcealedActor = nullptr;
+            }
+        }
+
         repl::State out;
         if (!s.stream.Sample(nowUs, out)) continue;    // fewer than 2 snapshots: nothing to show yet
 

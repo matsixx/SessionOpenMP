@@ -596,7 +596,11 @@ static void buildRows() {
             log("[menu] could not build the replay Look At row -- skipped");
         }
         // The view row fails independently: no Look At page, no view row, but never the reverse.
-        if (g_replayPageKey &&
+        // Only in the retired recorded-peers mode -- without recordings there is nothing to show or
+        // hide (peers are concealed during playback wholesale). The slot is reserved for the future
+        // "Sync Replay" per-player toggle.
+        if (omp::game::Proxy::Tuning().recordPeers &&
+            g_replayPageKey &&
             buildRow(g_viewRow, "OmpPeerReplay", "Show in Replay",
                      "Whether the Look At player's recording appears in your replay. Off hides them "
                      "until you leave the editor.", &g_viewKey)) {

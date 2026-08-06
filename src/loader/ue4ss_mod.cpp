@@ -934,33 +934,13 @@ static void hkSkaterReplayMode(void* skater, uint8_t mode) {
     bool isProxy = false;
     __try { isProxy = game::IsProxyActor(skater); } __except (EXCEPTION_EXECUTE_HANDLER) { isProxy = false; }
     if (isProxy) {
-        if (g_replayModeInner) {
-            static long routed = 0;
-            if (InterlockedIncrement(&routed) <= 3) {
-                char m[160];
-                snprintf(m, sizeof(m), "[mod] proxy replay mode -> %u via the inner handler "
-                         "(camera-light attach skipped)", (unsigned)mode);
-                logLine(m);
-            }
-            g_replayModeInner(skater, mode);
-            return;
-        }
-        // Fallback when the wrapper's byte shape did not verify (a game update moved it): the old
-        // gate on the crash condition itself. Entries pass only when the attach target is present;
-        // exits always pass. Known cost: a null-field proxy stays out of playback.
-        if (mode == 2) {
-            void* attachA = nullptr;
-            __try { attachA = *(void**)((uint8_t*)skater + game::off::kSkaterReplayAttachA); }
-            __except (EXCEPTION_EXECUTE_HANDLER) { attachA = nullptr; }
-            if (!attachA) {
-                static long blocked = 0;
-                if (InterlockedIncrement(&blocked) <= 3)
-                    logLine("[mod] playback entry BLOCKED for a proxy -- attach field [0xa68] is null "
-                            "(the original crash shape; this proxy stays out of playback)");
-                return;
-            }
-        }
-        o_SkaterReplayMode(skater, mode);
+        // Proxies are OUT of the replay system entirely (recordPeers false: components pruned
+        // continuously, actors concealed during local playback), so the game's per-skater replay
+        // transition has nothing to manage on them -- and its playback entry attaches CameraLight
+        // [0xa68], null on proxies (the original AV). Block every transition: the months-stable
+        // original shape. When a transferred-replay mode arrives, it drives proxies through the
+        // MOD's live pipeline, never through this handler. (g_replayModeInner stays derived above
+        // for that future -- calling it would run the state work without the light attach.)
         return;
     }
     // Ours: pass through, and record the mode. This is the exact call that knows whether the local
