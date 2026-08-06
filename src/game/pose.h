@@ -47,12 +47,14 @@ struct Tuning {
     uint8_t captureMode = 2;
     uint32_t freshMs = 500;     // a pose older than this is ignored, so a quiet stream hands the
                                 // skeleton back to the proxy's own graph rather than freezing it
-    // The replay system does not record proxies, and during a LOCAL replay the anim graph does not
-    // drive a skater either, so nothing would pose a peer's skeleton and it would collapse into a heap.
-    // Re-stamp the last pose their own graph produced instead: a peer standing still beats a peer in a
-    // puddle. (A peer sending us their pose while WE scrub is the mirror of `captureMode` and needs a
-    // wire change.)
-    bool holdInLocalReplay = true;
+    // RETIRED (default false): re-stamp the last held pose over a proxy's skeleton during a local
+    // replay. It served the live-view-while-scrubbing era, where fresh pose-lane packets always won
+    // the race above and the hold only covered gaps. Today it has no beneficiary and one victim:
+    // unsynced peers are CONCEALED during playback (a hold on an invisible skater is nothing), and
+    // a SYNC-DRIVEN peer's graph IS live -- driven from their transferred history -- so the hold
+    // stomped the finished pose every frame at FinalizeBones and froze them standing
+    // (field-logged: holdApplied climbing ~120/s while the synced skater stood still).
+    bool holdInLocalReplay = false;
     // Serve live results to a PEER who is scrubbing. OFF: the replay editor shows recordings only,
     // so a scrubbing peer applies no live poses and sending them is pure bandwidth. The machinery
     // stays because a future spectate mode outside the editor is exactly this lane switched on.
