@@ -46,13 +46,17 @@ static uint64_t rU64(const uint8_t* p) { uint64_t v; memcpy(&v, p, 8); return v;
 // A circular byte arena of packed snapshots plus an entry index. Entries are addressed by a
 // monotonically increasing VIRTUAL byte offset (arena index = off % kArena); a packet is never
 // split across the wrap -- if it will not fit contiguously the writer skips to the next lap and the
-// tail entries covering the skipped gap are dropped with the overwritten ones. ~120 s at 60 Hz of
-// ~350 B packets is ~2.5 MB, so the 3 MB arena is the limiting window in practice.
-static const int      kArena       = 3 << 20;
+// tail entries covering the skipped gap are dropped with the overwritten ones.
+// Entries are FAT snapshots (drivers + anim blob + the CAPTURED 70-bone pose, ~1.3 KB at cap 2048):
+// during the requester's local replay playback the anim graph cannot evaluate a skater (thrice-
+// measured -- the heap-of-clothes), so the transferred history must carry the finished skeleton and
+// the receiver stamps bones at FinalizeBones, the one path proven to work in playback. ~120 s at
+// 60 Hz of ~1.3 KB is ~9.4 MB; the 10 MB arena is the limiting window in practice.
+static const int      kArena       = 10 << 20;
 static const int      kIdxCap      = 16384;         // > 120 s x 60 Hz, power of two for cheap mod
 static const uint64_t kRingSpanUs  = 120ull * 1000 * 1000;
 static uint8_t  g_arena[kArena];
-struct OwnEntry { uint64_t vOff = 0; uint64_t us = 0; uint16_t len = 0; };
+struct OwnEntry { uint64_t vOff = 0; uint64_t us = 0; uint16_t len = 0; };   // len <= 2048
 static OwnEntry g_own[kIdxCap];
 static int      g_ownHead = 0, g_ownCount = 0;      // ring: head = next write slot
 static uint64_t g_vHead = 0;                        // next virtual byte offset
@@ -63,7 +67,7 @@ static OwnEntry& ownAt(int fromTail) {              // 0 = oldest
 }
 
 void RecordOwn(const uint8_t* pkt, int len, uint64_t senderUs) {
-    if (!pkt || len <= 0 || len > 1024) return;
+    if (!pkt || len <= 0 || len > 2048) return;
     // never split across the wrap: skip the tail gap if the packet will not fit contiguously
     uint64_t v = g_vHead;
     if ((int)(v % kArena) + len > kArena) v += kArena - (v % kArena);
@@ -156,7 +160,7 @@ static void beginOutgoing(int peerIdx, uint32_t reqId, uint64_t nowUs, void (*lo
 // ==== THE INCOMING TRANSFER (we are the requester) ===================================================
 // One in flight at a time (the menu syncs one player per toggle); completed buffers are kept
 // per-peer until DropAll. All fields of every packet are validated -- P2P input is untrusted.
-static const uint32_t kMaxTotal = 8u << 20;
+static const uint32_t kMaxTotal = 12u << 20;
 struct ReadyBuf {
     bool     used = false;
     int      peerIdx = -1;
@@ -206,7 +210,7 @@ static bool finishIncoming(void (*logf)(const char*)) {
     while (w + 10 <= g_in.total && n < g_in.entryCount) {
         const uint16_t len = rU16(g_in.buf + w);
         const uint64_t us  = rU64(g_in.buf + w + 2);
-        if (len == 0 || len > 1024 || w + 10u + len > g_in.total || us < prevUs) break;
+        if (len == 0 || len > 2048 || w + 10u + len > g_in.total || us < prevUs) break;
         idx[n].off = w + 10; idx[n].len = len; idx[n].us = us;
         prevUs = us; n++; w += 10u + len;
     }

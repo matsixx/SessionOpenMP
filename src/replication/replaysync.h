@@ -67,8 +67,9 @@ uint64_t BufferOldestUs(int peerIdx);
 
 // Live-tunable knobs (statics in the .cpp): transfer pacing etc.
 struct Tuning {
-    int   chunksPerTick   = 6;      // paced from Tick (~60/s): 6 -> ~360 chunks/s ~ 320 KB/s. The
-                                    // EOS reliable queue is finite; a NAK round recovers any drop.
+    int   chunksPerTick   = 20;     // paced from Tick (~60/s): 20 -> ~1200 chunks/s ~ 1 MB/s, so a
+                                    // ~9 MB bone-carrying history lands in ~10 s. The EOS reliable
+                                    // queue is finite; a NAK round recovers any drop.
     float nakIntervalMs   = 400.f;  // how often the requester re-asks for holes
     float hdrTimeoutMs    = 3000.f; // REQ sent, no HDR: retry REQ (x3) then fail
     float stallTimeoutMs  = 12000.f;// mid-transfer silence -> fail (sender: -> free)

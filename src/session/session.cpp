@@ -469,8 +469,19 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
                                            // Audio rides the snapshot and is sized LAST, so a full
                                            // frame drops trailing sounds, never pose.
             const int n = repl::Pack(own, nowUs, pkt, sizeof(pkt));
-            // Retain what we just published: the ring any peer's "Sync Replay" transfer serves from.
-            if (n > 0) replaysync::RecordOwn(pkt, n, nowUs);
+            // Retain a FAT copy for the replay-sync ring: drivers + anim blob + our CAPTURED
+            // skeleton. The bones are the piece playback cannot live without -- the requester's
+            // anim graph cannot evaluate a skater during their local replay (the heap-of-clothes,
+            // thrice-measured), so their editor stamps this pose at FinalizeBones instead. Cap
+            // 2048 so Pack keeps blob AND bones (the 1 KB cap is the WIRE's, not Pack's); the
+            // capture itself is a 70-bone read, microseconds.
+            if (n > 0) {
+                repl::State ringSt = own;
+                game::pose::CaptureFromPawn(ownPawn, ringSt);
+                uint8_t ringPkt[2048];
+                const int rn = repl::Pack(ringSt, nowUs, ringPkt, sizeof(ringPkt));
+                replaysync::RecordOwn(rn > 0 ? ringPkt : pkt, rn > 0 ? rn : n, nowUs);
+            }
             // A peer with the replay editor open cannot evaluate our drivers -- their anim graph is
             // not running a skater. They get a RESULTS packet (the finished skeleton), built once per
             // publish and unicast to scrubbing peers alone. Everyone else keeps the driver packet,
