@@ -545,7 +545,8 @@ bool GatherOwnCosmetics(void* ownPawn, repl::CosmeticSet& out, void (*logf)(cons
 
 // ---- dress -------------------------------------------------------------------------------------------
 // Borrow the global, refresh, put it back. Everything saved is restored on every exit path.
-struct SavedItem { uint8_t bytes[kItemSize]; };
+// The category KEY is saved beside the value so the restore can go BY KEY (see restoreMap).
+struct SavedItem { int32_t cat = 0; uint8_t bytes[kItemSize]; };
 
 static const repl::CosmeticItem* findCat(const repl::CosmeticItem* arr, int n, int32_t cat) {
     for (int i = 0; i < n; i++) if (arr[i].cat == cat) return &arr[i];
@@ -559,17 +560,22 @@ static int wearMap(void* map, const repl::CosmeticItem* items, int n,
                    SavedItem* saved, int savedCap, int* savedCount, int* unresolved,
                    void (*logf)(const char*), void* proxyActor = nullptr,
                    SavedInstance* savedInst = nullptr, int* savedInstCount = nullptr,
-                   int savedInstCap = 0, int* unmatchedColors = nullptr) {
+                   int savedInstCap = 0, int* unmatchedColors = nullptr,
+                   int32_t* insertedCats = nullptr, int insertedCap = 0, int* insertedCount = nullptr) {
     MapWalk w;
     if (!mapOpen(map, w)) return 0;
     int worn = 0;
+    int32_t seenCats[64]; int nSeen = 0; bool seenOverflow = false;
     for (int i = 0; i < w.num; i++) {
         if (!mapAlive(w, i)) continue;
         uint8_t* e = mapElem(w, i);
         int32_t cat = 0;
         __try { cat = *(int32_t*)(e + 0x00); } __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
+        if (nSeen < (int)(sizeof(seenCats)/sizeof(seenCats[0]))) seenCats[nSeen++] = cat;
+        else seenOverflow = true;                           // cannot prove a cat unseen: no inserts
         if (*savedCount >= savedCap) break;                 // out of restore room: stop, never overwrite
-        __try { memcpy(saved[*savedCount].bytes, e + kElemValue, kItemSize); }
+        __try { saved[*savedCount].cat = cat;
+                memcpy(saved[*savedCount].bytes, e + kElemValue, kItemSize); }
         __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
         (*savedCount)++;
         uint8_t nv[kItemSize];
@@ -600,9 +606,69 @@ static int wearMap(void* map, const repl::CosmeticItem* items, int n,
         }
         __try { memcpy(e + kElemValue, nv, kItemSize); } __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
+    // ---- categories the LOCAL profile has no ELEMENT for. The walk above can only OVERWRITE live
+    // elements, and a profile only carries elements for what its OWN player wears -- so a PRO
+    // skater's EMPTY clothing map could dress nobody (every peer in underwear, the field symptom),
+    // and even a normal profile silently dropped a peer category the local player wears nothing in.
+    // The game's own Emplace inserts the missing slot (allocation + hashing are its logic, never
+    // ours); each inserted KEY is recorded so the restore can clear it -- there is no sanctioned
+    // "remove key", and a cleared item is the exact state every dress already writes into categories
+    // a peer did not send.
+    {
+        const Syms& S = Get();
+        if (S.ProfileEmplace && insertedCats && insertedCount && !seenOverflow) {
+            for (int i = 0; i < n; i++) {
+                const repl::CosmeticItem& it = items[i];
+                if (!it.name[0]) continue;
+                bool seen = false;
+                for (int k = 0; k < nSeen && !seen; k++) seen = (seenCats[k] == it.cat);
+                if (seen) continue;
+                if (*insertedCount >= insertedCap) break;
+                uint8_t nv[kItemSize];
+                memset(nv, 0, sizeof(nv));
+                const char* why = "name did not resolve";
+                if (fnameOf(it.name, nv) && itemUsableHere(nv, &why, logf)) {
+                    nv[0x08] = it.inst;
+                    memcpy(nv + 0x0c, &it.variant, 4);
+                    bool ins = false;
+                    __try { S.ProfileEmplace(map, &it.cat, nv); ins = true; }
+                    __except (EXCEPTION_EXECUTE_HANDLER) {}
+                    if (ins) {
+                        insertedCats[(*insertedCount)++] = it.cat;
+                        worn++;
+                        if (savedInst && savedInstCount && *savedInstCount < savedInstCap) {
+                            void* instP = instanceFor(proxyActor, nv, it.inst);
+                            if (instP) wearInstanceAttribs(instP, it, savedInst[(*savedInstCount)++],
+                                                           unmatchedColors);
+                        }
+                    }
+                } else {
+                    if (unresolved) (*unresolved)++;
+                    if (logf) { char m[180];
+                        snprintf(m, sizeof(m), "[cosmetics]   '%s' (cat=%d) skipped -- %s",
+                                 it.name, (int)it.cat, (why && *why) ? why : "unusable here");
+                        logf(m); }
+                }
+            }
+        }
+    }
     return worn;
 }
 static void restoreMap(void* map, const SavedItem* saved, int savedCount, int* cursor) {
+    // BY KEY when the game's Emplace is available: an insert during the wear phase can fill a
+    // free-list HOLE below the originals, and an order-walk would then pair saved values with the
+    // wrong elements -- scrambling the local player's own wardrobe. Emplace by key is immune to
+    // element order and to the array reallocating under an insert.
+    const Syms& S = Get();
+    if (S.ProfileEmplace) {
+        for (int i = 0; i < savedCount; i++) {
+            __try { S.ProfileEmplace(map, &saved[i].cat, saved[i].bytes); }
+            __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+        if (cursor) *cursor = savedCount;
+        return;
+    }
+    // No Emplace resolved = no inserts happened either, so the order-walk is exact (today's shape).
     MapWalk w;
     if (!mapOpen(map, w)) return;
     for (int i = 0; i < w.num; i++) {
@@ -629,7 +695,10 @@ static bool refreshFaults(void* proxy) {
     (void)proxy; return false;
 #endif
 }
-// Write one item (or none) into `map`, clearing every other live slot.
+// Write one item (or none) into `map`, clearing every other live slot. OVERWRITE-ONLY on purpose:
+// the bisect must not insert keys it has no restore bookkeeping for, so an item whose category has
+// no local element simply cannot be probed (it also cannot have been the fault -- the wear phase's
+// insert is what would have applied it, and its own SEH already attributes an Emplace fault).
 static void wearOnly(void* map, const repl::CosmeticItem* only) {
     MapWalk w;
     if (!mapOpen(map, w)) return;
@@ -709,10 +778,15 @@ bool DressProxy(void* proxyActor, const repl::CosmeticSet& c, int* unresolved, v
     // the inventory instances borrowed alongside the profile (colours/variant/sock height)
     SavedInstance savedInst[40];
     int nSavedInst = 0, unmatchedColors = 0;
+    // categories INSERTED into the borrowed maps (no local element existed) -- cleared on restore
+    int32_t insC[24], insB[16];
+    int nInsC = 0, nInsB = 0;
     const int wornC = wearMap(charMap, c.chr, c.nChar, savedC, 48, &nSavedC, unresolved, logf,
-                              proxyActor, savedInst, &nSavedInst, 40, &unmatchedColors);
+                              proxyActor, savedInst, &nSavedInst, 40, &unmatchedColors,
+                              insC, 24, &nInsC);
     const int wornB = wearMap(brdMap,  c.brd, c.nBoard, savedB, 48, &nSavedB, unresolved, logf,
-                              proxyActor, savedInst, &nSavedInst, 40, &unmatchedColors);
+                              proxyActor, savedInst, &nSavedInst, 40, &unmatchedColors,
+                              insB, 16, &nInsB);
     // ---- the BASE BODY. The rebuild takes the definition from the ACTOR (RefreshVisuals passes
     // skater+0x570 into BuildCharacterMesh), so the peer's body is written THERE -- their proxy's own
     // field, semantically correct, no borrow needed -- plus the instance pointer inside the borrow
@@ -727,17 +801,23 @@ bool DressProxy(void* proxyActor, const repl::CosmeticSet& c, int* unresolved, v
     bool  actorDefWritten = false;
     if (c.visualDef[0]) {
         peerBodyDef = resolveVisualDef(gi, c.visualDef);
-        if (peerBodyDef && peerBodyDef != savedVisualDef) {
+        if (peerBodyDef) {
             __try {
+                // Compared against the ACTOR's current definition, not the instance's: the actor
+                // KEEPS a previously-applied peer body across dresses, so "peer switched back to the
+                // body I also use" must still write -- an instance-compare would skip it and leave
+                // the proxy stuck in the old body.
                 savedActorDef = *(void**)((uint8_t*)proxyActor + off::kSkaterVisualDef);
-                *(void**)((uint8_t*)proxyActor + off::kSkaterVisualDef) = peerBodyDef;
+                if (peerBodyDef != savedActorDef) {
+                    *(void**)((uint8_t*)proxyActor + off::kSkaterVisualDef) = peerBodyDef;
+                    actorDefWritten = true;
+                    if (logf) { char m[140];
+                        snprintf(m, sizeof(m), "[cosmetics] body definition '%s' applied", c.visualDef);
+                        logf(m); }
+                }
                 *(void**)(inst + off::kSkInstVisualDef) = peerBodyDef;   // restored with the borrow
-                actorDefWritten = true;
-                if (logf) { char m[140];
-                    snprintf(m, sizeof(m), "[cosmetics] body definition '%s' applied", c.visualDef);
-                    logf(m); }
             } __except (EXCEPTION_EXECUTE_HANDLER) {}
-        } else if (!peerBodyDef && logf) {
+        } else if (logf) {
             char m[140];
             snprintf(m, sizeof(m), "[cosmetics] body definition '%s' not available here (kept local)",
                      c.visualDef);
@@ -798,15 +878,27 @@ bool DressProxy(void* proxyActor, const repl::CosmeticSet& c, int* unresolved, v
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
     { int cur = 0; restoreMap(charMap, savedC, nSavedC, &cur); }
     { int cur = 0; restoreMap(brdMap,  savedB, nSavedB, &cur); }
+    // Keys the wear phase INSERTED had no original to restore: overwrite each back to a cleared
+    // item. A lingering cleared key is inert (it is the state every dress writes into unsent
+    // categories, proven through RefreshVisuals since the first cosmetics round).
+    if ((nInsC || nInsB) && S.ProfileEmplace) {
+        const uint8_t cleared[kItemSize] = {};
+        for (int i = 0; i < nInsC; i++) {
+            __try { S.ProfileEmplace(charMap, &insC[i], cleared); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+        for (int i = 0; i < nInsB; i++) {
+            __try { S.ProfileEmplace(brdMap, &insB[i], cleared); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+    }
     for (int i = 0; i < nSavedInst; i++) restoreInstance(savedInst[i]);   // the wardrobe, exactly as found
 
     if (logf) {
         char m[200];
-        snprintf(m, sizeof(m), "[cosmetics] dressed proxy: %d clothing + %d board item(s) applied, "
-                               "%d not installed here | attribs: %d instance(s), %d colour(s) with no "
-                               "local slot%s",
-                 wornC, wornB, unresolved ? *unresolved : 0, nSavedInst, unmatchedColors,
-                 ok ? "" : " (refresh faulted)");
+        snprintf(m, sizeof(m), "[cosmetics] dressed proxy: %d clothing + %d board item(s) applied "
+                               "(%d into empty categories), %d not installed here | attribs: %d "
+                               "instance(s), %d colour(s) with no local slot%s",
+                 wornC, wornB, nInsC + nInsB, unresolved ? *unresolved : 0, nSavedInst,
+                 unmatchedColors, ok ? "" : " (refresh faulted)");
         logf(m);
     }
     return ok;

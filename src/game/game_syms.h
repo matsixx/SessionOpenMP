@@ -34,6 +34,12 @@ using GetGameInstFn     = void* (*)(void* actor);   // AActor::GetGameInstance -
 // MapItemMaterials+0x60, reading a TArray at +0xd8). The vanilla menu can only offer items you own,
 // so the null path is unreachable in the real game and unguarded. Every peer item must be checked here.
 using GetCustomItemFn   = void* (*)(const void* fname);
+// TMapBase<int32,FCustomizationProfileItem>::Emplace -- overwrites the value at `key` or INSERTS a
+// new element (allocation, hashing and the free list are all its own). The sanctioned way to give a
+// borrowed profile a category slot it does not have: a PRO skater's clothing map is EMPTY, so a pro
+// user's client could not dress anyone (0 slots to overwrite = every peer in underwear). Reached by
+// DECODING a call site (see the table): the body has 7+ byte-twin template instantiations.
+using ProfileEmplaceFn  = void  (*)(void* map, const int32_t* key, const void* value16);
 // FSoftObjectPath::TryLoad(FUObjectSerializeContext* = null) -- LOADS the asset and returns it.
 // The customization rebuild only ever calls FSoftObjectPath::ResolveObject, which returns null for
 // anything not already in memory: the local player's garments were streamed in when their own profile
@@ -211,6 +217,7 @@ struct Syms {
     GetGameInstFn    GetGameInstance   = nullptr;
     GetCustomItemFn  GetCustomizationItem = nullptr;
     TryLoadFn        SoftPathTryLoad   = nullptr;
+    ProfileEmplaceFn ProfileEmplace    = nullptr;   // decoded from ProfileEmplaceSite, see the bind block
     SetHiddenFn      SetActorHidden    = nullptr;
     SetCollisionFn   SetActorCollision = nullptr;
     SetActorTickFn   SetActorTick      = nullptr;

@@ -213,6 +213,13 @@ static const SigEntry kSigs[] = {
     // ASkateboardEx::RebuildBrokenBoard   Epic 0xf965b0 / Steam 0xf563c0 (sigmake): keeps the
     // _currentBrokenBoardState displacement 0x3f1 concrete -- it IS the identity of the gate it opens with.
     { "RebuildBrokenBoard",   "44 88 44 24 18 88 54 24 10 48 89 4C 24 08 55 41 54 41 57 48 8D 6C 24 B9 48 81 EC B0 00 00 00 80 B9 F1 03 00 00 00 45 0F B6 E0", false },
+    // --- CALL SITE, not a function (the MenuTextSite pattern): the Emplace call inside
+    // ACharacterCustomization::SetProfileItem, whose E8 targets TMapBase<int,
+    // FCustomizationProfileItem>::Emplace. The Emplace BODY cannot be sig'd -- 7+ template
+    // instantiations are byte-twins once the helper rel32s are wildcarded. The site also proves the
+    // ABI on its face: rcx = &map, rdx = &int32 key (rsp+0x30), r8 = &16-byte item (rsp+0x38).
+    // Site: Epic 0x1034237 / Steam 0xff4497; target Epic 0x7dbb60 / Steam 0x895eb0.
+    { "ProfileEmplaceSite",   "4C 8D 97 E0 02 00 00 49 8B 4F 18 48 89 4C 24 38 4C 8D 44 24 38 49 8B CA 44 88 6C 24 40 48 8D 54 24 30 44 89 64 24 44 E8 ?? ?? ?? ??", false },
 };
 static const int kSigN = (int)(sizeof(kSigs) / sizeof(kSigs[0]));
 
@@ -504,6 +511,25 @@ const Syms& Resolve(void (*logf)(const char*)) {
     g_syms.GetViewportSize    = (ViewportSizeFn)    found[i++];
     g_syms.BreakBoardInternal = (BreakBoardIntFn)   found[i++];
     g_syms.RebuildBrokenBoard = (RebuildBoardFn)    found[i++];
+    // ProfileEmplaceSite is a CALL SITE like MenuTextSite: the symbol is the E8 target in its last
+    // five bytes. Same guard -- if the last opcode is not an E8, no address is taken at all.
+    {
+        const int siteIdx = i;
+        const uint8_t* site = (const uint8_t*)found[i++];
+        Pat sp;
+        if (site && parsePat(kSigs[siteIdx].sig, sp) && sp.n >= 5) {
+            const uint8_t* call = site + sp.n - 5;
+            if (*call == 0xE8) {
+                int32_t rel = 0; memcpy(&rel, call + 1, 4);
+                g_syms.ProfileEmplace = (ProfileEmplaceFn)(call + 5 + rel);
+            }
+        }
+        char m[160];
+        snprintf(m, sizeof(m), "[sym] %-22s %s exe+%p (decoded from ProfileEmplaceSite)", "ProfileEmplace",
+                 g_syms.ProfileEmplace ? "->" : "!! NOT DECODED",
+                 g_syms.ProfileEmplace ? (void*)((uint8_t*)g_syms.ProfileEmplace - base) : nullptr);
+        say(m);
+    }
 
     // LOCKSTEP CHECK. The block above is POSITIONAL, and a table entry added without its assignment --
     // or vice versa -- shifts every later symbol onto the wrong address SILENTLY: sigs still resolve

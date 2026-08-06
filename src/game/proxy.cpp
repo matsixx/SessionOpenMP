@@ -846,6 +846,13 @@ void Proxy::Apply(const repl::State& s, uint64_t nowMs, uint64_t nowUs, void (*l
     AudioApply(s, bd);
     // ---- 7. the BOARD.
     if (!bd) return;
+    // While the owner's board is BROKEN its pieces belong to the local break physics: stamping or
+    // driving the actor every frame drags the simulating halves around, which renders as the wreck
+    // sliding away with its wheels spinning against nothing. Hands off entirely -- both machines'
+    // boards tracked to the break frame, so each wreck lies where it broke; the repair edge's
+    // RebuildBrokenBoard hands a whole board back to the paths below, whose stamp re-converges it
+    // onto the wire pose.
+    if (s.brokenState) { lastDriveUs_ = 0; return; }
     if (!s.onBoard) {
         // ---- 7a. OFF BOARD = the CARRY. The carry needs no local reproduction: on the SENDER the
         // carried board is positioned every frame by USkateboardExMovementComponent::PlaceInHand
