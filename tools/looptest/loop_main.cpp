@@ -774,6 +774,62 @@ static bool extrapCoherenceCheck() {
     return bad == 0;
 }
 
+// ---- ANIM-BLOB INTERPOLATION. Continuous anim fields (floats and FVector deltas) must ride the
+// same interpolation t as the positions; a blob stepped whole from the older snapshot renders the
+// body rising into a pop before the pose plays it. Bools must keep STEPPING -- a lerped enum is a
+// corrupted enum.
+static bool animLerpCheck() {
+    Stream st;
+    State a{}; State b{};
+    a.deckQuat[3] = a.bodyQuat[3] = 1; b.deckQuat[3] = b.bodyQuat[3] = 1;
+    a.bodyPosOk = b.bodyPosOk = 1;
+    // A real-shaped blob, filled to the table's full length. The first field is a float (blob
+    // position 0); the first size-1 field proves stepping.
+    int total = 0, boolPos = -1;
+    for (int i = 0; i < AnimFieldCount(); i++) {
+        const AnimField& f = AnimFieldAt(i);
+        if (boolPos < 0 && f.size == 1) boolPos = total;
+        total += f.size;
+    }
+    a.animLen = b.animLen = (uint16_t)total;
+    // A steady 10 Hz stream so the playback clock locks and the playhead actually lands between
+    // snapshots. The float field carries the SNAPSHOT INDEX, so a fractional read proves
+    // interpolation and its integer part names the bracket; the bool flips with index parity, so
+    // the stepped expectation is decidable from the same read.
+    // Interleave pushes and samples the way live operation does, so the playback clock locks and
+    // the playhead genuinely lands between snapshots.
+    State out{};
+    float got = -1, frac = 0;
+    bool found = false;
+    int pushed = 0;
+    for (uint64_t us = 0; us < 3000000 && !found; us += 2000) {
+        while (pushed < 20 && (uint64_t)pushed * 100000 <= us) {
+            State s2 = a;
+            const float v = (float)pushed;
+            memcpy(s2.anim, &v, 4);
+            s2.anim[boolPos] = (uint8_t)(pushed & 1);
+            st.Push(s2, (uint64_t)pushed * 100000, (uint64_t)pushed * 100000);
+            pushed++;
+        }
+        if (!st.Sample(us, out)) continue;
+        memcpy(&got, out.anim, 4);
+        frac = got - (float)(int)got;
+        if (got > 0.5f && frac > 0.25f && frac < 0.75f) found = true;
+    }
+    bool ok = true;
+    if (!found) {
+        printf("  anim lerp: float field never read fractional (last %.3f) -- the blob is not "
+               "riding the interpolation\n", (double)got);
+        ok = false;
+    } else if (out.anim[boolPos] != (uint8_t)((int)got & 1)) {
+        printf("  anim lerp: BOOL field failed to step (lerped enums are corrupted enums)\n");
+        ok = false;
+    }
+    if (ok) printf("  anim lerp: floats ride the position timeline (read %.2f), bools step  PASS\n",
+                   (double)got);
+    return ok;
+}
+
 int main(int argc, char**) {
     const bool dbg = argc > 1;                      // any arg = per-second clock internals, clean profile
     printf("SessionOpenMP replication loop test\n");
@@ -781,6 +837,7 @@ int main(int argc, char**) {
     if (!audioEventCheck()) { printf("\nAUDIO EVENT FAIL\n"); return 1; }
     if (!pushQueueCheck())  { printf("\nPUSH QUEUE FAIL\n");  return 1; }
     if (!extrapCoherenceCheck()) { printf("\nEXTRAP COHERENCE FAIL\n"); return 1; }
+    if (!animLerpCheck()) { printf("\nANIM LERP FAIL\n"); return 1; }
     printf("%-13s %8s %8s %8s %6s %7s %7s %7s %7s\n",
            "profile", "outEwma", "outMax", "delay", "alpha", "starve", "resync", "extrap", "verdict");
     bool allPass = true;
