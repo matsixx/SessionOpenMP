@@ -518,6 +518,11 @@ namespace off {
     constexpr int kObjNamePrivate     = 0x18;    // UObjectBase::NamePrivate (FName)
     // USkeletalMeshComponent, for the replay-driver probe (PDB): the bitfield byte carrying
     // bNoSkeletonUpdate and bPauseAnims, and the per-mesh anim rate. Read-only diagnostics.
+    // ASkaterCharacterBase fields the playback-entry handler ATTACHES: `[0xa68]->AttachToComponent(
+    // manager->Root | [0xa50])`. Null [0xa68] on a proxy was the original replay-editor crash; the
+    // guard now reads it at call time and passes the entry only when the attach can succeed.
+    constexpr int kSkaterReplayAttachA = 0xa68;
+    constexpr int kSkaterReplayAttachB = 0xa50;
     constexpr int kMeshAnimFlagsByte  = 0x8c1;
     constexpr int kMeshGlobalAnimRate = 0x8b0;
     // ---- TYPE IDENTITY. All three read out of the PDB, not inferred:

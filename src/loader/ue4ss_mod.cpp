@@ -914,16 +914,29 @@ static void hkSkaterReplayMode(void* skater, uint8_t mode) {
     bool isProxy = false;
     __try { isProxy = game::IsProxyActor(skater); } __except (EXCEPTION_EXECUTE_HANDLER) { isProxy = false; }
     if (isProxy) {
-        // ENTERING playback stays blocked for every proxy -- the handler's AttachToComponent nulls
-        // are the original hard crash, and a live-viewed proxy has no business in the playback state.
-        // LEAVING must pass through for a proxy whose view was RECORDED: its components were
-        // playback-driven, and this broadcast is the game's own "return to live" -- eating it leaves
-        // the peer's animation parked in replay state after the editor closes, which is exactly the
-        // stuck-drivers symptom it caused. The view flag is read at broadcast time, before the
-        // frame-edge reset clears it.
-        static long announced = 0;
-        if (InterlockedIncrement(&announced) <= 3)
-            logLine("[mod] replay mode change IGNORED for a proxy (it is not part of your replay)");
+        // Proxies get the FULL transitions. These calls are what keep a skater's replay components'
+        // record/playback cursors sane across editor sessions -- the local skater gets them, and
+        // blocking them for proxies left their tracks mismatched on the second entry (first replay
+        // fine, re-entry broken). The original reason to block was one hard crash: the mode-2
+        // handler attaches `this->[0xa68]`, null on the era's proxies. So the gate is the CRASH
+        // CONDITION itself, read at call time: entries pass when the attach target is present,
+        // exits always pass (twice field-proven safe, and they attach nothing).
+        if (mode == 2) {
+            void* attachA = nullptr;
+            __try { attachA = *(void**)((uint8_t*)skater + game::off::kSkaterReplayAttachA); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { attachA = nullptr; }
+            if (!attachA) {
+                static long blocked = 0;
+                if (InterlockedIncrement(&blocked) <= 3)
+                    logLine("[mod] playback entry BLOCKED for a proxy -- attach field [0xa68] is null "
+                            "(the original crash shape; this proxy stays out of playback)");
+                return;
+            }
+            static long entered = 0;
+            if (InterlockedIncrement(&entered) <= 3)
+                logLine("[mod] playback entry passed to a proxy (attach field present)");
+        }
+        o_SkaterReplayMode(skater, mode);
         return;
     }
     // Ours: pass through, and record the mode. This is the exact call that knows whether the local
