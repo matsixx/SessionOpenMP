@@ -899,28 +899,55 @@ static void InstallAnimApplyHook() {
 }
 
 // =====================================================================================================
-// THE REPLAY-EDITOR GUARD. Opening the replay editor with a second skater in the world is otherwise a
-// hard crash: AReplayManager::Play broadcasts the mode change to EVERY subscribed skater, and each one
-// re-parents a component of its own --
-// `this->[0xa68]->AttachToComponent(<manager>->RootComponent | this->[0xa50], ...)`. On a PROXY one of
-// those pointers is null, so it AVs at +0xc0 inside USceneComponent::AttachToComponent.
-// The guard REFUSES THE CALL rather than repairing the null: a wire-driven skater has no business
-// entering the local player's replay playback -- the same rule as every other proxy guard here (actor
-// tick, board tick, bail veto). The derived handler tail-jumps into
-// ASkaterCharacterBase::OnReplayModeChanged, so one guard covers both halves.
+// THE REPLAY-EDITOR GUARD. The hooked function is a THIN WRAPPER: its only own work is re-parenting
+// the skater's replay camera LIGHT -- `this->CameraLight[0xa68]->AttachToComponent(` playback ?
+// `<manager>->Root : this->FollowCamera[0xa50])` -- then it tail-jumps (+0x6f, E9 rel32) into the
+// REAL mode handler at +0x80, which saves/restores movement mode, ragdoll and physics state and
+// never touches either camera field (verified over its full 226 instructions). CameraLight is null
+// on proxies (the original AV inside AttachToComponent), but the light attach is replay-editor
+// LIGHTING for the filmed skater -- a proxy does not need it. So proxy transitions go STRAIGHT TO
+// THE INNER HANDLER: full record/playback state transitions (which keep their replay cursors sane
+// across editor sessions), zero exposure to the null field. Gating entries on the field instead
+// (the previous shape) silently kept the proxy OUT of playback whenever it was null -- the skater
+// stood off its replayed board while the board's own recording played fine.
 // It must PASS THROUGH for the local player, or the replay editor breaks for everyone.
 static void (*o_SkaterReplayMode)(void*, uint8_t) = nullptr;
+static void (*g_replayModeInner)(void*, uint8_t) = nullptr;
+// Byte-verified derivation of the inner handler from the wrapper. Must run BEFORE MH_CreateHook --
+// MinHook overwrites the wrapper's first instruction (the +0x00 anchor) with its detour jmp.
+static void DeriveReplayModeInner(void* wrapper) {
+#ifdef _WIN32
+    __try {
+        const uint8_t* w = (const uint8_t*)wrapper;
+        static const uint8_t kPro[5]   = { 0x48, 0x89, 0x5C, 0x24, 0x08 };  // mov [rsp+8], rbx
+        static const uint8_t kCmp[3]   = { 0x80, 0xFA, 0x02 };              // cmp dl, 2
+        static const uint8_t kInner[5] = { 0x48, 0x89, 0x5C, 0x24, 0x10 };  // mov [rsp+0x10], rbx
+        if (memcmp(w, kPro, 5) != 0 || memcmp(w + 0x17, kCmp, 3) != 0 || w[0x6f] != 0xE9) return;
+        int32_t rel = *(const int32_t*)(w + 0x70);
+        const uint8_t* inner = w + 0x74 + rel;
+        if (memcmp(inner, kInner, 5) != 0) return;
+        g_replayModeInner = (void(*)(void*, uint8_t))inner;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { g_replayModeInner = nullptr; }
+#endif
+}
 static void hkSkaterReplayMode(void* skater, uint8_t mode) {
     bool isProxy = false;
     __try { isProxy = game::IsProxyActor(skater); } __except (EXCEPTION_EXECUTE_HANDLER) { isProxy = false; }
     if (isProxy) {
-        // Proxies get the FULL transitions. These calls are what keep a skater's replay components'
-        // record/playback cursors sane across editor sessions -- the local skater gets them, and
-        // blocking them for proxies left their tracks mismatched on the second entry (first replay
-        // fine, re-entry broken). The original reason to block was one hard crash: the mode-2
-        // handler attaches `this->[0xa68]`, null on the era's proxies. So the gate is the CRASH
-        // CONDITION itself, read at call time: entries pass when the attach target is present,
-        // exits always pass (twice field-proven safe, and they attach nothing).
+        if (g_replayModeInner) {
+            static long routed = 0;
+            if (InterlockedIncrement(&routed) <= 3) {
+                char m[160];
+                snprintf(m, sizeof(m), "[mod] proxy replay mode -> %u via the inner handler "
+                         "(camera-light attach skipped)", (unsigned)mode);
+                logLine(m);
+            }
+            g_replayModeInner(skater, mode);
+            return;
+        }
+        // Fallback when the wrapper's byte shape did not verify (a game update moved it): the old
+        // gate on the crash condition itself. Entries pass only when the attach target is present;
+        // exits always pass. Known cost: a null-field proxy stays out of playback.
         if (mode == 2) {
             void* attachA = nullptr;
             __try { attachA = *(void**)((uint8_t*)skater + game::off::kSkaterReplayAttachA); }
@@ -932,9 +959,6 @@ static void hkSkaterReplayMode(void* skater, uint8_t mode) {
                             "(the original crash shape; this proxy stays out of playback)");
                 return;
             }
-            static long entered = 0;
-            if (InterlockedIncrement(&entered) <= 3)
-                logLine("[mod] playback entry passed to a proxy (attach field present)");
         }
         o_SkaterReplayMode(skater, mode);
         return;
@@ -955,12 +979,17 @@ static void InstallReplayGuard() {
         logLine("[mod] SkaterReplayMode unresolved -- the replay editor will CRASH while a proxy exists");
         return;
     }
+    DeriveReplayModeInner(S.SkaterReplayMode);   // before the hook patches the wrapper's prologue
     if (MH_CreateHook(S.SkaterReplayMode, (void*)&hkSkaterReplayMode, (void**)&o_SkaterReplayMode) == MH_OK &&
         MH_EnableHook(S.SkaterReplayMode) == MH_OK) {
-        // Hand the trampoline to the game layer: restoring a playback-touched proxy at the
-        // recorded->live toggle needs the game's own transition, called on one skater.
-        game::SetSkaterReplayModeCaller(o_SkaterReplayMode);
-        logLine("[mod] replay-editor guard installed (proxies ignore replay mode changes)");
+        // Hand the game layer a transition caller for restoring a proxy after playback. Its only
+        // callers are proxy-side, so it gets the inner handler too when derived -- the wrapper's
+        // light attach would AV (SEH-swallowed, transition lost) on a null CameraLight.
+        game::SetSkaterReplayModeCaller(g_replayModeInner ? g_replayModeInner : o_SkaterReplayMode);
+        logLine(g_replayModeInner
+            ? "[mod] replay-editor guard installed (proxy transitions -> inner handler)"
+            : "[mod] replay-editor guard installed (inner handler NOT derived -- proxy playback "
+              "entries gated on the attach field)");
     }
     else
         logLine("[mod] *** replay-editor guard FAILED -- opening the replay editor may crash");
