@@ -1037,6 +1037,34 @@ static void hkCamReplaying(void* self, int a, int b, int c, float alpha) {
     }
     o_CamReplaying(self, a, b, c, alpha);
 }
+// ---- same clamp for the derived float-track Replaying override. It calls the base (guarded above)
+// first, then lerps its OWN float array -- count at [this+0xa0] -- with its own unclamped index
+// copies. A component registered after recording began (a peer who joined mid-session) has tracks
+// shorter than the manager's timeline, and the manager passes ONE global index pair to every
+// component, so the short track reads past its allocation: garbage floats when the overrun lands on
+// mapped heap, an AV when it does not (field crash: index 2722 into 2260 keys, seconds after a
+// playback entry with a 76-second-old peer).
+static void (*o_FloatTrackReplaying)(void*, int, int, int, float) = nullptr;
+static void hkFloatTrackReplaying(void* self, int a, int b, int c, float alpha) {
+    int num = 0;
+    __try { num = *(const int*)((const uint8_t*)self + 0xa0); }   // this track's own Num
+    __except (EXCEPTION_EXECUTE_HANDLER) { num = 0; }
+    if (num >= 2) {
+        const int last = num - 1, a0 = a, c0 = c;
+        if (a < 0) a = 0; else if (a > last) a = last;
+        if (c < 0) c = 0; else if (c > last) c = last;
+        if (a != a0 || c != c0) {
+            static long clamped = 0;
+            if (InterlockedIncrement(&clamped) <= 3) {
+                char m[190];
+                snprintf(m, sizeof(m), "[replay] float-track keyframe index out of range (%d,%d vs %d"
+                                       " keys) -- clamped; the game does not bounds-check this", a0, c0, num);
+                logLine(m);
+            }
+        }
+    }
+    o_FloatTrackReplaying(self, a, b, c, alpha);
+}
 static void InstallReplayCamGuard() {
     const game::Syms& S = game::Get();
     if (!S.CamReplaying) { logLine("[mod] CamReplaying unresolved -- the replay editor may still crash"); return; }
@@ -1045,6 +1073,12 @@ static void InstallReplayCamGuard() {
         logLine("[mod] replay camera guard installed (keyframe index clamped to the component's array)");
     else
         logLine("[mod] *** replay camera guard FAILED -- the replay editor may crash while scrubbing");
+    if (!S.FloatTrackReplaying) { logLine("[mod] FloatTrackReplaying unresolved -- playback may crash on short tracks"); return; }
+    if (MH_CreateHook(S.FloatTrackReplaying, (void*)&hkFloatTrackReplaying, (void**)&o_FloatTrackReplaying) == MH_OK &&
+        MH_EnableHook(S.FloatTrackReplaying) == MH_OK)
+        logLine("[mod] replay float-track guard installed (keyframe index clamped to the track's array)");
+    else
+        logLine("[mod] *** replay float-track guard FAILED -- playback may crash on short tracks");
 }
 
 static void InstallEngineTickAnchor() {

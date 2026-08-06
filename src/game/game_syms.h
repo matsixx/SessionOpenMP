@@ -292,6 +292,7 @@ struct Syms {
     // The hook clamps the indices to the component's own array. Worst case the camera holds its last
     // keyframe for a frame; the alternative is reading garbage.
     void*            CamReplaying      = nullptr;
+    void*            FloatTrackReplaying = nullptr;
     // HOOKED, never called: USkeletalMeshComponent::FinalizeBoneTransform -- THE POSE SEAM. Pre-hook,
     // because its first act is the component-space buffer flip: that is the last moment a finished
     // pose can still be replaced before it is published. See pose.h.

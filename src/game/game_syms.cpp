@@ -135,6 +135,12 @@ static const SigEntry kSigs[] = {
     // HOOK TARGET: UCameraReplayComponent::Replaying  Epic 0x340a090 / Steam 0x33d0f50.
     // Clamped, not replaced -- see game_syms.h for why the game reads past its own array.
     { "CamReplaying",         "48 8B C4 53 48 81 EC D0 00 00 00 83 79 50 02 48 8B D9 0F 8C ?? ?? ?? ?? 4C 8B 51 48", false },
+    // HOOK TARGET: the derived float-track Replaying override  Epic 0x1158a80 / Steam 0x1118f50.
+    // It calls the base above FIRST (which the CamReplaying clamp protects), then lerps ITS OWN
+    // float array with its own UNCLAMPED index copies -- count at [this+0xa0], data [this+0x98] --
+    // so a track shorter than the manager timeline (a peer who joined after recording began) reads
+    // past the allocation. Clamped by the same guard shape as the base.
+    { "FloatTrackReplaying",  "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 40 0F 29 74 24 30 48 8B D9 F3 0F 10 74 24 70 49 63 F9 48 63 F2 44 8B CF 8B D6 F3 0F 11 74 24 20 E8 ?? ?? ?? ?? 83 BB A0 00 00 00 02", false },
     // HOOK TARGET: USkeletalMeshComponent::FinalizeBoneTransform  Epic 0x2b58280 / Steam 0x2b1aac0.
     // THE POSE SEAM. Its very first act is the buffer flip (USkinnedMeshComponent::FinalizeBoneTransform
     // -> FlipEditableSpaceBases), so at PRE-hook time the EDITABLE component-space array holds this
@@ -446,6 +452,7 @@ const Syms& Resolve(void (*logf)(const char*)) {
     g_syms.ReplayMgrInstance  = (GetReplayMgrFn)    found[i++];
     g_syms.ReplayCamSetType   = (SetCamTypeFn)      found[i++];
     g_syms.CamReplaying       =                     found[i++];   // hooked, never called directly
+    g_syms.FloatTrackReplaying =                    found[i++];   // hooked, never called directly
     g_syms.MeshFinalizeBones  =                     found[i++];   // hooked, never called directly
     g_syms.MenuCreateItems    =                     found[i++];   // hooked, never called directly
     g_syms.MenuSelConfirmed   =                     found[i++];   // hooked, never called directly
