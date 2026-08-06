@@ -109,5 +109,10 @@ bool  IsProxyActor(void* actor);
 void  SetPeerViewRecorded(int peerId, bool recorded);
 bool  PeerViewRecorded(void* actor);
 void  ResetPeerViews();
+// A proxy the playback machinery drove and has not yet released -- the mesh's anim rate is zeroed
+// until the game's own transition restores it. Read by the replay-mode guard to decide which exit
+// broadcasts must pass; cleared where the restore runs.
+bool  PeerPlaybackTouched(void* actor);
+void  ClearPlaybackTouched(void* actor);
 
 }} // namespace omp::session

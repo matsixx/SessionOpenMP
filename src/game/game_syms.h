@@ -350,6 +350,12 @@ bool DisablePause(void (*logf)(const char*));
 // diagnostics -- there is no other cheap way to ask "am I scrubbing?".
 void    SetLocalReplayMode(uint8_t mode);
 uint8_t LocalReplayMode();
+uint8_t LastLiveReplayMode();               // the most recent non-playback mode (default 1)
+// The game's own per-skater replay-mode transition, via the loader's trampoline. Used to RESTORE a
+// proxy the playback machinery touched -- its mesh's GlobalAnimRateScale is zeroed while its
+// components are playback-driven, and only this call puts the whole state back.
+void SetSkaterReplayModeCaller(void (*fn)(void*, uint8_t));
+bool CallSkaterReplayMode(void* skater, uint8_t mode);
 
 // These entries have an ACTOR's lifetime, NOT a packet's: a registry that answers "is this actor one
 // of ours?" must be keyed to the actor's LIFETIME. Register at spawn, drop at Forget -- both

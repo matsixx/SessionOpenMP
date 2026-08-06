@@ -580,8 +580,26 @@ bool DisablePause(void (*)(const char*)) { return false; }
 // LIVE PROXY REGISTRY. See game_syms.h for how entry lifetime is keyed.
 // =====================================================================================================
 static uint8_t g_localReplayMode = 0;
-void    SetLocalReplayMode(uint8_t m) { g_localReplayMode = m; }
+static uint8_t g_lastLiveReplayMode = 1;    // what "live" is on this build; every non-playback
+                                            // mode the local skater reports refreshes it
+void    SetLocalReplayMode(uint8_t m) { g_localReplayMode = m; if (m != 2) g_lastLiveReplayMode = m; }
 uint8_t LocalReplayMode() { return g_localReplayMode; }
+uint8_t LastLiveReplayMode() { return g_lastLiveReplayMode; }
+
+// The loader owns the MinHook trampoline for ASkaterCharacterBase's replay-mode handler; it registers
+// it here so game-side code can invoke the game's OWN transition on a specific skater -- the full
+// restore (GlobalAnimRateScale back to 1, component states, all of it), not a hand-rebuilt subset.
+static void (*g_skaterReplayModeFn)(void*, uint8_t) = nullptr;
+void SetSkaterReplayModeCaller(void (*fn)(void*, uint8_t)) { g_skaterReplayModeFn = fn; }
+bool CallSkaterReplayMode(void* skater, uint8_t mode) {
+    if (!g_skaterReplayModeFn || !skater) return false;
+#ifdef _WIN32
+    __try { g_skaterReplayModeFn(skater, mode); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+#else
+    return false;
+#endif
+}
 
 static const int kProxyRefs = 16;                       // the peer cap
 struct ProxyRef { void* actor = nullptr; void* board = nullptr; };

@@ -59,6 +59,11 @@ struct Slot {
     // pose lane serves), true = the recording drives them and every live writer yields. Reset when
     // playback ends so each scrub starts from the predictable default.
     bool        viewRecorded = false;
+    // The playback machinery has DRIVEN this proxy and not yet let go: being playback-driven zeroes
+    // the mesh's GlobalAnimRateScale, and only the game's own mode transition restores it. This
+    // outlives viewRecorded on purpose -- a peer toggled back to live, or an exit while viewing
+    // live, still owes the restore. Cleared only when the restore actually runs.
+    bool        playbackTouched = false;
 };
 
 // Unsigned timestamps must never be subtracted raw: a sample stamped slightly in the future (clock
@@ -110,7 +115,7 @@ static Slot* slotFor(int peerIdx, uint64_t nowUs) {
         s.used = true; s.peerIdx = peerIdx; s.lastPacketUs = nowUs; s.quietHandled = false;
         memset(&s.cosmetics, 0, sizeof(s.cosmetics));   // padding too -- it is memcmp'd for changes
         s.haveCosmetics = false; s.wornForActor = nullptr; s.peerReplaying = false;
-        s.viewRecorded = false;
+        s.viewRecorded = false; s.playbackTouched = false;
         g_cosResend = true;                          // they need OUR look too, now rather than in 10 s
         if (g_logf) { char m[120]; snprintf(m, sizeof(m), "[session] stream opened for peer %d", peerIdx); g_logf(m); }
         return &s;
@@ -233,7 +238,11 @@ void* PeerActorById(int peerId) {
 // playback. Guarded on recordPeers: with recording off there is no recording to view.
 void SetPeerViewRecorded(int peerId, bool recorded) {
     if (!game::Proxy::Tuning().recordPeers) return;
-    for (auto& s : g_slots) if (s.used && s.peerIdx == peerId) { s.viewRecorded = recorded; return; }
+    for (auto& s : g_slots) if (s.used && s.peerIdx == peerId) {
+        s.viewRecorded = recorded;
+        if (recorded) s.playbackTouched = true;   // cleared only when the game's restore runs
+        return;
+    }
 }
 bool PeerViewRecorded(void* actor) {
     if (!actor) return false;
@@ -241,7 +250,17 @@ bool PeerViewRecorded(void* actor) {
     return false;
 }
 // Playback ended: every peer goes back to the default LIVE view for the next scrub.
+// playbackTouched deliberately survives this -- it tracks a debt to the game's restore call, not a
+// view preference, and it is cleared where the restore actually happens.
 void ResetPeerViews() { for (auto& s : g_slots) s.viewRecorded = false; }
+bool PeerPlaybackTouched(void* actor) {
+    if (!actor) return false;
+    for (auto& s : g_slots) if (s.used && s.proxy.actor() == actor) return s.playbackTouched;
+    return false;
+}
+void ClearPlaybackTouched(void* actor) {
+    for (auto& s : g_slots) if (s.used && s.proxy.actor() == actor) { s.playbackTouched = false; return; }
+}
 
 bool IsProxyActor(void* actor) {
     if (!actor) return false;
@@ -286,7 +305,7 @@ static bool worldTakesProxies(const char* world) {
 static const uint64_t kWorldSettleMs = 2000;
 
 void ForgetProxies() {
-    for (auto& s : g_slots) if (s.used) s.proxy.Forget();
+    for (auto& s : g_slots) if (s.used) { s.proxy.Forget(); s.playbackTouched = false; s.viewRecorded = false; }
     g_settleUntilMs = 0;                 // re-armed by Frame, which owns the clock
     g_lastOwnPawn   = nullptr;
     g_ownMap[0]     = 0;

@@ -11,6 +11,7 @@
 // loads into. See LICENSE-EXCEPTION.txt.
 #include "spectate.h"
 #include "game_syms.h"
+#include "../session/session.h"
 #include <cstdio>
 #include <cstring>
 #ifdef _WIN32
@@ -279,8 +280,15 @@ void SetPeerPlayback(void* skaterActor, bool recorded, void (*logf)(const char*)
             "[replay] peer %p -> RECORDING view (%d component(s) re-registered)", skaterActor, n); logf(m); }
     } else {
         const int n = pruneCore(skaterActor, /*stash*/ true, logf);
-        if (logf) { char m[140]; snprintf(m, sizeof(m),
-            "[replay] peer %p -> LIVE view (%d component(s) parked)", skaterActor, n); logf(m); }
+        // Being playback-driven zeroed this skater's mesh anim rate; parking the components stops
+        // the driving but restores nothing. Run the game's own transition now, so live view after
+        // the toggle is genuinely live -- not a frozen graph masked by pose stamps until the next
+        // exit happens to repair it.
+        const bool restored = game::CallSkaterReplayMode(skaterActor, game::LastLiveReplayMode());
+        if (restored) session::ClearPlaybackTouched(skaterActor);
+        if (logf) { char m[180]; snprintf(m, sizeof(m),
+            "[replay] peer %p -> LIVE view (%d component(s) parked, game restore %s)",
+            skaterActor, n, restored ? "ran" : "UNAVAILABLE"); logf(m); }
     }
 }
 

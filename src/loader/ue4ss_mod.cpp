@@ -926,12 +926,16 @@ static void hkSkaterReplayMode(void* skater, uint8_t mode) {
         // stuck-drivers symptom it caused. The view flag is read at broadcast time, before the
         // frame-edge reset clears it.
         if (mode != 2) {
-            bool viewRec = false;
-            __try { viewRec = session::PeerViewRecorded(skater); }
-            __except (EXCEPTION_EXECUTE_HANDLER) { viewRec = false; }
-            if (viewRec) {
-                logLine("[mod] replay-exit restore passed through to a recorded-view proxy");
+            // Keyed on the DEBT, not the current view: a peer toggled back to live still owes the
+            // restore if the toggle-time call was unavailable, and the current view says nothing
+            // about whether playback ever zeroed their anim rate.
+            bool owed = false;
+            __try { owed = session::PeerPlaybackTouched(skater); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { owed = false; }
+            if (owed) {
+                logLine("[mod] replay-exit restore passed through to a playback-touched proxy");
                 o_SkaterReplayMode(skater, mode);
+                session::ClearPlaybackTouched(skater);
                 return;
             }
         }
@@ -957,8 +961,12 @@ static void InstallReplayGuard() {
         return;
     }
     if (MH_CreateHook(S.SkaterReplayMode, (void*)&hkSkaterReplayMode, (void**)&o_SkaterReplayMode) == MH_OK &&
-        MH_EnableHook(S.SkaterReplayMode) == MH_OK)
+        MH_EnableHook(S.SkaterReplayMode) == MH_OK) {
+        // Hand the trampoline to the game layer: restoring a playback-touched proxy at the
+        // recorded->live toggle needs the game's own transition, called on one skater.
+        game::SetSkaterReplayModeCaller(o_SkaterReplayMode);
         logLine("[mod] replay-editor guard installed (proxies ignore replay mode changes)");
+    }
     else
         logLine("[mod] *** replay-editor guard FAILED -- opening the replay editor may crash");
 }
