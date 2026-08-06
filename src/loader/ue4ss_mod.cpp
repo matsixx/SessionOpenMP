@@ -758,6 +758,10 @@ static void GameThreadFrame() {
                          p.captured, p.bones, p.noted, p.hookCalls, p.applied, p.stale,
                          p.skippedCount, p.meshBones, p.faults, p.held, p.holdApplied);
                 logLine(m);
+                // Measurement only, and silent outside replay playback: whether proxy anim graphs
+                // still UPDATE while the local player scrubs, and the state of the standard
+                // suppression knobs. Settles whether the driver lane could ever serve the scrubber.
+                game::ReplayDriverProbe(ms, logLine);
             }
         }
     }

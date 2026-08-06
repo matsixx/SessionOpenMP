@@ -293,10 +293,20 @@ static void DropAnimSlot(Proxy* owner) {
 
 static void (*g_animLogf)(const char*) = nullptr;   // set by Apply; the post-pass has no logf of its own
 
+// Probe counter, read once per second by ReplayDriverProbe: how often the game's own anim UPDATE
+// runs for a proxy-owned instance. The pose lane was built on "the anim graph does not drive a
+// skater during playback" -- an observed symptom whose cause was never found. If this keeps ticking
+// while the local player scrubs, the graph still UPDATES during replay and the driver lane may be
+// recoverable there; if it stops, the suppression is upstream of the anim update and the pose lane
+// is the right design. Counts every call for a known proxy instance, fresh blob or not.
+static volatile LONG g_animUpdCalls = 0;
+uint32_t AnimUpdateCalls() { return (uint32_t)g_animUpdCalls; }
+
 void AnimPostApply(void* ai) {
     if (!ai) return;
     for (auto& s : g_animSlots) {
         if (s.ai != ai || !s.owner) continue;
+        InterlockedIncrement(&g_animUpdCalls);
         if (GetTickCount64() - s.freshMs > 500) return;      // stale stream: let the local graph run
 #ifdef _WIN32
         __try {
@@ -384,6 +394,43 @@ void AnimPostApply(void* ai) {
         return;
     }
 }
+
+// ---- the replay-driver probe --------------------------------------------------------------------
+// One line per second, only while the local player is in replay playback. Reports whether the anim
+// UPDATE still fires for proxy instances, and the state of the three standard suppression knobs on
+// a live proxy mesh (the bPauseAnims/bNoSkeletonUpdate bitfield byte, and GlobalAnimRateScale).
+// Together these say WHY proxies go un-driven during a replay -- the fact the pose lane was built on
+// but never root-caused. Read-only; writes nothing.
+void ReplayDriverProbe(uint64_t nowMs, void (*logf)(const char*)) {
+    if (!logf || LocalReplayMode() != 2) return;
+    static uint64_t lastMs = 0;
+    static uint32_t lastUpd = 0;
+    if (nowMs - lastMs < 1000) return;
+    const uint32_t upd = AnimUpdateCalls();
+    const uint32_t updPerSec = (lastMs && upd >= lastUpd) ? (upd - lastUpd) : 0;
+    lastMs = nowMs; lastUpd = upd;
+
+    int flags = -1; float rate = -1.f;
+    for (auto& sl : g_animSlots) {
+        if (!sl.owner) continue;
+        void* mesh = safePtr(sl.owner, off::kSkaterMesh);
+        if (!mesh) continue;
+#ifdef _WIN32
+        __try {
+            flags = *(uint8_t*)((uint8_t*)mesh + off::kMeshAnimFlagsByte);
+            rate  = *(float*)((uint8_t*)mesh + off::kMeshGlobalAnimRate);
+        } __except (EXCEPTION_EXECUTE_HANDLER) { flags = -1; rate = -1.f; }
+#endif
+        break;
+    }
+    char m[180];
+    snprintf(m, sizeof(m),
+             "[rprobe] scrubbing: proxy animUpd/s=%u meshFlags=0x%02x animRate=%.2f "
+             "(upd>0 = the graph still updates; flags/rate name the suppressor if it stops)",
+             updPerSec, (unsigned)(flags & 0xff), (double)rate);
+    logf(m);
+}
+
 
 // =====================================================================================================
 // APPLY -- one frame

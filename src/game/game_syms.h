@@ -508,6 +508,10 @@ namespace off {
     constexpr int kAnimFlipTrick      = 0x4c8;   // FlipTrick (gates the trick ratios)
     constexpr int kAnimRevertBS       = 0x4e0;   // RevertBlendSpace
     constexpr int kObjNamePrivate     = 0x18;    // UObjectBase::NamePrivate (FName)
+    // USkeletalMeshComponent, for the replay-driver probe (PDB): the bitfield byte carrying
+    // bNoSkeletonUpdate and bPauseAnims, and the per-mesh anim rate. Read-only diagnostics.
+    constexpr int kMeshAnimFlagsByte  = 0x8c1;
+    constexpr int kMeshGlobalAnimRate = 0x8b0;
     // ---- TYPE IDENTITY. All three read out of the PDB, not inferred:
     //   pdbmembers.py UObjectBase -> ClassPrivate +0x10, NamePrivate +0x18
     //   pdbmembers.py UStruct     -> SuperStruct  +0x40

@@ -139,6 +139,13 @@ private:
 // belongs to one of our proxies the stored blob is applied ON TOP -- the last writer before evaluation.
 void AnimPostApply(void* animInstance);
 
+// Replay-driver probe: how often the game's anim update ran for proxy instances (cumulative), and a
+// once-per-second log line emitted only while the local player is in replay playback. Measurement
+// only -- it changes nothing. It exists to settle whether the graph still updates proxies during a
+// local replay, which decides whether the driver lane could ever serve the scrubber.
+uint32_t AnimUpdateCalls();
+void     ReplayDriverProbe(uint64_t nowMs, void (*logf)(const char*));
+
 // Transported names rejected by a type gate since launch. Rides the 1 Hz board line as `rej=`; 0 in
 // normal play.
 uint32_t TypeRejects();
