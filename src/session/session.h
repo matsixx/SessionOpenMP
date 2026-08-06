@@ -103,5 +103,11 @@ void* PeerActorById(int peerId);
 // is a real actor of the player's own skater class, so the engine's own "is this locally
 // controlled" test cannot tell them apart if a controller ever possesses one.
 bool  IsProxyActor(void* actor);
+// The per-peer replay view (ProxyTuning::recordPeers): during the LOCAL player's playback a peer
+// either shows LIVE (default) or is driven by the recording. Set by the pause menu, read by the
+// live writers, reset by the loader when playback ends.
+void  SetPeerViewRecorded(int peerId, bool recorded);
+bool  PeerViewRecorded(void* actor);
+void  ResetPeerViews();
 
 }} // namespace omp::session

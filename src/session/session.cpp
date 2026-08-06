@@ -55,6 +55,10 @@ struct Slot {
     // per-peer packet choice in the publish loop: a scrubbing peer gets RESULTS, everyone else
     // keeps DRIVERS. Latched from the stream, so a quiet peer keeps their last known state.
     bool        peerReplaying = false;
+    // During OUR replay playback: false = this peer shows LIVE (the default -- live lane applies,
+    // pose lane serves), true = the recording drives them and every live writer yields. Reset when
+    // playback ends so each scrub starts from the predictable default.
+    bool        viewRecorded = false;
 };
 
 // Unsigned timestamps must never be subtracted raw: a sample stamped slightly in the future (clock
@@ -106,6 +110,7 @@ static Slot* slotFor(int peerIdx, uint64_t nowUs) {
         s.used = true; s.peerIdx = peerIdx; s.lastPacketUs = nowUs; s.quietHandled = false;
         memset(&s.cosmetics, 0, sizeof(s.cosmetics));   // padding too -- it is memcmp'd for changes
         s.haveCosmetics = false; s.wornForActor = nullptr; s.peerReplaying = false;
+        s.viewRecorded = false;
         g_cosResend = true;                          // they need OUR look too, now rather than in 10 s
         if (g_logf) { char m[120]; snprintf(m, sizeof(m), "[session] stream opened for peer %d", peerIdx); g_logf(m); }
         return &s;
@@ -223,6 +228,20 @@ void* PeerActorById(int peerId) {
     for (auto& s : g_slots) if (s.used && s.peerIdx == peerId) return s.proxy.actor();
     return nullptr;                       // they left, or the slot was reused by somebody else
 }
+
+// The per-peer view switch, written by the pause menu and read by every live writer during
+// playback. Guarded on recordPeers: with recording off there is no recording to view.
+void SetPeerViewRecorded(int peerId, bool recorded) {
+    if (!game::Proxy::Tuning().recordPeers) return;
+    for (auto& s : g_slots) if (s.used && s.peerIdx == peerId) { s.viewRecorded = recorded; return; }
+}
+bool PeerViewRecorded(void* actor) {
+    if (!actor) return false;
+    for (auto& s : g_slots) if (s.used && s.proxy.actor() == actor) return s.viewRecorded;
+    return false;
+}
+// Playback ended: every peer goes back to the default LIVE view for the next scrub.
+void ResetPeerViews() { for (auto& s : g_slots) s.viewRecorded = false; }
 
 bool IsProxyActor(void* actor) {
     if (!actor) return false;
@@ -484,12 +503,12 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
         s.peerReplaying = out.replaying != 0;
         if (out.replaying) anyPeerReplaying = true;
 
-        // Recorded peers: while the LOCAL player is in replay playback, the replay system is the
-        // only author of every proxy -- it is replaying what it recorded of them. Applying live
-        // state on top is the two-writer fight that made recorded peers thrash. So the live lane
-        // only BUFFERS here (Push in OnPacket keeps running); the moment playback ends, Apply
-        // resumes from the stream's current head as if nothing happened.
-        if (game::Proxy::Tuning().recordPeers && game::LocalReplayMode() == 2) {
+        // While the LOCAL player is in replay playback, authorship is PER PEER: a peer toggled to
+        // their recording is driven by the replay system alone, and applying live state on top is
+        // the two-writer fight that made recorded peers thrash -- so the live lane only BUFFERS for
+        // them (Push in OnPacket keeps running). Peers left on the default LIVE view keep the full
+        // live lane exactly as outside playback.
+        if (game::LocalReplayMode() == 2 && s.viewRecorded) {
             if (s.proxy.actor()) alive++;
             continue;
         }

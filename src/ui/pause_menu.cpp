@@ -488,6 +488,15 @@ static int       g_spectateSel   = 0;               // row position, display onl
 static int       g_spectateSelPeer = -1;            // THE selection. -1 = your own skater.
 static const LONG kSpecNoPending = 0x7FFFFFFF;
 static volatile LONG g_spectatePending = kSpecNoPending;   // a PEER ID, posted by the menu callback
+// ---- the per-player replay view row ("Their Skater: Live / Recording"). Applies to whoever the
+// Look At row selects; with "Me" selected it refuses (your own skater IS the replay). The posted
+// value is (peerId << 1) | recorded, so the pump applies the choice to the player it was made for
+// even if the Look At selection moves before the game thread runs.
+static uint8_t   g_viewRow[0x90];
+static uint64_t  g_viewKey = 0;
+static FTextBlob g_viewOpts[2];
+static int       g_viewSel = 0;                            // display only, rebuilt with the page
+static volatile LONG g_viewPending = kSpecNoPending;
 
 static uint32_t g_tmplPlatforms  = 0xFFFFFFFFu;
 static uint8_t  g_tmplEditorOnly = 0;
@@ -586,6 +595,22 @@ static void buildRows() {
             g_replayPageKey = 0;
             log("[menu] could not build the replay Look At row -- skipped");
         }
+        // The view row fails independently: no Look At page, no view row, but never the reverse.
+        if (g_replayPageKey &&
+            buildRow(g_viewRow, "OmpPeerReplay", "Their Skater",
+                     "For the Look At player: Live shows them as they are right now; Recording plays "
+                     "back what you recorded of them on this replay's timeline", &g_viewKey)) {
+            const FTextBlob* live = cachedText("Live");
+            const FTextBlob* rec  = cachedText("Recording");
+            if (live && rec) {
+                g_viewOpts[0] = *live; g_viewOpts[1] = *rec;
+                *(g_viewRow + off::kItemType) = 2;                       // MultiOption
+                *(void**)  (g_viewRow + off::kItemMultiTexts)        = g_viewOpts;
+                *(int32_t*)(g_viewRow + off::kItemMultiTexts + 0x08) = 2;
+                *(int32_t*)(g_viewRow + off::kItemMultiTexts + 0x0c) = 2;
+                *(int32_t*)(g_viewRow + off::kItemMultiStart)        = 0;
+            } else g_viewKey = 0;
+        } else g_viewKey = 0;
     }
     if (!buildRow(g_playersOpenRow, "OmpPlayers", "Players",
                   "Kick or ban someone from the game you are hosting", &g_playersOpenKey) ||
@@ -830,14 +855,25 @@ static const TArrayHdr* chooseArray(void* page, const TArrayHdr* items, TArrayHd
         if (g_spectateSel == 0) g_spectateSelPeer = -1;
         *(int32_t*)(g_spectateRow + off::kItemMultiTexts + 0x08) = g_spectateCount;
         *(int32_t*)(g_spectateRow + off::kItemMultiStart)        = g_spectateSel;
-        if (items->num + 1 > PauseMenu_Tuning().maxItems || items->num + 1 > kRowCap) return items;
+        const int extra = 1 + (g_viewKey ? 1 : 0);
+        if (items->num + extra > PauseMenu_Tuning().maxItems || items->num + extra > kRowCap) return items;
         uint8_t* out2 = g_rowBuf;
         for (int i = 0; i < items->num; i++)
             memcpy(out2 + (size_t)i * off::kItemSize,
                    (const uint8_t*)items->data + (size_t)i * off::kItemSize, off::kItemSize);
         memcpy(out2 + (size_t)items->num * off::kItemSize, g_spectateRow, off::kItemSize);
         stampTemplate(out2 + (size_t)items->num * off::kItemSize);
-        ours->data = out2; ours->num = items->num + 1; ours->max = ours->num;
+        if (g_viewKey) {
+            // The row shows the CURRENT Look At player's state, re-read at build time -- opening the
+            // menu is when "what am I looking at" gets refreshed, same as the roster above.
+            void* selActor = (g_spectateSelPeer >= 0)
+                           ? omp::session::PeerActorById(g_spectateSelPeer) : nullptr;
+            g_viewSel = (selActor && omp::session::PeerViewRecorded(selActor)) ? 1 : 0;
+            *(int32_t*)(g_viewRow + off::kItemMultiStart) = g_viewSel;
+            memcpy(out2 + (size_t)(items->num + 1) * off::kItemSize, g_viewRow, off::kItemSize);
+            stampTemplate(out2 + (size_t)(items->num + 1) * off::kItemSize);
+        }
+        ours->data = out2; ours->num = items->num + extra; ours->max = ours->num;
         return ours;
     }
 
@@ -1311,6 +1347,24 @@ void PauseMenu_Pump() {
             omp::game::spectate::SetLookTarget(target, &log);
         }
     }
+    {
+        const LONG want = InterlockedExchange(&g_viewPending, kSpecNoPending);
+        if (want != kSpecNoPending) {
+            const int  peer     = (int)(want >> 1);
+            const bool recorded = (want & 1) != 0;
+            void* actor = omp::session::PeerActorById(peer);
+            if (!actor) {
+                log("[menu] that player is no longer in the session -- view unchanged");
+            } else if (omp::game::LocalReplayMode() != 2) {
+                // Outside playback the toggle has nothing to act on: entry parks everyone and the
+                // views reset on exit, so the choice would be silently discarded. Say so instead.
+                log("[menu] Their Skater applies while you are in a replay -- open one and toggle there");
+            } else {
+                omp::session::SetPeerViewRecorded(peer, recorded);
+                omp::game::spectate::SetPeerPlayback(actor, recorded, &log);
+            }
+        }
+    }
     // A search FINISHING is the one thing that changes a page of ours without a button press, so it
     // is polled (an int compare) and turned into a rebuild through the same queue as every other
     // swap -- still outside the engine's menu callbacks.
@@ -1572,6 +1626,17 @@ static bool handleValueChange(void* params, bool isSlider) {
                 const float v = MPBUBBLE_DIST_MIN + pct * (float)(MPBUBBLE_DIST_MAX - MPBUBBLE_DIST_MIN);
                 MpPrefs_SetBubbleDistM((int)(v + 0.5f));
             }
+            return true;
+        }
+        if (g_viewKey && k == g_viewKey && !isSlider) {
+            const int idx = *(const int32_t*)((const uint8_t*)params + off::kChangeParamsNew);
+            if (idx == g_viewSel) return true;               // engine echo of the current value
+            g_viewSel = idx;
+            if (g_spectateSelPeer < 0) {
+                log("[menu] pick a player in Look At first -- Their Skater applies to them");
+                return true;
+            }
+            InterlockedExchange(&g_viewPending, (LONG)((g_spectateSelPeer << 1) | (idx ? 1 : 0)));
             return true;
         }
         if (g_spectateKey && k == g_spectateKey && !isSlider) {

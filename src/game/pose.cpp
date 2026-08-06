@@ -184,8 +184,8 @@ void OnFinalizeBones(void* mesh, uint64_t nowMs) {
     // confirm the mesh belongs to a LIVE proxy -- otherwise a released proxy whose address was reused
     // means stamping a pose into an unrelated actor's skeleton. Never trust a cached handle; ask the
     // resolver.
+    void* owner = nullptr;
     {
-        void* owner = nullptr;
         __try { owner = *(void**)((uint8_t*)mesh + off::kCompOwner); }
         __except (EXCEPTION_EXECUTE_HANDLER) { owner = nullptr; }
         if (!owner || !IsProxyActor(owner)) { if (sl) Forget(mesh); return; }
@@ -199,10 +199,10 @@ void OnFinalizeBones(void* mesh, uint64_t nowMs) {
     // Measurement round: adopt the slot (the probe reads flags off its mesh) but write NOTHING --
     // no stamp, no hold. What renders is the graph's own evaluation, which is the question.
     if (debug::Get().replayDriverTest) return;
-    // Recorded peers: during playback the replay system poses this skeleton from its recording, and
+    // A peer toggled to their RECORDING during playback: the replay system poses this skeleton, and
     // both the transported-pose stamp and the hold would overwrite it -- the two-writer fight again,
-    // one layer down. Outside playback nothing changes.
-    if (game::Proxy::Tuning().recordPeers && LocalReplayMode() == 2) return;
+    // one layer down. Live-viewed peers keep the stamp and the hold exactly as before.
+    if (LocalReplayMode() == 2 && session::PeerViewRecorded(owner)) return;
 #ifdef _WIN32
     int num = 0;
     uint8_t* cs = compSpace(mesh, /*editable*/ true, &num);

@@ -710,8 +710,24 @@ static void GameThreadFrame() {
     // -- cheaper than the check that would decide whether to run it.
     // ...unless peers are being RECORDED (the default): then their components stay registered and
     // the replay system captures everyone. The old prune remains the kill-switch path.
-    if (!game::Proxy::Tuning().recordPeers)
+    if (!game::Proxy::Tuning().recordPeers) {
         game::spectate::PruneProxyComponents(&logLine);
+    } else {
+        // Playback edges. Entering parks every peer's components so they all show LIVE (the default
+        // view); the pause menu's per-player toggle re-registers one to watch their recording.
+        // Exiting restores everyone and resets the toggles, so recording resumes for the whole
+        // session and the next scrub starts predictable.
+        static uint8_t lastReplayMode = 0;
+        const uint8_t rm = game::LocalReplayMode();
+        if (rm != lastReplayMode) {
+            if (rm == 2)                 game::spectate::EnterReplayPlayback(&logLine);
+            else if (lastReplayMode == 2) {
+                game::spectate::ExitReplayPlayback(&logLine);
+                session::ResetPeerViews();
+            }
+            lastReplayMode = rm;
+        }
+    }
 
     // the wire was already pumped in MpPump (same thread, same run); just drive the frame.
     session::Frame(g_ownPawn, us, ms, &game::GatherOwnState);

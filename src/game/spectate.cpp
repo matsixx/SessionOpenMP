@@ -95,12 +95,39 @@ static void* replayCamera() { return nullptr; }
 // watch them skating live while you scrub. That also ends the two-writers fight that makes a recorded
 // peer's board thrash, their feet lift off the deck, and their live bails play back as phantom falls.
 // =====================================================================================================
-int PruneProxyComponents(void (*logf)(const char*)) {
-#ifdef _WIN32
+// ---- per-peer registration surgery ------------------------------------------------------------------
+// A recorded peer can be flipped to LIVE view (and back) during playback by removing (re-adding)
+// their components from the manager's array. Removal stashes the entries per skater-owner -- every
+// component a peer registers, the board's included, reads its owner as the SKATER actor (log-proven
+// by the prune's own class dump) -- and the append only ever writes into slack: entries go back into
+// the same array they were pruned from, so Num < Max holds by construction, and if it ever does not,
+// the append refuses rather than growing an engine-owned allocation.
+struct CompStash { void* owner; void* entries[12]; int n; };
+static CompStash g_stash[24];
+
+static CompStash* stashFor(void* owner, bool create) {
+    for (auto& b : g_stash) if (b.owner == owner) return &b;
+    if (!create) return nullptr;
+    for (auto& b : g_stash) if (!b.owner) { b.owner = owner; b.n = 0; return &b; }
+    return nullptr;
+}
+
+static void* replayMgr() {
     const Syms& S = Get();
-    if (!S.ReplayMgrInstance) return 0;
+    if (!S.ReplayMgrInstance) return nullptr;
     void* mgr = nullptr;
+#ifdef _WIN32
     __try { mgr = S.ReplayMgrInstance(); } __except (EXCEPTION_EXECUTE_HANDLER) { mgr = nullptr; }
+#endif
+    return mgr;
+}
+
+// Remove proxy-owned entries from the manager array. `onlyOwner` null = every proxy. `stash` keeps
+// the removed entries so AppendPeer can restore them; the kill-switch prune passes false, because in
+// that mode nothing may ever re-register.
+static int pruneCore(void* onlyOwner, bool stash, void (*logf)(const char*)) {
+#ifdef _WIN32
+    void* mgr = replayMgr();
     if (!mgr) return 0;
 
     // Gathered under the guard, reported outside it -- naming a class calls back into the game, which
@@ -125,10 +152,15 @@ int PruneProxyComponents(void (*logf)(const char*)) {
                 // wrong removal.
                 uint8_t* comp  = entry - off::kReplayIfaceToComp;
                 void*    owner = *(void**)(comp + off::kCompOwner);
-                if (owner && IsProxyActor(owner)) {                 // covers the skater AND its board
+                if (owner && IsProxyActor(owner) && (!onlyOwner || owner == onlyOwner)) {
                     drop = true;
                     if (removed < 8) removedComp[removed] = comp;
                     removed++;
+                    if (stash) {
+                        CompStash* b = stashFor(owner, true);
+                        if (b && b->n < (int)(sizeof(b->entries)/sizeof(b->entries[0])))
+                            b->entries[b->n++] = entry;             // the INTERFACE pointer, as stored
+                    }
                 }
             }
             if (!drop) data[w++] = data[r];                         // order-preserving, like Remove()
@@ -155,15 +187,95 @@ int PruneProxyComponents(void (*logf)(const char*)) {
             }
         }
         char m[210];
-        snprintf(m, sizeof(m), "[replay] kept %d peer component(s) out of your recording (%d were"
-                               " registered) -- a peer's skating belongs in THEIR replay, and during"
-                               " yours you now see them live", removed, scanned);
+        snprintf(m, sizeof(m), "[replay] removed %d peer component(s) from the replay set (%d were"
+                               " registered)", removed, scanned);
         logf(m);
     }
     return removed;
 #else
-    (void)logf; return 0;
+    (void)onlyOwner; (void)stash; (void)logf; return 0;
 #endif
+}
+
+// The kill-switch path: peers are never recorded, so nothing is stashed and nothing may return.
+int PruneProxyComponents(void (*logf)(const char*)) {
+    return pruneCore(nullptr, /*stash*/ false, logf);
+}
+
+// Restore a stashed owner's entries into the manager array. Slack-only by design: the entries came
+// out of this same array, so unless something else registered meanwhile Num < Max holds; if it does
+// not, refuse loudly rather than grow an engine-owned allocation.
+static int appendFor(void* owner, void (*logf)(const char*)) {
+#ifdef _WIN32
+    CompStash* b = stashFor(owner, false);
+    if (!b || !b->n) return 0;
+    void* mgr = replayMgr();
+    if (!mgr) return 0;
+    int appended = 0;
+    __try {
+        void** data = *(void***)((uint8_t*)mgr + off::kReplayMgrCompData);
+        int*   num  =  (int*)   ((uint8_t*)mgr + off::kReplayMgrCompNum);
+        int*   max  =  (int*)   ((uint8_t*)mgr + off::kReplayMgrCompNum + 4);
+        if (!data || *num < 0 || *num > 4096 || *max < *num) return 0;
+        for (int i = 0; i < b->n; i++) {
+            if (*num >= *max) {
+                if (logf) logf("[replay] no slack to re-register a peer component -- left out");
+                break;
+            }
+            // AddUnique semantics: BeginPlay uses it, so a double-add must not slip in here either.
+            bool dup = false;
+            for (int r = 0; r < *num && !dup; r++) dup = (data[r] == b->entries[i]);
+            if (dup) { appended++; continue; }
+            data[(*num)++] = b->entries[i];
+            appended++;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        if (logf) logf("[replay] append FAULTED -- manager array left as it was");
+        return 0;
+    }
+    if (appended == b->n) { b->owner = nullptr; b->n = 0; }   // fully restored: bucket free again
+    return appended;
+#else
+    (void)owner; (void)logf; return 0;
+#endif
+}
+
+// ---- playback transitions and the per-peer view switch ----------------------------------------------
+// Entering playback prunes every peer WITH stash: the replay system then drives nobody of ours, the
+// live lane keeps applying, and every peer appears LIVE -- the default view. Toggling one peer to
+// "recording" re-appends their components (playback picks them up from its recorded tracks) and the
+// live writers yield for that actor alone. Exiting playback restores everyone, so recording resumes
+// for the whole session the moment live play does.
+void EnterReplayPlayback(void (*logf)(const char*)) {
+    const int n = pruneCore(nullptr, /*stash*/ true, logf);
+    if (n && logf) {
+        char m[160];
+        snprintf(m, sizeof(m), "[replay] playback: %d peer component(s) parked -- peers show LIVE; "
+                               "toggle a player to watch their recording", n);
+        logf(m);
+    }
+}
+void ExitReplayPlayback(void (*logf)(const char*)) {
+    int n = 0;
+    for (auto& b : g_stash) if (b.owner) n += appendFor(b.owner, logf);
+    if (n && logf) {
+        char m[120];
+        snprintf(m, sizeof(m), "[replay] playback over: %d peer component(s) re-registered -- "
+                               "recording everyone again", n);
+        logf(m);
+    }
+}
+void SetPeerPlayback(void* skaterActor, bool recorded, void (*logf)(const char*)) {
+    if (!skaterActor) return;
+    if (recorded) {
+        const int n = appendFor(skaterActor, logf);
+        if (logf) { char m[140]; snprintf(m, sizeof(m),
+            "[replay] peer %p -> RECORDING view (%d component(s) re-registered)", skaterActor, n); logf(m); }
+    } else {
+        const int n = pruneCore(skaterActor, /*stash*/ true, logf);
+        if (logf) { char m[140]; snprintf(m, sizeof(m),
+            "[replay] peer %p -> LIVE view (%d component(s) parked)", skaterActor, n); logf(m); }
+    }
 }
 
 // ---- what the camera was before the mod touched it, so "Me" can put it back.
