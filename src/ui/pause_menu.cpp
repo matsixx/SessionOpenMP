@@ -488,10 +488,12 @@ static int       g_spectateSel   = 0;               // row position, display onl
 static int       g_spectateSelPeer = -1;            // THE selection. -1 = your own skater.
 static const LONG kSpecNoPending = 0x7FFFFFFF;
 static volatile LONG g_spectatePending = kSpecNoPending;   // a PEER ID, posted by the menu callback
-// ---- the per-player replay visibility row ("Show in Replay: On / Off"). Applies to whoever the
-// Look At row selects; with "Me" selected it refuses (hiding your own skater is not a replay). The
-// posted value is (peerId << 1) | hidden, so the pump applies the choice to the player it was made
-// for even if the Look At selection moves before the game thread runs.
+// ---- the per-player "Sync Replay: Off / On" row. Applies to whoever the Look At row selects; ON
+// requests that player's own recent state history over the wire and, once it lands, shows their
+// skater in the local replay driven by THEIR data at the scrub position (session::SetPeerReplaySync;
+// the transfer itself is src/replication/replaysync.*). The posted value is (peerId << 1) | on, so
+// the pump applies the choice to the player it was made for even if the Look At selection moves
+// before the game thread runs.
 static uint8_t   g_viewRow[0x90];
 static uint64_t  g_viewKey = 0;
 static FTextBlob g_viewOpts[2];
@@ -596,18 +598,14 @@ static void buildRows() {
             log("[menu] could not build the replay Look At row -- skipped");
         }
         // The view row fails independently: no Look At page, no view row, but never the reverse.
-        // Only in the retired recorded-peers mode -- without recordings there is nothing to show or
-        // hide (peers are concealed during playback wholesale). The slot is reserved for the future
-        // "Sync Replay" per-player toggle.
-        if (omp::game::Proxy::Tuning().recordPeers &&
-            g_replayPageKey &&
-            buildRow(g_viewRow, "OmpPeerReplay", "Show in Replay",
-                     "Whether the Look At player's recording appears in your replay. Off hides them "
-                     "until you leave the editor.", &g_viewKey)) {
-            const FTextBlob* live = cachedText("On");
-            const FTextBlob* rec  = cachedText("Off");
-            if (live && rec) {
-                g_viewOpts[0] = *live; g_viewOpts[1] = *rec;
+        if (g_replayPageKey &&
+            buildRow(g_viewRow, "OmpPeerReplay", "Sync Replay",
+                     "Fetch the Look At player's own replay data and show their skater in your "
+                     "replay. Lasts until you leave the editor.", &g_viewKey)) {
+            const FTextBlob* offT = cachedText("Off");
+            const FTextBlob* onT  = cachedText("On");
+            if (offT && onT) {
+                g_viewOpts[0] = *offT; g_viewOpts[1] = *onT;
                 *(g_viewRow + off::kItemType) = 2;                       // MultiOption
                 *(void**)  (g_viewRow + off::kItemMultiTexts)        = g_viewOpts;
                 *(int32_t*)(g_viewRow + off::kItemMultiTexts + 0x08) = 2;
@@ -870,9 +868,8 @@ static const TArrayHdr* chooseArray(void* page, const TArrayHdr* items, TArrayHd
         if (g_viewKey) {
             // The row shows the CURRENT Look At player's state, re-read at build time -- opening the
             // menu is when "what am I looking at" gets refreshed, same as the roster above.
-            void* selActor = (g_spectateSelPeer >= 0)
-                           ? omp::session::PeerActorById(g_spectateSelPeer) : nullptr;
-            g_viewSel = (selActor && omp::session::PeerReplayHidden(selActor)) ? 1 : 0;
+            g_viewSel = (g_spectateSelPeer >= 0 &&
+                         omp::session::PeerReplaySyncState(g_spectateSelPeer) != 0) ? 1 : 0;
             *(int32_t*)(g_viewRow + off::kItemMultiStart) = g_viewSel;
             memcpy(out2 + (size_t)(items->num + 1) * off::kItemSize, g_viewRow, off::kItemSize);
             stampTemplate(out2 + (size_t)(items->num + 1) * off::kItemSize);
@@ -1354,18 +1351,17 @@ void PauseMenu_Pump() {
     {
         const LONG want = InterlockedExchange(&g_viewPending, kSpecNoPending);
         if (want != kSpecNoPending) {
-            const int  peer   = (int)(want >> 1);
-            const bool hidden = (want & 1) != 0;
-            void* actor = omp::session::PeerActorById(peer);
-            if (!actor) {
+            const int  peer = (int)(want >> 1);
+            const bool on   = (want & 1) != 0;
+            if (!omp::session::PeerActorById(peer)) {
                 log("[menu] that player is no longer in the session -- nothing changed");
-            } else if (omp::game::LocalReplayMode() != 2) {
-                // Outside playback there is nothing to hide from: visibility resets when the editor
-                // closes, so the choice would be silently discarded. Say so instead.
-                log("[menu] Show in Replay applies while you are in a replay -- open one and toggle there");
-            } else {
-                omp::session::SetPeerReplayHidden(peer, hidden);
-                omp::game::spectate::SetPeerShownInReplay(actor, !hidden, &log);
+            } else if (on && omp::game::LocalReplayMode() != 2) {
+                // A sync window is anchored to the playback session; outside one there is nothing
+                // to anchor to and the buffers would be discarded on entry anyway. Say so.
+                log("[menu] Sync Replay applies while you are in a replay -- open one and toggle there");
+            } else if (omp::session::SetPeerReplaySync(peer, on)) {
+                log(on ? "[menu] Sync Replay ON -- fetching their replay data..."
+                       : "[menu] Sync Replay off -- their skater leaves your replay");
             }
         }
     }
@@ -1637,7 +1633,7 @@ static bool handleValueChange(void* params, bool isSlider) {
             if (idx == g_viewSel) return true;               // engine echo of the current value
             g_viewSel = idx;
             if (g_spectateSelPeer < 0) {
-                log("[menu] pick a player in Look At first -- Show in Replay applies to them");
+                log("[menu] pick a player in Look At first -- Sync Replay applies to them");
                 return true;
             }
             InterlockedExchange(&g_viewPending, (LONG)((g_spectateSelPeer << 1) | (idx ? 1 : 0)));

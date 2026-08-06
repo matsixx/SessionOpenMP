@@ -849,23 +849,24 @@ void Proxy::Apply(const repl::State& s, uint64_t nowMs, uint64_t nowUs, void (*l
     }
 
     // ---- offscreen anim throttle, once per actor -- but NEVER while peers are recorded into the
-    // replay. The replay records the skater's EVALUATED pose, and every visibility-gated tick
-    // option skips at least the bone evaluation while unrendered -- so any stretch where the local
-    // camera simply is not LOOKING at a peer records them as a frozen standing skater (field-
-    // confirmed: "if I'm looking away when they do their tricks, in replay their animations aren't
-    // working"). AlwaysTickPose (1) -- graph updates, bone refresh skipped while unrendered --
-    // stays available for a future mode that does not record peers. One byte, engine's own
-    // mechanism.
+    // replay (the retired recordPeers mode): the game's recorder captures the EVALUATED pose, so
+    // any stretch the local camera was not looking at a peer recorded them frozen standing
+    // (field-confirmed, at both tick-option values). With peers OUT of the replay system this is
+    // free again, at the strongest setting: OnlyTickPoseWhenRendered (3) skips the whole anim
+    // update+evaluation for an unrendered proxy -- the largest per-proxy CPU cost -- and nothing
+    // observes the frozen graph: live viewers get the current pose the frame they look back, and
+    // replay sync renders from TRANSFERRED wire states, never from this client's anim instance.
+    // One byte, engine's own mechanism.
     if (g_tun.offscreenAnimThrottle && !g_tun.recordPeers && !animThrottled_) {
         void* mesh = safePtr(actor_, off::kSkaterMesh);
         if (mesh) {
 #ifdef _WIN32
             __try {
-                *(uint8_t*)((uint8_t*)mesh + off::kMeshAnimTickOption) = 1;
+                *(uint8_t*)((uint8_t*)mesh + off::kMeshAnimTickOption) = 3;
                 animThrottled_ = true;
                 static bool said = false;
                 if (!said && logf) { said = true;
-                    logf("[proxy] offscreen anim throttle ON (AlwaysTickPose: offscreen bone refresh skipped)"); }
+                    logf("[proxy] offscreen anim throttle ON (OnlyTickPoseWhenRendered)"); }
             } __except (EXCEPTION_EXECUTE_HANDLER) { animThrottled_ = true; }
 #endif
         }

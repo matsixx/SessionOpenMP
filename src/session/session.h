@@ -110,4 +110,12 @@ void  SetPeerReplayHidden(int peerId, bool hidden);
 bool  PeerReplayHidden(void* actor);
 void  RestoreHiddenAfterReplay(void (*logf)(const char*));
 
+// ---- replay sync (the "Sync Replay" pause-menu row). ON requests the peer's own state history
+// over the wire and, once it lands, shows their skater in the local replay driven by THEIR data at
+// the scrub position. Only meaningful while the local player is in playback; every sync is
+// single-playback-session (leaving the editor drops the buffers and resets the toggles).
+bool SetPeerReplaySync(int peerId, bool on);
+// 0 off, 1 transferring, 2 ready (showing), 3 failed -- for the menu row / logging.
+int  PeerReplaySyncState(int peerId);
+
 }} // namespace omp::session

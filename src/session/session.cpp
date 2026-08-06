@@ -18,6 +18,7 @@
 #include "../game/audio.h"
 #include "../game/pose.h"
 #include "../game/spectate.h"
+#include "../replication/replaysync.h"
 #include <cstring>
 #include <cstdio>
 
@@ -67,7 +68,15 @@ struct Slot {
     // frame you exit) but invisible. Keyed on the ACTOR, wornForActor-style, so a respawn mid-
     // playback gets hidden too and a world change cannot leave the flag pointing at a dead actor.
     void*       replayConcealedActor = nullptr;
+    // ---- replay sync: this peer's own state history, transferred on request, shown in OUR replay.
+    bool        syncOn = false;          // the menu's wish; the transfer/buffer state lives in replaysync
+    uint64_t    syncReqSentUs = 0;       // when we asked -- anchors their buffer's newest to our clock
 };
+
+// When the local player ENTERED playback (mode 2), our clock. The replay timeline's END is this
+// moment; a synced peer's buffer-newest is their syncReqSentUs moment. The difference maps scrub
+// seconds onto their history. 0 = not in playback.
+static uint64_t g_playbackEnteredUs = 0;
 
 // Unsigned timestamps must never be subtracted raw: a sample stamped slightly in the future (clock
 // granularity, a reordered call) wraps to ~1.8e19 instead of going negative, which reads as "ancient"
@@ -85,7 +94,7 @@ static bool     g_anyPeerReplaying = false;   // somebody is scrubbing and needs
 static repl::State g_ownLast;      // last successfully gathered own state (for spawn placement)
 static bool        g_haveOwn = false;
 
-void Init(void (*logf)(const char*)) { g_logf = logf; }
+void Init(void (*logf)(const char*)) { g_logf = logf; replaysync::SetSendFn(&Send); }
 void ResetAll() {
     int n = 0;
     for (auto& s : g_slots) if (s.used) {
@@ -99,6 +108,7 @@ void ResetAll() {
         s.used = false; n++;
     }
     if (n && g_logf) { char m[120]; snprintf(m, sizeof(m), "[session] reset -- %d peer slot(s) released", n); g_logf(m); }
+    replaysync::DropAll(); g_playbackEnteredUs = 0;
 }
 // NOT ResetAll: this runs from the mod's destructor, i.e. DLL unload, where the game may already be
 // tearing itself down -- and Retire touches actors, the replay camera and the audio system. Hiding a
@@ -119,6 +129,7 @@ static Slot* slotFor(int peerIdx, uint64_t nowUs) {
         memset(&s.cosmetics, 0, sizeof(s.cosmetics));   // padding too -- it is memcmp'd for changes
         s.haveCosmetics = false; s.wornForActor = nullptr; s.peerReplaying = false;
         s.replayHidden = false; s.boardNear = true; s.replayConcealedActor = nullptr;
+        s.syncOn = false; s.syncReqSentUs = 0;
         g_cosResend = true;                          // they need OUR look too, now rather than in 10 s
         if (g_logf) { char m[120]; snprintf(m, sizeof(m), "[session] stream opened for peer %d", peerIdx); g_logf(m); }
         return &s;
@@ -128,6 +139,12 @@ static Slot* slotFor(int peerIdx, uint64_t nowUs) {
 
 void OnPacket(int peerIdx, const uint8_t* data, int len, uint64_t nowUs) {
     if (!g_cfg.enabled) return;
+    // Replay-sync protocol traffic (requests for and chunks of a peer's own state history). Checked
+    // first: chunks arrive at hundreds per second mid-transfer.
+    if (replaysync::IsSyncPacket(data, len)) {
+        replaysync::OnPacket(peerIdx, data, len, nowUs, g_logf);
+        return;
+    }
     // Several message types share this transport, routed by magic. Cosmetics are rare and large; the
     // 60 Hz snapshot stays small and self-contained.
     if (repl::IsCosmeticsPacket(data, len)) {
@@ -237,6 +254,38 @@ void* PeerActorById(int peerId) {
     return nullptr;                       // they left, or the slot was reused by somebody else
 }
 
+// ---- replay sync (the pause menu's "Sync Replay" row). The setter only records the WISH; the
+// request itself is stamped from Frame so it shares Frame's clock epoch. Toggling off cancels the
+// transfer and drops any buffer; toggling on after a failure retries from scratch.
+bool SetPeerReplaySync(int peerId, bool on) {
+    for (auto& s : g_slots) if (s.used && s.peerIdx == peerId) {
+        if (!on) {
+            s.syncOn = false; s.syncReqSentUs = 0;
+            replaysync::CancelSync(peerId);
+            return true;
+        }
+        if (game::LocalReplayMode() != 2) return false;   // the row only means something in playback
+        if (replaysync::PeerSyncState(peerId, nullptr) == replaysync::SyncState::Failed)
+            replaysync::CancelSync(peerId);               // clear the failure so Frame re-requests
+        s.syncOn = true; s.syncReqSentUs = 0;
+        return true;
+    }
+    return false;
+}
+int PeerReplaySyncState(int peerId) {
+    for (auto& s : g_slots) if (s.used && s.peerIdx == peerId) {
+        if (!s.syncOn) return 0;
+        int pct = 0;
+        switch (replaysync::PeerSyncState(peerId, &pct)) {
+        case replaysync::SyncState::Transferring: return 1;
+        case replaysync::SyncState::Ready:        return 2;
+        case replaysync::SyncState::Failed:       return 3;
+        default:                                  return s.syncReqSentUs ? 1 : 0;
+        }
+    }
+    return 0;
+}
+
 // The per-peer visibility switch for the replay editor, written by the pause menu.
 void SetPeerReplayHidden(int peerId, bool hidden) {
     if (!game::Proxy::Tuning().recordPeers) return;
@@ -322,6 +371,24 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
     const uint64_t quietUs = (uint64_t)(g_cfg.quietMs * 1000.0f);
     const uint64_t dropUs  = (uint64_t)(g_cfg.dropMs  * 1000.0f);
 
+    // ---- replay sync: pump the transfer machine, and anchor the playback-entry moment. A sync
+    // window is single-playback-session: leaving the editor drops every transferred buffer and
+    // clears the toggles -- re-entering starts fresh (the histories would be stale anyway).
+    replaysync::Tick(nowUs, g_logf);
+    {
+        static uint8_t lastRm = 0;
+        const uint8_t rm = game::LocalReplayMode();
+        if (rm != lastRm) {
+            if (rm == 2) g_playbackEnteredUs = nowUs;
+            if (lastRm == 2) {
+                g_playbackEnteredUs = 0;
+                replaysync::DropAll();
+                for (auto& sl : g_slots) { sl.syncOn = false; sl.syncReqSentUs = 0; }
+            }
+            lastRm = rm;
+        }
+    }
+
     // Hold spawning until the game's own pawn has stopped moving around. Any change re-arms the
     // window, so a level load -- which swaps the pawn at least once -- is covered from whichever end
     // it is observed, and a settled world costs one pointer compare per frame.
@@ -402,6 +469,8 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
                                            // Audio rides the snapshot and is sized LAST, so a full
                                            // frame drops trailing sounds, never pose.
             const int n = repl::Pack(own, nowUs, pkt, sizeof(pkt));
+            // Retain what we just published: the ring any peer's "Sync Replay" transfer serves from.
+            if (n > 0) replaysync::RecordOwn(pkt, n, nowUs);
             // A peer with the replay editor open cannot evaluate our drivers -- their anim graph is
             // not running a skater. They get a RESULTS packet (the finished skeleton), built once per
             // publish and unicast to scrubbing peers alone. Everyone else keeps the driver packet,
@@ -515,22 +584,59 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
             if (s.proxy.actor()) alive++;
             continue;
         }
-        // Conceal every peer while the local player is in replay playback; reveal on exit. Runs
-        // before the stream gates so a quiet peer is concealed too. SetPeerShownInReplay hides the
-        // skater AND the board (its component park/append halves are no-ops here -- proxies are
-        // never registered with the replay manager).
-        {
+        // ---- the local player is in replay playback: the editor is their own instance. Every
+        // peer is concealed but stays live underneath -- except a SYNCED one, who is revealed and
+        // driven from their TRANSFERRED history at the scrub position. The live stream only
+        // BUFFERS either way (Push keeps running in OnPacket); it resumes the moment playback
+        // ends. Runs before the stream gates so a quiet peer is concealed too.
+        if (game::LocalReplayMode() == 2) {
             void* actor = s.proxy.actor();
-            if (game::LocalReplayMode() == 2) {
-                if (actor && s.replayConcealedActor != actor) {
+            // the menu set the wish; the request is stamped HERE so it shares Frame's clock epoch
+            // with g_playbackEnteredUs (one clock per subtraction)
+            if (actor && s.syncOn && !s.syncReqSentUs &&
+                replaysync::PeerSyncState(s.peerIdx, nullptr) == replaysync::SyncState::None) {
+                if (replaysync::RequestSync(s.peerIdx, nowUs)) s.syncReqSentUs = nowUs;
+            }
+            bool syncDriven = false;
+            if (actor && s.syncOn && s.syncReqSentUs &&
+                replaysync::PeerSyncState(s.peerIdx, nullptr) == replaysync::SyncState::Ready) {
+                float cur = 0, total = 0;
+                const uint64_t newest = replaysync::BufferNewestUs(s.peerIdx);
+                if (newest && game::ReplayPlayTime(&cur, &total) &&
+                    s.syncReqSentUs >= g_playbackEnteredUs) {
+                    // Map the scrub position onto their history. Our timeline's END is the moment
+                    // playback was entered; their buffer's NEWEST is the moment we asked for it.
+                    // Both offsets are receiver-clock durations, applied to their owner-clock
+                    // timestamps -- clock RATE drift over a 90 s window is ppm-level noise.
+                    const uint64_t back = (s.syncReqSentUs - g_playbackEnteredUs)
+                                        + (uint64_t)((double)(total - cur) * 1e6);
+                    repl::State rs;
+                    if (replaysync::SampleAt(s.peerIdx, newest > back ? newest - back : 0, rs)) {
+                        // their history replays VISUALS only: no sounds, no ragdoll trigger, and
+                        // never the scrubbing flag (that is a live-routing signal)
+                        rs.nLoops = 0; rs.nEvents = 0; rs.bailing = 0; rs.replaying = 0;
+                        s.proxy.SetNearLocal(false);      // the board STAMPS at the replayed pose
+                        s.proxy.Apply(rs, nowMs, nowUs, g_logf);
+                        syncDriven = true;
+                    }
+                }
+            }
+            if (actor) {
+                if (!syncDriven && s.replayConcealedActor != actor) {
                     game::spectate::SetPeerShownInReplay(actor, false, g_logf);
                     s.replayConcealedActor = actor;
-                }
-            } else if (s.replayConcealedActor) {
-                if (actor == s.replayConcealedActor)   // a dead actor needs (and can take) no unhide
+                } else if (syncDriven && s.replayConcealedActor == actor) {
                     game::spectate::SetPeerShownInReplay(actor, true, g_logf);
-                s.replayConcealedActor = nullptr;
+                    s.replayConcealedActor = nullptr;
+                }
+                alive++;
             }
+            continue;
+        }
+        if (s.replayConcealedActor) {                   // playback ended: reveal
+            if (s.proxy.actor() == s.replayConcealedActor)
+                game::spectate::SetPeerShownInReplay(s.replayConcealedActor, true, g_logf);
+            s.replayConcealedActor = nullptr;
         }
 
         repl::State out;
@@ -556,16 +662,6 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
         // keep us paying for a pose lane nobody is watching.
         s.peerReplaying = out.replaying != 0;
         if (out.replaying) anyPeerReplaying = true;
-
-        // The replay editor shows RECORDINGS, and nothing else: while the local player is in
-        // playback, the replay system is the only author of every proxy, and applying live state on
-        // top is the two-writer fight that makes recorded peers thrash. The live lane only BUFFERS
-        // here (Push in OnPacket keeps running); it resumes from the stream head the moment playback
-        // ends. A live view of peers belongs to a future spectate mode, outside the replay editor.
-        if (game::Proxy::Tuning().recordPeers && game::LocalReplayMode() == 2) {
-            if (s.proxy.actor()) alive++;
-            continue;
-        }
 
         if (!s.proxy.actor()) {
             // Spawn needs a world handle, which only our own pawn provides.

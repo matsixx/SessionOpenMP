@@ -189,6 +189,12 @@ struct State {
 int  Pack(const State& s, uint64_t senderUs, uint8_t* out, int cap);                 // -> bytes or 0
 bool Unpack(const uint8_t* data, int len, State& out, uint64_t* senderUs);
 
+// Interpolate two states at alpha t in [0,1]: positions and quats blend, whitelisted continuous anim
+// floats blend, and every bool/enum/rotator/state byte steps from `a`. This is the EXACT math
+// Stream::Sample renders live peers with, extracted so replay playback of a transferred state
+// history (replaysync) looks identical to live replication. t <= 0 copies `a`.
+void InterpStates(const State& a, const State& b, float t, State& out);
+
 // ============================ COSMETICS ==============================================================
 // A player's whole look: the game's FSkaterInstance reduced to what can legally travel. Item identity
 // is a NAME (FName indices are per-process, so only the string can travel), plus the two small ints

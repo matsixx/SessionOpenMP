@@ -46,18 +46,19 @@ struct ProxyTuning {
                                           // and ResetRagDoll on the falling edge to recover
     // ---- SCALING. What N players cost is dominated by the game simulating N real skaters; these
     // two shed the cost where it cannot be seen or felt.
-    bool  offscreenAnimThrottle = true;   // proxy meshes get AlwaysTickPose -- ONLY while peers are
-                                          // NOT being recorded into the replay (see the recordPeers
-                                          // gate at the write). Visibility-gating proxy anim is
-                                          // fundamentally incompatible with recordPeers: value 3
-                                          // froze the graph (replay tracks froze in stretches), and
-                                          // value 1 still skips bone EVALUATION while unrendered --
-                                          // the recording captures the evaluated pose, so a peer
-                                          // whose window/camera never rendered them records as a
-                                          // frozen standing skater (their board, unthrottled,
-                                          // replays fine -- the exact field symptom). Dead while
-                                          // recordPeers is on; armed for a future non-recording
-                                          // spectate mode.
+    bool  offscreenAnimThrottle = true;   // proxy skater meshes get OnlyTickPoseWhenRendered: a
+                                          // peer not on screen (shadows count) skips anim update
+                                          // AND evaluation, the largest per-proxy CPU cost, and is
+                                          // current again the frame they re-enter view. ONLY legal
+                                          // because peers are OUT of the replay system (recordPeers
+                                          // gate at the write): the game's recorder captured the
+                                          // EVALUATED pose, so any visibility gating froze recorded
+                                          // stretches -- field-confirmed at BOTH option values (3
+                                          // froze the graph, 1 still skipped evaluation; the
+                                          // unthrottled board replaying fine was the tell). Replay
+                                          // sync renders from transferred wire states and never
+                                          // reads this client's anim instance, so it cannot see
+                                          // the frozen graph either.
     float boardSimMaxDistM = 25.0f;       // beyond this the peer's board stops SIMULATING and is
                                           // stamped instead: collision response only matters at
                                           // contact range, and by the time you can reach a board it

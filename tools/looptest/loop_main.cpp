@@ -17,6 +17,7 @@
 // audio-event and push-transition gates below. Run it with any argument for per-second clock
 // internals on the clean profile.
 #include "../../src/replication/replication.h"
+#include "../../src/replication/replaysync.h"
 #include "../../src/replication/anim_fields.h"
 #include <cstdio>
 #include <cstring>
@@ -830,6 +831,89 @@ static bool animLerpCheck() {
     return ok;
 }
 
+
+// ==== REPLAY SYNC TRANSFER =========================================================================
+// The whole protocol, offline: an "owner" ring of packed snapshots is requested by a "requester"
+// over a loopback send that DROPS a deterministic slice of chunks; the NAK loop must recover, the
+// blob must validate, and SampleAt must reproduce the original states exactly at their own
+// timestamps and interpolate between them. Fails loudly at each stage.
+static int  g_syncDropMod = 7;                  // every 7th chunk is dropped on first send
+static int  g_syncChunksSeen = 0;
+static bool g_syncLoopback = true;
+static void syncLoopSend(int peerIdx, const void* data, int len, bool) {
+    if (!g_syncLoopback) return;
+    // Chunks are type 3 at byte 4; drop a deterministic slice on FIRST delivery only. Resends are
+    // recognizable because the drop counter keeps advancing -- every index eventually gets through.
+    const uint8_t* d = (const uint8_t*)data;
+    if (len > 4 && d[4] == 3) {
+        g_syncChunksSeen++;
+        if (g_syncDropMod > 0 && (g_syncChunksSeen % g_syncDropMod) == 0) return;   // lost
+    }
+    // deliver to the OTHER end: both ends live in this process, peer index is just echoed back
+    omp::replaysync::OnPacket(peerIdx, d, len, 0, nullptr);
+}
+
+static bool syncTransferCheck() {
+    using namespace omp::replaysync;
+    SetSendFn(&syncLoopSend);
+    // ---- the owner's ring: 600 packed snapshots at 60 Hz, deck X = the snapshot index
+    State src{}; src.deckQuat[3] = src.bodyQuat[3] = 1; src.bodyPosOk = 1;
+    uint8_t pkt[1024];
+    const int N = 600;
+    for (int i = 0; i < N; i++) {
+        src.deckPos[0] = (float)i;
+        src.bodyPos[0] = (float)i * 2;
+        const uint64_t us = 1000000ull + (uint64_t)i * 16667;
+        const int n = Pack(src, us, pkt, sizeof(pkt));
+        if (n <= 0) { printf("  sync: Pack failed at %d\n", i); return false; }
+        RecordOwn(pkt, n, us);
+    }
+    // ---- request as "peer 3" and pump both ends until Ready (Tick paces chunks + NAKs)
+    g_syncChunksSeen = 0;
+    if (!RequestSync(3, 5000000ull)) { printf("  sync: RequestSync refused\n"); return false; }
+    uint64_t us = 5000000ull;
+    SyncState st = SyncState::None;
+    for (int it = 0; it < 20000; it++) {
+        Tick(us, nullptr);
+        us += 16000;
+        st = PeerSyncState(3, nullptr);
+        if (st == SyncState::Ready || st == SyncState::Failed) break;
+    }
+    if (st != SyncState::Ready) {
+        printf("  sync: transfer never completed (state %d, %d chunk sends)\n", (int)st, g_syncChunksSeen);
+        return false;
+    }
+    // ---- exact reproduction at an entry's own timestamp, interpolation between entries
+    const uint64_t oldest = BufferOldestUs(3), newest = BufferNewestUs(3);
+    if (!(oldest == 1000000ull && newest == 1000000ull + (uint64_t)(N - 1) * 16667)) {
+        printf("  sync: window wrong (%llu..%llu)\n",
+               (unsigned long long)oldest, (unsigned long long)newest);
+        return false;
+    }
+    State out{};
+    if (!SampleAt(3, 1000000ull + 100 * 16667, out) || out.deckPos[0] != 100.f) {
+        printf("  sync: exact sample wrong (deckX %.3f, want 100)\n", (double)out.deckPos[0]);
+        return false;
+    }
+    if (!SampleAt(3, 1000000ull + 100 * 16667 + 8333, out) ||
+        out.deckPos[0] < 100.4f || out.deckPos[0] > 100.6f ||
+        out.bodyPos[0] < 200.8f || out.bodyPos[0] > 201.2f) {
+        printf("  sync: midpoint sample wrong (deckX %.3f want ~100.5, bodyX %.3f want ~201)\n",
+               (double)out.deckPos[0], (double)out.bodyPos[0]);
+        return false;
+    }
+    // clamped ends: before the window holds the oldest state
+    if (!SampleAt(3, 0, out) || out.deckPos[0] != 0.f) {
+        printf("  sync: pre-window clamp wrong (deckX %.3f, want 0)\n", (double)out.deckPos[0]);
+        return false;
+    }
+    DropAll();
+    SetSendFn(nullptr);
+    printf("  sync transfer: %d chunk sends incl. drops+resends, window+exact+lerp+clamp  PASS\n",
+           g_syncChunksSeen);
+    return true;
+}
+
 int main(int argc, char**) {
     const bool dbg = argc > 1;                      // any arg = per-second clock internals, clean profile
     printf("SessionOpenMP replication loop test\n");
@@ -838,6 +922,7 @@ int main(int argc, char**) {
     if (!pushQueueCheck())  { printf("\nPUSH QUEUE FAIL\n");  return 1; }
     if (!extrapCoherenceCheck()) { printf("\nEXTRAP COHERENCE FAIL\n"); return 1; }
     if (!animLerpCheck()) { printf("\nANIM LERP FAIL\n"); return 1; }
+    if (!syncTransferCheck()) { printf("\nSYNC TRANSFER FAIL\n"); return 1; }
     printf("%-13s %8s %8s %8s %6s %7s %7s %7s %7s\n",
            "profile", "outEwma", "outMax", "delay", "alpha", "starve", "resync", "extrap", "verdict");
     bool allPass = true;

@@ -351,6 +351,10 @@ bool DisablePause(void (*logf)(const char*));
 // diagnostics -- there is no other cheap way to ask "am I scrubbing?".
 void    SetLocalReplayMode(uint8_t mode);
 uint8_t LocalReplayMode();
+// The replay playhead in seconds (CurrentPlayTime / TotalPlayTime off the live manager's active
+// instance). False when the manager or instance is not up. Timeline END (cur == total) is the
+// moment playback was entered; the session maps that to peers' transferred history windows.
+bool ReplayPlayTime(float* cur, float* total);
 uint8_t LastLiveReplayMode();               // the most recent non-playback mode (default 1)
 // The game's own per-skater replay-mode transition, via the loader's trampoline. Used to RESTORE a
 // proxy the playback machinery touched -- its mesh's GlobalAnimRateScale is zeroed while its
@@ -524,6 +528,11 @@ namespace off {
     // guard now reads it at call time and passes the entry only when the attach can succeed.
     constexpr int kSkaterReplayAttachA = 0xa68;
     constexpr int kSkaterReplayAttachB = 0xa50;
+    // AReplayManager (PDB): the active instance data pointer, and on it the playhead in SECONDS.
+    // The scrub clock for replay sync -- no keyframe index math, the game keeps the float for us.
+    constexpr int kReplayMgrActiveInst = 0x278;   // FReplayManagerInstanceData*
+    constexpr int kReplayInstCurTime   = 0x8d4;   // CurrentPlayTime  (float, seconds into the timeline)
+    constexpr int kReplayInstTotalTime = 0x8dc;   // TotalPlayTime    (float, timeline length)
     // USkinnedMeshComponent::VisibilityBasedAnimTickOption (PDB +0x604). 3 = OnlyTickPoseWhenRendered:
     // an unrendered mesh skips anim update+evaluation entirely, which is where a proxy's per-frame
     // cost lives. bRecentlyRendered includes the shadow passes, so a peer whose shadow you can see

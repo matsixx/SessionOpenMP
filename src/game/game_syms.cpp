@@ -591,6 +591,30 @@ static uint8_t g_lastLiveReplayMode = 1;    // what "live" is on this build; eve
                                             // mode the local skater reports refreshes it
 void    SetLocalReplayMode(uint8_t m) { g_localReplayMode = m; if (m != 2) g_lastLiveReplayMode = m; }
 uint8_t LocalReplayMode() { return g_localReplayMode; }
+
+// The scrub clock: CurrentPlayTime/TotalPlayTime in seconds off the live manager's active instance
+// data. Pure reads under SEH -- the manager getter and both pointers are game-owned and may be down
+// during loads.
+bool ReplayPlayTime(float* cur, float* total) {
+    const Syms& S = Get();
+    if (!S.ReplayMgrInstance) return false;
+#ifdef _WIN32
+    __try {
+        void* mgr = S.ReplayMgrInstance();
+        if (!mgr) return false;
+        void* inst = *(void**)((uint8_t*)mgr + off::kReplayMgrActiveInst);
+        if (!inst) return false;
+        const float c = *(const float*)((uint8_t*)inst + off::kReplayInstCurTime);
+        const float t = *(const float*)((uint8_t*)inst + off::kReplayInstTotalTime);
+        if (!(c >= 0.f && c < 1e6f) || !(t > 0.f && t < 1e6f)) return false;
+        if (cur) *cur = c;
+        if (total) *total = t;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+#else
+    return false;
+#endif
+}
 uint8_t LastLiveReplayMode() { return g_lastLiveReplayMode; }
 
 // The loader owns the MinHook trampoline for ASkaterCharacterBase's replay-mode handler; it registers

@@ -774,6 +774,62 @@ void Stream::Push(const State& s, uint64_t senderUs, uint64_t localUs) {
     st_.pushed++; st_.netJitMs = jitPeakMs_; st_.gapAvgMs = gapAvgMs_;   // report what steers the floor
 }
 
+// The shared snapshot interpolator -- the body Stream::Sample used to inline. See the header note:
+// live replication and replay playback of a transferred history must render identically, so there is
+// exactly one copy of this math.
+void InterpStates(const State& a, const State& b, float t, State& out) {
+    out = a;
+    if (t > 0) {
+        lerp3(a.deckPos, b.deckPos, t, out.deckPos);
+        qLerp(a.deckQuat, b.deckQuat, t, out.deckQuat);
+        if (a.meshOk && b.meshOk) qLerp(a.meshQuat, b.meshQuat, t, out.meshQuat);
+        if (a.bodyRotOk && b.bodyRotOk) {
+            qLerp(a.bodyQuat, b.bodyQuat, t, out.bodyQuat);   // hemisphere-safe; the euler fields
+            out.bodyYaw   = wrapLerpDeg(a.bodyYaw, b.bodyYaw, t);          // below are debug-only
+            out.bodyPitch = a.bodyPitch + (b.bodyPitch - a.bodyPitch) * t;
+            out.bodyRoll  = a.bodyRoll  + (b.bodyRoll  - a.bodyRoll)  * t;
+        }
+        if (a.bodyPosOk && b.bodyPosOk) lerp3(a.bodyPos, b.bodyPos, t, out.bodyPos);
+        if (a.relOk && b.relOk)         lerp3(a.relPos,  b.relPos,  t, out.relPos);
+        if (a.feetOk && b.feetOk && a.feetWorld == b.feetWorld) {
+            lerp3(a.lFootPos, b.lFootPos, t, out.lFootPos);
+            lerp3(a.rFootPos, b.rFootPos, t, out.rFootPos);
+            // rotators STEP (out = a already): rotLerp routes through the quatToRot/rotToQuat pair,
+            // which is NOT self-inverse. A stepped 60 Hz rotator is correct by construction.
+        }
+        if (a.handOk && b.handOk && a.handWorld == b.handWorld) {
+            lerp3(a.lHandPos, b.lHandPos, t, out.lHandPos);
+            lerp3(a.rHandPos, b.rHandPos, t, out.rHandPos);
+            // rotators STEP (out = a already), for the same reason as the feet above: rotLerp routes
+            // through the quatToRot/rotToQuat pair, which is NOT self-inverse and flips the pose at
+            // the poles. No euler round-trip on an interpolation path, ever.
+        }
+        if (a.artOk && b.artOk) {
+            qLerp(a.truckB, b.truckB, t, out.truckB);
+            qLerp(a.truckF, b.truckF, t, out.truckF);
+            if (a.artOk >= 2 && b.artOk >= 2) qLerp(a.wheelBL, b.wheelBL, t, out.wheelBL);
+        }
+        // The pose blob: whitelisted continuous floats blend between the bracketing snapshots; every
+        // bool/enum/state byte comes from `a` unblended, which copying `a` already did.
+        // Unequal lengths = the sender changed mid-stream (build boundary); step, never mis-align.
+        // Unaligned float access is fine on x64, which is what the 1/4/12-byte field packing implies.
+        if (a.animLen && a.animLen == b.animLen) {
+            int n = 0;
+            for (int i = 0; i < AnimFieldCount(); i++) {
+                const AnimField& f = AnimFieldAt(i);
+                if (n + f.size > (int)a.animLen) break;
+                if (AnimFieldSmoothed(f.off, f.size)) {
+                    const float* fa = (const float*)(a.anim + n);
+                    const float* fb = (const float*)(b.anim + n);
+                    float* fo = (float*)(out.anim + n);
+                    for (int c = 0; c < f.size / 4; c++) fo[c] = fa[c] + (fb[c] - fa[c]) * t;
+                }
+                n += f.size;
+            }
+        }
+    }
+}
+
 bool Stream::Sample(uint64_t localUs, State& out) {
     if (count_ < 2) return false;
     int64_t dt = lastLocalUs_ ? (int64_t)(localUs - lastLocalUs_) : 0;
@@ -859,58 +915,10 @@ bool Stream::Sample(uint64_t localUs, State& out) {
     st_.alpha = t;
     st_.leadMs = (float)((double)((int64_t)newest.t - (int64_t)playUs_) / 1000.0);
 
-    // Interpolate. `out` starts as *A, so every field that is not blended is the at-render-time value
-    // -- exactly the stepped-not-blended rule for bools, enums and the anim blob.
-    out = A->s;
-    if (B && t > 0) {
-        lerp3(A->s.deckPos, B->s.deckPos, t, out.deckPos);
-        qLerp(A->s.deckQuat, B->s.deckQuat, t, out.deckQuat);
-        if (A->s.meshOk && B->s.meshOk) qLerp(A->s.meshQuat, B->s.meshQuat, t, out.meshQuat);
-        if (A->s.bodyRotOk && B->s.bodyRotOk) {
-            qLerp(A->s.bodyQuat, B->s.bodyQuat, t, out.bodyQuat);   // hemisphere-safe; the euler fields
-            out.bodyYaw   = wrapLerpDeg(A->s.bodyYaw, B->s.bodyYaw, t);        // below are debug-only
-            out.bodyPitch = A->s.bodyPitch + (B->s.bodyPitch - A->s.bodyPitch) * t;
-            out.bodyRoll  = A->s.bodyRoll  + (B->s.bodyRoll  - A->s.bodyRoll)  * t;
-        }
-        if (A->s.bodyPosOk && B->s.bodyPosOk) lerp3(A->s.bodyPos, B->s.bodyPos, t, out.bodyPos);
-        if (A->s.relOk && B->s.relOk)         lerp3(A->s.relPos,  B->s.relPos,  t, out.relPos);
-        if (A->s.feetOk && B->s.feetOk && A->s.feetWorld == B->s.feetWorld) {
-            lerp3(A->s.lFootPos, B->s.lFootPos, t, out.lFootPos);
-            lerp3(A->s.rFootPos, B->s.rFootPos, t, out.rFootPos);
-            // rotators STEP (out = A already): rotLerp routes through the quatToRot/rotToQuat pair,
-            // which is NOT self-inverse. A stepped 60 Hz rotator is correct by construction.
-        }
-        if (A->s.handOk && B->s.handOk && A->s.handWorld == B->s.handWorld) {
-            lerp3(A->s.lHandPos, B->s.lHandPos, t, out.lHandPos);
-            lerp3(A->s.rHandPos, B->s.rHandPos, t, out.rHandPos);
-            // rotators STEP (out = A already), for the same reason as the feet above: rotLerp routes
-            // through the quatToRot/rotToQuat pair, which is NOT self-inverse and flips the pose at
-            // the poles. No euler round-trip on an interpolation path, ever.
-        }
-        if (A->s.artOk && B->s.artOk) {
-            qLerp(A->s.truckB, B->s.truckB, t, out.truckB);
-            qLerp(A->s.truckF, B->s.truckF, t, out.truckF);
-            if (A->s.artOk >= 2 && B->s.artOk >= 2) qLerp(A->s.wheelBL, B->s.wheelBL, t, out.wheelBL);
-        }
-        // The pose blob: whitelisted continuous floats blend between the bracketing snapshots; every
-        // bool/enum/state byte comes from A unblended, which copying A already did.
-        // Unequal lengths = the sender changed mid-stream (build boundary); step, never mis-align.
-        // Unaligned float access is fine on x64, which is what the 1/4/12-byte field packing implies.
-        if (A->s.animLen && A->s.animLen == B->s.animLen) {
-            int n = 0;
-            for (int i = 0; i < AnimFieldCount(); i++) {
-                const AnimField& f = AnimFieldAt(i);
-                if (n + f.size > (int)A->s.animLen) break;
-                if (AnimFieldSmoothed(f.off, f.size)) {
-                    const float* fa = (const float*)(A->s.anim + n);
-                    const float* fb = (const float*)(B->s.anim + n);
-                    float* fo = (float*)(out.anim + n);
-                    for (int c = 0; c < f.size / 4; c++) fo[c] = fa[c] + (fb[c] - fa[c]) * t;
-                }
-                n += f.size;
-            }
-        }
-    }
+    // Interpolate -- via the shared helper so replay playback (replaysync) renders with the exact
+    // same math. `out` starts as *A inside it, so every field that is not blended is the
+    // at-render-time value: the stepped-not-blended rule for bools, enums and the anim blob.
+    InterpStates(A->s, B ? B->s : A->s, B ? t : 0.f, out);
     // Starved -> project POSITION ONLY along the velocity implied by the two newest samples, bounded in
     // time and distance. Pose is never guessed, and the deck and the body get the SAME displacement or
     // the board slides out of the rider's hands.

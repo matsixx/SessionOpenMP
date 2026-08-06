@@ -52,7 +52,7 @@ add_custom_command(TARGET omp_ping POST_BUILD
             "${EOS_SDK}/Bin/EOSSDK-Win64-Shipping.dll" "$<TARGET_FILE_DIR:omp_ping>")
 
 # M2: the replication core -- game-free, judged by omp_looptest before any game loads it.
-add_library(omp_replication STATIC src/replication/replication.cpp)
+add_library(omp_replication STATIC src/replication/replication.cpp src/replication/replaysync.cpp)
 target_include_directories(omp_replication PUBLIC src)
 
 add_executable(omp_looptest tools/looptest/loop_main.cpp)
@@ -109,6 +109,7 @@ if(EXISTS "${UE4SS_LIB}")
         src/transport/shm_transport.cpp
         src/transport/udp_transport.cpp
         src/replication/replication.cpp
+        src/replication/replaysync.cpp
         src/game/game_syms.cpp
         src/game/proxy.cpp
         src/game/gather.cpp
