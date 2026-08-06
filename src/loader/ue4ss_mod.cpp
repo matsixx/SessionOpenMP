@@ -918,6 +918,23 @@ static void hkSkaterReplayMode(void* skater, uint8_t mode) {
     bool isProxy = false;
     __try { isProxy = game::IsProxyActor(skater); } __except (EXCEPTION_EXECUTE_HANDLER) { isProxy = false; }
     if (isProxy) {
+        // ENTERING playback stays blocked for every proxy -- the handler's AttachToComponent nulls
+        // are the original hard crash, and a live-viewed proxy has no business in the playback state.
+        // LEAVING must pass through for a proxy whose view was RECORDED: its components were
+        // playback-driven, and this broadcast is the game's own "return to live" -- eating it leaves
+        // the peer's animation parked in replay state after the editor closes, which is exactly the
+        // stuck-drivers symptom it caused. The view flag is read at broadcast time, before the
+        // frame-edge reset clears it.
+        if (mode != 2) {
+            bool viewRec = false;
+            __try { viewRec = session::PeerViewRecorded(skater); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { viewRec = false; }
+            if (viewRec) {
+                logLine("[mod] replay-exit restore passed through to a recorded-view proxy");
+                o_SkaterReplayMode(skater, mode);
+                return;
+            }
+        }
         static long announced = 0;
         if (InterlockedIncrement(&announced) <= 3)
             logLine("[mod] replay mode change IGNORED for a proxy (it is not part of your replay)");

@@ -407,7 +407,12 @@ void AnimPostApply(void* ai) {
 // Together these say WHY proxies go un-driven during a replay -- the fact the pose lane was built on
 // but never root-caused. Read-only; writes nothing.
 void ReplayDriverProbe(uint64_t nowMs, void (*logf)(const char*)) {
-    if (!logf || LocalReplayMode() != 2) return;
+    if (!logf) return;
+    // Also runs for a few seconds AFTER playback ends: whether the anim update comes back for
+    // proxies at exit is exactly what a stuck-after-replay report needs the log to answer.
+    static uint64_t lastScrubMs = 0;
+    if (LocalReplayMode() == 2) lastScrubMs = nowMs;
+    else if (!lastScrubMs || nowMs - lastScrubMs > 5000) return;
     static uint64_t lastMs = 0;
     static uint32_t lastUpd = 0;
     if (nowMs - lastMs < 1000) return;
@@ -429,9 +434,9 @@ void ReplayDriverProbe(uint64_t nowMs, void (*logf)(const char*)) {
     }
     char m[180];
     snprintf(m, sizeof(m),
-             "[rprobe] scrubbing: proxy animUpd/s=%u meshFlags=0x%02x animRate=%.2f "
+             "[rprobe] %s: proxy animUpd/s=%u meshFlags=0x%02x animRate=%.2f "
              "(upd>0 = the graph still updates; flags/rate name the suppressor if it stops)",
-             updPerSec, (unsigned)(flags & 0xff), (double)rate);
+             LocalReplayMode() == 2 ? "scrubbing" : "post-exit", updPerSec, (unsigned)(flags & 0xff), (double)rate);
     logf(m);
 }
 
