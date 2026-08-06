@@ -523,6 +523,11 @@ namespace off {
     // guard now reads it at call time and passes the entry only when the attach can succeed.
     constexpr int kSkaterReplayAttachA = 0xa68;
     constexpr int kSkaterReplayAttachB = 0xa50;
+    // USkinnedMeshComponent::VisibilityBasedAnimTickOption (PDB +0x604). 3 = OnlyTickPoseWhenRendered:
+    // an unrendered mesh skips anim update+evaluation entirely, which is where a proxy's per-frame
+    // cost lives. bRecentlyRendered includes the shadow passes, so a peer whose shadow you can see
+    // still animates.
+    constexpr int kMeshAnimTickOption = 0x604;
     constexpr int kMeshAnimFlagsByte  = 0x8c1;
     constexpr int kMeshGlobalAnimRate = 0x8b0;
     // ---- TYPE IDENTITY. All three read out of the PDB, not inferred:

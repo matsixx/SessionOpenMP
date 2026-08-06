@@ -213,6 +213,7 @@ void Proxy::Forget() {
     for (auto& l : audioLoops_) { l.slot = 0; l.comp = nullptr; }
     actor_ = nullptr; world_ = nullptr; tries_ = 0; lastTryMs_ = 0;
     refreshed_ = repOff_ = boardRepOff_ = tickOff_ = boardHidden_ = simOn_ = boardLogged_ = false;
+    nearLocal_ = true; animThrottled_ = false;
     lastBailing_ = 0;
     // change-edge caches too: a REPLACEMENT actor must get every write again even when the wire value
     // never changed across the world change (a matching cache would skip its first def/state write).
@@ -837,9 +838,34 @@ void Proxy::Apply(const repl::State& s, uint64_t nowMs, uint64_t nowUs, void (*l
         // the mount), anything else = the normal split.
         const bool handHeld = (s.boardMode == off::kBoardModeInHand);
         const bool airborne = g_tun.driveGroundedOnly && (s.grounded == 0);
-        if (handHeld) { st_.carryStamps++; StampBoard(s); }
+        // A far peer's board is stamped, never simulated: collision response only matters at contact
+        // range, and the session's distance gate (with hysteresis) turns the sim back on before the
+        // local player can reach it. Fewer live rigid bodies, and the whole velocity-drive PhysX
+        // call chain skipped for everyone out of reach.
+        if (!nearLocal_) { if (simOn_) StopBoardSim(); StampBoard(s); }
+        else if (handHeld) { st_.carryStamps++; StampBoard(s); }
         else if (!g_tun.velocityDrive || airborne) { if (airborne) st_.airSkips++; StampBoard(s); }
         else if (!VelocityDrive(s, nowUs)) StampBoard(s);
+    }
+
+    // ---- offscreen anim throttle, once per actor. OnlyTickPoseWhenRendered (3): an unrendered
+    // proxy (shadow passes count as rendered) skips anim update and evaluation, the largest
+    // per-proxy CPU cost. Transported state keeps arriving and the driver stamp lives in the anim
+    // update itself, so the pose is current again the frame they re-enter view. One byte, engine's
+    // own mechanism, no per-frame cost.
+    if (g_tun.offscreenAnimThrottle && !animThrottled_) {
+        void* mesh = safePtr(actor_, off::kSkaterMesh);
+        if (mesh) {
+#ifdef _WIN32
+            __try {
+                *(uint8_t*)((uint8_t*)mesh + off::kMeshAnimTickOption) = 3;
+                animThrottled_ = true;
+                static bool said = false;
+                if (!said && logf) { said = true;
+                    logf("[proxy] offscreen anim throttle ON (OnlyTickPoseWhenRendered for proxy meshes)"); }
+            } __except (EXCEPTION_EXECUTE_HANDLER) { animThrottled_ = true; }
+#endif
+        }
     }
 
     // ---- board telemetry, 1 Hz: which path placed the board this second, the drive's error against

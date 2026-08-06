@@ -59,6 +59,9 @@ struct Slot {
     // Hidden from the LOCAL player's replay: their components are parked and the actor concealed
     // while playback runs. Reset when playback ends -- the next replay starts with everyone shown.
     bool        replayHidden = false;
+    // Within board-sim range of the local player (hysteresis lives here, where the distance is
+    // measured). Starts near so a board simulates until proven far.
+    bool        boardNear = true;
 };
 
 // Unsigned timestamps must never be subtracted raw: a sample stamped slightly in the future (clock
@@ -110,7 +113,7 @@ static Slot* slotFor(int peerIdx, uint64_t nowUs) {
         s.used = true; s.peerIdx = peerIdx; s.lastPacketUs = nowUs; s.quietHandled = false;
         memset(&s.cosmetics, 0, sizeof(s.cosmetics));   // padding too -- it is memcmp'd for changes
         s.haveCosmetics = false; s.wornForActor = nullptr; s.peerReplaying = false;
-        s.replayHidden = false;
+        s.replayHidden = false; s.boardNear = true;
         g_cosResend = true;                          // they need OUR look too, now rather than in 10 s
         if (g_logf) { char m[120]; snprintf(m, sizeof(m), "[session] stream opened for peer %d", peerIdx); g_logf(m); }
         return &s;
@@ -509,6 +512,21 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
         }
         repl::State out;
         if (!s.stream.Sample(nowUs, out)) continue;    // fewer than 2 snapshots: nothing to show yet
+
+        // The board-sim distance gate. Both positions are in the same world frame: ours from the
+        // last gathered own state, theirs from the interpolated stream. Hysteresis so the boundary
+        // cannot flap the sim; unknown positions keep the last verdict rather than guessing.
+        if (g_haveOwn && g_ownLast.bodyPosOk && out.bodyPosOk) {
+            const float dx = out.bodyPos[0] - g_ownLast.bodyPos[0];
+            const float dy = out.bodyPos[1] - g_ownLast.bodyPos[1];
+            const float dz = out.bodyPos[2] - g_ownLast.bodyPos[2];
+            const float d2 = dx*dx + dy*dy + dz*dz;
+            const float inCm  = game::Proxy::Tuning().boardSimMaxDistM * 100.f;
+            const float outCm = inCm + game::Proxy::Tuning().boardSimHystM * 100.f;
+            if (s.boardNear) { if (d2 > outCm * outCm) s.boardNear = false; }
+            else             { if (d2 < inCm  * inCm)  s.boardNear = true;  }
+        }
+        s.proxy.SetNearLocal(s.boardNear);
         // This peer is in the replay editor, so their machine will not evaluate OUR skeleton -- they
         // need results, not drivers. Latched per frame and read by pose::Capture on the way out. Only
         // peers we are actually driving count: a quiet or departed peer's last known flag must not

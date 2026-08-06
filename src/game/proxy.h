@@ -44,6 +44,18 @@ struct ProxyTuning {
                                           // query-collidable board at the dismount point.
     bool  bailSync        = true;         // owner's ragdoll edge -> execute Bail locally on the proxy,
                                           // and ResetRagDoll on the falling edge to recover
+    // ---- SCALING. What N players cost is dominated by the game simulating N real skaters; these
+    // two shed the cost where it cannot be seen or felt.
+    bool  offscreenAnimThrottle = true;   // proxy meshes get OnlyTickPoseWhenRendered: a peer you
+                                          // cannot see (shadow included) skips anim update+eval,
+                                          // the largest per-proxy CPU cost. Their transported state
+                                          // keeps arriving, so the pose is current again the frame
+                                          // they re-enter view.
+    float boardSimMaxDistM = 25.0f;       // beyond this the peer's board stops SIMULATING and is
+                                          // stamped instead: collision response only matters at
+                                          // contact range, and by the time you can reach a board it
+                                          // is simulating again.
+    float boardSimHystM    = 5.0f;        // re-enter band, so the boundary cannot flap sim on/off
     // Record peers into the local replay. Their replay components self-register at BeginPlay (a
     // proxy is a real skater); with this on they are left registered, so the game records everyone
     // and a replay scrubs through the whole session, not just you. The fight that used to make a
@@ -99,6 +111,9 @@ public:
 
     void*      actor() const { return actor_; }
     ProxyStats stats() const { return st_; }
+    // Written by the session each frame from the distance between the LOCAL player and this peer
+    // (with hysteresis). Far = the board is stamped, never simulated.
+    void       SetNearLocal(bool near) { nearLocal_ = near; }
     static ProxyTuning& Tuning();
 
     // ---- visuals handshake with the cosmetics layer -------------------------------------------------
@@ -129,6 +144,8 @@ private:
     int        tries_ = 0;
     bool       refreshed_ = false, repOff_ = false, boardRepOff_ = false, tickOff_ = false;
     bool       boardHidden_ = false, simOn_ = false, boardLogged_ = false;
+    bool       nearLocal_ = true;         // default near: sim until the session has measured
+    bool       animThrottled_ = false;    // the tick-option write happens once per actor
     uint8_t    lastPushState_ = 0, lastBrakeState_ = 0, lastBailing_ = 0;
     char       lastTrickName_[48] = {}, lastGrindName_[48] = {};
     void*      trickDef_ = nullptr;       // the RESOLVED trick def on OUR side
