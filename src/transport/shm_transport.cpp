@@ -39,8 +39,13 @@ namespace omp { namespace shmb {
 
 static const int      kSlots   = 16;
 static const int      kMaxMsg  = 1024;               // > our packet (State ~= 470 B) with room to grow
-static const int      kRelRing = 8;                  // reliable messages in flight per sender
-static const char*    kMapName = "Local\\SessionOpenMP_Mailbox_v2";   // v2: + the reliable ring
+static const int      kRelRing = 64;                 // reliable messages in flight per sender. Sized
+                                                     // for the replay-sync bulk transfer: its chunk
+                                                     // burst is capped at kRelRing/2 per tick (see
+                                                     // SendBudget), so one frame's burst can never
+                                                     // lap a reader that drains every poll. The old
+                                                     // 8 lost the transfer's header EVERY frame.
+static const char*    kMapName = "Local\\SessionOpenMP_Mailbox_v3";   // v3: kRelRing 8 -> 64
 
 // WHY THERE ARE TWO CHANNELS.
 // The mailbox is LATEST-WINS by design: for 60 Hz pose snapshots you want the newest one and nothing

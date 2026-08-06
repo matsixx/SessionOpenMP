@@ -38,6 +38,10 @@ namespace omp { namespace replaysync {
 // How the module sends. Wired by the session to transport Send; wired by tests to a loopback.
 using SendFn = void (*)(int peerIdx, const void* data, int len, bool reliable);
 void SetSendFn(SendFn fn);
+// The wire's per-Tick reliable-message budget (transport SendBudget()), refreshed by the session
+// each frame; chunk bursts are capped at min(this, Tuning::chunksPerTick). 0 = unknown = no cap
+// beyond the tuning (tests).
+void SetChunkBudget(int budget);
 
 // True if this buffer carries a replay-sync packet (magic peek; route before the snapshot path).
 bool IsSyncPacket(const uint8_t* data, int len);

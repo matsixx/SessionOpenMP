@@ -58,6 +58,11 @@ const char* MyId();                          // Eos: PUID string. Shm: "shm:<slo
 int         AddPeer(const char* puidStr);    // -> peer index, or -1 (Shm: peers are discovered, not added)
 int         PeerCount();                     // peer indices are [0, PeerCount) and are NEVER reused
 void        Send(int peerIdx, const void* data, int len, bool reliable);
+// How many RELIABLE messages this wire can absorb per Tick without loss -- the backpressure hint
+// for bulk senders (replay sync paces its chunk bursts by it). Shm: half its reliable ring, so one
+// burst can never lap a reader that drains every poll; EOS/UDP: the SDK/socket queues buffer far
+// more, capped to keep bursts polite. Numbers, not identities: the seam's rule holds.
+int         SendBudget();
 void        Tick(RecvFn onRecv, void* user); // platform tick + receive drain; call every ~10 ms
 bool        GetStats(int peerIdx, PeerStats* out);
 void        Log(const char* fmt, ...);

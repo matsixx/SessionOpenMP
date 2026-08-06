@@ -26,6 +26,8 @@ Tuning& Tune() { return g_tun; }
 
 static SendFn g_send = nullptr;
 void SetSendFn(SendFn fn) { g_send = fn; }
+static int g_budget = 0;
+void SetChunkBudget(int budget) { g_budget = budget; }
 
 bool IsSyncPacket(const uint8_t* d, int len) {
     if (!d || len < 5) return false;
@@ -103,6 +105,8 @@ struct OutXfer {
     uint32_t sweep = 0;                              // first pass cursor
     uint16_t resendQ[kResendCap]; int rHead = 0, rCount = 0;
     uint64_t lastActUs = 0;
+    uint64_t lastHdrUs = 0;                          // periodic HDR re-sends until the requester speaks
+    bool     heardBack = false;                      // a NAK arrived: the HDR landed, stop repeating it
 };
 static OutXfer g_out[kOutMax];
 
@@ -129,9 +133,15 @@ static void sendChunk(OutXfer& x, uint16_t idx) {
 }
 
 static void beginOutgoing(int peerIdx, uint32_t reqId, uint64_t nowUs, void (*logf)(const char*)) {
-    // one transfer per requesting peer; a repeat REQ (their retry) restarts cleanly
+    // A repeat REQ with the SAME id is the requester saying "I never saw your header" -- re-send
+    // the header, keep the transfer exactly where it is. Only a NEW id (a fresh toggle) rebuilds.
+    // The old restart-on-every-REQ turned the requester's 3 s retry into a permanent reset loop
+    // whenever the header kept getting lost.
+    for (auto& o : g_out) if (o.active && o.peerIdx == peerIdx) {
+        if (o.reqId == reqId) { sendHdr(o); o.lastHdrUs = nowUs; o.lastActUs = nowUs; return; }
+        outFree(o);
+    }
     OutXfer* x = nullptr;
-    for (auto& o : g_out) if (o.active && o.peerIdx == peerIdx) { outFree(o); }
     for (auto& o : g_out) if (!o.active) { x = &o; break; }
     if (!x || g_ownCount < 2) return;                // nothing worth sending
     uint32_t total = 0;
@@ -149,6 +159,7 @@ static void beginOutgoing(int peerIdx, uint32_t reqId, uint64_t nowUs, void (*lo
     x->chunkCount = (uint16_t)((w + kChunkData - 1) / kChunkData);
     x->oldestUs = ownAt(0).us; x->newestUs = ownAt(g_ownCount - 1).us;
     x->sweep = 0; x->rHead = x->rCount = 0; x->lastActUs = nowUs;
+    x->lastHdrUs = nowUs; x->heardBack = false;
     sendHdr(*x);
     if (logf) { char m[160];
         snprintf(m, sizeof(m), "[sync] peer %d requested our replay history -- sending %u KB"
@@ -292,7 +303,7 @@ void OnPacket(int peerIdx, const uint8_t* d, int len, uint64_t nowUs, void (*log
                 const uint16_t idx = rU16(d + 11 + i * 2);
                 if (idx < o.chunkCount) { o.resendQ[(o.rHead + o.rCount) % kResendCap] = idx; o.rCount++; }
             }
-            o.lastActUs = nowUs;
+            o.lastActUs = nowUs; o.heardBack = true;   // they have the header: NAKs name chunks
         }
         break;
     }
@@ -345,7 +356,13 @@ void Tick(uint64_t nowUs, void (*logf)(const char*)) {
     // ---- pace outgoing chunks: resends first (they are the requester's actual holes), then the sweep
     for (auto& o : g_out) {
         if (!o.active) continue;
+        // Until the requester has spoken (a NAK proves the header landed), repeat the header every
+        // ~500 ms: the header shares the reliable channel with the chunk burst, and on a lossy or
+        // ring-buffered wire the FIRST copy is the likeliest casualty.
+        if (!o.heardBack && nowUs - o.lastHdrUs > 500000ull) { sendHdr(o); o.lastHdrUs = nowUs; }
         int budget = g_tun.chunksPerTick;
+        if (g_budget > 0 && budget > g_budget) budget = g_budget;
+        if (!o.heardBack && budget > 1) budget -= 1;   // leave room for the repeated header
         while (budget > 0 && o.rCount > 0) {
             sendChunk(o, o.resendQ[o.rHead]); o.rHead = (o.rHead + 1) % kResendCap; o.rCount--; budget--;
         }

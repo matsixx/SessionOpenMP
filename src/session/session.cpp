@@ -374,6 +374,7 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
     // ---- replay sync: pump the transfer machine, and anchor the playback-entry moment. A sync
     // window is single-playback-session: leaving the editor drops every transferred buffer and
     // clears the toggles -- re-entering starts fresh (the histories would be stale anyway).
+    replaysync::SetChunkBudget(SendBudget());
     replaysync::Tick(nowUs, g_logf);
     {
         static uint8_t lastRm = 0;

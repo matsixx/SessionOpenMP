@@ -81,6 +81,15 @@ bool Init(Backend which, const char* logPath, bool forceRelays) {
     return ok;
 }
 
+int SendBudget() {
+    switch (Current()) {
+    case BK_SHM: return 32;    // = shm's kRelRing/2 (v3) -- keep in step with shm_transport.cpp
+    case BK_EOS: return 64;
+    case BK_UDP: return 32;
+    default:     return 8;
+    }
+}
+
 Backend Current() { return g_cur; }
 
 // Free the seam for a different backend. See the header for the shm-full-teardown / EOS-resident
