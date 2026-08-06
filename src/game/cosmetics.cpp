@@ -62,6 +62,10 @@ static bool mapOpen(void* map, MapWalk& w) {
         w.numBits = *(int32_t*)((uint8_t*)map + 0x28);
         void* sec = *(void**)((uint8_t*)map + 0x20);
         w.bits    = (const uint32_t*)(sec ? sec : ((uint8_t*)map + 0x10));
+        // An EMPTY map is VALID, and its data pointer is legitimately null -- a PRO skater's clothing
+        // map is exactly this, and rejecting it as unreadable is what kept a pro user's client from
+        // ever reaching the insert pass (every peer in underwear). Zero elements walk as a no-op.
+        if (w.num == 0) { w.numBits = 0; return true; }
         // Sanity: a plausible map or nothing. Bad numbers mean the layout belief is wrong, and the
         // caller logs that rather than walking into the weeds.
         if (!w.data || w.num < 0 || w.num > 4096 || w.numBits < w.num) return false;
@@ -477,6 +481,10 @@ static bool readMapInto(void* map, repl::CosmeticItem* dst, int cap, uint8_t& co
             it.variant = *(int32_t*)(e + kElemValue + 0x0c);
         } __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
         fnameToString(e + kElemValue, it.name, sizeof(it.name));   // ItemName is the value's first field
+        // A cleared slot (empty ItemName) is not a worn item -- receivers already treat it as
+        // absent, and a dress restore leaves cleared keys behind, which would otherwise flap the
+        // own-look change detector forever (an extra "item" appearing after every dress).
+        if (!it.name[0]) continue;
         // the attributes that decide how it LOOKS live on the inventory instance, not the profile
         readInstanceAttribs(instanceFor(ownPawn, e + kElemValue, it.inst), it, logf);
         dst[count++] = it;
