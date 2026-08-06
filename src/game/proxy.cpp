@@ -411,17 +411,16 @@ void ReplayDriverProbe(uint64_t nowMs, void (*logf)(const char*)) {
     lastMs = nowMs; lastUpd = upd;
 
     int flags = -1; float rate = -1.f;
-    for (auto& sl : g_animSlots) {
-        if (!sl.owner) continue;
-        void* mesh = safePtr(sl.owner, off::kSkaterMesh);
-        if (!mesh) continue;
+    // The pose slots track proxy meshes directly and are refreshed every frame, so that pointer is
+    // the reliable one; the anim-slot owner's mesh read proved flaky in the field.
+    void* mesh = pose::FirstProxyMesh();
+    if (mesh) {
 #ifdef _WIN32
         __try {
             flags = *(uint8_t*)((uint8_t*)mesh + off::kMeshAnimFlagsByte);
             rate  = *(float*)((uint8_t*)mesh + off::kMeshGlobalAnimRate);
         } __except (EXCEPTION_EXECUTE_HANDLER) { flags = -1; rate = -1.f; }
 #endif
-        break;
     }
     char m[180];
     snprintf(m, sizeof(m),

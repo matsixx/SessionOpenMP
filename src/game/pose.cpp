@@ -11,7 +11,8 @@
 // loads into. See LICENSE-EXCEPTION.txt.
 #include "pose.h"
 #include "game_syms.h"
-#include "../session/session.h"     // AnyPeerReplaying: who a pose is being served TO
+#include "../session/session.h"
+#include "../debug.h"
 #include <cstring>
 #include <cstdio>
 #ifdef _WIN32
@@ -136,6 +137,11 @@ static Slot* slotFor(void* mesh) {
     for (auto& sl : g_slots) if (sl.mesh == mesh) return &sl;
     return nullptr;
 }
+// The first mesh any slot tracks, for diagnostics that need "a live proxy mesh" and nothing more.
+void* FirstProxyMesh() {
+    for (auto& sl : g_slots) if (sl.mesh) return sl.mesh;
+    return nullptr;
+}
 void Note(void* mesh, const State& s, uint64_t nowMs) {
     if (!g_tun.enabled || !mesh) return;
     if (!s.poseN) {
@@ -189,6 +195,9 @@ void OnFinalizeBones(void* mesh, uint64_t nowMs) {
         sl->mesh = mesh; sl->n = 0; sl->freshMs = 0; sl->holdN = 0;
     }
     g_st.hookCalls++;
+    // Measurement round: adopt the slot (the probe reads flags off its mesh) but write NOTHING --
+    // no stamp, no hold. What renders is the graph's own evaluation, which is the question.
+    if (debug::Get().replayDriverTest) return;
 #ifdef _WIN32
     int num = 0;
     uint8_t* cs = compSpace(mesh, /*editable*/ true, &num);

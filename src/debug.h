@@ -31,6 +31,13 @@ struct Flags {
     // One-time dump of each game menu page's key, item count and item keys, as the page is built.
     // How you find the key of a page you want to add a row to.
     bool menuPages        = false;
+    // MEASUREMENT ROUND: expose what a proxy's own anim graph produces during a local replay.
+    // On the sender it stops unicasting results to scrubbing peers (drivers keep flowing); on the
+    // scrubber it disables the pose stamp AND the hold, so the skeleton shows the graph's raw output.
+    // The [rprobe] line proved the graph still UPDATES at 60/s while scrubbing; this answers whether
+    // its EVALUATION is usable. If a peer skates live under this flag, the driver lane works in
+    // replay and the pose lane can shrink to the sender side only. Both clients need it on.
+    bool replayDriverTest = false;
 };
 
 // Header-only: one shared instance across every translation unit that includes this.

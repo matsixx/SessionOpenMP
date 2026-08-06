@@ -85,5 +85,7 @@ void Forget(void* mesh);
 // Called from the FinalizeBoneTransform pre-hook for EVERY skeletal mesh in the game; cheap and
 // silent unless the mesh is a proxy we have a fresh pose for.
 void OnFinalizeBones(void* mesh, uint64_t nowMs);
+// A live proxy mesh for diagnostics, or null. The pose slots track meshes directly.
+void* FirstProxyMesh();
 
 }}} // namespace omp::game::pose

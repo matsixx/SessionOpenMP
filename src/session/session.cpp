@@ -370,7 +370,7 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
             // and there is nothing to split. If the pose capture fails, the driver packet goes to
             // everyone -- a scrubbing peer seeing stale drivers beats seeing nothing.
             uint8_t posePkt[1024]; int pn = 0;
-            if (!own.poseN && game::pose::Tune().serveScrubbingPeers) {
+            if (!own.poseN && game::pose::Tune().serveScrubbingPeers && !debug::Get().replayDriverTest) {
                 bool anyScrub = false;
                 for (auto& sl : g_slots) if (sl.used && sl.peerReplaying) { anyScrub = true; break; }
                 if (anyScrub) {
