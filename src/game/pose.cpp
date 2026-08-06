@@ -69,17 +69,8 @@ static uint8_t* compSpace(void*, bool, int*) { return nullptr; }
 // =====================================================================================================
 // SENDER
 // =====================================================================================================
-bool Capture(void* mesh, State& s) {
-    s.poseN = 0;
-    if (!g_tun.enabled || !mesh) return false;
-    // TWO reasons to send the skeleton, and they are mirror images (replication.h has the argument):
-    //   * The LOCAL player is scrubbing -- the drivers are inert, so the pose is all there is.
-    //   * A PEER is scrubbing -- their machine will not evaluate our skeleton at all while the replay
-    //     is up, so however live and correct our drivers are, they cannot be turned into a pose over
-    //     there. A transported pose still can be.
-    const bool weScrub   = (LocalReplayMode() == g_tun.captureMode);
-    const bool theyScrub = g_tun.serveScrubbingPeers && session::AnyPeerReplaying();
-    if (!weScrub && !theyScrub) return false;                    // live skating uses the driver path
+// The copy itself, no gate: both public entry points funnel here.
+static bool captureInto(void* mesh, State& s) {
 #ifdef _WIN32
     int num = 0;
     // READ buffer here: the sender samples from outside the animation pipeline (the engine-tick
@@ -108,6 +99,34 @@ bool Capture(void* mesh, State& s) {
 #else
     return false;
 #endif
+}
+
+bool Capture(void* mesh, State& s) {
+    s.poseN = 0;
+    if (!g_tun.enabled || !mesh) return false;
+    // ONLY while the LOCAL player is scrubbing. Their drivers are inert (0/97 fields moving), so the
+    // pose is all there is, and every receiver must get it.
+    //
+    // The mirror case -- a PEER is scrubbing, and their machine cannot evaluate our drivers -- is NOT
+    // handled here any more, because this state is the one broadcast to everyone: pose-ifying it
+    // meant one player opening the replay editor put every OTHER player on stepped 30 Hz skeletons
+    // with no foot IK and no extrapolation, and any packet hiccup rendered as a driverless anim
+    // graph instead of a clean freeze. The session now builds a SEPARATE results packet and unicasts
+    // it to the scrubbing peers alone (CaptureFromPawn below); everyone else keeps drivers.
+    if (LocalReplayMode() != g_tun.captureMode) return false;
+    return captureInto(mesh, s);
+}
+
+bool CaptureFromPawn(void* pawn, State& s) {
+    s.poseN = 0;
+    if (!g_tun.enabled || !pawn) return false;
+    void* mesh = nullptr;
+#ifdef _WIN32
+    __try { mesh = *(void**)((uint8_t*)pawn + off::kSkaterMesh); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+#endif
+    if (!mesh) return false;
+    return captureInto(mesh, s);
 }
 
 // =====================================================================================================

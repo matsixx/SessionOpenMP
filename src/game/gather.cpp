@@ -415,8 +415,9 @@ bool GatherOwnState(void* pawn, repl::State& out) {
     // ---- tell peers this machine is scrubbing, so they send RESULTS: their drivers cannot be turned
     // into a pose on a machine whose replay editor is up. Costs no bytes (f2 bit 4).
     out.replaying = (LocalReplayMode() == 2);
-    // ---- if the driver blob is inert (replay playback), send the SKELETON instead. Also fires while
-    // a PEER scrubs, for the mirror-image reason.
+    // ---- if the driver blob is inert (replay playback), send the SKELETON instead. Fires only while
+    // the LOCAL player scrubs; a scrubbing PEER is served by a separate unicast packet built in the
+    // session's publish loop, so everyone else keeps drivers.
     // Deliberately last: Capture clears animLen/feetOk, which only makes sense once they are sampled.
     pose::Capture(mesh, out);
     return out.bodyPosOk != 0;

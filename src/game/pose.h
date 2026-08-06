@@ -53,9 +53,9 @@ struct Tuning {
     // puddle. (A peer sending us their pose while WE scrub is the mirror of `captureMode` and needs a
     // wire change.)
     bool holdInLocalReplay = true;
-    // Also capture while a PEER is scrubbing, so they see us skating live instead of the frozen pose
-    // the hold above gives them. Costs a pose lane (and the driver blob, which does not fit alongside
-    // it) for as long as somebody has the replay editor open.
+    // Serve results to a PEER who is scrubbing, so they see us skating live instead of a frozen pose.
+    // The session builds that as a SEPARATE packet and unicasts it to the scrubbing peers alone --
+    // everyone else keeps the driver lane, so one player's replay session costs nobody else anything.
     bool serveScrubbingPeers = true;
 };
 Tuning& Tune();
@@ -71,8 +71,13 @@ struct Stats {
 Stats GetStats();
 
 // ---- sender: fill s.poseN/poseRot/posePos from this mesh's finished pose. Returns false (and leaves
-// the pose empty) whenever the driver path should be used instead.
+// the pose empty) whenever the driver path should be used instead. Fires ONLY while the local player
+// is scrubbing -- that state is broadcast to everyone, and everyone needs the pose then.
 bool Capture(void* mesh, repl::State& s);
+// Ungated capture off the pawn, for the packet the session unicasts to a SCRUBBING peer alone. Their
+// replay editor cannot evaluate our drivers, so they get results -- while everyone else keeps the
+// driver lane and never pays for somebody else's replay session.
+bool CaptureFromPawn(void* pawn, repl::State& s);
 
 // ---- receiver: remember a proxy's transported pose, keyed by the mesh that must wear it.
 void Note(void* mesh, const repl::State& s, uint64_t nowMs);

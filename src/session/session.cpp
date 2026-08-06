@@ -16,6 +16,7 @@
 #include "../game/game_syms.h"
 #include "../game/cosmetics.h"
 #include "../game/audio.h"
+#include "../game/pose.h"
 #include <cstring>
 #include <cstdio>
 
@@ -50,6 +51,10 @@ struct Slot {
     bool        rejectedSpoken = false;
     // Said once per peer per world: the map gate is evaluated every frame.
     bool        mapSkipSpoken = false;
+    // This peer has the replay editor open (their latest sampled snapshot says so). Drives the
+    // per-peer packet choice in the publish loop: a scrubbing peer gets RESULTS, everyone else
+    // keeps DRIVERS. Latched from the stream, so a quiet peer keeps their last known state.
+    bool        peerReplaying = false;
 };
 
 // Unsigned timestamps must never be subtracted raw: a sample stamped slightly in the future (clock
@@ -100,7 +105,7 @@ static Slot* slotFor(int peerIdx, uint64_t nowUs) {
         s.stream.Reset(); s.proxy.Forget();          // nothing carries across to a new peer
         s.used = true; s.peerIdx = peerIdx; s.lastPacketUs = nowUs; s.quietHandled = false;
         memset(&s.cosmetics, 0, sizeof(s.cosmetics));   // padding too -- it is memcmp'd for changes
-        s.haveCosmetics = false; s.wornForActor = nullptr;
+        s.haveCosmetics = false; s.wornForActor = nullptr; s.peerReplaying = false;
         g_cosResend = true;                          // they need OUR look too, now rather than in 10 s
         if (g_logf) { char m[120]; snprintf(m, sizeof(m), "[session] stream opened for peer %d", peerIdx); g_logf(m); }
         return &s;
@@ -357,10 +362,33 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
                                            // Audio rides the snapshot and is sized LAST, so a full
                                            // frame drops trailing sounds, never pose.
             const int n = repl::Pack(own, nowUs, pkt, sizeof(pkt));
+            // A peer with the replay editor open cannot evaluate our drivers -- their anim graph is
+            // not running a skater. They get a RESULTS packet (the finished skeleton), built once per
+            // publish and unicast to scrubbing peers alone. Everyone else keeps the driver packet,
+            // so one player's replay session no longer degrades what every other player sees.
+            // If WE are scrubbing, `own` already IS the results packet (pose::Capture in the gather)
+            // and there is nothing to split. If the pose capture fails, the driver packet goes to
+            // everyone -- a scrubbing peer seeing stale drivers beats seeing nothing.
+            uint8_t posePkt[1024]; int pn = 0;
+            if (!own.poseN && game::pose::Tune().serveScrubbingPeers) {
+                bool anyScrub = false;
+                for (auto& sl : g_slots) if (sl.used && sl.peerReplaying) { anyScrub = true; break; }
+                if (anyScrub) {
+                    repl::State posed = own;
+                    if (game::pose::CaptureFromPawn(ownPawn, posed))
+                        pn = repl::Pack(posed, nowUs, posePkt, sizeof(posePkt));
+                }
+            }
             if (n > 0) {
                 PeerStats ps;
-                for (int i = 0; i < nPeers; i++)
-                    if (GetStats(i, &ps) && ps.state != 5) Send(i, pkt, n, false);
+                for (int i = 0; i < nPeers; i++) {
+                    if (!GetStats(i, &ps) || ps.state == 5) continue;
+                    const uint8_t* d = pkt; int dn = n;
+                    if (pn > 0)
+                        for (auto& sl : g_slots)
+                            if (sl.used && sl.peerIdx == i && sl.peerReplaying) { d = posePkt; dn = pn; break; }
+                    Send(i, d, dn, false);
+                }
                 g_st.published++;
                 // PHASE-ACCUMULATE the publish clock. `last = now`, sampled at the caller's
                 // granularity, aliases against the period; accumulating keeps the true cadence. A
@@ -453,6 +481,7 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
         // need results, not drivers. Latched per frame and read by pose::Capture on the way out. Only
         // peers we are actually driving count: a quiet or departed peer's last known flag must not
         // keep us paying for a pose lane nobody is watching.
+        s.peerReplaying = out.replaying != 0;
         if (out.replaying) anyPeerReplaying = true;
 
         if (!s.proxy.actor()) {
