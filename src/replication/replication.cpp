@@ -59,7 +59,9 @@ namespace omp { namespace repl {
 //   OMPG -> cosmetics: sender map name
 //   OMPH -> chat
 //   OMPI -> PushSpeedMultiplier (a peer on an older build animates every push at 1.0x, silently)
-static const uint32_t kMagic = 0x49504D4Fu; // "OMPI"
+//   OMPJ -> CLAIMED by the replay-sync transfer protocol (replaysync.cpp) -- never a snapshot value
+//   OMPK -> board brokenState byte (a peer's board break/repair renders on their proxy)
+static const uint32_t kMagic = 0x4B504D4Fu; // "OMPK"
 
 static bool finite3(const float* v, float lim) {
     for (int i = 0; i < 3; i++) if (!(v[i] > -lim && v[i] < lim)) return false;   // rejects NaN/Inf too
@@ -241,6 +243,7 @@ int Pack(const State& s, uint64_t senderUs, uint8_t* out, int cap) {
                      | (s.handOk ? 32 : 0) | (s.handWorld ? 64 : 0));
     w.u8(f1); w.u8(f2);
     w.u8(s.pushFlags); w.u8(s.pushState); w.u8(s.brakeState); w.u8(s.boardMode);
+    w.u8(s.brokenState);
     // PushSpeedMultiplier. h16 is plenty: it is a small animation-rate multiplier around 1.0, and the
     // clamp is what keeps a garbage read from driving the proxy's push animation to an absurd rate.
     w.h16(clampf(s.pushSpeed, 8.f));
@@ -384,6 +387,7 @@ bool Unpack(const uint8_t* d, int len, State& out, uint64_t* senderUs) {
     const bool grind = (f2 & 8) != 0;
     out.replaying = (f2 & 16) != 0;    // "I am scrubbing" -- see the pose lane in the header
     out.pushFlags = r.u8(); out.pushState = r.u8(); out.brakeState = r.u8(); out.boardMode = r.u8();
+    out.brokenState = r.u8();
     out.pushSpeed = r.h16();
     // A push rate of 0 would FREEZE the animation and a negative would run it backwards -- neither is
     // a thing the sender can be in, so a decode that produces one is corruption, not a slow push.

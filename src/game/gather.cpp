@@ -129,6 +129,10 @@ bool GatherOwnState(void* pawn, repl::State& out) {
         // where the value lives, not the value the consumers actually read.
         { const int bm = BoardMovementMode(bd);
           out.boardMode = (bm >= 0) ? (uint8_t)bm : 0; }
+        // The broken-state byte, raw. 0 = intact; unreadable defaults to intact (a wrong "broken"
+        // would break every peer's view of this board, a wrong "intact" just misses a break).
+        { const int bs = rdByte(bd, off::kBoardBrokenState);
+          out.brokenState = (bs > 0) ? (uint8_t)bs : 0; }
         void* deck = rdPtr(bd, off::kBoardFlipper);          // the deck you can SEE
         if (!deck) deck = rdPtr(bd, off::kBoardTruckBack);
         if (!deck) deck = rdPtr(bd, off::kActorRootComp);

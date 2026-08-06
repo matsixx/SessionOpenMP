@@ -207,6 +207,12 @@ static const SigEntry kSigs[] = {
     { "ProjectToScreen",      "48 89 5C 24 10 48 89 6C 24 18 56 57 41 56 48 81 EC 20 01 00 00 48 8B 99 98 02 00 00 41 0F B6 F1 49 8B E8 48 8B FA", false },
     // APlayerController::GetViewportSize                           Epic 0x2ecd8a0 / Steam 0x2e90380
     { "GetViewportSize",      "48 89 5C 24 10 48 89 74 24 18 57 48 83 EC 20 33 C0 49 8B F8 89 02 48 8B F2 41 89 00 48 8B 99 98 02 00 00", false },
+    // --- BOARD BREAKAGE. Both optional: without them a peer's break simply does not show.
+    // ASkateboardEx::BreakBoard_Internal  Epic 0xf81580 / Steam 0xf41390 (sigmake)
+    { "BreakBoardInternal",   "48 89 5C 24 18 88 54 24 10 55 56 57 41 54 41 55 41 56 41 57 48 8D 6C 24 D9 48 81 EC C0 00 00 00 41 0F B6 F8 0F B6 F2 4C 8B F1", false },
+    // ASkateboardEx::RebuildBrokenBoard   Epic 0xf965b0 / Steam 0xf563c0 (sigmake): keeps the
+    // _currentBrokenBoardState displacement 0x3f1 concrete -- it IS the identity of the gate it opens with.
+    { "RebuildBrokenBoard",   "44 88 44 24 18 88 54 24 10 48 89 4C 24 08 55 41 54 41 57 48 8D 6C 24 B9 48 81 EC B0 00 00 00 80 B9 F1 03 00 00 00 45 0F B6 E0", false },
 };
 static const int kSigN = (int)(sizeof(kSigs) / sizeof(kSigs[0]));
 
@@ -496,6 +502,8 @@ const Syms& Resolve(void (*logf)(const char*)) {
     // `found[i++]`, so the positional run continues here and the table stays append-only.
     g_syms.ProjectToScreen    = (ProjectToScreenFn) found[i++];
     g_syms.GetViewportSize    = (ViewportSizeFn)    found[i++];
+    g_syms.BreakBoardInternal = (BreakBoardIntFn)   found[i++];
+    g_syms.RebuildBrokenBoard = (RebuildBoardFn)    found[i++];
 
     // LOCKSTEP CHECK. The block above is POSITIONAL, and a table entry added without its assignment --
     // or vice versa -- shifts every later symbol onto the wrong address SILENTLY: sigs still resolve

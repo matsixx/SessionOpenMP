@@ -91,6 +91,9 @@ static bool codecCheck() {
     strcpy_s(s.grindName, "GRIND_BS_5050_Regular_Long");
     s.grindPitch = -3.875f; s.grindYaw = 271.25f;
     s.boardMode = 9;
+    // Broken state deliberately NOT 0 (the intact default and every failure path's fallback) and NOT
+    // 1 (the only value the game currently sends) -- the byte must travel value-preserving.
+    s.brokenState = 2;
     // anim blob: field-table-shaped, adversarial values -- zeros, ratios, a big magnitude that MUST
     // escape to f32, negatives, and byte fields.
     { int off = 0, i = 0;
@@ -170,6 +173,7 @@ static bool codecCheck() {
     near1(o.grindPitch, s.grindPitch, 0.01f, "grindPitch");
     near1(o.grindYaw,   s.grindYaw,   0.25f, "grindYaw");     // f16 at ~271: quantum ~0.25
     if (o.boardMode != 9) { printf("  codec: boardMode %d\n", o.boardMode); bad++; }
+    if (o.brokenState != 2) { printf("  codec: brokenState %d\n", o.brokenState); bad++; }
     if (o.crankDefOff != 3 || !o.crankOn) { printf("  codec: crank fields\n"); bad++; }
     near1(o.crankPocket, s.crankPocket, 0.001f, "crankPocket");
     if (o.pushFlags != 0x40 || o.pushState != 3 || o.brakeState != 2) { printf("  codec: push/brake\n"); bad++; }

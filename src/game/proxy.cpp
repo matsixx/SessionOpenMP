@@ -215,6 +215,7 @@ void Proxy::Forget() {
     refreshed_ = repOff_ = boardRepOff_ = tickOff_ = boardHidden_ = simOn_ = boardLogged_ = false;
     nearLocal_ = true; animThrottled_ = false;
     lastBailing_ = 0;
+    lastBroken_ = 0;
     // change-edge caches too: a REPLACEMENT actor must get every write again even when the wire value
     // never changed across the world change (a matching cache would skip its first def/state write).
     lastPushState_ = lastBrakeState_ = 0; lastCrankOn_ = 0; lastCrankIdx_ = 0xfffe;
@@ -504,6 +505,19 @@ void Proxy::Apply(const repl::State& s, uint64_t nowMs, uint64_t nowUs, void (*l
         } __except (EXCEPTION_EXECUTE_HANDLER) {}
 #endif
     }
+    // ---- 3.4 break veto, the same shape one actor over: a proxy board must not DECIDE to break.
+    //          CanBreakBoard fails while _breakBoardRequested is set, so holding it closes the gate
+    //          for the board's own landing/grind break rolls without a hook. The transported break
+    //          (step 3.6) calls BreakBoardInternal, which bypasses the gate -- and clears this byte
+    //          at entry, which is why the hold re-asserts every Apply rather than being set once.
+    if (g_tun.vetoBreak && bd) {
+#ifdef _WIN32
+        __try {
+            uint8_t* br = (uint8_t*)bd + off::kBoardBreakRequested;
+            if (*br == 0) { *br = 1; st_.breakVetoes++; }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+#endif
+    }
     // ---- 3.5 BAIL SYNC. The owner's ragdoll bit (+0x710 bit 0x02) is on the wire; on its RISING edge
     //          the proxy EXECUTES the game's own Bail -- its local ragdoll sim plays the flop (each
     //          client is authoritative for itself; the exact pose is not worth transporting), while
@@ -514,7 +528,12 @@ void Proxy::Apply(const repl::State& s, uint64_t nowMs, uint64_t nowUs, void (*l
     //          bail deciders; _canBail is lifted for exactly the one triggered call. The trigger needs
     //          the board link up -- the small Bail overload's location fallback derefs skater+0x568 --
     //          and a missed edge just means no flop, never a retry storm: the latch advances regardless.
-    if (g_tun.bailSync && (s.bailing ? 1 : 0) != lastBailing_) {
+    // Both edge machines hold still during local replay playback: Apply then only runs for
+    // SYNC-DRIVEN proxies, whose states are HISTORICAL -- acting on a scrubbed transition would
+    // ragdoll/repair the live actor mid-scrub, and advancing a latch would fire the inverse edge on
+    // exit. Leave the latches untouched; the live stream re-applies cleanly when playback ends.
+    const bool historicalState = (LocalReplayMode() == 2);
+    if (g_tun.bailSync && !historicalState && (s.bailing ? 1 : 0) != lastBailing_) {
         lastBailing_ = s.bailing ? 1 : 0;
         if (s.bailing) {
             if (S.Bail && bd) {
@@ -543,6 +562,50 @@ void Proxy::Apply(const repl::State& s, uint64_t nowMs, uint64_t nowUs, void (*l
             }
             if (logf) logf("[proxy] bail END -> ResetRagDoll");
         }
+    }
+    // ---- 3.6 BOARD-BREAK SYNC. The owner's _currentBrokenBoardState byte is on the wire; this is a
+    //          STATE latch-compare, not an edge -- a peer already broken when their proxy (or its
+    //          board) appears must render broken with no transition ever seen. The whole step,
+    //          LATCH INCLUDED, sits inside the board link: boards link a frame-or-a-minute after the
+    //          skater, and advancing the latch against a null board would eat the one transition
+    //          there was. Rising: BreakBoardInternal -- the pure visual half. NOT the public
+    //          BreakBoard: its CanBreakBoard gate lets the VIEWER's own gameplay setting veto a
+    //          peer's transported break, it re-plays the crack (already transported by the audio
+    //          funnel), and it writes the LOCAL save. Its embedded Bail is inert here (the _canBail
+    //          hold); the owner's real bail rides bailSync. Falling: RebuildBrokenBoard(1, 0), the
+    //          repair input action's own args; it gates on actually-broken itself. The latch
+    //          advances whether or not the call succeeded -- a missed break is a cosmetic miss, a
+    //          retry storm is a fault machine.
+    if (g_tun.breakSync && bd && !historicalState && s.brokenState != lastBroken_) {
+        lastBroken_ = s.brokenState;
+#ifdef _WIN32
+        if (s.brokenState) {
+            if (S.BreakBoardInternal) {
+                __try {
+                    S.BreakBoardInternal(bd, s.brokenState, 0);
+                    st_.breaks++;
+                    if (logf) {
+                        char m[96];
+                        snprintf(m, sizeof(m), "[proxy] BOARD BREAK (owner state %u)",
+                                 (unsigned)s.brokenState);
+                        logf(m);
+                    }
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    if (logf) logf("[proxy] BreakBoardInternal FAULTED (suppressed)");
+                }
+            } else if (logf) logf("[proxy] owner broke their board but no BreakBoardInternal sym -- skipped");
+        } else {
+            if (S.RebuildBrokenBoard) {
+                __try {
+                    S.RebuildBrokenBoard(bd, 1, 0);
+                    st_.repairs++;
+                    if (logf) logf("[proxy] board REPAIR (owner state 0)");
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    if (logf) logf("[proxy] RebuildBrokenBoard FAULTED (suppressed)");
+                }
+            } else if (logf) logf("[proxy] owner repaired their board but no RebuildBrokenBoard sym -- skipped");
+        }
+#endif
     }
     // There is deliberately no step that drives the proxy's on/off-board MODE: nothing in the overlay
     // reads the proxy's bOnBoard -- the off-board LOOK is the anim blob, and the board is step 7.
@@ -882,10 +945,10 @@ void Proxy::Apply(const repl::State& s, uint64_t nowMs, uint64_t nowUs, void (*l
             char m[220];
             snprintf(m, sizeof(m),
                      "[proxy] board err=%.0fcm driven=%u snaps=%u stamps(air)=%u carry=%u stops=%u sim=%d"
-                     " onBoard=%d grounded=%d bail=%d mode=%d rej=%u",
+                     " onBoard=%d grounded=%d bail=%d mode=%d broken=%d rej=%u",
                      st_.driveErrCm, st_.driven, st_.snaps, st_.airSkips, st_.carryStamps, st_.stops,
                      (int)simOn_, (int)(s.onBoard != 0), (int)(s.grounded != 0), (int)(s.bailing != 0),
-                     (int)s.boardMode, TypeRejects());
+                     (int)s.boardMode, (int)s.brokenState, TypeRejects());
             logf(m);
         }
     }

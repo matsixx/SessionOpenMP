@@ -44,6 +44,10 @@ struct ProxyTuning {
                                           // query-collidable board at the dismount point.
     bool  bailSync        = true;         // owner's ragdoll edge -> execute Bail locally on the proxy,
                                           // and ResetRagDoll on the falling edge to recover
+    bool  vetoBreak       = true;         // a proxy board must not DECIDE to break (hold
+                                          // _breakBoardRequested, which CanBreakBoard fails on)
+    bool  breakSync       = true;         // owner's brokenState byte -> BreakBoardInternal /
+                                          // RebuildBrokenBoard on the proxy's board (latch-compare)
     // ---- SCALING. What N players cost is dominated by the game simulating N real skaters; these
     // two shed the cost where it cannot be seen or felt.
     bool  offscreenAnimThrottle = true;   // proxy skater meshes get OnlyTickPoseWhenRendered: a
@@ -89,7 +93,8 @@ struct ProxyTuning {
 
 struct ProxyStats {
     uint32_t spawnTries = 0, spawnFails = 0, driven = 0, snaps = 0, airSkips = 0, carryStamps = 0,
-             stops = 0, bailVetoes = 0, bails = 0, pushes = 0;
+             stops = 0, bailVetoes = 0, bails = 0, pushes = 0, breakVetoes = 0, breaks = 0,
+             repairs = 0;
     float    driveErrCm = 0;
     bool     alive = false, boardOwned = false, onBoard = false;
 };
@@ -157,6 +162,9 @@ private:
     bool       nearLocal_ = true;         // default near: sim until the session has measured
     bool       animThrottled_ = false;    // the tick-option write happens once per actor
     uint8_t    lastPushState_ = 0, lastBrakeState_ = 0, lastBailing_ = 0;
+    uint8_t    lastBroken_ = 0;           // last APPLIED brokenState -- only advances with the board
+                                          // linked, so a break arriving before the board link still
+                                          // applies once the board is up
     char       lastTrickName_[48] = {}, lastGrindName_[48] = {};
     void*      trickDef_ = nullptr;       // the RESOLVED trick def on OUR side
     uint16_t   lastCrankIdx_ = 0xfffe;    // crank edge probes (0xfffe = "never seen", so the first

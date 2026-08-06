@@ -137,6 +137,11 @@ struct State {
     // the START of the mount while the board is still hand-carried for a beat -- driving the board
     // during that window chases the swinging hand, so mode 9 means stamp instead of drive.
     uint8_t  boardMode = 0;
+    // The board's _currentBrokenBoardState byte (0 = intact). A STATE, not an event: the receiver
+    // latch-compares and calls the game's own break/rebuild on change, so a peer already broken at
+    // proxy spawn renders broken with no edge ever seen. Travels value-preserving -- the game's own
+    // BreakBoard_Internal takes the value as its argument.
+    uint8_t  brokenState = 0;
     uint16_t animLen = 0; uint8_t anim[320] = {};
 
     // ==== AUDIO ======================================================================================

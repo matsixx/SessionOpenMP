@@ -62,6 +62,18 @@ using BoardSetLinVelFn  = void  (*)(void* board, const float* vel, bool addToCur
 // big 5-arg overload. In-game callers pass (&printfString, 1, 1).
 using BailFn            = void  (*)(void* skater, void* reasonFString, bool a, bool bRagdoll);
 using ResetRagDollFn    = void  (*)(void* skater);   // safe when not ragdolling (gates on +0x710 bit 2)
+// ASkateboardEx::BreakBoard_Internal: the pure visual/physics half of a board break -- swaps in the
+// broken meshes and stores `state` into _currentBrokenBoardState (+0x3f1). Called DIRECTLY on a proxy
+// board (the public BreakBoard is the wrong entry there: its CanBreakBoard gate lets the VIEWER's own
+// gameplay setting veto a peer's transported break, and it also plays the crack sound -- which already
+// arrives via the audio funnel -- and writes the local save). Self-guards world membership; clears
+// _breakBoardRequested (+0x783) at entry, so the proxy's veto hold re-asserts next Apply. Its embedded
+// Bail call is suppressed on proxies by the _canBail hold; the real bail is transported. The game
+// schedules it as (state, 0).
+using BreakBoardIntFn   = void  (*)(void* board, uint8_t state, uint8_t flag);
+// ASkateboardEx::RebuildBrokenBoard: the un-break -- restores the intact meshes and resets +0x3f1 to
+// 0. Gates on actually-broken itself. (1, 0) mirrors the player-facing repair input action's args.
+using RebuildBoardFn    = void  (*)(void* board, uint8_t a, uint8_t b);
 // USkaterAnimInstance::SaveFootToBoardTransition: saves the CURRENT pose into the transition buffer
 // (anim+0x5c0 FTransform array) the graph blends FROM during the on/off-board switch. The game calls
 // it from ApplyToggleOnBoard/DoBoardPickup -- input-driven gameplay code that never runs on a proxy,
@@ -218,6 +230,10 @@ struct Syms {
     // TRANSPORTED pose (the sender's own PlaceInHand output), not locally reproduced.
     BailFn           Bail              = nullptr;
     ResetRagDollFn   ResetRagDoll      = nullptr;
+    // The board-break pair, the bail pair's shape exactly: the owner's transported broken-state byte
+    // rises -> BreakBoardInternal on the proxy's board; falls -> RebuildBrokenBoard.
+    BreakBoardIntFn  BreakBoardInternal = nullptr;
+    RebuildBoardFn   RebuildBrokenBoard = nullptr;
     SaveFootTransFn  SaveFootTrans     = nullptr;   // see the typedef's comment
     SetWorldRotQFn   SetWorldRotQuat   = nullptr;
     IsLocallyCtrlFn  IsLocallyControlled = nullptr;
@@ -645,6 +661,17 @@ namespace off {
     constexpr int kSkInstVisualDef    = 0x08;    //   ::BaseVisualDefinition (USkaterVisualsDefinition*)
     constexpr int kSkInstProfile      = 0x10;    //   ::CustomizationProfile  (=> gi+0x400, what
                                                  //   RefreshVisuals was seen reading)
+    // The BASE BODY. The rebuild takes the definition from the ACTOR, not the instance:
+    // RefreshVisuals (Epic 0x1000590 @+0x156) passes skater+0x570 into BuildCharacterMesh_From-
+    // CustomizationProfile. A peer's definition NAME is resolved through the game instance's own
+    // _skaterDefinitions soft-pointer array -- its DECLARED element type (PDB:
+    // TArray<TSoftObjectPtr<USkaterVisualsDefinition>>) is the type gate a bare
+    // StaticFindObject(ANY_PACKAGE) can never provide, and TryLoad on the matching path both loads a
+    // never-resident pro/female body asset and proves it.
+    constexpr int kSkaterVisualDef    = 0x570;   // ASkaterCharacterBase::_skaterDefinition
+    constexpr int kGiDefaultVisualDef = 0x1d0;   // USessionGameInstance::_defaultVisualsDefinition
+    constexpr int kGiSkaterDefs       = 0x1d8;   // ::_skaterDefinitions TArray<TSoftObjectPtr<...>>
+                                                 // (data +0, Num +8; entry stride kSoftPtrSize)
     // UCustomizationItemDefinition + the mesh entries its rebuild resolves (PDB-exact).
     // A TSoftObjectPtr is {FWeakObjectPtr(8), int32 TagAtLastTest, pad, FSoftObjectPath(24)} = 40 B,
     // so the loadable PATH sits at +0x10 inside each of these and the cached weak pointer at +0x00.
@@ -748,6 +775,12 @@ namespace off {
     // (+0x4f0) -> actor root.
     constexpr int kBoardFlipper       = 0x4e8;   // ASkateboardEx::_flipper -- the deck you can SEE
     constexpr int kBoardTruckBack     = 0x4f0;   // ASkateboardEx::_truckBack -- first fallback
+    // Board breakage (PDB: pdbmembers ASkateboardEx). The state byte is what BreakBoard_Internal
+    // stores and RebuildBrokenBoard clears, so transporting it covers every break/repair path.
+    constexpr int kBoardBrokenState   = 0x3f1;   // ASkateboardEx::_currentBrokenBoardState (u8, 0=intact)
+    constexpr int kBoardBreakRequested= 0x783;   // ASkateboardEx::_breakBoardRequested -- CanBreakBoard
+                                                 // fails while set: held at 1 on proxy boards so they
+                                                 // can never DECIDE to break (the _canBail-hold shape)
     // vtable slots on UPrimitiveComponent (PDB: linear +0x610, angular 0x10 before it in 4 vtables)
     constexpr int kVtblSetLinearVel   = 0x610;
     constexpr int kVtblSetAngularVel  = 0x620;

@@ -132,6 +132,91 @@ static bool fnameOf(const char* name, void* out8) {
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
+// ---- the BASE BODY definition -----------------------------------------------------------------------
+// The ASSET-NAME TAIL of a soft path's FName ("/Game/Path/Package.AssetName" -> "AssetName"), cached by
+// FName value like fnameToString -- but with its OWN cache: fnameToString's 48-char entries would
+// truncate a long asset PATH, and the tail lives at the truncated end, so a cache hit there would
+// return a path whose tail is gone. Tails themselves are short, so caching only the tail is exact.
+static bool softPathAssetTail(const void* fnamePtr, char* out, int cap) {
+    out[0] = 0;
+    const Syms& S = Get();
+    if (!S.FNameToString || !fnamePtr) return false;
+    uint64_t key = 0;
+    __try { key = *(const uint64_t*)fnamePtr; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    if (!key) return false;
+    struct Entry { uint64_t key; char tail[48]; };
+    static Entry cache[32];
+    static int   nCached = 0;
+    for (int i = 0; i < nCached; i++) {
+        if (cache[i].key != key) continue;
+        strncpy_s(out, (size_t)cap, cache[i].tail, _TRUNCATE);
+        return out[0] != 0;
+    }
+    __try {
+        struct FStr { wchar_t* d; int n; int max; } fs{};
+        S.FNameToString(fnamePtr, &fs);                  // FString leaked ONCE per distinct path name
+        if (!fs.d || fs.n <= 0) return false;
+        int tail = 0;
+        for (int k = 0; k < fs.n && fs.d[k]; k++) if (fs.d[k] == L'.' || fs.d[k] == L'/') tail = k + 1;
+        int k = 0;
+        for (; tail + k < fs.n && k < cap - 1 && fs.d[tail + k]; k++)
+            out[k] = (char)(fs.d[tail + k] < 128 ? fs.d[tail + k] : '?');
+        out[k] = 0;
+        if (k > 0 && nCached < (int)(sizeof(cache)/sizeof(cache[0]))) {
+            cache[nCached].key = key;
+            strncpy_s(cache[nCached].tail, sizeof(cache[nCached].tail), out, _TRUNCATE);
+            nCached++;
+        }
+        return k > 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { out[0] = 0; return false; }
+}
+static bool nameEqNoCase(const char* a, const char* b) {
+    for (;; a++, b++) {
+        const char ca = (*a >= 'A' && *a <= 'Z') ? (char)(*a + 32) : *a;
+        const char cb = (*b >= 'A' && *b <= 'Z') ? (char)(*b + 32) : *b;
+        if (ca != cb) return false;
+        if (!ca) return true;
+    }
+}
+// Resolve a peer's body-definition NAME to a local USkaterVisualsDefinition. NOT findByName:
+// StaticFindObject(ANY_PACKAGE) returns the first object of ANY class with that name, and a
+// wrong-typed pointer where the rebuild expects exactly this type is an AV -- which is why the body
+// stayed local until now. The game instance's own `_skaterDefinitions` array IS the type gate (its
+// declared element type is TSoftObjectPtr<USkaterVisualsDefinition>), and TryLoad on the MATCHING
+// path both loads a never-resident body asset (a pro/female model this player has never equipped)
+// and proves it loaded -- residency is never inferred (the garment-mesh lesson). Names are compared
+// FIRST so only the one matching asset is ever loaded, not the whole roster.
+static void* resolveVisualDef(void* gi, const char* name) {
+    const Syms& S = Get();
+    if (!gi || !name || !name[0]) return nullptr;
+    __try {
+        uint8_t* arr = (uint8_t*)gi + off::kGiSkaterDefs;
+        uint8_t* d = *(uint8_t**)arr;
+        const int32_t n = *(int32_t*)(arr + 8);
+        if (d && n > 0 && n <= 64 && S.SoftPathTryLoad) {
+            for (int i = 0; i < n; i++) {
+                uint8_t* path = d + (size_t)i * off::kSoftPtrSize + off::kSoftPathInPtr;
+                if (*(uint64_t*)path == 0) continue;             // empty slot
+                char tail[48];
+                if (!softPathAssetTail(path, tail, sizeof(tail)) || !nameEqNoCase(tail, name)) continue;
+                void* obj = S.SoftPathTryLoad(path, nullptr);
+                if (obj) return obj;                             // typed by the array's declaration
+            }
+        }
+        // Fallbacks: the two definitions already resident on the instance, matched by OBJECT name --
+        // covers a name the roster array does not carry but the local player happens to be using.
+        void* cand[2] = { *(void**)((uint8_t*)gi + off::kGiDefaultVisualDef),
+                          *(void**)((uint8_t*)gi + off::kGiSkaterInstance + off::kSkInstVisualDef) };
+        for (int i = 0; i < 2; i++) {
+            char nm[64];
+            if (cand[i] && fnameToString((uint8_t*)cand[i] + off::kObjNamePrivate, nm, sizeof(nm))
+                && nameEqNoCase(nm, name))
+                return cand[i];
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return nullptr;
+}
+
 // THE ASSET GATE. Two independent nulls have to be closed here, or the rebuild crashes.
 // (1) Having an FName is NOT the same as this install HAVING the item: the game resolves a profile
 // item through its own catalog (`GetCustomizationItem`), which returns NULL for anything this copy
@@ -628,14 +713,37 @@ bool DressProxy(void* proxyActor, const repl::CosmeticSet& c, int* unresolved, v
                               proxyActor, savedInst, &nSavedInst, 40, &unmatchedColors);
     const int wornB = wearMap(brdMap,  c.brd, c.nBoard, savedB, 48, &nSavedB, unresolved, logf,
                               proxyActor, savedInst, &nSavedInst, 40, &unmatchedColors);
-    // THE BASE VISUALS POINTER IS DELIBERATELY NOT WRITTEN. `findByName` is
-    // StaticFindObject(ANY_PACKAGE) -- it returns the FIRST object of ANY class with that name, so
-    // "AverageMaleXX04Definition" could just as easily hand back a generated class, a redirector or a
-    // CDO as the USkaterVisualsDefinition asset, and there is no type check available here. Storing a
-    // wrong-typed pointer where the rebuild expects that exact type is an AV. The peer's body
-    // definition is worth far less than clothing and board, so it stays LOCAL until it can be resolved
-    // through the game instance's own `_skaterDefinitions` list rather than a name-first-match. Same
-    // argument for SkaterName.
+    // ---- the BASE BODY. The rebuild takes the definition from the ACTOR (RefreshVisuals passes
+    // skater+0x570 into BuildCharacterMesh), so the peer's body is written THERE -- their proxy's own
+    // field, semantically correct, no borrow needed -- plus the instance pointer inside the borrow
+    // window, for any callee that reads the instance instead. resolveVisualDef goes through the game
+    // instance's _skaterDefinitions soft array, whose declared element type is the type gate a bare
+    // name-first-match could never provide (the reason this stayed local until now). SkaterName still
+    // stays local. Both writes land BEFORE the one RefreshVisuals call so a single rebuild carries
+    // body and clothes together. TryLoad on a first-seen pro/female body is a synchronous load -- a
+    // one-time hitch on that dress is expected, not a defect.
+    void* peerBodyDef  = nullptr;
+    void* savedActorDef = nullptr;
+    bool  actorDefWritten = false;
+    if (c.visualDef[0]) {
+        peerBodyDef = resolveVisualDef(gi, c.visualDef);
+        if (peerBodyDef && peerBodyDef != savedVisualDef) {
+            __try {
+                savedActorDef = *(void**)((uint8_t*)proxyActor + off::kSkaterVisualDef);
+                *(void**)((uint8_t*)proxyActor + off::kSkaterVisualDef) = peerBodyDef;
+                *(void**)(inst + off::kSkInstVisualDef) = peerBodyDef;   // restored with the borrow
+                actorDefWritten = true;
+                if (logf) { char m[140];
+                    snprintf(m, sizeof(m), "[cosmetics] body definition '%s' applied", c.visualDef);
+                    logf(m); }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        } else if (!peerBodyDef && logf) {
+            char m[140];
+            snprintf(m, sizeof(m), "[cosmetics] body definition '%s' not available here (kept local)",
+                     c.visualDef);
+            logf(m);
+        }
+    }
     __try { *(uint8_t*)(prof + off::kProfStance) = c.stance; }
     __except (EXCEPTION_EXECUTE_HANDLER) {}
 
@@ -659,8 +767,28 @@ bool DressProxy(void* proxyActor, const repl::CosmeticSet& c, int* unresolved, v
             logf(m);
         }
     }
+    // A faulting rebuild with a peer body def in play needs ONE discriminating probe before the item
+    // bisect: put the LOCAL body back and refresh again with the peer's items still worn. Clean now =>
+    // the BODY DEFINITION is the fault (named, item bisect skipped); still faulting => the body is
+    // cleared of suspicion and the item bisect runs against the local body, cleanly isolated. Either
+    // way the peer's def stays on the actor only after a SUCCESSFUL rebuild -- a def the game refuses
+    // must not be left where every later game-side refresh would re-fault on it.
+    bool bodyDefWasFault = false;
+    if (!ok && actorDefWritten) {
+        __try {
+            *(void**)((uint8_t*)proxyActor + off::kSkaterVisualDef) = savedActorDef;
+            *(void**)(inst + off::kSkInstVisualDef) = savedVisualDef;
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        actorDefWritten = false;                       // restored; the success path below keeps it only when ok
+        if (g_bisectOnFault) {
+            bodyDefWasFault = !refreshFaults(proxyActor);
+            if (logf) logf(bodyDefWasFault
+                ? "[cosmetics]   probe: LOCAL body def -> ok => the peer's BODY DEFINITION is the fault"
+                : "[cosmetics]   probe: LOCAL body def -> still faults => body def cleared, bisecting items");
+        }
+    }
     // One dress, one complete answer -- see bisectCulprit's comment.
-    if (!ok && g_bisectOnFault) bisectCulprit(proxyActor, charMap, brdMap, c, logf);
+    if (!ok && g_bisectOnFault && !bodyDefWasFault) bisectCulprit(proxyActor, charMap, brdMap, c, logf);
 
     // ---- give the local player their look back, always
     __try {
