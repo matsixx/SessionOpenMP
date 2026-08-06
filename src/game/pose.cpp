@@ -242,12 +242,15 @@ void OnFinalizeBones(void* mesh, uint64_t nowMs) {
 
     // ---- 3. A LOCAL replay, and no transported pose to wear. Nothing else will pose this skeleton
     // this frame: unregistering the proxy's replay component removed the only writer the replay path
-    // had, and the anim graph does not drive a skater during playback. Left alone the buffer publishes
-    // degenerate transforms and the peer renders as a heap of clothes on the ground. Re-stamp the last
-    // live pose so they stand as they last stood.
-    // This is a HOLDING PATTERN: the full fix is a peer sending their pose while the LOCAL player is in
-    // replay, the mirror of the capture gate. `holdApplied` in the [pose] line reports whether this
-    // seam still fires during playback, which is the precondition for that.
+    // had, and the graph's own output is unusable here -- FIELD-MEASURED, not assumed: during a local
+    // replay the anim UPDATE still fires at full frame rate for proxies (the [rprobe] line), the
+    // standard suppressors are clean (bPauseAnims/bNoSkeletonUpdate unset, GlobalAnimRateScale 1.0),
+    // and the EVALUATION still publishes degenerate transforms -- a peer rendered from it collapses
+    // into a heap of clothes. The suppression lives inside evaluation state the replay system owns;
+    // do not re-chase it with the component knobs.
+    // So the transported pose is the only usable writer during a replay, and this hold bridges the
+    // gap before it arrives (about a second of unicast round-trip when the editor opens) and any
+    // stall while it flows: re-stamp the last live pose so they stand as they last stood.
     if (!sl->holdN || (int)sl->holdN != num) { g_st.skippedCount++; return; }
     __try {
         for (int b = 0; b < (int)sl->holdN; b++) {
