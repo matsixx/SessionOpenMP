@@ -848,13 +848,15 @@ void Proxy::Apply(const repl::State& s, uint64_t nowMs, uint64_t nowUs, void (*l
         else if (!VelocityDrive(s, nowUs)) StampBoard(s);
     }
 
-    // ---- offscreen anim throttle, once per actor. AlwaysTickPose (1): the graph updates every
-    // frame -- the replay records anim fields and playback advances them, so the graph must never
-    // be visibility-gated (OnlyTickPoseWhenRendered froze peers' replay tracks in every stretch
-    // they were offscreen) -- but the bone evaluation/refresh, the expensive half of anim cost, is
-    // skipped while the mesh is not rendered (shadow passes count as rendered). One byte, engine's
-    // own mechanism, no per-frame cost.
-    if (g_tun.offscreenAnimThrottle && !animThrottled_) {
+    // ---- offscreen anim throttle, once per actor -- but NEVER while peers are recorded into the
+    // replay. The replay records the skater's EVALUATED pose, and every visibility-gated tick
+    // option skips at least the bone evaluation while unrendered -- so any stretch where the local
+    // camera simply is not LOOKING at a peer records them as a frozen standing skater (field-
+    // confirmed: "if I'm looking away when they do their tricks, in replay their animations aren't
+    // working"). AlwaysTickPose (1) -- graph updates, bone refresh skipped while unrendered --
+    // stays available for a future mode that does not record peers. One byte, engine's own
+    // mechanism.
+    if (g_tun.offscreenAnimThrottle && !g_tun.recordPeers && !animThrottled_) {
         void* mesh = safePtr(actor_, off::kSkaterMesh);
         if (mesh) {
 #ifdef _WIN32
