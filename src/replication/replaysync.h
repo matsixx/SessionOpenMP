@@ -71,12 +71,27 @@ uint64_t BufferOldestUs(int peerIdx);
 
 // Live-tunable knobs (statics in the .cpp): transfer pacing etc.
 struct Tuning {
-    int   chunksPerTick   = 20;     // paced from Tick (~60/s): 20 -> ~1200 chunks/s ~ 1 MB/s, so a
-                                    // ~9 MB bone-carrying history lands in ~10 s. The EOS reliable
-                                    // queue is finite; a NAK round recovers any drop.
+    int   chunksPerTick   = 20;     // per-Tick burst ceiling; the WINDOW below is the real governor
+    // ---- FLOW CONTROL. The sweep keeps at most `windowChunks` un-ACKed chunks in flight: the
+    // requester reports its received count every ackIntervalMs, and the sweep only advances as those
+    // reports come back -- self-clocked to what the path actually carries. Open-loop pacing is a
+    // measured field failure: a fixed 64/tick dumped the whole history into the EOS reliable queue
+    // in ~3 s, and the relay spent ~30 s force-delivering the backlog -- drowning the live snapshot
+    // lane with it (the peer froze for the duration, on BOTH ends' screens). ~32 x ~0.9 KB = ~29 KB
+    // in flight adds <100 ms of queue to a typical relayed path, so the live lane keeps breathing;
+    // throughput = window/RTT (~300 KB/s at 100 ms RTT), and a NAK-driven resend bypasses the window
+    // (the receiver asked for it, so it has room; sweep-closed + NAK resends cannot deadlock).
+    int   windowChunks    = 32;
+    float ackIntervalMs   = 150.f;  // requester's progress-report cadence (13 B reliable each)
+    // ---- HISTORY DOWNSAMPLE. Entries closer than this are skipped when the outgoing blob is built:
+    // ~33 ms = ~30 Hz, the SAME cadence the live pose lane serves a scrubbing peer at, and the
+    // scrub-side InterpStates blends drivers AND bones between entries -- so fidelity matches live
+    // scrubbing while the transfer halves (~9.4 MB -> ~4.7 MB of a full 120 s ring).
+    float historyMinGapMs = 33.f;
     float nakIntervalMs   = 400.f;  // how often the requester re-asks for holes
     float hdrTimeoutMs    = 3000.f; // REQ sent, no HDR: retry REQ (x3) then fail
-    float stallTimeoutMs  = 12000.f;// mid-transfer silence -> fail (sender: -> free)
+    float stallTimeoutMs  = 12000.f;// mid-transfer NO-PROGRESS -> fail (sender: -> free). Progress
+                                    // resets it, so a slow flow-controlled transfer never trips.
 };
 Tuning& Tune();
 

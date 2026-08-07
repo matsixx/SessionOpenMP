@@ -19,7 +19,10 @@ namespace omp { namespace replaysync {
 // Same "OMP?" namespace as the snapshot (OMPI), cosmetics (OMPG) and chat (OMPH) magics -- see the
 // lineage note at the top of replication.cpp. Every sync packet is magic + a subtype byte.
 static const uint32_t kMagic = 0x4A504D4Fu;   // "OMPJ"
-enum : uint8_t { kReq = 1, kHdr = 2, kChunk = 3, kNak = 4, kDone = 5, kCancel = 6 };
+// kAck is a later addition (flow control); an older build's `default: break` ignores it, and an
+// older requester that never ACKs still completes against a new sender through NAK resends, which
+// bypass the window. Subtype extension only -- the OMPJ magic is unchanged.
+enum : uint8_t { kReq = 1, kHdr = 2, kChunk = 3, kNak = 4, kDone = 5, kCancel = 6, kAck = 7 };
 
 static Tuning g_tun;
 Tuning& Tune() { return g_tun; }
@@ -103,6 +106,8 @@ struct OutXfer {
     uint16_t chunkCount = 0;
     uint64_t newestUs = 0, oldestUs = 0;
     uint32_t sweep = 0;                              // first pass cursor
+    uint32_t swept = 0;                              // sweep chunks SENT (resends excluded -- see Tick)
+    uint32_t ackedGot = 0;                           // requester's reported received count (monotonic)
     uint16_t resendQ[kResendCap]; int rHead = 0, rCount = 0;
     uint64_t lastActUs = 0;
     uint64_t lastHdrUs = 0;                          // periodic HDR re-sends until the requester speaks
@@ -144,21 +149,36 @@ static void beginOutgoing(int peerIdx, uint32_t reqId, uint64_t nowUs, void (*lo
     OutXfer* x = nullptr;
     for (auto& o : g_out) if (!o.active) { x = &o; break; }
     if (!x || g_ownCount < 2) return;                // nothing worth sending
-    uint32_t total = 0;
-    for (int i = 0; i < g_ownCount; i++) total += 10u + ownAt(i).len;
-    x->buf = new uint8_t[total];
-    uint32_t w = 0;
+    // DOWNSAMPLED to ~30 Hz (historyMinGapMs): the cadence the live pose lane already serves a
+    // scrubbing peer at, and the scrub-side interp blends between entries -- half the bytes, same
+    // scrub fidelity. The newest entry is always kept: it anchors the timeline mapping.
+    const uint64_t minGapUs = (uint64_t)(g_tun.historyMinGapMs * 1000.f);
+    uint32_t total = 0, kept = 0;
+    uint64_t lastKeptUs = 0;
     for (int i = 0; i < g_ownCount; i++) {
         OwnEntry& e = ownAt(i);
+        if (i > 0 && i != g_ownCount - 1 && e.us - lastKeptUs < minGapUs) continue;
+        total += 10u + e.len; kept++; lastKeptUs = e.us;
+    }
+    if (kept < 2) return;
+    x->buf = new uint8_t[total];
+    uint32_t w = 0; uint64_t firstUs = 0, lastUs = 0;
+    bool haveFirst = false;
+    lastKeptUs = 0;
+    for (int i = 0; i < g_ownCount; i++) {
+        OwnEntry& e = ownAt(i);
+        if (i > 0 && i != g_ownCount - 1 && e.us - lastKeptUs < minGapUs) continue;
         wU16(x->buf + w, e.len); wU64(x->buf + w + 2, e.us);
         memcpy(x->buf + w + 10, g_arena + (e.vOff % kArena), e.len);
-        w += 10u + e.len;
+        w += 10u + e.len; lastKeptUs = e.us;
+        if (!haveFirst) { firstUs = e.us; haveFirst = true; }
+        lastUs = e.us;
     }
     x->active = true; x->peerIdx = peerIdx; x->reqId = reqId;
-    x->total = w; x->entryCount = (uint32_t)g_ownCount;
+    x->total = w; x->entryCount = kept;
     x->chunkCount = (uint16_t)((w + kChunkData - 1) / kChunkData);
-    x->oldestUs = ownAt(0).us; x->newestUs = ownAt(g_ownCount - 1).us;
-    x->sweep = 0; x->rHead = x->rCount = 0; x->lastActUs = nowUs;
+    x->oldestUs = firstUs; x->newestUs = lastUs;
+    x->sweep = 0; x->swept = 0; x->ackedGot = 0; x->rHead = x->rCount = 0; x->lastActUs = nowUs;
     x->lastHdrUs = nowUs; x->heardBack = false;
     sendHdr(*x);
     if (logf) { char m[160];
@@ -193,7 +213,7 @@ struct InXfer {
     uint32_t total = 0, entryCount = 0, got = 0;
     uint16_t chunkCount = 0, chunkSize = 0;
     uint64_t newestUs = 0, oldestUs = 0;
-    uint64_t startUs = 0, lastActUs = 0, lastNakUs = 0;
+    uint64_t startUs = 0, lastActUs = 0, lastNakUs = 0, lastAckUs = 0;
     int      reqRetries = 0;
     bool     failed = false;
 };
@@ -307,6 +327,17 @@ void OnPacket(int peerIdx, const uint8_t* d, int len, uint64_t nowUs, void (*log
         }
         break;
     }
+    case kAck: {
+        // The requester's progress report: its unique-received chunk count. Monotonic on this side --
+        // ACKs ride the reliable channel but a stale count must never re-widen the outstanding figure.
+        if (len < 13) return;
+        const uint32_t got = rU32(d + 9);
+        for (auto& o : g_out) if (o.active && o.peerIdx == peerIdx && o.reqId == reqId) {
+            if (got > o.ackedGot && got <= o.chunkCount) o.ackedGot = got;
+            o.lastActUs = nowUs; o.heardBack = true;   // an ACK proves the header landed too
+        }
+        break;
+    }
     case kHdr: {
         if (!g_in.active || g_in.peerIdx != peerIdx || g_in.reqId != reqId || g_in.haveHdr) return;
         if (len < 37) return;
@@ -363,10 +394,23 @@ void Tick(uint64_t nowUs, void (*logf)(const char*)) {
         int budget = g_tun.chunksPerTick;
         if (g_budget > 0 && budget > g_budget) budget = g_budget;
         if (!o.heardBack && budget > 1) budget -= 1;   // leave room for the repeated header
+        // Resends first and OUTSIDE the window: the requester named these holes, so it has room for
+        // them, and they are what re-opens a loss-narrowed window (got rises -> ACK -> sweep moves).
         while (budget > 0 && o.rCount > 0) {
             sendChunk(o, o.resendQ[o.rHead]); o.rHead = (o.rHead + 1) % kResendCap; o.rCount--; budget--;
         }
-        while (budget > 0 && o.sweep < o.chunkCount) { sendChunk(o, (uint16_t)o.sweep++); budget--; }
+        // The SWEEP is window-gated: at most windowChunks beyond the requester's last reported
+        // receive count in flight. `swept` counts sweep sends only -- a resend must not inflate the
+        // outstanding figure, since a chunk the requester already had leaves `got` unchanged and the
+        // window would ratchet shut on every recovered loss. SIGNED and clamped: a quiet-period NAK
+        // names every missing chunk including not-yet-swept ones, so resends can push `got` PAST
+        // `swept` -- unsigned math would wrap that into a permanently shut window.
+        while (budget > 0 && o.sweep < o.chunkCount) {
+            int outstanding = (int)o.swept - (int)o.ackedGot;
+            if (outstanding < 0) outstanding = 0;
+            if (outstanding >= g_tun.windowChunks) break;
+            sendChunk(o, (uint16_t)o.sweep++); o.swept++; budget--;
+        }
         if (o.sweep >= o.chunkCount && o.rCount == 0 &&
             nowUs - o.lastActUs > (uint64_t)(g_tun.stallTimeoutMs * 1000.f))
             outFree(o);                              // requester went quiet; DONE/NAK never came
@@ -377,14 +421,26 @@ void Tick(uint64_t nowUs, void (*logf)(const char*)) {
             if (nowUs - g_in.lastActUs > (uint64_t)(g_tun.hdrTimeoutMs * 1000.f)) {
                 if (++g_in.reqRetries > 3) {
                     g_in.failed = true;
+                    sendSimple(g_in.peerIdx, kCancel, g_in.reqId);   // a giver-up must SAY so, or the
                     if (logf) logf("[sync] no response to the replay-history request -- peer offline"
                                    " or running an older version");
                 } else { sendSimple(g_in.peerIdx, kReq, g_in.reqId); g_in.lastActUs = nowUs; }
             }
         } else if (g_in.got < g_in.chunkCount) {
+            // Progress report for the sender's flow-control window, on its own cadence -- tiny,
+            // reliable, and what the sweep's throughput is made of.
+            if (nowUs - g_in.lastAckUs > (uint64_t)(g_tun.ackIntervalMs * 1000.f)) {
+                uint8_t p[13];
+                wU32(p, kMagic); p[4] = kAck; wU32(p + 5, g_in.reqId); wU32(p + 9, g_in.got);
+                if (g_send) g_send(g_in.peerIdx, p, 13, true);
+                g_in.lastAckUs = nowUs;
+            }
             if (nowUs - g_in.startUs > (uint64_t)(g_tun.stallTimeoutMs * 1000.f) &&
                 nowUs - g_in.lastActUs > (uint64_t)(g_tun.stallTimeoutMs * 1000.f)) {
                 g_in.failed = true;
+                // ...sender keeps feeding a dead transfer into the connection's reliable queue,
+                // which is the drowning this protocol's window exists to prevent.
+                sendSimple(g_in.peerIdx, kCancel, g_in.reqId);
                 if (logf) logf("[sync] replay-history transfer stalled -- giving up");
             } else if (nowUs - g_in.lastNakUs > (uint64_t)(g_tun.nakIntervalMs * 1000.f) &&
                        nowUs - g_in.lastActUs > (uint64_t)(g_tun.nakIntervalMs * 1000.f)) {
