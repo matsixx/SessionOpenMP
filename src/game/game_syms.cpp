@@ -220,6 +220,9 @@ static const SigEntry kSigs[] = {
     // ABI on its face: rcx = &map, rdx = &int32 key (rsp+0x30), r8 = &16-byte item (rsp+0x38).
     // Site: Epic 0x1034237 / Steam 0xff4497; target Epic 0x7dbb60 / Steam 0x895eb0.
     { "ProfileEmplaceSite",   "4C 8D 97 E0 02 00 00 49 8B 4F 18 48 89 4C 24 38 4C 8D 44 24 38 49 8B CA 44 88 6C 24 40 48 8D 54 24 30 44 89 64 24 44 E8 ?? ?? ?? ??", false },
+    // HOOK TARGET: ASkaterCharacter::PopulateMarkerInfo  Epic 0xffe090 / Steam 0xfbdec0 (sigmake).
+    // Keeps the -0x4f0 sub-object displacement concrete. See the Syms field comment for the guard.
+    { "PopulateMarkerInfo",   "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 40 C6 02 01 48 8B DA 48 8B 81 10 FB FF FF 48 8B F9 48 85 C0 ?? ?? 0F B6 88 20 0E 00 00", false },
 };
 static const int kSigN = (int)(sizeof(kSigs) / sizeof(kSigs[0]));
 
@@ -530,6 +533,7 @@ const Syms& Resolve(void (*logf)(const char*)) {
                  g_syms.ProfileEmplace ? (void*)((uint8_t*)g_syms.ProfileEmplace - base) : nullptr);
         say(m);
     }
+    g_syms.PopulateMarkerInfo = found[i++];
 
     // LOCKSTEP CHECK. The block above is POSITIONAL, and a table entry added without its assignment --
     // or vice versa -- shifts every later symbol onto the wrong address SILENTLY: sigs still resolve

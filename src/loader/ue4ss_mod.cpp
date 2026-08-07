@@ -978,6 +978,45 @@ static void InstallReplayGuard() {
         logLine("[mod] *** replay-editor guard FAILED -- opening the replay editor may crash");
 }
 
+// ---- THE MARKER GUARD. ASkaterCharacter::PopulateMarkerInfo reads FollowCamera without a null
+// check; on proxies that component is null (the replay guard's finding, one field over), and break
+// sync opened the game's own path there for proxies: PostInitCharacter's deferred streamable
+// completion populates the marker only when the skater's BOARD IS BROKEN -- a state only load-ins
+// with a saved broken board reached before, and one every broken proxy board now sits in (crash:
+// AV at PopulateMarkerInfo+0x1e3 off a streamable-manager tick). `self` is the derived-part
+// SUB-OBJECT at actor+0xa40 -- the virtual dispatch carries that pointer, not the actor.
+// The skip writes a zeroed struct: IsSet=0 is the "no marker" shape every consumer handles.
+static void (*o_PopulateMarkerInfo)(void*, void*) = nullptr;
+static void hkPopulateMarkerInfo(void* self, void* out) {
+    bool skip = false;
+#ifdef _WIN32
+    __try {
+        void* actor = (uint8_t*)self - game::off::kSkaterDerivedPart;
+        void* cam   = *(void**)((uint8_t*)actor + game::off::kSkaterFollowCam);
+        skip = (cam == nullptr) || game::IsProxyActor(actor);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { skip = true; }
+    if (skip) {
+        __try { memset(out, 0, game::off::kMarkerInfoSize); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        return;
+    }
+#endif
+    o_PopulateMarkerInfo(self, out);
+}
+static void InstallMarkerGuard() {
+    const game::Syms& S = game::Get();
+    if (!S.PopulateMarkerInfo) {
+        logLine("[mod] PopulateMarkerInfo unresolved -- a broken proxy board can CRASH the deferred"
+                " character init");
+        return;
+    }
+    if (MH_CreateHook(S.PopulateMarkerInfo, (void*)&hkPopulateMarkerInfo,
+                      (void**)&o_PopulateMarkerInfo) == MH_OK &&
+        MH_EnableHook(S.PopulateMarkerInfo) == MH_OK)
+        logLine("[mod] marker guard installed (null-camera / proxy skaters -> IsSet=0)");
+    else
+        logLine("[mod] *** marker guard FAILED -- a broken proxy board can crash the deferred init");
+}
+
 // ---- THE POSE SEAM. Fires for every skeletal mesh in the game and is silent unless the mesh belongs
 // to a proxy with a fresh transported pose. PRE-hook by necessity: the original's first act is the
 // buffer flip, so this is the last moment the finished pose can still be replaced.
@@ -1149,7 +1188,7 @@ public:
         // Unarmed cost: one branch per frame.
         // ORDER MATTERS: without the rename guard, the first proxy spawn is a GUARANTEED
         // LowLevelFatalError -- so no guard means no anchor, which means no sessions at all.
-        if (InstallRenameGuard()) { InstallAnimApplyHook(); InstallReplayGuard(); InstallPoseSeam(); InstallReplayCamGuard(); InstallEngineTickAnchor(); }
+        if (InstallRenameGuard()) { InstallAnimApplyHook(); InstallReplayGuard(); InstallMarkerGuard(); InstallPoseSeam(); InstallReplayCamGuard(); InstallEngineTickAnchor(); }
         else logLine("[mod] *** sessions DISABLED (rename guard missing)");
         // Pause must not freeze the world: in overlay mode YOUR pause stops your own skater and every
         // proxy in your world, so you cannot watch anyone while the menu is open. Unconditional -- it

@@ -244,6 +244,13 @@ struct Syms {
     SaveFootTransFn  SaveFootTrans     = nullptr;   // see the typedef's comment
     SetWorldRotQFn   SetWorldRotQuat   = nullptr;
     IsLocallyCtrlFn  IsLocallyControlled = nullptr;
+    // Not called -- HOOKED (MinHook, loader). ASkaterCharacter::PopulateMarkerInfo reads FollowCamera
+    // (skater+0xa50) with no null check; that component is null on proxies (the replay-guard
+    // finding), and break sync opened a path there for proxies: PostInitCharacter's deferred
+    // streamable completion populates the marker only WHEN THE BOARD IS BROKEN (it calls IsBroken
+    // and skips otherwise) -- a state only load-ins with a saved broken board reached before, and
+    // one every broken proxy board now sits in. The guard hands back IsSet=0 instead.
+    void*            PopulateMarkerInfo = nullptr;
     // Not called -- PATCHED. `AGameModeBase::AllowPausing` is the single gate every pause request goes
     // through, so the table keeps its address rather than a callable type. See DisablePause().
     void*            AllowPausing      = nullptr;
@@ -676,6 +683,12 @@ namespace off {
     // StaticFindObject(ANY_PACKAGE) can never provide, and TryLoad on the matching path both loads a
     // never-resident pro/female body asset and proves it.
     constexpr int kSkaterVisualDef    = 0x570;   // ASkaterCharacterBase::_skaterDefinition
+    // ASkaterCharacter's derived part starts at 0xa40 (ASkaterCharacterBase is size 0xa40); its
+    // camera components live right at its head. PopulateMarkerInfo is dispatched on the SUB-OBJECT
+    // at actor+0xa40, so a hook there sees `this` = that sub-object, not the actor.
+    constexpr int kSkaterDerivedPart  = 0xa40;
+    constexpr int kSkaterFollowCam    = 0xa50;   // ASkaterCharacter::FollowCamera -- null on proxies
+    constexpr int kMarkerInfoSize     = 112;     // sizeof(FSessionPlayerMarkerInfo), PDB
     constexpr int kGiDefaultVisualDef = 0x1d0;   // USessionGameInstance::_defaultVisualsDefinition
     constexpr int kGiSkaterDefs       = 0x1d8;   // ::_skaterDefinitions TArray<TSoftObjectPtr<...>>
                                                  // (data +0, Num +8; entry stride kSoftPtrSize)
