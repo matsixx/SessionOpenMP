@@ -71,6 +71,14 @@ enum : int {
     MI_STATIC_SWITCHES      = 0x148,  // FStaticParameterSet.StaticSwitchParameters
                                       //   (stride 40, name +0x00, bool value +0x24)
     // every parameter struct starts with FMaterialParameterInfo whose FName Name is at +0x00
+    // UMaterialParameterCollection (the MPC_ClothWind lead)
+    MPC_SCALAR_PARAMS       = 0x38,   // TArray<FCollectionScalarParameter> (stride 28)
+    MPC_VECTOR_PARAMS       = 0x48,   // TArray<FCollectionVectorParameter> (stride 40)
+                                      //   both: FName name +0x00, DefaultValue +0x18
+    // UMaterialParameterCollectionInstance (the world's LIVE values; only runtime-set keys appear)
+    MPCI_COLLECTION         = 0x30,   // UMaterialParameterCollection*
+    MPCI_SCALAR_MAP         = 0x40,   // TMap<FName,float>        (element stride 20, value +0x08)
+    MPCI_VECTOR_MAP         = 0x90,   // TMap<FName,FLinearColor> (element stride 32, value +0x08)
 };
 
 // ------------------------------------------------------------------ FName -> text (cached)
@@ -129,39 +137,20 @@ static bool g_probeOK = true;            // one-shot kill: a faulting dump disab
 static char g_status[96] = "no dump yet";
 
 // ------------------------------------------------------------------ material dump
-static void dumpMaterial(int slot, const void* mat) {
-    char name[64], cls[64];
-    if (!mat) { TwkLog("[cloth]   slot %d: <null material>", slot); return; }
-    NameOfObject(mat, name, sizeof(name));
-    ClassNameOf(mat, cls, sizeof(cls));
-    TwkLog("[cloth]   slot %d: %s (%s)", slot, name[0] ? name : "?", cls[0] ? cls : "?");
-    if (!strstr(cls, "MaterialInstance")) return;   // a base UMaterial has no override arrays
-
-    // Parent chain up to the master -- route B (re-parent onto a wind master) needs these names.
-    const void* cur = mat;
-    for (int d = 0; d < 4; d++) {
-        const void* parent = twkP(cur, MI_PARENT);
-        if (!parent) break;
-        char pn[64], pc[64];
-        NameOfObject(parent, pn, sizeof(pn));
-        ClassNameOf(parent, pc, sizeof(pc));
-        TwkLog("[cloth]     parent[%d]: %s (%s)", d, pn[0] ? pn : "?", pc[0] ? pc : "?");
-        if (!strstr(pc, "MaterialInstance")) break;  // reached the base material
-        cur = parent;
-    }
-    // Overridden parameters. Only OVERRIDES live here -- a parameter left at the parent's default
-    // does not appear, which is exactly what makes the windy-vs-plain diff meaningful.
+// One instance level's OVERRIDES. A parameter left at the parent's default does not appear here,
+// which is exactly what makes a windy-vs-plain diff meaningful.
+static void dumpMatParams(const void* mat, const char* ind) {
     const uint8_t* sd = (const uint8_t*)twkP(mat, MI_SCALAR_PARAMS);
     int sn = twkI(mat, MI_SCALAR_PARAMS + 8); if (sn < 0 || sn > 128) sn = 0;
     for (int i = 0; i < sn && sd; i++) {
         char pn[64]; NameOfFName(sd + i * 36, pn, sizeof(pn));
-        TwkLog("[cloth]     scalar '%s' = %.4f", pn[0] ? pn : "?", twkF(sd, i * 36 + 0x10));
+        TwkLog("[cloth]   %sscalar '%s' = %.4f", ind, pn[0] ? pn : "?", twkF(sd, i * 36 + 0x10));
     }
     const uint8_t* vd = (const uint8_t*)twkP(mat, MI_VECTOR_PARAMS);
     int vn = twkI(mat, MI_VECTOR_PARAMS + 8); if (vn < 0 || vn > 128) vn = 0;
     for (int i = 0; i < vn && vd; i++) {
         char pn[64]; NameOfFName(vd + i * 48, pn, sizeof(pn));
-        TwkLog("[cloth]     vector '%s' = (%.3f %.3f %.3f %.3f)", pn[0] ? pn : "?",
+        TwkLog("[cloth]   %svector '%s' = (%.3f %.3f %.3f %.3f)", ind, pn[0] ? pn : "?",
                twkF(vd, i * 48 + 0x10), twkF(vd, i * 48 + 0x14),
                twkF(vd, i * 48 + 0x18), twkF(vd, i * 48 + 0x1c));
     }
@@ -171,13 +160,38 @@ static void dumpMaterial(int slot, const void* mat) {
         char pn[64], tex[64];
         NameOfFName(td + i * 40, pn, sizeof(pn));
         NameOfObject(twkP(td, i * 40 + 0x10), tex, sizeof(tex));
-        TwkLog("[cloth]     texture '%s' = %s", pn[0] ? pn : "?", tex[0] ? tex : "<null>");
+        TwkLog("[cloth]   %stexture '%s' = %s", ind, pn[0] ? pn : "?", tex[0] ? tex : "<null>");
     }
     const uint8_t* wd = (const uint8_t*)twkP(mat, MI_STATIC_SWITCHES);
     int wn = twkI(mat, MI_STATIC_SWITCHES + 8); if (wn < 0 || wn > 64) wn = 0;
     for (int i = 0; i < wn && wd; i++) {
         char pn[64]; NameOfFName(wd + i * 40, pn, sizeof(pn));
-        TwkLog("[cloth]     switch '%s' = %d", pn[0] ? pn : "?", twkB(wd, i * 40 + 0x24));
+        TwkLog("[cloth]   %sswitch '%s' = %d", ind, pn[0] ? pn : "?", twkB(wd, i * 40 + 0x24));
+    }
+}
+static void dumpMaterial(int slot, const void* mat) {
+    char name[64], cls[64];
+    if (!mat) { TwkLog("[cloth]   slot %d: <null material>", slot); return; }
+    NameOfObject(mat, name, sizeof(name));
+    ClassNameOf(mat, cls, sizeof(cls));
+    TwkLog("[cloth]   slot %d: %s (%s)", slot, name[0] ? name : "?", cls[0] ? cls : "?");
+    if (!strstr(cls, "MaterialInstance")) return;   // a base UMaterial has no override arrays
+    dumpMatParams(mat, "  ");
+    // Parent chain up to the master, dumping EVERY instance level's overrides: a per-item wind gate
+    // set on the item's MaterialInstanceConstant (under a shared per-category MID) would be
+    // invisible in a top-level-only dump -- the first field round proved the garment MIDs carry
+    // nothing but 'Dirt'.
+    const void* cur = mat;
+    for (int d = 0; d < 4; d++) {
+        const void* parent = twkP(cur, MI_PARENT);
+        if (!parent) break;
+        char pn[64], pc[64];
+        NameOfObject(parent, pn, sizeof(pn));
+        ClassNameOf(parent, pc, sizeof(pc));
+        TwkLog("[cloth]     parent[%d]: %s (%s)", d, pn[0] ? pn : "?", pc[0] ? pc : "?");
+        if (!strstr(pc, "MaterialInstance")) break;  // reached the base material
+        dumpMatParams(parent, "    ");
+        cur = parent;
     }
 }
 
@@ -239,6 +253,62 @@ static void dumpCensus(const wchar_t* cls, const char* what, bool listAll) {
     }
 }
 
+// ------------------------------------------------------------------ parameter collections
+// Each collection ASSET carries the parameter names + authored defaults; the per-world INSTANCE
+// carries only the values something set at runtime. Together they name every global knob the cloth
+// wind could ride and what it currently reads as.
+static void dumpOneCollection(const void* col) {
+    char cn[64]; NameOfObject(col, cn, sizeof(cn));
+    const uint8_t* sd = (const uint8_t*)twkP(col, MPC_SCALAR_PARAMS);
+    int sn = twkI(col, MPC_SCALAR_PARAMS + 8); if (sn < 0 || sn > 64) sn = 0;
+    const uint8_t* vd = (const uint8_t*)twkP(col, MPC_VECTOR_PARAMS);
+    int vn = twkI(col, MPC_VECTOR_PARAMS + 8); if (vn < 0 || vn > 64) vn = 0;
+    TwkLog("[cloth] collection %s: %d scalar, %d vector", cn[0] ? cn : "?", sn, vn);
+    for (int i = 0; i < sn && sd; i++) {
+        char pn[64]; NameOfFName(sd + i * 28, pn, sizeof(pn));
+        TwkLog("[cloth]     scalar '%s' default=%.4f", pn[0] ? pn : "?", twkF(sd, i * 28 + 0x18));
+    }
+    for (int i = 0; i < vn && vd; i++) {
+        char pn[64]; NameOfFName(vd + i * 40, pn, sizeof(pn));
+        TwkLog("[cloth]     vector '%s' default=(%.3f %.3f %.3f %.3f)", pn[0] ? pn : "?",
+               twkF(vd, i * 40 + 0x18), twkF(vd, i * 40 + 0x1c),
+               twkF(vd, i * 40 + 0x20), twkF(vd, i * 40 + 0x24));
+    }
+}
+// A TMap's sparse array: {Data, Num, Max, ...}; element = TPair + 8 bytes of hash bookkeeping.
+// Freed holes read as garbage names and are skipped -- read-only, so a wrong assumption can only
+// mis-read (the same argument as the cosmetics map walker).
+static void dumpInstanceMap(const void* inst, int mapOff, int stride, bool vec, const char* kind) {
+    const uint8_t* data = (const uint8_t*)twkP(inst, mapOff);
+    int num = twkI(inst, mapOff + 8); if (num < 0 || num > 64) num = 0;
+    for (int i = 0; i < num && data; i++) {
+        char pn[64];
+        if (!NameOfFName(data + i * stride, pn, sizeof(pn)) || !pn[0]) continue;
+        if (vec)
+            TwkLog("[cloth]     live %s '%s' = (%.3f %.3f %.3f %.3f)", kind, pn,
+                   twkF(data, i * stride + 0x8), twkF(data, i * stride + 0xc),
+                   twkF(data, i * stride + 0x10), twkF(data, i * stride + 0x14));
+        else
+            TwkLog("[cloth]     live %s '%s' = %.4f", kind, pn, twkF(data, i * stride + 0x8));
+    }
+}
+static void dumpCollections() {
+    std::vector<RC::Unreal::UObject*> cols;
+    if (findAllSeh(L"MaterialParameterCollection", cols)) {
+        for (int i = 0; i < (int)cols.size() && i < 16; i++) dumpOneCollection(cols[i]);
+    }
+    std::vector<RC::Unreal::UObject*> insts;
+    if (findAllSeh(L"MaterialParameterCollectionInstance", insts)) {
+        TwkLog("[cloth] %d collection instance(s) (runtime-set values only):", (int)insts.size());
+        for (int i = 0; i < (int)insts.size() && i < 16; i++) {
+            char cn[64]; NameOfObject(twkP(insts[i], MPCI_COLLECTION), cn, sizeof(cn));
+            TwkLog("[cloth]   instance[%d] of %s", i, cn[0] ? cn : "?");
+            dumpInstanceMap(insts[i], MPCI_SCALAR_MAP, 20, false, "scalar");
+            dumpInstanceMap(insts[i], MPCI_VECTOR_MAP, 32, true,  "vector");
+        }
+    }
+}
+
 // ------------------------------------------------------------------ the dump
 static void runDump() {
     void* skater = CatchTweaks_Skater();
@@ -277,8 +347,8 @@ static void runDump() {
     // process (zero across varied outfits = real cloth has no data to run on), is there a wind/
     // weather material parameter collection (a global knob the wobble might ride), any wind sources.
     dumpCensus(L"ClothingAssetCommon",            "ClothingAssetCommon", true);
-    dumpCensus(L"MaterialParameterCollection",    "MaterialParameterCollection", true);
     dumpCensus(L"WindDirectionalSourceComponent", "WindDirectionalSourceComponent", false);
+    dumpCollections();
     TwkLog("[cloth] ================ dump complete ================");
     SYSTEMTIME t; GetLocalTime(&t);
     snprintf(g_status, sizeof(g_status), "dumped %02d:%02d:%02d -- see SessionTweaks.log",
