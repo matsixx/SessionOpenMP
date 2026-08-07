@@ -428,6 +428,10 @@ bool LocalMapName(void* pawn, char* out, int cap);      // the UWorld object's o
 bool CacheMapSelectData(void* pawn);                    // resolves gi+0x388; true once it is cached
 bool HaveMapSelectData();
 bool PrettyMapName(const char* internalName, char* out, int cap);
+// Dump the whole label table (name = label, DLC entries marked). Called once when the asset caches:
+// a map with no pretty name is either missing from the table or has a label that will not read, and
+// on screen those look the same.
+void LogMapSelectTable(void (*logf)(const char*));
 
 // ---- member offsets + vtable slots (PDB-derived; a wrong one here is silent, so each cites its source)
 namespace off {
@@ -591,6 +595,7 @@ namespace off {
     constexpr int kMapDataStride      = 120;     // sizeof(FMapSelectData)
     constexpr int kMapDataName        = 0x00;    //   ::MapName  (FName, the internal level name)
     constexpr int kMapDataLabel       = 0x10;    //   ::MapLabel (FText, what Map Select displays)
+    constexpr int kMapDataDlc         = 0x71;    //   ::DLCAffiliation (EDLCNames, 0 = base game)
     // ---- the pause menu. Every offset below is PDB-exact (pdbmembers) and each was re-confirmed
     // against the code that uses it, because a wrong one here is silent.
     // UMenuPage:

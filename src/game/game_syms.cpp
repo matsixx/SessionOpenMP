@@ -312,30 +312,84 @@ static bool ftextToAscii(const void* ftext, char* out, int cap) {
     } __except (EXCEPTION_EXECUTE_HANDLER) { out[0] = 0; return false; }
 }
 
+// The world object name is the PERSISTENT level ("NYC01_LP_Persistent"); a table entry may be
+// authored either with that suffix or without it. Comparing on the stem makes both spellings the
+// same key, which is a real equivalence rather than a guess -- it is the same level either way.
+static void mapStem(const char* in, char* out, int cap) {
+    if (!out || cap <= 0) return;
+    out[0] = 0;
+    if (!in) return;
+    strncpy_s(out, (size_t)cap, in, _TRUNCATE);
+    const size_t n = strlen(out);
+    static const char kSuf[] = "_Persistent";
+    const size_t sn = sizeof(kSuf) - 1;
+    if (n > sn && _stricmp(out + n - sn, kSuf) == 0) out[n - sn] = 0;
+}
+
 bool PrettyMapName(const char* internalName, char* out, int cap) {
     if (!out || cap <= 0) return false;
     out[0] = 0;
     if (!internalName || !*internalName) return false;
     strncpy_s(out, (size_t)cap, internalName, _TRUNCATE);         // fall back to the name given
     if (!g_mapData) return false;
+    char wantStem[64]; mapStem(internalName, wantStem, sizeof(wantStem));
     __try {
         // UMapSelectDataAsset::_maps at +0x30; FMapSelectData is 120 bytes with MapName at +0x00 and
         // MapLabel (FText) at +0x10 -- all PDB-exact.
         const uint8_t* arr = *(const uint8_t* const*)((const uint8_t*)g_mapData + off::kMapDataMaps);
         const int32_t  num = *(const int32_t*)((const uint8_t*)g_mapData + off::kMapDataMaps + 8);
         if (!arr || num <= 0 || num > 512) return false;
-        for (int i = 0; i < num; i++) {
-            const uint8_t* e = arr + (size_t)i * off::kMapDataStride;
-            char nm[64];
-            if (!fnameToAscii(e + off::kMapDataName, nm, sizeof(nm))) continue;
-            if (_stricmp(nm, internalName) != 0) continue;
-            char label[64];
-            if (ftextToAscii(e + off::kMapDataLabel, label, sizeof(label)) && label[0])
-                strncpy_s(out, (size_t)cap, label, _TRUNCATE);
-            return true;
+        // Exact first, stem second: an exact hit must never lose to a stem collision.
+        for (int pass = 0; pass < 2; pass++) {
+            for (int i = 0; i < num; i++) {
+                const uint8_t* e = arr + (size_t)i * off::kMapDataStride;
+                char nm[64];
+                if (!fnameToAscii(e + off::kMapDataName, nm, sizeof(nm))) continue;
+                if (pass == 0) {
+                    if (_stricmp(nm, internalName) != 0) continue;
+                } else {
+                    char haveStem[64]; mapStem(nm, haveStem, sizeof(haveStem));
+                    if (!haveStem[0] || _stricmp(haveStem, wantStem) != 0) continue;
+                }
+                char label[64];
+                if (ftextToAscii(e + off::kMapDataLabel, label, sizeof(label)) && label[0]) {
+                    strncpy_s(out, (size_t)cap, label, _TRUNCATE);
+                    return true;
+                }
+                return false;      // entry found but its label would not read: keep the raw name
+            }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) { }
     return false;
+}
+
+// Every entry of the label table, once per session. A map whose pretty name does not appear is
+// either absent from this table or carries a label that will not read, and those two have identical
+// symptoms on screen -- this is what tells them apart without another build.
+void LogMapSelectTable(void (*logf)(const char*)) {
+    if (!logf || !g_mapData) return;
+    __try {
+        const uint8_t* arr = *(const uint8_t* const*)((const uint8_t*)g_mapData + off::kMapDataMaps);
+        const int32_t  num = *(const int32_t*)((const uint8_t*)g_mapData + off::kMapDataMaps + 8);
+        if (!arr || num <= 0 || num > 512) return;
+        { char m[80]; snprintf(m, sizeof(m), "[maps] label table: %d entr%s", num, num == 1 ? "y" : "ies");
+          logf(m); }
+        char line[220]; int n = 0;
+        for (int i = 0; i < num; i++) {
+            const uint8_t* e = arr + (size_t)i * off::kMapDataStride;
+            char nm[64] = {0}, label[64] = {0};
+            fnameToAscii(e + off::kMapDataName, nm, sizeof(nm));
+            const bool haveLabel = ftextToAscii(e + off::kMapDataLabel, label, sizeof(label)) && label[0];
+            const uint8_t dlc = *(const uint8_t*)(e + off::kMapDataDlc);
+            const int w = snprintf(line + n, sizeof(line) - n, "%s%s=%s%s",
+                                   n ? " | " : "   ", nm[0] ? nm : "(unnamed)",
+                                   haveLabel ? label : "<NO LABEL>", dlc ? "*" : "");
+            if (w <= 0) break;
+            n += w;
+            if (n > 150 || i == num - 1) { logf(line); n = 0; line[0] = 0; }
+        }
+        logf("[maps] (* = DLC entry; <NO LABEL> = in the table but its display text would not read)");
+    } __except (EXCEPTION_EXECUTE_HANDLER) { }
 }
 
 // CACHED ON THE WORLD POINTER, AND IT MUST STAY THAT WAY. `fnameToAscii` leaks the FString that

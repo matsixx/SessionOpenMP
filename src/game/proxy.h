@@ -122,6 +122,14 @@ public:
     // before the pointers are dropped: Forget() only forgets, so without this the abandoned skater
     // stands there frozen while its board -- no longer written by anyone -- rolls off on its own.
     void Retire(void (*logf)(const char*));
+    // The peer walked into a DIFFERENT level. Their transported coordinates describe a world that is
+    // not ours, so driving their proxy with them parks a skater at a meaningless point in yours --
+    // hide it and its board, stop the board simulating, and reveal it when they come back. Retire's
+    // treatment without the permanence: a map switch is a round trip, and re-spawning on return
+    // strands one actor per crossing (a proxy actor is never destroyed -- that crashes the client).
+    // Idempotent; a no-op before the actor exists.
+    void SetPresent(bool present, void (*logf)(const char*));
+    bool Present() const { return present_; }
     void Forget();                        // world changed: every actor died with it; drop pointers
 
     void*      actor() const { return actor_; }
@@ -159,6 +167,7 @@ private:
     int        tries_ = 0;
     bool       refreshed_ = false, repOff_ = false, boardRepOff_ = false, tickOff_ = false;
     bool       boardHidden_ = false, simOn_ = false, boardLogged_ = false;
+    bool       present_ = true;           // false = concealed because the peer is in another level
     bool       nearLocal_ = true;         // default near: sim until the session has measured
     bool       animThrottled_ = false;    // the tick-option write happens once per actor
     uint8_t    lastPushState_ = 0, lastBrakeState_ = 0, lastBailing_ = 0;

@@ -230,8 +230,10 @@ static void publishUi() {
             void* pc = nullptr;
             __try { pc = (void*)RC::Unreal::UObjectGlobals::FindFirstOf(L"PlayerController"); }
             __except (EXCEPTION_EXECUTE_HANDLER) { pc = nullptr; }
-            if (pc && game::CacheMapSelectData(pc))
+            if (pc && game::CacheMapSelectData(pc)) {
                 logLine("[mod] map labels available (UMapSelectDataAsset via the game instance)");
+                game::LogMapSelectTable(&logLine);
+            }
         }
     }
     // The chat box would like the game's own typeface (game_font.h). Same throttle and the same

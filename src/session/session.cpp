@@ -51,8 +51,6 @@ struct Slot {
     // Said once per peer: an unreadable packet repeats at the send rate, and a warning that
     // repeats 60 times a second is a log flood, not a warning.
     bool        rejectedSpoken = false;
-    // Said once per peer per world: the map gate is evaluated every frame.
-    bool        mapSkipSpoken = false;
     // This peer has the replay editor open (their latest sampled snapshot says so). Drives the
     // per-peer packet choice in the publish loop: a scrubbing peer gets RESULTS, everyone else
     // keeps DRIVERS. Latched from the stream, so a quiet peer keeps their last known state.
@@ -68,6 +66,11 @@ struct Slot {
     // frame you exit) but invisible. Keyed on the ACTOR, wornForActor-style, so a respawn mid-
     // playback gets hidden too and a world change cannot leave the flag pointing at a dead actor.
     void*       replayConcealedActor = nullptr;
+    // In a DIFFERENT level from us. Their proxy (if one exists) is hidden and undriven until they
+    // come back -- see the gate in Frame. Read by PeerAt/PeerActorById, which report no actor for an
+    // away peer: it is hidden in a world they are not in, so nothing should point a nameplate or a
+    // replay camera at it.
+    bool        away = false;
     // ---- replay sync: this peer's own state history, transferred on request, shown in OUR replay.
     bool        syncOn = false;          // the menu's wish; the transfer/buffer state lives in replaysync
     uint64_t    syncReqSentUs = 0;       // when we asked -- anchors their buffer's newest to our clock
@@ -129,6 +132,7 @@ static Slot* slotFor(int peerIdx, uint64_t nowUs) {
         memset(&s.cosmetics, 0, sizeof(s.cosmetics));   // padding too -- it is memcmp'd for changes
         s.haveCosmetics = false; s.wornForActor = nullptr; s.peerReplaying = false;
         s.replayHidden = false; s.boardNear = true; s.replayConcealedActor = nullptr;
+        s.away = false;
         s.syncOn = false; s.syncReqSentUs = 0;
         g_cosResend = true;                          // they need OUR look too, now rather than in 10 s
         if (g_logf) { char m[120]; snprintf(m, sizeof(m), "[session] stream opened for peer %d", peerIdx); g_logf(m); }
@@ -233,7 +237,9 @@ bool PeerAt(int slot, char* nameOut, int nameCap, void** proxyActorOut, int* pee
         const char* n = (s.haveCosmetics && s.cosmetics.skaterName[0]) ? s.cosmetics.skaterName : "";
         strncpy_s(nameOut, (size_t)nameCap, n, _TRUNCATE);
     }
-    if (proxyActorOut) *proxyActorOut = s.proxy.actor();
+    // An away peer's actor is reported as NONE: it is hidden in a world they are not in, so a
+    // nameplate over it, or a replay camera locked to it, would be pointing at nothing.
+    if (proxyActorOut) *proxyActorOut = s.away ? nullptr : s.proxy.actor();
     if (peerIdOut)     *peerIdOut     = s.peerIdx;
     return true;
 }
@@ -250,7 +256,7 @@ bool PeerMap(int slot, char* out, int cap) {
 
 void* PeerActorById(int peerId) {
     if (peerId < 0) return nullptr;
-    for (auto& s : g_slots) if (s.used && s.peerIdx == peerId) return s.proxy.actor();
+    for (auto& s : g_slots) if (s.used && s.peerIdx == peerId) return s.away ? nullptr : s.proxy.actor();
     return nullptr;                       // they left, or the slot was reused by somebody else
 }
 
@@ -356,11 +362,10 @@ static bool worldTakesProxies(const char* world) {
 static const uint64_t kWorldSettleMs = 2000;
 
 void ForgetProxies() {
-    for (auto& s : g_slots) if (s.used) { s.proxy.Forget(); s.replayHidden = false; }
+    for (auto& s : g_slots) if (s.used) { s.proxy.Forget(); s.replayHidden = false; s.away = false; }
     g_settleUntilMs = 0;                 // re-armed by Frame, which owns the clock
     g_lastOwnPawn   = nullptr;
     g_ownMap[0]     = 0;
-    for (auto& s : g_slots) s.mapSkipSpoken = false;   // a new world is a new question
     if (g_logf) g_logf("[session] world changed -- all proxy pointers dropped, spawning held until the world settles");
 }
 
@@ -399,7 +404,6 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
         g_ownMap[0] = 0;
         if (ownPawn) {
             game::LocalMapName(ownPawn, g_ownMap, sizeof(g_ownMap));
-            for (auto& s : g_slots) s.mapSkipSpoken = false;
             // Name the level we landed in. Without this a level-specific problem is only ever
             // describable as "the apartment" -- the log should say which world that is.
             if (g_logf) { char m[140]; snprintf(m, sizeof(m), "[session] now in world '%s'",
@@ -651,6 +655,35 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
             s.replayConcealedActor = nullptr;
         }
 
+        // ---- IS THIS PEER EVEN HERE? Their level travels with their cosmetics, so once both names
+        // are known a difference is decisive. Checked for EVERY peer, not just unspawned ones: a peer
+        // who walks to another map keeps publishing, and their coordinates now describe a world that
+        // is not ours -- driving an existing proxy with them leaves their skater standing at a
+        // meaningless point in your level (that was the visible bug). Unknown either side = treat
+        // them as here, so a peer whose cosmetics have not landed is never wrongly hidden.
+        // `worldTakesProxies` rides along because it answers the same question for OUR world: in the
+        // apartment nobody else is really present, each player being in their own copy of it.
+        const bool elsewhere =
+            !worldTakesProxies(g_ownMap) ||
+            (s.haveCosmetics && s.cosmetics.mapName[0] && g_ownMap[0] &&
+             _stricmp(s.cosmetics.mapName, g_ownMap) != 0);
+        s.away = elsewhere;              // read by PeerAt/PeerActorById: an away peer offers no actor
+        // RE-ASSERTED from the proxy's own visibility, not from a latch: the replay-playback exit
+        // above reveals whatever it concealed, and a latch that only fires on change would leave an
+        // away peer visible after that. Asking the proxy what it currently is makes every path
+        // converge, however it got there.
+        if (s.proxy.actor() && s.proxy.Present() == elsewhere) {
+            s.proxy.SetPresent(!elsewhere, g_logf);
+            if (g_logf) { char m[190];
+                if (elsewhere) snprintf(m, sizeof(m), "[session] peer %d is on '%s' and we are on '%s'"
+                                        " -- hidden here until they come back", s.peerIdx,
+                                        s.cosmetics.mapName[0] ? s.cosmetics.mapName : "(unknown)",
+                                        g_ownMap[0] ? g_ownMap : "(unknown)");
+                else           snprintf(m, sizeof(m), "[session] peer %d is back in our level", s.peerIdx);
+                g_logf(m); }
+        }
+        if (elsewhere) continue;         // nothing of theirs belongs in this world: do not drive it
+
         repl::State out;
         if (!s.stream.Sample(nowUs, out)) continue;    // fewer than 2 snapshots: nothing to show yet
 
@@ -680,35 +713,10 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
             if (!ownPawn) continue;
             // ...and a world that has finished deciding whose pawn is whose. See kWorldSettleMs.
             if (nowMs < g_settleUntilMs) continue;
-            // ...and a world that tolerates one at all. Checked before the map comparison because
-            // this holds even when the peer is standing in "the same" level: two people in the hub
-            // are in two different copies of it.
-            if (!worldTakesProxies(g_ownMap)) {
-                if (!s.mapSkipSpoken) {
-                    s.mapSkipSpoken = true;
-                    if (g_logf) { char m[170]; snprintf(m, sizeof(m),
-                        "[session] '%s' does not take proxies -- peer %d stays unspawned while we are here",
-                        g_ownMap, s.peerIdx); g_logf(m); }
-                }
-                continue;
-            }
-            // ...and a peer who is actually HERE. Their map travels with their cosmetics, so once
-            // both names are known a difference is decisive: a peer in another level has nothing to
-            // show in this one, and spawning them anyway is how a skater ends up standing in your
-            // apartment. It is also the only defence against levels where the game possesses a
-            // freshly spawned skater -- there the spawn itself is the damage, whatever the timing,
-            // and not spawning is the only thing that helps. Unknown either side = spawn as before,
-            // so a peer whose cosmetics have not landed yet is never permanently invisible.
-            if (s.haveCosmetics && s.cosmetics.mapName[0] && g_ownMap[0] &&
-                _stricmp(s.cosmetics.mapName, g_ownMap) != 0) {
-                if (!s.mapSkipSpoken) {
-                    s.mapSkipSpoken = true;
-                    if (g_logf) { char m[190]; snprintf(m, sizeof(m),
-                        "[session] peer %d is on '%s' and we are on '%s' -- not spawning them here",
-                        s.peerIdx, s.cosmetics.mapName, g_ownMap); g_logf(m); }
-                }
-                continue;
-            }
+            // A peer who is elsewhere never reaches here -- the presence gate above already
+            // continued -- which is what keeps a skater from being spawned into your apartment, and
+            // is the only defence in levels where the game possesses a freshly spawned character:
+            // there the spawn ITSELF is the damage, whatever the timing.
             if (!s.proxy.EnsureSpawned(ownPawn, out, nowMs, g_logf)) continue;
         }
         s.proxy.Apply(out, nowMs, nowUs, g_logf);

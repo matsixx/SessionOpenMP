@@ -213,7 +213,7 @@ void Proxy::Forget() {
     for (auto& l : audioLoops_) { l.slot = 0; l.comp = nullptr; }
     actor_ = nullptr; world_ = nullptr; tries_ = 0; lastTryMs_ = 0;
     refreshed_ = repOff_ = boardRepOff_ = tickOff_ = boardHidden_ = simOn_ = boardLogged_ = false;
-    nearLocal_ = true; animThrottled_ = false;
+    nearLocal_ = true; animThrottled_ = false; present_ = true;
     lastBailing_ = 0;
     lastBroken_ = 0;
     // change-edge caches too: a REPLACEMENT actor must get every write again even when the wire value
@@ -1157,6 +1157,28 @@ void Proxy::PlayPushStates(const uint8_t* states, int n) {
         lastPushState_ = states[i];
         st_.pushes++;
     }
+}
+
+void Proxy::SetPresent(bool present, void (*logf)(const char*)) {
+    if (!actor_ || present == present_) return;
+    present_ = present;
+    const Syms& S = Get();
+    // Going away is Retire's treatment minus the permanence: silence their loops and stop the board,
+    // because nothing writes either while they are elsewhere, and an unwritten board free-spins.
+    if (!present) { AudioStopAll(); if (simOn_) StopBoardSim(); }
+    // Hiding is purely visual -- the collision stays -- so an actor that is only hidden leaves an
+    // invisible obstacle where it stood (the departed-peer lesson). Collision follows visibility.
+    auto reveal = [&](void* a) {
+        if (!a) return;
+#ifdef _WIN32
+        if (S.SetActorHidden)    { __try { S.SetActorHidden(a, !present); }   __except (EXCEPTION_EXECUTE_HANDLER) {} }
+        if (S.SetActorCollision) { __try { S.SetActorCollision(a, present); } __except (EXCEPTION_EXECUTE_HANDLER) {} }
+#endif
+    };
+    reveal(actor_);
+    reveal(OwnBoard());
+    if (logf) logf(present ? "[proxy] peer is back in our level -- their skater is visible again"
+                           : "[proxy] peer is in another level -- their skater is hidden here");
 }
 
 void Proxy::Retire(void (*logf)(const char*)) {
