@@ -59,11 +59,23 @@ struct Tuning {
     // so a scrubbing peer applies no live poses and sending them is pure bandwidth. The machinery
     // stays because a future spectate mode outside the editor is exactly this lane switched on.
     bool serveScrubbingPeers = false;
+    // On a bone-COUNT mismatch, stamp the common PREFIX instead of refusing. The character mesh is
+    // MERGED from body + garments and garments can carry rig bones, so two ends dressing the same
+    // player from different installed content get DIFFERENT counts -- one item "not installed here"
+    // and every transferred pose was refused (field: skipCnt == noted, the synced skater a heap of
+    // clothes; invisible on the same-PC rig, where both installs wear identical content). Merged
+    // meshes share the base skeleton as their index prefix, so the prefix is the body; component-
+    // space transforms are absolute, so a subset stamp is geometrically consistent. In the common
+    // direction (their mesh carries MORE bones than our stripped-down proxy) our mesh is fully
+    // posed. false = the old exact-match refuse, kept for A/B: if the prefix assumption were wrong
+    // it would show instantly as a scrambled pose, and this switch restores the refuse.
+    bool prefixOnMismatch = true;
 };
 Tuning& Tune();
 
 struct Stats {
     uint32_t captured = 0, applied = 0, skippedCount = 0, faults = 0;
+    uint32_t prefixStamps = 0;   // mismatched-count frames stamped as a prefix (see prefixOnMismatch)
     uint32_t hookCalls = 0, noted = 0, stale = 0;
     // held        = frames a proxy's own finished pose was snapshotted (normal play)
     // holdApplied = frames that snapshot was re-stamped during a local replay

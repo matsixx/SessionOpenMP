@@ -217,9 +217,19 @@ void OnFinalizeBones(void* mesh, uint64_t nowMs) {
     const bool haveFresh = sl->n && !(nowMs > sl->freshMs && nowMs - sl->freshMs > g_tun.freshMs);
     if (sl->n && !haveFresh) g_st.stale++;
     if (haveFresh) {
-        if (num != (int)sl->n) { g_st.skippedCount++; return; }
+        // Count mismatch = the two ends MERGED different meshes for this player (garments carry rig
+        // bones, and an item not installed here changes the merged mesh). The base skeleton is the
+        // index prefix of every merge, so the prefix IS the body: stamp what both sides have. Any
+        // local bones past their count are garment extras left un-stamped -- and in the common
+        // direction (their outfit is richer than our stripped-down proxy) there are none.
+        int nStamp = (int)sl->n;
+        if (num != (int)sl->n) {
+            if (!g_tun.prefixOnMismatch) { g_st.skippedCount++; return; }
+            nStamp = num < (int)sl->n ? num : (int)sl->n;
+            g_st.prefixStamps++;             // visible as pfx= in the 1 Hz [pose] line
+        }
         __try {
-            for (int b = 0; b < (int)sl->n; b++) {
+            for (int b = 0; b < nStamp; b++) {
                 uint8_t* t = cs + (size_t)b * off::kTransformStride;
                 memcpy(t + off::kTransformRotOff, sl->rot[b], 16);
                 memcpy(t + off::kTransformPosOff, sl->pos[b], 12);

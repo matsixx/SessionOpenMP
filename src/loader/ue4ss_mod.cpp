@@ -771,10 +771,10 @@ static void GameThreadFrame() {
             const game::pose::Stats p = game::pose::GetStats();
             if (p.captured || p.noted || p.applied || p.faults || p.holdApplied) {
                 snprintf(m, sizeof(m),
-                         "[pose] cap=%u(%uB) noted=%u hook=%u applied=%u stale=%u skipCnt=%u"
+                         "[pose] cap=%u(%uB) noted=%u hook=%u applied=%u pfx=%u stale=%u skipCnt=%u"
                          " meshBones=%u faults=%u held=%u holdApplied=%u",
-                         p.captured, p.bones, p.noted, p.hookCalls, p.applied, p.stale,
-                         p.skippedCount, p.meshBones, p.faults, p.held, p.holdApplied);
+                         p.captured, p.bones, p.noted, p.hookCalls, p.applied, p.prefixStamps,
+                         p.stale, p.skippedCount, p.meshBones, p.faults, p.held, p.holdApplied);
                 logLine(m);
                 // Measurement only, and silent outside replay playback: whether proxy anim graphs
                 // still UPDATE while the local player scrubs, and the state of the standard
