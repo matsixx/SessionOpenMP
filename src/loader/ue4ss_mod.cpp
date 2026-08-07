@@ -200,6 +200,21 @@ static bool keyEdge(int vk, bool* held) {
     *held = down;
     return edge;
 }
+// ---- the map-label asset scan, split so SEH and object unwinding never share a function:
+// findAllMapAssetsSeh holds the __try (vector by pointer, nothing to unwind); its caller owns the
+// vector and has no __try.
+static bool findAllMapAssetsSeh(std::vector<RC::Unreal::UObject*>* out) {
+    __try { RC::Unreal::UObjectGlobals::FindAllOf(L"MapSelectDataAsset", *out); return true; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+static int scanForMapLabelAssets() {
+    std::vector<RC::Unreal::UObject*> assets;
+    if (!findAllMapAssetsSeh(&assets)) return 0;
+    int added = 0;
+    for (RC::Unreal::UObject* a : assets) added += omp::game::AddMapLabelsFrom((void*)a);
+    return added;
+}
+
 // Refresh what the menu displays. Called on EVERY MpPump path -- the pre-session states ("signing in",
 // "transport failed") are exactly the ones the user most needs to see, and an early return that skipped
 // the publish would leave the menu insisting there is no session while EOS is mid-login.
@@ -222,16 +237,28 @@ static void publishUi() {
     // definition has not armed yet and so has no pawn to reach the game instance through.
     // `AActor::GetGameInstance` works on any actor, so the PlayerController does just as well as the
     // pawn. Throttled, and it stops the moment it succeeds -- FindFirstOf walks GUObjectArray.
-    if (!game::HaveMapSelectData()) {
+    // Also RE-scanned whenever a label lookup missed: the base asset only names the 12 core maps
+    // (measured), and each DLC's table is its own instance of the same class, loaded with its menu.
+    // The scan stops itself -- no misses, no walks of GUObjectArray.
+    // (Split across two helpers below: the std::vector may not live in a function with __try.)
+    if (!game::HaveMapSelectData() || game::MapLabelsMissed()) {
         static uint64_t lastMapTry = 0;
         const uint64_t ms = GetTickCount64();
-        if (ms - lastMapTry > 2000) {
+        if (ms - lastMapTry > (game::HaveMapSelectData() ? 5000u : 2000u)) {
             lastMapTry = ms;
+            const bool hadBase = game::HaveMapSelectData();
             void* pc = nullptr;
             __try { pc = (void*)RC::Unreal::UObjectGlobals::FindFirstOf(L"PlayerController"); }
             __except (EXCEPTION_EXECUTE_HANDLER) { pc = nullptr; }
-            if (pc && game::CacheMapSelectData(pc)) {
-                logLine("[mod] map labels available (UMapSelectDataAsset via the game instance)");
+            if (pc) game::CacheMapSelectData(pc);
+            int added = 0;
+            if (game::HaveMapSelectData()) {          // base first, so its labels win name collisions
+                added = scanForMapLabelAssets();
+                game::ClearMapLabelMiss();            // this scan answered what it could
+            }
+            if ((!hadBase && game::HaveMapSelectData()) || added > 0) {
+                logLine(added > 0 ? "[mod] map labels extended (additional MapSelectDataAsset instances)"
+                                  : "[mod] map labels available (UMapSelectDataAsset via the game instance)");
                 game::LogMapSelectTable(&logLine);
             }
         }
@@ -1170,6 +1197,7 @@ public:
             };
             // Version skew has no other symptom than a player who never appears, so it is said in the
             // chat box -- the one surface already on screen during play. Fires once per peer.
+            sc.onNotice = [](const char* text) { Chat_System(text); };
             sc.onVersionMismatch = [](int) {
                 Chat_System("A player here is running a different SessionOpenMP version, so you will not "
                             "see each other. Run update.bat in the game folder to get the latest.");

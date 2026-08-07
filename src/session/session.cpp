@@ -66,6 +66,9 @@ struct Slot {
     // frame you exit) but invisible. Keyed on the ACTOR, wornForActor-style, so a respawn mid-
     // playback gets hidden too and a world change cannot leave the flag pointing at a dead actor.
     void*       replayConcealedActor = nullptr;
+    // This peer has been announced in chat ("<name> joined"). Set when their name first lands (it
+    // rides cosmetics), so the announcement can use it; reset with the slot.
+    bool        joinAnnounced = false;
     // In a DIFFERENT level from us. Their proxy (if one exists) is hidden and undriven until they
     // come back -- see the gate in Frame. Read by PeerAt/PeerActorById, which report no actor for an
     // away peer: it is hidden in a world they are not in, so nothing should point a nameplate or a
@@ -132,7 +135,7 @@ static Slot* slotFor(int peerIdx, uint64_t nowUs) {
         memset(&s.cosmetics, 0, sizeof(s.cosmetics));   // padding too -- it is memcmp'd for changes
         s.haveCosmetics = false; s.wornForActor = nullptr; s.peerReplaying = false;
         s.replayHidden = false; s.boardNear = true; s.replayConcealedActor = nullptr;
-        s.away = false;
+        s.away = false; s.joinAnnounced = false;
         s.syncOn = false; s.syncReqSentUs = 0;
         g_cosResend = true;                          // they need OUR look too, now rather than in 10 s
         if (g_logf) { char m[120]; snprintf(m, sizeof(m), "[session] stream opened for peer %d", peerIdx); g_logf(m); }
@@ -170,6 +173,28 @@ void OnPacket(int peerIdx, const uint8_t* data, int len, uint64_t nowUs) {
         memcpy(merged.mapName,    c.mapName,    sizeof(merged.mapName));
         if (section == repl::kCosBoard) { memcpy(merged.brd, c.brd, sizeof(merged.brd)); merged.nBoard = c.nBoard; }
         else                            { memcpy(merged.chr, c.chr, sizeof(merged.chr)); merged.nChar  = c.nChar;  }
+        // ---- chat notices. Both ride this packet because it is where the facts live: the NAME
+        // arrives only with cosmetics, and the map name travels here too. The join line waits for
+        // the name rather than firing on the slot opening -- "somebody joined" with no name helps
+        // nobody, and the name lands within a second.
+        if (g_cfg.onNotice) {
+            char note[160] = {0};
+            if (!cs->joinAnnounced && merged.skaterName[0]) {
+                cs->joinAnnounced = true;
+                char where[64] = {0};
+                if (merged.mapName[0]) game::PrettyMapName(merged.mapName, where, sizeof(where));
+                if (where[0]) snprintf(note, sizeof(note), "%s joined the session (%s)", merged.skaterName, where);
+                else          snprintf(note, sizeof(note), "%s joined the session", merged.skaterName);
+            } else if (cs->joinAnnounced && merged.mapName[0] && cs->cosmetics.mapName[0] &&
+                       _stricmp(merged.mapName, cs->cosmetics.mapName) != 0) {
+                char where[64] = {0};
+                game::PrettyMapName(merged.mapName, where, sizeof(where));
+                snprintf(note, sizeof(note), "%s went to %s",
+                         merged.skaterName[0] ? merged.skaterName : "A player",
+                         where[0] ? where : merged.mapName);
+            }
+            if (note[0]) g_cfg.onNotice(note);
+        }
         const bool changed = !cs->haveCosmetics || memcmp(&cs->cosmetics, &merged, sizeof(merged)) != 0;
         cs->cosmetics = merged; cs->haveCosmetics = true;
         if (changed) {

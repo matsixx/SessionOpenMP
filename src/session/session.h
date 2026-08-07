@@ -44,6 +44,9 @@ struct Config {
     // ONCE per peer, so it is safe to put in front of the player. Optional: the session already logs
     // it, and this exists so the UI can say it where the player is actually looking.
     void (*onVersionMismatch)(int peerId) = nullptr;
+    // Session happenings worth a line in the chat box: a player joining, a player changing maps.
+    // Plain prose, already formatted -- the UI shows it as a system line.
+    void (*onNotice)(const char* text) = nullptr;
 };
 
 struct Stats {
