@@ -9,12 +9,15 @@
 // Additional permission under GNU GPL version 3 section 7: you may link and convey this
 // work combined with the Epic Online Services SDK and the proprietary game runtime it
 // loads into. See LICENSE-EXCEPTION.txt.
-// SessionTweaks -- CLOTH/WIND recon probe. Read-only, on-demand dump of everything that decides
-// whether clothes can be made to move: the skater's merged mesh and every prop component (clothing
-// sim data, physics assets/bodies), each material slot's instance -> parent chain with its scalar/
-// vector/texture/static-switch parameters (the wind wobble some shirts show is material-side; two
-// dumps -- windy shirt vs plain -- name the mechanism), plus a global census of loaded clothing
-// assets, material parameter collections and wind sources. Writes nothing to the game.
+// SessionTweaks -- cloth wind. Two halves:
+//  * CLOTH WIND BOOST: wind-capable garments (the MAT_ClothMaster shirts with a WindMask texture)
+//    flap by the 'PlayerSpeed' scalar of the MPC_ClothWind parameter collection. A hook on the
+//    game's own SetScalarParameterValue scales that write and floors it, so those clothes flap
+//    harder with speed and keep a breeze at a standstill. Garments on the procedural masters
+//    (MAT_Cloth_UB_Master etc.) have no wind in their shader and cannot be given one.
+//  * RECON DUMP (F1 button): read-only dump of the merged mesh + props (cloth sim data, physics
+//    bodies), every material chain with parameters at each level, and the parameter-collection
+//    census -- the instrument that decoded the above; kept for future outfits and game updates.
 #pragma once
 struct OmpMenuApi;
 void ClothPhys_ReadConfig(const char* iniText);

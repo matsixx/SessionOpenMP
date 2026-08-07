@@ -16,7 +16,7 @@
 //   run_out       low-air missed-trick bails become the native run-out
 //   catch_level   board levels out when it hits your foot (restores a removed feature)
 //   grind_pop     read-only probe on the grind-exit pop pipeline (measurement, changes nothing)
-//   cloth_physics read-only cloth/wind recon dump (merged mesh, props, material params; no writes)
+//   cloth_physics cloth wind boost (stronger flap + standstill breeze) + cloth/material recon dump
 //
 // A SEPARATE UE4SS C++ mod (Mods\SessionTweaks\dlls\main.dll), deliberately not part of the
 // multiplayer mod: gameplay feel and co-op ship together by the user's distribution choice, but they
@@ -319,7 +319,7 @@ public:
     SessionTweaks() {
         ModName = STR("SessionTweaks");
         // Version history is kept with the releases, not in the source.
-        ModVersion = STR("2.13.1");
+        ModVersion = STR("2.14.0");
         ModDescription = STR("Gameplay fixes: real-stick-sweep scoop speed, wider manual catch window, darkslide-aware catch fix, run out on missed tricks");
         ModAuthors = STR("matsix");
         char dir[MAX_PATH]{};
@@ -328,7 +328,7 @@ public:
         char path[MAX_PATH];
         snprintf(path, sizeof(path), "%sSessionTweaks.log", dir);
         g_log = fopen(path, "w");
-        TwkLog("=== SessionTweaks 2.13.1 loading (UE4SS C++ mod) ===");
+        TwkLog("=== SessionTweaks 2.14.0 loading (UE4SS C++ mod) ===");
         readConfig(dir);
     }
     ~SessionTweaks() override {

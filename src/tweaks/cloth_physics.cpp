@@ -21,9 +21,22 @@
 // switch (cooked, per-instance)? None of that is knowable from code; this dump reads it out of the
 // live objects. The follow-up feature builds on whichever channel the log proves real.
 //
-// Everything here is a READ. The only game function called is FName::ToString (via the cached
+// The dump is a READ. The only game function it calls is FName::ToString (via the cached
 // resolver), plus UE4SS's FindAllOf for the global census -- both from the game thread, one shot
 // per button press.
+//
+// CLOTH WIND BOOST (the shipped feature the dumps led to). The field dumps decoded the wobble:
+// wind-capable garments sit on the MAT_ClothMaster master material (baked BC/MG/NM + a per-item
+// WindMask texture); the newer procedural masters (MAT_Cloth_UB_Master, M_Apparel_LowerBody_Master,
+// MAT_Cap_Master, MAT_Shoe_Master) have no wind code at all, so shader wind cannot be given to
+// those garments -- their look is composed in-shader with different parameters, and re-parenting
+// them onto MAT_ClothMaster would replace the garment's appearance with the master's defaults.
+// The wind amplitude rides ONE global: the 'PlayerSpeed' scalar of the MPC_ClothWind material
+// parameter collection, written by the game through UMaterialParameterCollectionInstance::
+// SetScalarParameterValue. The boost hooks that setter and, when the write is ClothWind's
+// PlayerSpeed, scales it and floors it -- flap harder while riding, keep a breeze at a standstill.
+// The hook itself never calls a game API and never logs; naming the (instance, FName) pair happens
+// on the pump from a small candidate table, and only the named pair is ever modified.
 // =====================================================================================================
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
@@ -32,6 +45,7 @@
 #include "catch_tweaks.h"          // CatchTweaks_Skater(): the live skater, published for pump use
 #include "cloth_physics.h"
 #include "ue4ss_abi.h"             // RC::Unreal::UObjectGlobals::FindAllOf (global census)
+#include "MinHook.h"
 #include "ui/menu_ext.h"
 
 // ------------------------------------------------------------------ offsets (all PDB-read)
@@ -135,6 +149,104 @@ static bool ClassNameOf(const void* obj, char* out, int cap) {
 static volatile LONG g_dumpReq = 0;      // set by the F1 button (render thread), drained by the pump
 static bool g_probeOK = true;            // one-shot kill: a faulting dump disables ONLY this probe
 static char g_status[96] = "no dump yet";
+
+// ------------------------------------------------------------------ wind boost
+// UMaterialParameterCollectionInstance::SetScalarParameterValue -- Epic 0x2d85a80 / Steam 0x2d482f0,
+// sig unique in both. ABI read out of the callee: rcx=this, rdx=FName BY VALUE, xmm2=float (the
+// entry spills it with movss, so it is provably a single, not a double); returns bool (false when
+// the name is not in the instance's collection).
+static const char* SIG_MPCI_SET_SCALAR =
+    "F3 0F 11 54 24 18 48 89 54 24 10 53 55 41 56 48 83 EC 50 48 8B 41 30 48 8B E9 48 8B DA 48 63 48 40";
+typedef bool (*MpciSetScalarFn)(void*, uint64_t, float);
+static MpciSetScalarFn g_origSetScalar = nullptr;
+
+// Knobs (ini + F1). The boost only ever changes the ONE value the dumps proved is the wind
+// amplitude, so a wrong theory shows as "nothing happens", never as damage.
+static int   g_windBoost = 1;        // master toggle
+static float g_windBase  = 400.0f;   // breeze floor, in the game's own PlayerSpeed units (~cm/s)
+static float g_windMult  = 200.0f;   // percent applied to the game's written speed
+
+static bool g_windOK = true;         // one-shot kill for the floor writer alone
+
+// Identification: the hook records (instance, FName) pairs it sees; the pump names them (FName::
+// ToString is a game API and may not be called from inside the hooked callstack) and latches the
+// ClothWind/PlayerSpeed pair. FNames are stable for the process, so after that the hook matches by
+// FName value alone -- the instance pointer is refreshed from each matching write because the
+// per-world instance dies on a map change.
+struct WindCand { void* inst; uint64_t fname; };
+static WindCand      g_windCands[8];
+static volatile LONG g_windCandN = 0;
+static volatile LONG g_windIdDone = 0;
+static uint64_t          g_cwFName = 0;
+static void* volatile    g_cwInst = nullptr;
+static volatile LONGLONG g_cwLastWriteMs = 0;   // GAME writes only (our floor writes bypass the hook)
+
+static bool hkSetScalar(void* inst, uint64_t fname, float v) {
+    if (g_windIdDone) {
+        if (fname == g_cwFName) {
+            g_cwInst = inst;
+            InterlockedExchange64(&g_cwLastWriteMs, (LONGLONG)GetTickCount64());
+            if (g_windBoost) {
+                float boosted = v * (g_windMult * 0.01f);
+                if (boosted < g_windBase) boosted = g_windBase;
+                v = boosted;
+            }
+        }
+    } else if (g_windCandN < 8) {
+        const LONG n = g_windCandN;
+        bool seen = false;
+        for (LONG i = 0; i < n && i < 8; i++)
+            if (g_windCands[i].inst == inst && g_windCands[i].fname == fname) { seen = true; break; }
+        if (!seen) {
+            const LONG at = InterlockedIncrement(&g_windCandN) - 1;
+            if (at < 8) { g_windCands[at].inst = inst; g_windCands[at].fname = fname; }
+        }
+    }
+    return g_origSetScalar ? g_origSetScalar(inst, fname, v) : false;
+}
+
+// GAME THREAD (from the pump). Names candidates until the pair is found, then keeps the breeze
+// alive when the game's own writer goes quiet (its write already carries the floor otherwise).
+static void windPump() {
+    if (!g_origSetScalar) return;
+    if (!g_windIdDone) {
+        const LONG n = g_windCandN;
+        for (LONG i = 0; i < n && i < 8; i++) {
+            char cn[64], pn[64];
+            NameOfObject(twkP(g_windCands[i].inst, MPCI_COLLECTION), cn, sizeof(cn));
+            if (strcmp(cn, "MPC_ClothWind") != 0) continue;
+            NameOfFName(&g_windCands[i].fname, pn, sizeof(pn));
+            if (strcmp(pn, "PlayerSpeed") != 0) continue;
+            g_cwFName = g_windCands[i].fname;
+            g_cwInst  = g_windCands[i].inst;
+            InterlockedExchange64(&g_cwLastWriteMs, (LONGLONG)GetTickCount64());
+            InterlockedExchange(&g_windIdDone, 1);
+            TwkLog("[cloth] wind writer identified: MPC_ClothWind 'PlayerSpeed' -- boost %s (base %.0f, x%.0f%%)",
+                   g_windBoost ? "ON" : "off", g_windBase, g_windMult);
+            break;
+        }
+        return;
+    }
+    if (!g_windBoost || !g_windOK) return;
+    void* inst = g_cwInst;
+    if (!inst) return;
+    const LONGLONG now = (LONGLONG)GetTickCount64();
+    const LONGLONG last = g_cwLastWriteMs;
+    // No game write for a long time = the instance may be a dead world's; drop it and wait for the
+    // next real write to re-point us. A missed breeze is recoverable, a call into a freed object is not.
+    if (now - last > 5000) { g_cwInst = nullptr; return; }
+    if (now - last > 250) {
+        static LONGLONG lastFloor = 0;
+        if (now - lastFloor > 100) {
+            lastFloor = now;
+            __try { g_origSetScalar(inst, g_cwFName, g_windBase); }
+            __except (EXCEPTION_EXECUTE_HANDLER) {
+                g_windOK = false;
+                TwkLog("[cloth] wind floor write FAULTED -- breeze floor disabled (hook boost still active)");
+            }
+        }
+    }
+}
 
 // ------------------------------------------------------------------ material dump
 // One instance level's OVERRIDES. A parameter left at the parent's default does not appear here,
@@ -356,27 +468,62 @@ static void runDump() {
 }
 
 // ------------------------------------------------------------------ module surface
-// No persisted settings: the probe is a button, not a behavior. The config hooks exist so the shell
-// contract stays uniform and future knobs have a home.
-void ClothPhys_ReadConfig(const char*) {}
-void ClothPhys_SaveConfig(char*, size_t) {}
-void ClothPhys_ResetDefaults() {}
+void ClothPhys_ReadConfig(const char* ini) {
+    g_windBoost = TwkIniInt(ini, "ClothWindBoost", 1);
+    g_windBase  = (float)TwkIniInt(ini, "ClothWindBase", 400);
+    g_windMult  = (float)TwkIniInt(ini, "ClothWindMult", 200);
+    TwkLog("[cloth] config: ClothWindBoost=%d ClothWindBase=%.0f ClothWindMult=%.0f%%",
+           g_windBoost, g_windBase, g_windMult);
+}
+void ClothPhys_SaveConfig(char* ini, size_t cap) {
+    TwkIniSetInt(ini, cap, "ClothWindBoost", g_windBoost ? 1 : 0);
+    TwkIniSetInt(ini, cap, "ClothWindBase", (int)g_windBase);
+    TwkIniSetInt(ini, cap, "ClothWindMult", (int)g_windMult);
+}
+void ClothPhys_ResetDefaults() {
+    g_windBoost = 1;
+    g_windBase  = 400.0f;
+    g_windMult  = 200.0f;
+}
 
 void ClothPhys_Install() {
     g_fnameToStr = (FNameToStrFn)TwkScanExe(SIG_FNAME_TOSTR);
     if (!g_fnameToStr)
         TwkLog("[cloth] FName::ToString not found -- dump will show pointers without names");
+    uint8_t* t = TwkScanExe(SIG_MPCI_SET_SCALAR);
+    if (t && MH_CreateHook(t, (void*)&hkSetScalar, (void**)&g_origSetScalar) == MH_OK &&
+        MH_EnableHook(t) == MH_OK) {
+        TwkLog("[cloth] wind boost hooked SetScalarParameterValue @ %p (boost %s)", t,
+               g_windBoost ? "ON" : "off");
+    } else {
+        g_origSetScalar = nullptr;
+        TwkLog("[cloth] SetScalarParameterValue not hooked -- wind boost off (dump still works)");
+    }
     TwkLog("[cloth] recon probe ready (F1 -> Session Tweaks -> Dump cloth/material recon)");
 }
 
 void ClothPhys_DrawMenu(const OmpMenuApi* api) {
     if (!api) return;
+    bool b = g_windBoost != 0;
+    if (api->Checkbox && api->Checkbox("Cloth wind boost", &b)) { g_windBoost = b ? 1 : 0; TwkMarkDirty(); }
+    float v = g_windBase;
+    if (api->SliderFloat && api->SliderFloat("Breeze at standstill", &v, 0.0f, 2000.0f, "%.0f")) {
+        g_windBase = v; TwkMarkDirty();
+    }
+    v = g_windMult;
+    if (api->SliderFloat && api->SliderFloat("Wind vs speed (%)", &v, 0.0f, 1000.0f, "%.0f")) {
+        g_windMult = v; TwkMarkDirty();
+    }
+    if (g_origSetScalar)
+        api->TextDisabled(g_windIdDone ? "wind writer: found (MPC_ClothWind)"
+                                       : "wind writer: waiting for the game's first wind write");
     if (api->version >= 2 && api->Button && api->Button("Dump cloth/material recon"))
         InterlockedExchange(&g_dumpReq, 1);
     api->TextDisabled(g_status);
 }
 
 void ClothPhys_PumpFrame() {
+    windPump();
     if (!g_dumpReq) return;
     InterlockedExchange(&g_dumpReq, 0);
     if (!g_probeOK) return;
