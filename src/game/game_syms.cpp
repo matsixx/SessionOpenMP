@@ -265,53 +265,8 @@ bool LocalSkaterName(void* pawn, char* out, int cap) {
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 // ---- pretty map labels -------------------------------------------------------------------------------
-// The labels are COPIED out of the assets rather than read through a cached pointer at lookup time.
-// The base UMapSelectDataAsset is anchored by the game instance and lives forever, but the DLC maps
-// come from SEPARATE instances of the same class (the base table stops at 12 entries -- measured:
-// Paris and the rest are simply not in it) with nothing pinning them for us -- a cached pointer to
-// one is a dangling pointer after the next GC. Strings we own cannot dangle.
-static bool ftextToAscii(const void* ftext, char* out, int cap);   // defined below the table
-struct MapLabel { char name[64]; char label[64]; uint8_t dlc; };
-static MapLabel g_mapLabels[96];
-static int      g_mapLabelN = 0;
-static bool     g_mapData = false;            // the game-instance BASE asset has been ingested
-static bool     g_mapLabelMiss = false;       // a lookup failed: the loader should rescan for assets
-
-bool HaveMapSelectData() { return g_mapData; }
-bool MapLabelsMissed()   { return g_mapLabelMiss; }
-void ClearMapLabelMiss() { g_mapLabelMiss = false; }
-
-// Copy every (MapName, MapLabel) pair out of one UMapSelectDataAsset. First writer wins on a name
-// collision -- the base asset is ingested first, and its labels are the ones the game's own menu
-// shows. Returns how many NEW names were added; 0 for a dup, a full table, or a shape that fails
-// the sanity test (a wrong pointer would be read as an array of 120-byte structs and have its
-// FTexts called through).
-int AddMapLabelsFrom(void* asset) {
-    if (!asset) return 0;
-    int added = 0;
-    __try {
-        const uint8_t* arr = *(const uint8_t* const*)((const uint8_t*)asset + off::kMapDataMaps);
-        const int32_t  num = *(const int32_t*)((const uint8_t*)asset + off::kMapDataMaps + 8);
-        if (!arr || num <= 0 || num > 512) return 0;
-        for (int i = 0; i < num && g_mapLabelN < (int)(sizeof(g_mapLabels) / sizeof(g_mapLabels[0])); i++) {
-            const uint8_t* e = arr + (size_t)i * off::kMapDataStride;
-            char nm[64] = {0}, label[64] = {0};
-            if (!fnameToAscii(e + off::kMapDataName, nm, sizeof(nm)) || !nm[0]) continue;
-            bool dup = false;
-            for (int k = 0; k < g_mapLabelN; k++)
-                if (_stricmp(g_mapLabels[k].name, nm) == 0) { dup = true; break; }
-            if (dup) continue;
-            if (!ftextToAscii(e + off::kMapDataLabel, label, sizeof(label)) || !label[0]) continue;
-            MapLabel& L = g_mapLabels[g_mapLabelN++];
-            strncpy_s(L.name,  sizeof(L.name),  nm,    _TRUNCATE);
-            strncpy_s(L.label, sizeof(L.label), label, _TRUNCATE);
-            L.dlc = *(const uint8_t*)(e + off::kMapDataDlc);
-            added++;
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) { }
-    return added;
-}
-
+static void* g_mapData = nullptr;
+bool HaveMapSelectData() { return g_mapData != nullptr; }
 bool CacheMapSelectData(void* pawn) {
     if (g_mapData) return true;
     if (!pawn || !g_syms.GetGameInstance) return false;
@@ -320,8 +275,13 @@ bool CacheMapSelectData(void* pawn) {
         if (!gi) return false;
         void* a = *(void**)((uint8_t*)gi + off::kGiMapSelectData);
         if (!a) return false;
-        if (AddMapLabelsFrom(a) <= 0 && g_mapLabelN == 0) return false;
-        g_mapData = true;
+        // Believe it only if it looks like the array the consumer bounds-checks: a sane count and a
+        // non-null buffer. A wrong pointer here would be read as an array of 120-byte structs and
+        // have its FTexts called through -- worth one cheap sanity test.
+        const void*   arr = *(const void* const*)((const uint8_t*)a + off::kMapDataMaps);
+        const int32_t num = *(const int32_t*)((const uint8_t*)a + off::kMapDataMaps + 8);
+        if (!arr || num <= 0 || num > 512) return false;
+        g_mapData = a;
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
@@ -352,65 +312,30 @@ static bool ftextToAscii(const void* ftext, char* out, int cap) {
     } __except (EXCEPTION_EXECUTE_HANDLER) { out[0] = 0; return false; }
 }
 
-// The world object name is the PERSISTENT level ("NYC01_LP_Persistent"); a table entry may be
-// authored either with that suffix or without it. Comparing on the stem makes both spellings the
-// same key, which is a real equivalence rather than a guess -- it is the same level either way.
-static void mapStem(const char* in, char* out, int cap) {
-    if (!out || cap <= 0) return;
-    out[0] = 0;
-    if (!in) return;
-    strncpy_s(out, (size_t)cap, in, _TRUNCATE);
-    const size_t n = strlen(out);
-    static const char kSuf[] = "_Persistent";
-    const size_t sn = sizeof(kSuf) - 1;
-    if (n > sn && _stricmp(out + n - sn, kSuf) == 0) out[n - sn] = 0;
-}
-
 bool PrettyMapName(const char* internalName, char* out, int cap) {
     if (!out || cap <= 0) return false;
     out[0] = 0;
     if (!internalName || !*internalName) return false;
     strncpy_s(out, (size_t)cap, internalName, _TRUNCATE);         // fall back to the name given
-    if (g_mapLabelN == 0) return false;
-    char wantStem[64]; mapStem(internalName, wantStem, sizeof(wantStem));
-    // Exact first, stem second: an exact hit must never lose to a stem collision.
-    for (int pass = 0; pass < 2; pass++) {
-        for (int i = 0; i < g_mapLabelN; i++) {
-            const MapLabel& L = g_mapLabels[i];
-            if (pass == 0) {
-                if (_stricmp(L.name, internalName) != 0) continue;
-            } else {
-                char haveStem[64]; mapStem(L.name, haveStem, sizeof(haveStem));
-                if (!haveStem[0] || _stricmp(haveStem, wantStem) != 0) continue;
-            }
-            strncpy_s(out, (size_t)cap, L.label, _TRUNCATE);
+    if (!g_mapData) return false;
+    __try {
+        // UMapSelectDataAsset::_maps at +0x30; FMapSelectData is 120 bytes with MapName at +0x00 and
+        // MapLabel (FText) at +0x10 -- all PDB-exact.
+        const uint8_t* arr = *(const uint8_t* const*)((const uint8_t*)g_mapData + off::kMapDataMaps);
+        const int32_t  num = *(const int32_t*)((const uint8_t*)g_mapData + off::kMapDataMaps + 8);
+        if (!arr || num <= 0 || num > 512) return false;
+        for (int i = 0; i < num; i++) {
+            const uint8_t* e = arr + (size_t)i * off::kMapDataStride;
+            char nm[64];
+            if (!fnameToAscii(e + off::kMapDataName, nm, sizeof(nm))) continue;
+            if (_stricmp(nm, internalName) != 0) continue;
+            char label[64];
+            if (ftextToAscii(e + off::kMapDataLabel, label, sizeof(label)) && label[0])
+                strncpy_s(out, (size_t)cap, label, _TRUNCATE);
             return true;
         }
-    }
-    // A miss asks the loader to go looking for map-select assets that were not resident before --
-    // the DLC tables load with their menus, not at startup.
-    g_mapLabelMiss = true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { }
     return false;
-}
-
-// Every entry of the label table, once per session. A map whose pretty name does not appear is
-// either absent from this table or carries a label that will not read, and those two have identical
-// symptoms on screen -- this is what tells them apart without another build.
-void LogMapSelectTable(void (*logf)(const char*)) {
-    if (!logf || g_mapLabelN == 0) return;
-    { char m[80]; snprintf(m, sizeof(m), "[maps] label table: %d entr%s", g_mapLabelN,
-                           g_mapLabelN == 1 ? "y" : "ies");
-      logf(m); }
-    char line[220]; int n = 0;
-    for (int i = 0; i < g_mapLabelN; i++) {
-        const MapLabel& L = g_mapLabels[i];
-        const int w = snprintf(line + n, sizeof(line) - n, "%s%s=%s%s",
-                               n ? " | " : "   ", L.name, L.label, L.dlc ? "*" : "");
-        if (w <= 0) break;
-        n += w;
-        if (n > 150 || i == g_mapLabelN - 1) { logf(line); n = 0; line[0] = 0; }
-    }
-    logf("[maps] (* = DLC-affiliated entry)");
 }
 
 // CACHED ON THE WORLD POINTER, AND IT MUST STAY THAT WAY. `fnameToAscii` leaks the FString that

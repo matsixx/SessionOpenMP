@@ -428,18 +428,9 @@ bool LocalMapName(void* pawn, char* out, int cap);      // the UWorld object's o
 bool CacheMapSelectData(void* pawn);                    // resolves gi+0x388; true once it is cached
 bool HaveMapSelectData();
 bool PrettyMapName(const char* internalName, char* out, int cap);
-// Ingest one UMapSelectDataAsset instance into the copied label table (first writer wins per name).
-// The DLC maps live in their OWN instances of the class -- the base table stops at the 12 core maps
-// -- and those load with their menus, so the loader feeds every instance FindAllOf can see whenever
-// a lookup has missed. Returns how many new names were added.
-int  AddMapLabelsFrom(void* asset);
-// A PrettyMapName lookup missed since the last scan -- the loader's cue to FindAllOf again.
-bool MapLabelsMissed();
-void ClearMapLabelMiss();
-// Dump the whole label table (name = label, DLC entries marked). Called once when the asset caches:
-// a map with no pretty name is either missing from the table or has a label that will not read, and
-// on screen those look the same.
-void LogMapSelectTable(void (*logf)(const char*));
+// DLC maps are NOT resolvable: their label tables live in per-DLC instances of UMapSelectDataAsset
+// that are not resident during play (FindAllOf found nothing while standing in one -- field-tested
+// 2026-08-07, the whole hunt was reverted). A DLC map shows its internal level name, accepted.
 
 // ---- member offsets + vtable slots (PDB-derived; a wrong one here is silent, so each cites its source)
 namespace off {
@@ -603,7 +594,6 @@ namespace off {
     constexpr int kMapDataStride      = 120;     // sizeof(FMapSelectData)
     constexpr int kMapDataName        = 0x00;    //   ::MapName  (FName, the internal level name)
     constexpr int kMapDataLabel       = 0x10;    //   ::MapLabel (FText, what Map Select displays)
-    constexpr int kMapDataDlc         = 0x71;    //   ::DLCAffiliation (EDLCNames, 0 = base game)
     // ---- the pause menu. Every offset below is PDB-exact (pdbmembers) and each was re-confirmed
     // against the code that uses it, because a wrong one here is silent.
     // UMenuPage:
