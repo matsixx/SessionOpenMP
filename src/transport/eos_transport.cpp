@@ -951,6 +951,16 @@ static void pollLogin() {
 int InitState() { return (int)g_initState; }
 
 void Shutdown() {
+    // Leave the lobby FIRST, with a short burst of ticks so the request actually reaches Epic --
+    // this is process exit, and an abandoned membership leaves a GHOST in the lobby: the session
+    // fragments around it for everyone else, and their clients keep knocking at the ghost for
+    // minutes (field-logged: the knocks then walked straight into the ghost's next hosted
+    // session). Best effort and bounded (~100 ms); a killed process still relies on the lobby's
+    // own member timeout, which is exactly what it exists for.
+    if (g_plat && g_lobbyId[0]) {
+        LobbyLeave();
+        for (int i = 0; i < 12; i++) { EOS_Platform_Tick(g_plat); Sleep(8); }
+    }
     if (g_plat) { EOS_Platform_Release(g_plat); g_plat = nullptr; }
     EOS_Shutdown();
 }

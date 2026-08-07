@@ -32,6 +32,8 @@ static int g_sent[64] = {};
 static int g_roster = 0;
 void Send(int peerIdx, const void*, int, bool) { if (peerIdx >= 0 && peerIdx < 64) g_sent[peerIdx]++; }
 int  SendBudget() { return 0; }   // no wire: replay-sync bursts uncapped (and unexercised) here
+TrustLevel BackendTrust() { return TRUST_NONE; }  // no wire can vouch: the spawn gate stays open here
+TrustLevel PeerTrust(int) { return TRUST_NONE; }
 bool GetStats(int idx, PeerStats* out) {
     if (idx < 0 || idx >= g_roster || !out) return false;
     *out = PeerStats{}; return true;

@@ -51,6 +51,8 @@ struct Slot {
     // Said once per peer: an unreadable packet repeats at the send rate, and a warning that
     // repeats 60 times a second is a log flood, not a warning.
     bool        rejectedSpoken = false;
+    // Said once per peer: held unspawned awaiting the lobby roster's vouch (see the spawn gate).
+    bool        unvouchedSpoken = false;
     // This peer has the replay editor open (their latest sampled snapshot says so). Drives the
     // per-peer packet choice in the publish loop: a scrubbing peer gets RESULTS, everyone else
     // keeps DRIVERS. Latched from the stream, so a quiet peer keeps their last known state.
@@ -134,6 +136,7 @@ static Slot* slotFor(int peerIdx, uint64_t nowUs) {
         s.used = true; s.peerIdx = peerIdx; s.lastPacketUs = nowUs; s.quietHandled = false;
         memset(&s.cosmetics, 0, sizeof(s.cosmetics));   // padding too -- it is memcmp'd for changes
         s.haveCosmetics = false; s.wornForActor = nullptr; s.peerReplaying = false;
+        s.rejectedSpoken = false; s.unvouchedSpoken = false;
         s.replayHidden = false; s.boardNear = true; s.replayConcealedActor = nullptr;
         s.away = false; s.joinAnnounced = false;
         s.syncOn = false; s.syncReqSentUs = 0;
@@ -177,7 +180,12 @@ void OnPacket(int peerIdx, const uint8_t* data, int len, uint64_t nowUs) {
         // arrives only with cosmetics, and the map name travels here too. The join line waits for
         // the name rather than firing on the slot opening -- "somebody joined" with no name helps
         // nobody, and the name lands within a second.
-        if (g_cfg.onNotice) {
+        // Held to the same vouch as the spawn gate: the field case's ghost-lobby knockers sent
+        // cosmetics too, and "<name> joined the session" for somebody EOS never placed in our lobby
+        // is the same lie as their skater appearing. A slow-vouched real joiner announces on their
+        // next cosmetics packet instead (heartbeats every 10 s).
+        if (g_cfg.onNotice &&
+            (BackendTrust() < TRUST_VOUCHED || PeerTrust(peerIdx) == TRUST_VOUCHED)) {
             char note[160] = {0};
             if (!cs->joinAnnounced && merged.skaterName[0]) {
                 cs->joinAnnounced = true;
@@ -736,6 +744,24 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
         if (!s.proxy.actor()) {
             // Spawn needs a world handle, which only our own pawn provides.
             if (!ownPawn) continue;
+            // ...and a sender the WIRE can vouch for, whenever it can vouch at all. On EOS the
+            // lobby roster IS the session: a sender who is not on it is somebody ELSE'S session
+            // state. The field case: a host closed their game without leaving, the abandoned
+            // lobby's members kept knocking at the ghost membership for minutes, and the moment
+            // that player re-hosted, both walked into the brand-new session as skaters without
+            // ever joining its lobby. Their packets still buffer above (the join window -- a real
+            // joiner's first packets legitimately beat the roster event), but nobody gets a
+            // SKATER until EOS places them in our lobby. Wires that can vouch for nothing (UDP by
+            // its nature, shm by same-PC trust) behave as before -- the user chose them knowingly.
+            if (BackendTrust() >= TRUST_VOUCHED && PeerTrust(s.peerIdx) != TRUST_VOUCHED) {
+                if (!s.unvouchedSpoken) {
+                    s.unvouchedSpoken = true;
+                    if (g_logf) { char m[160]; snprintf(m, sizeof(m),
+                        "[session] peer %d sends to us but is not on our lobby roster -- held"
+                        " unspawned until EOS vouches for them", s.peerIdx); g_logf(m); }
+                }
+                continue;
+            }
             // ...and a world that has finished deciding whose pawn is whose. See kWorldSettleMs.
             if (nowMs < g_settleUntilMs) continue;
             // A peer who is elsewhere never reaches here -- the presence gate above already
