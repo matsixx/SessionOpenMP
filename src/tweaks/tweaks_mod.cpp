@@ -1,4 +1,4 @@
-// SessionOpenMP -- co-op multiplayer for Session, as an overlay on N solo games.
+﻿// SessionOpenMP -- co-op multiplayer for Session, as an overlay on N solo games.
 // Copyright (C) 2026 matsix
 //
 // This program is free software: you can redistribute it and/or modify it under the
@@ -15,6 +15,9 @@
 //   catch_tweaks  wider MANUAL catch window + darkslide-aware eaten-catch fix
 //   run_out       low-air missed-trick bails become the native run-out
 //   catch_level   board levels out when it hits your foot (restores a removed feature)
+//   catch_sound   a catch sound on every catch (flip-trick anims carry no sound notify at all)
+//   pitch_range   spreads board pitch over the whole flick range, not just its first third
+//   foot_place    why the shoe sits off the deck (probe + one default-off clamp override)
 //   grind_pop     read-only probe on the grind-exit pop pipeline (measurement, changes nothing)
 //
 // A SEPARATE UE4SS C++ mod (Mods\SessionTweaks\dlls\main.dll), deliberately not part of the
@@ -34,10 +37,13 @@
 #include "tweaks_common.h"
 #include "tweaks_mod.h"
 #include "scoop_speed.h"
+#include "flip_speed.h"
 #include "catch_tweaks.h"
 #include "run_out.h"
 #include "catch_level.h"
 #include "catch_sound.h"
+#include "pitch_range.h"
+#include "foot_place.h"
 #include "grind_pop.h"
 #include "MinHook.h"
 #include "ue4ss_abi.h"
@@ -65,14 +71,17 @@ void TwkMarkDirty() {
 }
 static void saveSettings() {
     if (!g_iniPath[0]) return;
-    static char buf[16384]; buf[0] = 0;
+    static char buf[65536]; buf[0] = 0;
     FILE* f = fopen(g_iniPath, "r");
     if (f) { size_t n = fread(buf, 1, sizeof(buf) - 1, f); buf[n] = 0; fclose(f); }
     ScoopSpeed_SaveConfig(buf, sizeof(buf));
+    FlipSpeed_SaveConfig(buf, sizeof(buf));
     CatchTweaks_SaveConfig(buf, sizeof(buf));
     RunOut_SaveConfig(buf, sizeof(buf));
     CatchLevel_SaveConfig(buf, sizeof(buf));
     CatchSound_SaveConfig(buf, sizeof(buf));
+    PitchRange_SaveConfig(buf, sizeof(buf));
+    FootPlace_SaveConfig(buf, sizeof(buf));
     GrindPop_SaveConfig(buf, sizeof(buf));
     f = fopen(g_iniPath, "w");
     if (!f) { TwkLog("[tweaks] settings save FAILED (cannot write %s)", g_iniPath); return; }
@@ -87,7 +96,7 @@ static void readConfig(const char* dir) {
     snprintf(g_iniPath, sizeof(g_iniPath), "%s", p);
     // Generous buffer, and truncation is REPORTED: a config reader that silently drops settings is
     // worse than one that refuses.
-    static char buf[16384]; buf[0] = 0;
+    static char buf[65536]; buf[0] = 0;
     FILE* f = fopen(p, "r");
     const bool existed = (f != nullptr);
     if (f) {
@@ -98,10 +107,13 @@ static void readConfig(const char* dir) {
     // Each module parses its own keys and echoes every one, so a value that failed to parse is
     // visible at load time.
     ScoopSpeed_ReadConfig(buf);
+    FlipSpeed_ReadConfig(buf);
     CatchTweaks_ReadConfig(buf);
     RunOut_ReadConfig(buf);
     CatchLevel_ReadConfig(buf);
     CatchSound_ReadConfig(buf);
+    PitchRange_ReadConfig(buf);
+    FootPlace_ReadConfig(buf);
     GrindPop_ReadConfig(buf);
     // No ini yet: write one holding the defaults just loaded. Without the multiplayer mod there is
     // no menu to change a setting through, so the file IS the interface -- and a file that lists
@@ -119,10 +131,13 @@ static void readConfig(const char* dir) {
 // VelMax 1600), so this restores tuned values rather than blanking them.
 static void resetAllDefaults() {
     ScoopSpeed_ResetDefaults();
+    FlipSpeed_ResetDefaults();
     CatchTweaks_ResetDefaults();
     RunOut_ResetDefaults();
     CatchLevel_ResetDefaults();
     CatchSound_ResetDefaults();
+    PitchRange_ResetDefaults();
+    FootPlace_ResetDefaults();
     GrindPop_ResetDefaults();
     TwkLog("[tweaks] settings reset to defaults");
 }
@@ -130,6 +145,7 @@ static void resetAllDefaults() {
 static void drawSection(const OmpMenuApi* api, void*) {
     if (!api || api->version < 1) return;
     ScoopSpeed_DrawMenu(api);
+    FlipSpeed_DrawMenu(api);
     api->Separator();
     CatchTweaks_DrawMenu(api);
     api->Separator();
@@ -138,6 +154,10 @@ static void drawSection(const OmpMenuApi* api, void*) {
     CatchLevel_DrawMenu(api);
     api->Separator();
     CatchSound_DrawMenu(api);
+    api->Separator();
+    PitchRange_DrawMenu(api);
+    api->Separator();
+    FootPlace_DrawMenu(api);
     api->Separator();
     GrindPop_DrawMenu(api);
     // The same reset the pause menu offers, so neither surface is the only way to get back.
@@ -167,6 +187,12 @@ static const char* const kTwkGPitch   = "TwkGrindPitch";
 static const char* const kTwkGPitchAmt = "TwkGrindPitchAmt";
 static const char* const kTwkGSwing   = "TwkGrindSwing";
 static const char* const kTwkGSwingAmt = "TwkGrindSwingAmt";
+static const char* const kTwkPitch    = "TwkPitchRange";
+static const char* const kTwkPitchAmt = "TwkPitchSpread";
+static const char* const kTwkStopFlip = "TwkCatchStopsFlip";
+static const char* const kTwkFlip     = "TwkFlipSpeed";
+static const char* const kTwkFlipMin  = "TwkFlipVelMin";
+static const char* const kTwkFlipMax  = "TwkFlipVelMax";
 static const char* const kTwkReset    = "TwkResetDefaults";
 
 // An ACTION row on the page: pressed, not adjusted.
@@ -182,17 +208,23 @@ static void pageValue(const char* key, int iv, float fv, void*) {
     else if (!strcmp(key, kTwkCatch))  CatchTweaks_SetEnabled(iv != 0);
     else if (!strcmp(key, kTwkRunOut)) RunOut_SetEnabled(iv != 0);
     else if (!strcmp(key, kTwkDrop))   RunOut_SetMaxDropCm(fv);
-    else if (!strcmp(key, kTwkVelMin)) ScoopSpeed_SetVelMin(fv);
-    else if (!strcmp(key, kTwkVelMax)) ScoopSpeed_SetVelMax(fv);
+    else if (!strcmp(key, kTwkVelMin)) ScoopSpeed_SetVelMin(fv * 10.0f);   // shown in tens
+    else if (!strcmp(key, kTwkVelMax)) ScoopSpeed_SetVelMax(fv * 10.0f);
     else if (!strcmp(key, kTwkCatchX)) CatchTweaks_SetWindowMultPct(fv);
     else if (!strcmp(key, kTwkDsZone)) CatchTweaks_SetDarkslideZoneDeg(fv);
     else if (!strcmp(key, kTwkCatchSnd)) CatchSound_SetEnabled(iv != 0);
     else if (!strcmp(key, kTwkSndVol))   CatchSound_SetVolumePct(fv);
     else if (!strcmp(key, kTwkLevel))    CatchLevel_SetEnabled(iv != 0);
+    else if (!strcmp(key, kTwkStopFlip)) CatchTweaks_SetStopsFlip(iv != 0);
     else if (!strcmp(key, kTwkGPitch))    GrindPop_SetPitchEnabled(iv != 0);
     else if (!strcmp(key, kTwkGPitchAmt)) GrindPop_SetPitchScale(fv);
     else if (!strcmp(key, kTwkGSwing))    GrindPop_SetSwingEnabled(iv != 0);
     else if (!strcmp(key, kTwkGSwingAmt)) GrindPop_SetSwingBlend(fv);
+    else if (!strcmp(key, kTwkPitch))     PitchRange_SetEnabled(iv != 0);
+    else if (!strcmp(key, kTwkPitchAmt))  PitchRange_SetMaxAngleDeg(fv);
+    else if (!strcmp(key, kTwkFlip))      FlipSpeed_SetEnabled(iv != 0);
+    else if (!strcmp(key, kTwkFlipMin))   FlipSpeed_SetVelMin(fv);
+    else if (!strcmp(key, kTwkFlipMax))   FlipSpeed_SetVelMax(fv);
 }
 // ...and what it is set to RIGHT NOW, so a row opens showing the truth instead of a default.
 static int pageGet(const char* key, int* oi, float* of, void*) {
@@ -201,57 +233,89 @@ static int pageGet(const char* key, int* oi, float* of, void*) {
     else if (!strcmp(key, kTwkCatch))  { *oi = CatchTweaks_Enabled() ? 1 : 0; return 1; }
     else if (!strcmp(key, kTwkRunOut)) { *oi = RunOut_Enabled()      ? 1 : 0; return 1; }
     else if (!strcmp(key, kTwkDrop))   { *of = RunOut_MaxDropCm();           return 1; }
-    else if (!strcmp(key, kTwkVelMin)) { *of = ScoopSpeed_VelMin();          return 1; }
-    else if (!strcmp(key, kTwkVelMax)) { *of = ScoopSpeed_VelMax();          return 1; }
+    else if (!strcmp(key, kTwkVelMin)) { *of = ScoopSpeed_VelMin() / 10.0f;  return 1; }
+    else if (!strcmp(key, kTwkVelMax)) { *of = ScoopSpeed_VelMax() / 10.0f;  return 1; }
     else if (!strcmp(key, kTwkCatchX)) { *of = CatchTweaks_WindowMultPct();  return 1; }
     else if (!strcmp(key, kTwkDsZone)) { *of = CatchTweaks_DarkslideZoneDeg(); return 1; }
     else if (!strcmp(key, kTwkCatchSnd)) { *oi = CatchSound_Enabled() ? 1 : 0; return 1; }
     else if (!strcmp(key, kTwkSndVol))   { *of = CatchSound_VolumePct();       return 1; }
     else if (!strcmp(key, kTwkLevel))    { *oi = CatchLevel_Enabled() ? 1 : 0; return 1; }
+    else if (!strcmp(key, kTwkStopFlip)) { *oi = CatchTweaks_StopsFlip() ? 1 : 0; return 1; }
     else if (!strcmp(key, kTwkGPitch))    { *oi = GrindPop_PitchEnabled() ? 1 : 0; return 1; }
     else if (!strcmp(key, kTwkGPitchAmt)) { *of = GrindPop_PitchScale();           return 1; }
     else if (!strcmp(key, kTwkGSwing))    { *oi = GrindPop_SwingEnabled() ? 1 : 0; return 1; }
     else if (!strcmp(key, kTwkGSwingAmt)) { *of = GrindPop_SwingBlend();           return 1; }
+    else if (!strcmp(key, kTwkPitch))     { *oi = PitchRange_Enabled() ? 1 : 0;    return 1; }
+    else if (!strcmp(key, kTwkPitchAmt))  { *of = PitchRange_MaxAngleDeg();        return 1; }
+    else if (!strcmp(key, kTwkFlip))      { *oi = FlipSpeed_Enabled() ? 1 : 0;     return 1; }
+    else if (!strcmp(key, kTwkFlipMin))   { *of = FlipSpeed_VelMin();              return 1; }
+    else if (!strcmp(key, kTwkFlipMax))   { *of = FlipSpeed_VelMax();              return 1; }
     return 0;
 }
 // Every slider's units are chosen so its INTEGER readout is meaningful -- the pause menu's progress
 // row prints "%d" (cm, deg/s, deg, percent), unlike the F1 sliders which can format floats.
-static const OmpPageItem2 kTwkPageItems[] = {
+// The page is SPLIT into categories rather than run as one long list. A guest page does not scroll:
+// the engine's scroll math reads the real page's own definitions array, not the one we hand the row
+// builder, so a list longer than its ~14-row window is simply cut off at the bottom. Categories cost
+// one registration each, keep every page readable at a glance, and grow indefinitely.
+static const OmpPageItem2 kTwkRootItems[] = {
+    { OMP_ITEM_PAGE, "Board & tricks", "Board & tricks",  "Scoop and flip speed, board pitch control" },
+    { OMP_ITEM_PAGE, "Catch & bail",   "Catch & bail",    "Catch window, catch sound, running out of a bail" },
+    { OMP_ITEM_PAGE, "Grinds",         "Grinds",          "Pitch control and pop swing coming out of a grind" },
+    // Kept on the front page deliberately: it resets EVERY Session Tweaks setting, not one category.
+    { OMP_ITEM_ACTION, kTwkReset,  "Reset to defaults",   "Restore every Session Tweaks setting to its shipped value" },
+};
+static const OmpPageItem2 kTwkBoardItems[] = {
     { OMP_ITEM_TOGGLE, kTwkScoop,  "Scoop speed fix",         "Stick speed drives how fast the board scoops" },
-    { OMP_ITEM_SLIDER, kTwkVelMin, "  Slowest at (deg/s)",    "Stick speed that gives the slowest scoop",
-      nullptr, nullptr, 50.0f, 1500.0f, 50.0f },
-    { OMP_ITEM_SLIDER, kTwkVelMax, "  Fastest at (deg/s)",    "Stick speed that gives the fastest scoop",
-      nullptr, nullptr, 200.0f, 3000.0f, 100.0f },
+    // Shown in TENS of deg/s only here: the pause menu's value field clips at four digits, and this
+    // range runs to 3000. The F1 menu and the ini keep real deg/s -- only the display is scaled.
+    { OMP_ITEM_SLIDER, kTwkVelMin, "  Slowest at (x10 deg/s)", "Stick speed that gives the slowest scoop",
+      nullptr, nullptr, 5.0f, 150.0f, 5.0f },
+    { OMP_ITEM_SLIDER, kTwkVelMax, "  Fastest at (x10 deg/s)", "Stick speed that gives the fastest scoop",
+      nullptr, nullptr, 20.0f, 300.0f, 10.0f },
+    { OMP_ITEM_TOGGLE, kTwkFlip,    "Flip speed from the flick", "How fast you flick sets how fast the board flips" },
+    // ⚠️ These bounds MUST cover the shipped defaults (150 / 500), and every value here has to stay
+    // UNDER 1000 -- the pause menu's value field clips at four digits.
+    { OMP_ITEM_SLIDER, kTwkFlipMin, "  Slowest flip at",      "Flick speed that gives the slowest flip",
+      nullptr, nullptr, 20.0f, 400.0f, 10.0f },
+    { OMP_ITEM_SLIDER, kTwkFlipMax, "  Fastest flip at",      "Flick speed that gives the fastest flip",
+      nullptr, nullptr, 50.0f, 800.0f, 10.0f },
+    { OMP_ITEM_TOGGLE, kTwkPitch,    "Wider board pitch control", "Spreads board pitch over the whole flick instead of its first third" },
+    { OMP_ITEM_SLIDER, kTwkPitchAmt, "  Pitch spread (deg)",  "65 = stock; higher means full pitch needs a bigger flick",
+      nullptr, nullptr, 65.0f, 89.0f, 1.0f },
+};
+static const OmpPageItem2 kTwkCatchItems[] = {
     { OMP_ITEM_TOGGLE, kTwkCatch,  "Wider manual catch",      "Widens the catch window while Catch Mode is manual" },
     { OMP_ITEM_SLIDER, kTwkCatchX, "  Catch window (%)",      "200 = twice the stock window",
       nullptr, nullptr, 100.0f, 400.0f, 25.0f },
     { OMP_ITEM_SLIDER, kTwkDsZone, "  Dark slide zone (deg)", "How far from grip-down a dark slide is still reserved",
       nullptr, nullptr, 10.0f, 170.0f, 10.0f },
-    { OMP_ITEM_TOGGLE, kTwkRunOut, "Run out instead of bail", "Low missed tricks run out on foot (needs manual Catch Mode)" },
-    { OMP_ITEM_SLIDER, kTwkDrop,   "  Real bail if drop over (cm)", "Above this drop a missed trick still bails",
-      nullptr, nullptr, 50.0f, 600.0f, 25.0f },
+    { OMP_ITEM_TOGGLE, kTwkStopFlip, "Catch ends the flip",   "A caught board stops at griptape-up instead of spinning another full flip" },
     { OMP_ITEM_TOGGLE, kTwkLevel,   "Level board on catch",   "Eases the board flat when it hits your foot" },
     { OMP_ITEM_TOGGLE, kTwkCatchSnd, "Catch sound fix",       "A catch sound on every catch, and never too quiet" },
     { OMP_ITEM_SLIDER, kTwkSndVol,  "  Catch sound (%)",      "100 = the game's own volume",
       nullptr, nullptr, 50.0f, 300.0f, 10.0f },
+    { OMP_ITEM_TOGGLE, kTwkRunOut, "Run out instead of bail", "Low missed tricks run out on foot (needs manual Catch Mode)" },
+    { OMP_ITEM_SLIDER, kTwkDrop,   "  Real bail if drop over (cm)", "Above this drop a missed trick still bails",
+      nullptr, nullptr, 50.0f, 600.0f, 25.0f },
+};
+static const OmpPageItem2 kTwkGrindItems[] = {
     { OMP_ITEM_TOGGLE, kTwkGPitch,    "Pitch control out of grinds", "Board Control pitch works coming off a grind (set Board Control Mode to manual)" },
     { OMP_ITEM_SLIDER, kTwkGPitchAmt, "  Pitch amount (%)",   "How much of your input reaches the board out of a grind",
       nullptr, nullptr, 0.0f, 200.0f, 10.0f },
     { OMP_ITEM_TOGGLE, kTwkGSwing,    "Pop swing out of grinds",   "The board drops its tail before popping out of a grind" },
     { OMP_ITEM_SLIDER, kTwkGSwingAmt, "  Swing amount (%)",   "100 = the trick's full pop swing",
       nullptr, nullptr, 0.0f, 100.0f, 10.0f },
-    // "Reset to defaults" MUST stay last only as a matter of taste -- but note the host clamps a
-    // guest's count to OMP_PAGEITEM_MAX by truncating the TAIL, so if this list ever exceeds the cap
-    // it is this row that vanishes, not the newest one. The static_assert below is what makes that
-    // impossible to ship by accident.
-    { OMP_ITEM_ACTION, kTwkReset,  "Reset to defaults",       "Restore every Session Tweaks setting to its shipped value" },
 };
-// Enforced at COMPILE time, so the next row added fails the build instead of quietly deleting the
-// reset row in someone's pause menu.
-static_assert(sizeof(kTwkPageItems) / sizeof(kTwkPageItems[0]) <= OMP_PAGEITEM_MAX,
-              "SessionTweaks pause page exceeds OMP_PAGEITEM_MAX -- the host truncates the TAIL "
-              "silently, so the row that vanishes is the LAST one, not the one just added. Raise the "
-              "cap in menu_ext.h (host-side only) and ship both DLLs, or move the control to F1.");
+// Every page must stay inside the host's cap AND inside the engine's visible window -- the host
+// truncates the TAIL, so an over-long page loses its Back row, not the row just added.
+static_assert(sizeof(kTwkRootItems)  / sizeof(kTwkRootItems[0])  <= 13 &&
+              sizeof(kTwkBoardItems) / sizeof(kTwkBoardItems[0]) <= 13 &&
+              sizeof(kTwkCatchItems) / sizeof(kTwkCatchItems[0]) <= 13 &&
+              sizeof(kTwkGrindItems) / sizeof(kTwkGrindItems[0]) <= 13,
+              "A Session Tweaks page exceeds the engine's visible-row window (14 incl. the Back row "
+              "the host appends). Split it into another category page rather than raising this.");
+
 typedef int (*OmpMenuRegisterPage2Fn)(const char*, const OmpPageItem2*, int, OmpPageSelectFn,
                                       OmpPageValueFn, OmpPageGetFn, OmpPageStatusFn, void*);
 static bool g_pageRegistered = false;
@@ -278,11 +342,21 @@ static bool tryRegisterMenu() {
         // this, and losing the in-game page must never cost the F1 section (or vice versa).
         if (!g_pageRegistered) {
             auto regp = (OmpMenuRegisterPage2Fn)GetProcAddress(mods[i], "OmpMenu_RegisterPage2");
-            if (regp && regp("Session Tweaks", kTwkPageItems,
-                             (int)(sizeof(kTwkPageItems) / sizeof(kTwkPageItems[0])),
-                             &pageSelect, &pageValue, &pageGet, nullptr, nullptr)) {
-                g_pageRegistered = true;
-                TwkLog("[tweaks] registered a page in the game's pause menu (native toggles + slider)");
+            // The CATEGORY pages go in first: the front page's rows name them by title, and a name
+            // that resolves to nothing leaves its row inert. Only the front page carries the seam's
+            // success flag -- it is the one the pause menu lists.
+            if (regp) {
+                #define TWK_SUBPAGE(title, arr)                     regp(title, arr, (int)(sizeof(arr) / sizeof(arr[0])),                          &pageSelect, &pageValue, &pageGet, nullptr, nullptr)
+                TWK_SUBPAGE("Board & tricks", kTwkBoardItems);
+                TWK_SUBPAGE("Catch & bail",   kTwkCatchItems);
+                TWK_SUBPAGE("Grinds",         kTwkGrindItems);
+                #undef TWK_SUBPAGE
+                if (regp("Session Tweaks", kTwkRootItems,
+                         (int)(sizeof(kTwkRootItems) / sizeof(kTwkRootItems[0])),
+                         &pageSelect, &pageValue, &pageGet, nullptr, nullptr)) {
+                    g_pageRegistered = true;
+                    TwkLog("[tweaks] registered the pause-menu page (3 category pages + the front page)");
+                }
             }
         }
         if (g_menuRegistered && g_pageRegistered) return true;
@@ -291,8 +365,10 @@ static bool tryRegisterMenu() {
 }
 void Tweaks_PumpFrame() {
     RunOut_PumpFrame();              // the armed post-conversion fall watch + facing
+    CatchTweaks_PumpFrame();         // per-trick board-rotation watch
     CatchLevel_PumpFrame();          // catch-triggered board leveling
     CatchSound_PumpFrame();          // catch-sound telemetry (the fixes live in the hooks, not here)
+    FootPlace_PumpFrame();
     GrindPop_PumpFrame();            // grind-exit pop records: names resolved and logged out here
     if (g_dirty && (LONGLONG)GetTickCount64() - g_dirtyMs > 2000) {
         InterlockedExchange(&g_dirty, 0);
@@ -311,7 +387,7 @@ public:
     SessionTweaks() {
         ModName = STR("SessionTweaks");
         // Version history is kept with the releases, not in the source.
-        ModVersion = STR("2.14.1");
+        ModVersion = STR("2.28.2");
         ModDescription = STR("Gameplay fixes: real-stick-sweep scoop speed, wider manual catch window, darkslide-aware catch fix, run out on missed tricks");
         ModAuthors = STR("matsix");
         char dir[MAX_PATH]{};
@@ -320,7 +396,7 @@ public:
         char path[MAX_PATH];
         snprintf(path, sizeof(path), "%sSessionTweaks.log", dir);
         g_log = fopen(path, "w");
-        TwkLog("=== SessionTweaks 2.14.1 loading (UE4SS C++ mod) ===");
+        TwkLog("=== SessionTweaks 2.28.2 loading (UE4SS C++ mod) ===");
         readConfig(dir);
     }
     ~SessionTweaks() override {
@@ -334,9 +410,12 @@ public:
     auto on_unreal_init() -> void override {
         if (MH_Initialize() != MH_OK) { TwkLog("[tweaks] *** MinHook init failed -- mod inactive"); return; }
         ScoopSpeed_Install();
+    FlipSpeed_Install();
         CatchTweaks_Install();
         CatchLevel_Install();
-    CatchSound_Install();
+        CatchSound_Install();
+        PitchRange_Install();
+        FootPlace_Install();
         GrindPop_Install();
         RunOut_Install();
         // Registration is attempted once now (host usually loaded already; mods.txt order) and
@@ -354,3 +433,4 @@ extern "C" {
     TWEAKS_MOD_API RC::CppUserModBase* start_mod()           { return new SessionTweaks(); }
     TWEAKS_MOD_API void uninstall_mod(RC::CppUserModBase* m) { delete m; }
 }
+

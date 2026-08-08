@@ -26,5 +26,16 @@ void ScoopSpeed_ResetDefaults();
 bool ScoopSpeed_Enabled();
 void ScoopSpeed_SetEnabled(bool on);
 // The gesture-speed range, in deg/s -- integers, so they read correctly on a pause-menu slider.
+// Radial (flick) measurement off the SAME InputHandler::Tick samples this module already owns --
+// only one detour may exist on that address, so flip_speed is FED from here rather than hooking it.
+// Returns false when there is no live input tick to read.
+bool ScoopSpeed_FlickMeasure(bool rightStick, float windowSec, float* outSpeed, float* outPeak,
+                             float* outFrameMs);
+// Where the push is considered to start, and how far out a gesture must reach to count as a flick.
+// Live so they can be tuned against real samples rather than guessed at.
+extern float ScoopSpeed_FlickStartMag, ScoopSpeed_FlickMinPeak;
+// Log the raw magnitude samples behind the last `windowSec`.
+void ScoopSpeed_DumpFlick(bool rightStick, float windowSec);
+
 float ScoopSpeed_VelMin();  void ScoopSpeed_SetVelMin(float v);
 float ScoopSpeed_VelMax();  void ScoopSpeed_SetVelMax(float v);

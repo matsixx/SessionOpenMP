@@ -50,6 +50,7 @@
 #include "tweaks_common.h"
 #include "ui/menu_ext.h"
 #include "catch_level.h"
+#include "foot_place.h"
 #include <cmath>
 #include "MinHook.h"
 
@@ -135,6 +136,9 @@ enum { SUBOBJ_TO_COMP = 0x138, MC_OWNER_SKATER = 0x340 };
 typedef void* (*ExtraPitchFn)(void*, void*, uint64_t, void*, void*);
 typedef void  (*SetPitchFn)(void*, double);
 static void* g_orig = nullptr, *g_start = nullptr;
+// Exposed for pitch_range: see the header -- once we hook this function its byte signature no
+// longer matches, so a later module cannot resolve the address by scanning for it.
+const void* CatchLevel_ExtraPitchFn() { return g_start; }
 static void* g_setOrig = nullptr, *g_setStart = nullptr;
 static void* g_realComp = nullptr;      // learned + validated; the object that owns the pitch state
 
@@ -154,6 +158,11 @@ static double NowSec() { return GetTickCount64() / 1000.0; }
 // The `comp+0x340 == skater` check is a DIAGNOSTIC, not a gate -- `this+0x208` is believed to be the
 // skater but is not proved, and gating on an unproved fact would fail silently. The real judge is
 // the pitch snapshot logged beside it: a live component cannot read all-zero mid-trick.
+// The REAL USkateboardExMovementComponent, learned from SetBoardPitchExtraAngle's own `this` rather
+// than from skater+0x550 (which points somewhere else -- every Ex-specific field read zero through
+// it). Shared so other fixes do not have to re-derive it.
+void* CatchLevel_MovementComponent() { return g_realComp; }
+
 static void hkSetPitch(void* self, double angle) {
     __try {
         void* comp = (void*)((uint8_t*)self - SUBOBJ_TO_COMP);
@@ -268,6 +277,28 @@ void CatchLevel_PumpFrame() {
         if (catchState != 0 && g_lastCatch == 0 && g_catchT < 0.0) g_catchT = now;
         g_lastCatch = catchState;
         if (g_catchT < 0.0) return;                                   // not caught yet -- hands off
+
+        // ---- LET GO once the board is not ours to aim any more. The setpoint below is rewritten
+        // EVERY FRAME until the pitch arrives or `g_maxMs` expires, and neither of those noticed that
+        // the trick had ended -- so a level still running when the rider landed kept forcing a pitch
+        // target onto a board back on the ground, and the next ollie's crouch popped with the nose or
+        // tail already lifted. Levelling belongs to the airborne window between the catch and the
+        // landing; on the ground, and while a new trick is being set up, the pitch is the game's.
+        if (FootPlace_Grounded() || FootPlace_SettingUpTrick()) {
+            // Walking away is not enough: the last setpoint we wrote is still live, so the game's
+            // integrator would go on pulling toward it. Park start AND target on the CURRENT pitch --
+            // the interpolation then has nothing left to do and the board holds where it is, with no
+            // jump. The mode is left alone; the game rewrites it at the next trick.
+            if (g_levelling) {
+                *(float*)((uint8_t*)comp + MC_PITCH_START)  = pitchNow;
+                *(float*)((uint8_t*)comp + MC_PITCH_TARGET) = pitchNow;
+                if (g_log)
+                    TwkLog("[level] released at %.2f (%s) -- setpoint parked, the board is the game's again",
+                           pitchNow, FootPlace_SettingUpTrick() ? "setting up the next trick" : "landed");
+            }
+            g_skater = nullptr;
+            return;
+        }
 
         const double sinceCatch = (now - g_catchT) * 1000.0;
         if (sinceCatch < (double)g_delayMs) return;

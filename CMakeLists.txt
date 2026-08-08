@@ -211,10 +211,13 @@ if(EXISTS "${UE4SS_LIB}")
             src/tweaks/tweaks_mod.cpp
             src/tweaks/tweaks_common.cpp
             src/tweaks/scoop_speed.cpp
+    src/tweaks/flip_speed.cpp
             src/tweaks/catch_tweaks.cpp
             src/tweaks/run_out.cpp
             src/tweaks/catch_level.cpp
             src/tweaks/catch_sound.cpp
+            src/tweaks/pitch_range.cpp
+            src/tweaks/foot_place.cpp
             src/tweaks/grind_pop.cpp
             ${MINHOOK_SRC}/src/buffer.c
             ${MINHOOK_SRC}/src/hook.c

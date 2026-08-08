@@ -27,3 +27,6 @@ void  CatchSound_SetEnabled(bool on);
 // PERCENT, matching the ini's own CatchSoundVolumePct (100 = stock) -- integers for the slider row.
 float CatchSound_VolumePct();
 void  CatchSound_SetVolumePct(float pct);
+// UObject -> its object name, for logging (e.g. naming a trick definition). Cached by FName value.
+// Lives here because this module already resolves FName::ToString; false = unresolvable.
+bool CatchSound_ObjName(const void* obj, char* out, int cap);

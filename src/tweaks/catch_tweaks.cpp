@@ -42,6 +42,8 @@
 #include "tweaks_common.h"
 #include "ui/menu_ext.h"
 #include "catch_tweaks.h"
+#include "flip_speed.h"
+#include "catch_level.h"
 #include <cmath>
 #include "MinHook.h"
 
@@ -67,6 +69,9 @@ enum {
     SK_CATCH_MODE           = 0x63d,   // ECatchMode -- THIS is the menu's Catch Mode
     SK_CATCH_ORIENT_STATE   = 0x63e,   // ECatchOrientState -- nonzero = a catch actually ENGAGED
     SK_BOARD                = 0x568,   // ASkaterCharacterBase -> _skateboard (ASkateboardEx*)
+    MC_BOARD_FLIP_RATE      = 0x774,   // USkateboardExMovementComponent::_boardFlipRate. Reached
+                                       // through CatchLevel's learned component -- skater+0x550 is a
+                                       // different object and every Ex field reads zero through it.
     BOARD_FLIPPER           = 0x4e8,   // ASkateboardEx -> _flipper (UStaticMeshComponent, the DECK
                                        // mesh that visually flips -- its transform is the truth)
     COMP_CTW_QUAT           = 0x1c0,   // USceneComponent -> ComponentToWorld rotation quat (x,y,z,w)
@@ -91,6 +96,20 @@ static int   g_dsAngleDeg  = 60;      // DarkslideZoneDeg: the reservation is ho
                                       // the board is within this many degrees of grip-down (180);
                                       // elsewhere it is masked = native press-time catching
 static int   g_catchDiag   = 0;       // log every catch decision (verbose; for future catch work)
+// FlipCatchTrace -- read-only: measures how far the BOARD turns across a catch, so "it finished a
+// second flip" is a number instead of an impression. Costs nothing when no catch is pressed.
+static int   g_flipTrace   = 0;   // FlipCatchTrace -- diagnostic, off by default
+static int   g_flipTraceVerbose = 0;   // FlipCatchTraceVerbose -- per-frame lines as well
+// CatchStopsFlip: once a catch registers, the board stops at the first grip-up instead of carrying
+// on for another whole revolution. Measured behaviour this restores: on a good catch the deck runs
+// out to grip-up and stops (press + travelled ~= 185 every time); on a bad one it does that AND a
+// further ~360. Nothing here predicts WHICH reps go wrong -- it makes the wrong ones end where the
+// right ones already do.
+static int   g_stopFlip     = 1;      // CatchStopsFlip
+static int   g_stopFlipDeg  = 168;    // CatchStopFlipDeg -- how close to grip-up counts as arrived
+static int   g_snapMs       = 90;     // CatchSnapMs -- how long a caught board gets to finish its
+                                      // remaining travel. Lower = snappier catch, higher = softer.
+static volatile LONG g_uiFlipStops = 0;
 static volatile LONG g_faults = 0;
 static volatile LONG g_uiCatchMode = -1, g_uiOrientMode = -1;   // last observed mode pair
 static volatile LONG g_uiCatchWide = 0, g_uiCatchDefs = 0;      // widened? on how many defs?
@@ -156,6 +175,15 @@ void CatchTweaks_ReadConfig(const char* buf) {
     g_catchBeatsDS = TwkIniInt(buf, "CatchBeatsDarkslide", 1);
     g_dsAngleDeg   = TwkIniInt(buf, "DarkslideZoneDeg", 60);
     g_catchDiag    = TwkIniInt(buf, "CatchDiag", 0);
+    g_flipTrace    = TwkIniInt(buf, "FlipCatchTrace", 0);
+    g_flipTraceVerbose = TwkIniInt(buf, "FlipCatchTraceVerbose", 0);
+    g_stopFlip     = TwkIniInt(buf, "CatchStopsFlip", 1);
+    g_stopFlipDeg  = TwkIniInt(buf, "CatchStopFlipDeg", 168);
+    g_snapMs       = TwkIniInt(buf, "CatchSnapMs", 90);
+    if (g_snapMs < 30)  g_snapMs = 30;
+    if (g_snapMs > 400) g_snapMs = 400;
+    if (g_stopFlipDeg < 120) g_stopFlipDeg = 120;
+    if (g_stopFlipDeg > 179) g_stopFlipDeg = 179;
     if (g_catchMult < 1.0f) g_catchMult = 1.0f;                // never NARROW the window
     if (g_catchMult > 6.0f) g_catchMult = 6.0f;
     if (g_dsAngleDeg < 10)  g_dsAngleDeg = 10;
@@ -170,6 +198,9 @@ void CatchTweaks_SaveConfig(char* buf, size_t cap) {
     TwkIniSetInt(buf, cap, "CatchWindowMult",     (int)(g_catchMult * 100.0f + 0.5f));
     TwkIniSetInt(buf, cap, "CatchBeatsDarkslide", g_catchBeatsDS);
     TwkIniSetInt(buf, cap, "DarkslideZoneDeg",    g_dsAngleDeg);
+    TwkIniSetInt(buf, cap, "CatchStopsFlip",      g_stopFlip);
+    TwkIniSetInt(buf, cap, "CatchStopFlipDeg",    g_stopFlipDeg);
+    TwkIniSetInt(buf, cap, "CatchSnapMs",         g_snapMs);
 }
 
 // ------------------------------------------------------------------ sigs (dual-exe-verified)
@@ -185,6 +216,10 @@ struct DefSave { void* def; float flip, rot; };
 static DefSave g_defSave[512];
 static int     g_nDefSave = 0;
 static bool    g_widened  = false;
+// The multiplier actually WRITTEN into the trick defs. The widen only runs on a catch-mode
+// transition, so without this a slider change sits inert until the mode is toggled -- which made an
+// A/B of the window silently test nothing at all.
+static float   g_appliedMult = 0.0f;
 
 static void applyCatchWindow(void* tricksDb, bool widen) {
     if (!tricksDb) return;
@@ -207,6 +242,7 @@ static void applyCatchWindow(void* tricksDb, bool widen) {
                 *(float*)((uint8_t*)def + DEF_ROT_PRECATCH_ANGLE)  = r * g_catchMult;
             }
             g_widened = true;
+            g_appliedMult = g_catchMult;
             TwkLog("[catch] MANUAL catch: pre-catch angle x%.2f on %d trick defs (e.g. %.0f -> %.0f deg)",
                    g_catchMult, g_nDefSave,
                    g_nDefSave ? g_defSave[0].flip : 0.0f,
@@ -280,18 +316,38 @@ static bool hkCanCatchOrient(void* self, void* b, void* c, void* d) {
             void* skater = twkP(self, IAH_SKATER);
             const int catchMode  = skater ? twkB(skater, SK_CATCH_MODE) : -1;   // the MENU setting
             const int orientMode = twkB(self, IAH_CATCH_ORIENT_INPUT);          // a different enum
+            // ---- LEARN which ECatchMode value is MANUAL, instead of demanding it in the ini.
+            // The menu's Manual is the one that runs CanCatchOrient's TIMER branch, and that branch
+            // is selected by ECatchOrientInputMode == 3 (measured when the mode gates were mapped;
+            // the pairing catchMode=2 <-> orientMode=3 shows in every log since, on BOTH installs).
+            // So the first time we see the timer branch active, the current catchMode IS manual.
+            // Field-proven need: a friend's install ran with ManualCatchMode=-1 -- run-out silently
+            // did nothing ("manual=0" on every real-bail line) because the value only lived in one
+            // user's ini. An explicit ini value still wins; the learned one is session-only.
+            if (g_manualMode < 0 && orientMode == 3 && catchMode >= 0) {
+                g_manualMode = catchMode;
+                TwkLog("[catch] learned: ECatchMode=%d is MANUAL (the orient timer branch is active) "
+                       "-- window widening and run-out armed", catchMode);
+            }
             if (catchMode != (int)g_uiCatchMode || orientMode != (int)g_uiOrientMode) {
                 InterlockedExchange(&g_uiCatchMode,  (LONG)catchMode);
                 InterlockedExchange(&g_uiOrientMode, (LONG)orientMode);
                 TwkLog("[catch] ECatchMode=%d (the Catch Mode setting)  ECatchOrientInputMode=%d  -- %s",
                        catchMode, orientMode,
                        (g_manualMode < 0)
-                           ? "ManualCatchMode is UNSET: note which value is manual, set it in the ini"
+                           ? "ManualCatchMode unknown (learned on first manual-mode play; ini overrides)"
                            : (catchMode == g_manualMode ? "MANUAL -- widened window applies"
                                                         : "not manual -- stock window"));
             }
             const bool want = (g_catchFix != 0) && (g_manualMode >= 0) && (catchMode == g_manualMode);
-            if (want != g_widened) applyCatchWindow(twkP(self, IAH_TRICKS_DB), want);
+            if (want != g_widened) {
+                applyCatchWindow(twkP(self, IAH_TRICKS_DB), want);
+            } else if (want && g_appliedMult != g_catchMult) {
+                // The setting moved while it was already applied: put the originals back and
+                // re-widen with the new value, so the slider means something the moment it moves.
+                applyCatchWindow(twkP(self, IAH_TRICKS_DB), false);
+                applyCatchWindow(twkP(self, IAH_TRICKS_DB), true);
+            }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             g_catchFix = 0;
             TwkLog("[catch] caught fatal in the widen gate -> window fix off");
@@ -315,6 +371,20 @@ static bool hkCanCatchOrient(void* self, void* b, void* c, void* d) {
 typedef void* (*CatchDefaultFn)(void*, double, void*, void*, void*, void*, void*);
 static void* g_origCatchDef  = nullptr;
 static void* g_startCatchDef = nullptr;
+// Degrees from grip-down, measured off the RENDERED deck (the flipper component's world quat), which
+// is the only board-angle source in this game that has ever read correctly -- every movement-component
+// angle field tried here read a constant. -1 = unreadable.
+static float BoardGrip(void* skater) {
+    void* board   = skater ? twkP(skater, SK_BOARD) : nullptr;
+    void* flipper = board ? twkP(board, BOARD_FLIPPER) : nullptr;
+    if (!flipper) return -1.0f;
+    const float qx = twkF(flipper, COMP_CTW_QUAT), qy = twkF(flipper, COMP_CTW_QUAT + 4);
+    if (!(qx > -100000.0f) || !(qy > -100000.0f)) return -1.0f;
+    float upZ = 1.0f - 2.0f * (qx * qx + qy * qy);
+    if (upZ < -1.0f) upZ = -1.0f; else if (upZ > 1.0f) upZ = 1.0f;
+    return acosf(-upZ) * 57.2957795f;
+}
+
 static void* hkCatchDefault(void* self, double dt, void* frontStick, void* backStick,
                             void* a5, void* a6, void* a7) {
     void* skater = self ? twkP(self, IAH_SKATER) : nullptr;
@@ -378,6 +448,52 @@ static void* hkCatchDefault(void* self, double dt, void* frontStick, void* backS
         __try { *(uint8_t*)((uint8_t*)self + IAH_DS_CANCEL) = (uint8_t)dsSaved; }
         __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
+    // ---- flip-travel trace: what the BOARD does across a catch ------------------------------------
+    // ONE LINE PER CATCH by default. The first cut logged 20 lines a rep and stopped after a fixed 60
+    // frames whether or not the board had settled -- at 120 fps that is half a second, so a second
+    // flip that finished later was recorded as a clean catch. It now runs until the board is actually
+    // still, and prints a summary you can scan across dozens of reps.
+    if (g_flipTrace && self && skater) {
+        __try {
+            const float ang = BoardGrip(skater);
+            const float fx = twkF(frontStick, 0), fy = twkF(frontStick, 4);
+            const float bx = twkF(backStick, 0),  by = twkF(backStick, 4);
+            const float dzRead = twkF(twkP(self, IAH_CATCH_ORIENTS_DB), CODB_INPUT_DEADZONE);
+            const float dz = (dzRead > 0.0f && dzRead < 1.0f) ? dzRead : 0.2f;
+            const bool pressed = (fx*fx + fy*fy > dz*dz) || (bx*bx + by*by > dz*dz);
+            static bool  armed = false, wasPressed = false;
+            static float prev = -1.0f, travel = 0.0f, pressAng = 0.0f;
+            static int   frames = 0, still = 0, verdict = -1;
+            if (pressed && !wasPressed && ang >= 0.0f) {
+                armed = true; frames = 0; still = 0; travel = 0.0f; prev = ang;
+                pressAng = ang; verdict = a5 ? twkB(a5, 0) : -1;
+            }
+            wasPressed = pressed;
+            if (armed && ang >= 0.0f) {
+                if (verdict <= 0 && a5 && twkB(a5, 0) > 0) verdict = twkB(a5, 0);   // may land a frame late
+                const float d = fabsf(ang - prev);
+                if (d < 170.0f) travel += d;
+                still = (d < 1.0f) ? still + 1 : 0;        // settled = the deck has stopped moving
+                prev = ang;
+                if (g_flipTraceVerbose)
+                    TwkLog("[trace]   t+%2d  board %3.0f deg  travelled %4.0f deg  out5=%d state=%d",
+                           frames, ang, travel, a5 ? twkB(a5, 0) : -1,
+                           twkB(skater, SK_CATCH_ORIENT_STATE));
+                if (++frames > 400 || still > 12) {
+                    armed = false;
+                    // "Extra" is what the board did BEYOND running out to grip-up, which is all a
+                    // clean catch should ever do -- so a double reads as ~360 rather than needing
+                    // the press angle subtracted by eye.
+                    const float expected = 180.0f - pressAng;
+                    const float extra = travel - (expected > 0.0f ? expected : 0.0f);
+                    TwkLog("[catchtrace] %-22s press=%3.0f out5=%d | travelled=%3.0f expected=%3.0f "
+                           "extra=%3.0f%s", FlipSpeed_LastTrickName(), pressAng, verdict,
+                           travel, expected, extra, (extra > 120.0f) ? "   <-- EXTRA FLIP" : "");
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) { g_flipTrace = 0; }
+    }
+
     if (g_catchDiag && self && skater) {
         __try {
             // _Default does not engage the catch: it writes its verdict through the a5/a6
@@ -436,9 +552,12 @@ void CatchTweaks_SetEnabled(bool on) { g_catchFix = on ? 1 : 0; TwkMarkDirty(); 
 // nothing" -- resetting it would silently switch the whole catch feature off.
 void CatchTweaks_ResetDefaults() {
     g_catchFix = 1; g_catchMult = 2.0f; g_catchBeatsDS = 1; g_dsAngleDeg = 60; g_catchDiag = 0;
+    g_stopFlip = 1; g_stopFlipDeg = 168; g_snapMs = 90;
     TwkMarkDirty();
 }
 float CatchTweaks_WindowMultPct() { return g_catchMult * 100.0f; }
+bool  CatchTweaks_StopsFlip() { return g_stopFlip != 0; }
+void  CatchTweaks_SetStopsFlip(bool on) { g_stopFlip = on ? 1 : 0; TwkMarkDirty(); }
 void  CatchTweaks_SetWindowMultPct(float pct) { g_catchMult = pct / 100.0f; TwkMarkDirty(); }
 float CatchTweaks_DarkslideZoneDeg() { return (float)g_dsAngleDeg; }
 void  CatchTweaks_SetDarkslideZoneDeg(float deg) { g_dsAngleDeg = (int)deg; TwkMarkDirty(); }
@@ -482,4 +601,97 @@ void CatchTweaks_DrawMenu(const OmpMenuApi* api) {
                  (int)md, (md == g_manualMode) ? "MANUAL" : "auto",
                  g_uiCatchWide ? "yes" : "no", (int)g_uiCatchDefs);
     api->TextDisabled(b);
+}
+
+// ---- per-trick board-rotation watch --------------------------------------------------------------
+// Measures how far the DECK actually turns, from the moment a trick is selected until it stops
+// moving. Deliberately independent of the catch path: keying this on the catch press missed the very
+// reps worth seeing -- a bail ends the catch path, and a press that is held rather than tapped never
+// produces an edge, so the failures hid while the clean catches all recorded.
+//
+// Summing |delta| per frame recovers the true rotation despite the angle being unsigned: it folds at
+// grip-down and grip-up, and a fold reverses the sign of the step, not its size. At ~12 deg a frame
+// there is no risk of stepping over a fold.
+void CatchTweaks_PumpFrame() {
+    // ⚠️ The FIX (g_stopFlip) lives in here alongside the diagnostic trace, so this must not early-out
+    // on the trace flag -- doing so silently disabled the fix the moment logging was turned off for
+    // release. Each part checks its own switch below.
+    if (!g_flipTrace && !g_stopFlip) return;
+    __try {
+        void* skater = g_lastSkater;
+        if (!skater) return;
+        const float ang = BoardGrip(skater);
+        if (ang < 0.0f) return;
+        static long  lastSerial = -1;
+        static bool  watching = false;
+        static float prev = 0.0f, travel = 0.0f;
+        static int   still = 0, frames = 0;
+        // ---- the fix: a registered catch ends the flip at the first grip-up ----------------------
+        // `_boardFlipRate` is zeroed rather than the angle being written: the deck is already AT the
+        // orientation a completed flip ends on, so removing the rate leaves it exactly there and lets
+        // every other system (landing, pitch, the catch's own alignment) carry on untouched.
+        if (g_stopFlip) {
+            void* comp = CatchLevel_MovementComponent();
+            const int catchState = twkB(skater, SK_CATCH_ORIENT_STATE);
+            static bool  armed = false;
+            static float prevAng = -1.0f;
+            const float delta = (prevAng >= 0.0f) ? (ang - prevAng) : 0.0f;
+            if (catchState != 0 && !armed) {
+                armed = true;
+                // A caught board should come to the feet, not coast to griptape-up at full flip
+                // speed. Measured: a catch registering ~245 deg short of grip-up spent 200 ms
+                // getting there, which IS the extra flip the player sees. So the remaining travel
+                // is compressed into `snapMs` -- the board finishes fast and stops, rather than
+                // taking another revolution's worth of time to arrive.
+                if (comp && fabsf(delta) > 0.01f) {
+                    // Unsigned angle: rising means heading for grip-up, falling means it must pass
+                    // grip-down first. Either way this is the distance still to travel.
+                    const float remaining = (delta > 0.0f) ? (180.0f - ang) : (ang + 180.0f);
+                    const float rate = twkF(comp, MC_BOARD_FLIP_RATE);
+                    const float want = remaining / ((float)g_snapMs / 1000.0f);
+                    if (remaining > 40.0f && fabsf(rate) > 1.0f && want > fabsf(rate)) {
+                        float capped = want > 6000.0f ? 6000.0f : want;   // never absurd
+                        *(float*)((uint8_t*)comp + MC_BOARD_FLIP_RATE) = (rate < 0.0f) ? -capped : capped;
+                        TwkLog("[catch] caught %.0f deg short -- finishing the flip in %d ms "
+                               "(%.0f -> %.0f deg/s)", remaining, g_snapMs, fabsf(rate), capped);
+                    }
+                }
+            }
+            if (catchState == 0 && ang > 170.0f) armed = false;
+            if (armed && comp && ang >= (float)g_stopFlipDeg && delta > 0.0f) {
+                const float rate = twkF(comp, MC_BOARD_FLIP_RATE);
+                if (rate > 1.0f || rate < -1.0f) {
+                    *(float*)((uint8_t*)comp + MC_BOARD_FLIP_RATE) = 0.0f;
+                    InterlockedIncrement(&g_uiFlipStops);
+                    TwkLog("[catch] flip stopped at grip-up (%.0f deg, was %.0f deg/s) -- "
+                           "no second revolution", ang, rate);
+                }
+                armed = false;
+            }
+            prevAng = ang;
+        }
+
+        if (!g_flipTrace) return;                 // the rest of this is the diagnostic trace only
+        const long serial = FlipSpeed_TrickSerial();
+        if (serial != lastSerial) {                    // a new trick was just selected
+            lastSerial = serial;
+            watching = true; travel = 0.0f; still = 0; frames = 0; prev = ang;
+            return;
+        }
+        if (!watching) return;
+        const float d = fabsf(ang - prev);
+        if (d < 170.0f) travel += d;
+        prev = ang;
+        still = (d < 0.8f) ? still + 1 : 0;
+        if (++frames > 900) still = 99;                // never watch forever
+        if (still > 15) {
+            watching = false;
+            // A flip trick turns the deck 360. Anything near 720 did it twice -- reported as a count
+            // rather than a raw number so a double is unmistakable without arithmetic.
+            const float flips = travel / 360.0f;
+            TwkLog("[fliptrace] %-22s deck turned %4.0f deg = %.2f flip(s)%s",
+                   FlipSpeed_LastTrickName(), travel, flips,
+                   (flips > 1.4f) ? "   <-- SECOND FLIP" : "");
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { g_flipTrace = 0; }
 }

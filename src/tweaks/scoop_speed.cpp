@@ -117,6 +117,96 @@ static double nowSeconds() {
     LARGE_INTEGER t; QueryPerformanceCounter(&t);
     return (double)t.QuadPart / (double)f.QuadPart;
 }
+
+// ---- radial (flick) history, for flip_speed --------------------------------------------------
+// The tracker above measures ANGULAR sweep, which is what a scoop is. A flip flick is RADIAL --
+// straight out through the centre -- so it needs its own samples, and crucially they must be taken
+// with NO magnitude gate: the interesting part of a flick is the climb from the centre, which is
+// entirely below `g_trackMinMag` and never reaches the tracker at all.
+static const int kMagHist = 96;
+struct MagTrack { double t[kMagHist]; float m[kMagHist]; int n; };
+static MagTrack g_magL = {}, g_magR = {};
+// Below this the stick is still in the centre region -- the push is considered to start here.
+float ScoopSpeed_FlickStartMag = 0.10f;
+// A gesture that never gets this far out is not a flick; reporting a speed for it would let a nudge
+// of the stick register as a fast one just because it happened quickly.
+float ScoopSpeed_FlickMinPeak  = 0.18f;
+static void trackMag(MagTrack& M, float x, float y, double t) {
+    if (M.n >= kMagHist) {                       // keep the recent half, same shape as StickTracker
+        const int keep = kMagHist / 2;
+        memmove(M.t, M.t + (kMagHist - keep), keep * sizeof(M.t[0]));
+        memmove(M.m, M.m + (kMagHist - keep), keep * sizeof(M.m[0]));
+        M.n = keep;
+    }
+    M.t[M.n] = t;
+    M.m[M.n] = sqrtf(x * x + y * y);
+    M.n++;
+}
+// The FLICK, measured as the gesture it actually is: how far the stick travelled from where the push
+// began to where it peaked, over how long that took.
+//
+// ⚠️ THE OBVIOUS VERSION IS FRAME-RATE DEPENDENT, which is the whole bug this replaces. Taking the
+// fastest rate over sample pairs at least `lo` seconds apart sounds frame-rate independent -- it
+// divides by real time -- but the CLOSEST usable pair is bounded by the frame interval, so the
+// highest speed it can report is one full stick throw in that interval. At 60 fps that ceiling is
+// ~30 u/s; at 144 fps it is ~48. The same physical flick reads differently, and a threshold set on
+// one machine is unreachable on another.
+//
+// Measuring start-to-peak has no such ceiling: both the distance and the duration are properties of
+// YOUR HAND, and more samples only locate them more precisely. A flick that takes 45 ms to reach full
+// deflection reads ~22 u/s whether that was sampled 3 times or 12.
+// Prints the raw stick magnitudes leading up to NOW. The trick fires while the flick is still
+// travelling, so what the samples look like at that instant is the only thing that says whether a
+// speed can be measured there at all -- and that cannot be reasoned out from the outside.
+void ScoopSpeed_DumpFlick(bool rightStick, float windowSec) {
+    const MagTrack& M = rightStick ? g_magR : g_magL;
+    if (M.n < 2) { TwkLog("[flick] no samples"); return; }
+    const double now = nowSeconds();
+    char line[400]; int len = 0;
+    len += snprintf(line + len, sizeof(line) - len, "[flick] %c:", rightStick ? 'R' : 'L');
+    for (int i = 0; i < M.n && len < (int)sizeof(line) - 24; i++) {
+        if (now - M.t[i] > windowSec) continue;
+        len += snprintf(line + len, sizeof(line) - len, " %.0f:%.2f",
+                        (now - M.t[i]) * 1000.0, M.m[i]);
+    }
+    TwkLog("%s   (ms-ago:magnitude, newest last)", line);
+}
+
+bool ScoopSpeed_FlickMeasure(bool rightStick, float windowSec, float* outSpeed, float* outPeak,
+                             float* outFrameMs) {
+    const MagTrack& M = rightStick ? g_magR : g_magL;
+    if (outSpeed)   *outSpeed = 0.0f;
+    if (outPeak)    *outPeak = 0.0f;
+    if (outFrameMs) *outFrameMs = 0.0f;
+    if (M.n < 2) return false;
+    const double now = nowSeconds();
+    if (now - M.t[M.n - 1] > 0.25) return false;             // no live input tick: say nothing
+
+    int first = M.n - 1;                                     // oldest sample still inside the window
+    while (first > 0 && (now - M.t[first - 1]) <= windowSec) first--;
+    if (first >= M.n - 1) return false;
+    if (outFrameMs)                                          // mean sample spacing = the frame time
+        *outFrameMs = (float)((M.t[M.n - 1] - M.t[first]) / (M.n - 1 - first) * 1000.0);
+
+    int peak = first;                                        // where the push topped out
+    for (int i = first; i < M.n; i++) if (M.m[i] > M.m[peak]) peak = i;
+    if (outPeak) *outPeak = M.m[peak];
+    // ⚠️ FALSE, not "speed 0". A caller maps the speed onto its range, so returning 0 for an
+    // unmeasurable gesture silently requests the SLOWEST setting -- the opposite of "we don't know".
+    // Every bail below says "no measurement" so the caller can keep the game's own value.
+    if (M.m[peak] < ScoopSpeed_FlickMinPeak) return false;             // never pushed far enough to be a flick
+
+    int start = peak;                                        // back to where that push began
+    while (start > first && M.m[start - 1] < M.m[start] && M.m[start - 1] > ScoopSpeed_FlickStartMag) start--;
+    if (start > first && M.m[start - 1] <= ScoopSpeed_FlickStartMag) start--;   // include the sample below it
+    const double span = M.t[peak] - M.t[start];
+    if (span <= 0.0) return false;
+    const float rise = M.m[peak] - M.m[start];
+    if (rise <= 0.0f) return false;
+    if (outSpeed) *outSpeed = rise / (float)span;
+    return true;
+}
+
 static void trackOne(StickTracker& T, float x, float y, double t) {
     const float mag = sqrtf(x * x + y * y);
     if (mag < g_trackMinMag) { T.haveLast = false; return; }
@@ -148,8 +238,12 @@ static void trackOne(StickTracker& T, float x, float y, double t) {
 }
 static void trackStick(void* handler) {
     const double t = nowSeconds();
-    trackOne(g_trkL, twkF(handler, IH_FRAME_RAW_LEFT),  twkF(handler, IH_FRAME_RAW_LEFT + 4),  t);
-    trackOne(g_trkR, twkF(handler, IH_FRAME_RAW_RIGHT), twkF(handler, IH_FRAME_RAW_RIGHT + 4), t);
+    const float lx = twkF(handler, IH_FRAME_RAW_LEFT),  ly = twkF(handler, IH_FRAME_RAW_LEFT + 4);
+    const float rx = twkF(handler, IH_FRAME_RAW_RIGHT), ry = twkF(handler, IH_FRAME_RAW_RIGHT + 4);
+    trackOne(g_trkL, lx, ly, t);
+    trackOne(g_trkR, rx, ry, t);
+    trackMag(g_magL, lx, ly, t);
+    trackMag(g_magR, rx, ry, t);
 }
 static bool gestureFresh(const StickTracker& T) {
     return T.nSamples > 1 && (nowSeconds() - T.velT[T.nSamples - 1]) <= g_trackWindow;

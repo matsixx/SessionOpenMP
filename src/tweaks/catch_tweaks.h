@@ -44,3 +44,7 @@ float CatchTweaks_RecentMaxZ();
 // mount-time direction, so momentum must come from position history, which cannot go stale.
 // Returns false when there is no fresh sample pair.
 bool CatchTweaks_TravelVel(float* vx, float* vy, float* vz);
+// Per-frame board-rotation watch (the flip trace). GAME THREAD.
+void CatchTweaks_PumpFrame();
+// A registered catch ends the flip at griptape-up instead of letting it spin another revolution.
+bool CatchTweaks_StopsFlip();  void CatchTweaks_SetStopsFlip(bool on);

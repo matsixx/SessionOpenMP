@@ -267,6 +267,8 @@ static bool IsManual(int catchMode) {
 // here (that would need the game's allocator, which this DLL deliberately does not couple to). An
 // FName's text never changes, so caching by the FName value bounds this at exactly one leak per
 // distinct name.
+static bool NameOf(const void* obj, char* out, int cap);
+bool CatchSound_ObjName(const void* obj, char* out, int cap) { return NameOf(obj, out, cap); }
 static bool NameOf(const void* obj, char* out, int cap) {
     out[0] = 0;
     if (!obj || !g_fnameToStr) return false;
@@ -298,8 +300,13 @@ static bool NameOf(const void* obj, char* out, int cap) {
 // ---- an independent read of the blacklist, used two ways: to cross-check the hooked verdict (if
 // they disagree, one of the four inferred offsets is wrong and only the telemetry, never a fix, is
 // affected), and to dump the list by name once per session.
+// ⚠️ `def` is the trick to judge, CAPTURED BY THE CALLER AT ITS OWN MOMENT -- never re-read
+// `_currentFlipTrickDef` later and judge that. Field-measured: 74 self-plays landed on blacklisted
+// ollies/nollies because the old version re-read the CURRENT def ~40 ms after the catch edge, by
+// which time the game had already cleared/replaced it -- the ollie def was gone, the walk found
+// nothing, and the "honour the blacklist" guard silently passed the exact tricks it existed for.
 // Returns: -1 unreadable, 0 not blacklisted, 1 blacklisted.
-static int DerivedVerdict(void* skater) {
+static int DerivedVerdict(void* skater, void* def) {
     if (!skater) return -1;
     void* ad = twkP(skater, SK_AUDIO_DATA);
     if (!ad) return 0;                                    // the game's own answer with no audio data
@@ -308,9 +315,9 @@ static int DerivedVerdict(void* skater) {
     if (num < 0 || num > 512) return -1;                  // implausible -> refuse to walk it
     if (num == 0) return 0;
     if (!data) return -1;
-    void* cur = twkP(skater, SK_CUR_FLIP_DEF);
+    if (!def) return -1;                                  // nothing to judge -- caller decides
     for (int i = 0; i < num; i++)
-        if (twkP(data, i * 8) == cur) return 1;
+        if (twkP(data, i * 8) == def) return 1;
     return 0;
 }
 
@@ -325,6 +332,7 @@ static int DerivedVerdict(void* skater) {
 //      redirector or generated class with the same name would come back looking like a cue and
 //      spawning it would fault. Hence the class-name check below.
 static bool  g_cueTried = false;
+static volatile LONG g_spawnFaults = 0;   // fresh-resolve faults; 3 strikes = self-play off
 static void* ResolveCue() {
     if (g_catchCue) return g_catchCue;                 // learned from a notify: trustworthy
     if (g_cueTried || !g_staticFind) return nullptr;
@@ -367,8 +375,17 @@ static bool PlayCatchCue(void* skater) {
                    nullptr /*attenuation: the cue's own*/, nullptr /*concurrency: the cue's own*/,
                    true /*autoDestroy -- a one-shot, same as the notify stages*/);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        g_okSelfPlay = 0;
-        TwkLog("[csnd] caught fatal spawning the catch cue -> self-play off (nothing else affected)");
+        // Most likely a STALE CUE (GC'd with an old level). Drop the cache so the next attempt
+        // re-resolves by name instead of writing the feature off for the session -- the pawn-change
+        // reset re-arms g_okSelfPlay, so only repeated faults on a FRESH resolve stay fatal.
+        g_catchCue = nullptr; g_cueTried = false;
+        if (InterlockedIncrement(&g_spawnFaults) >= 3) {
+            g_okSelfPlay = 0;
+            TwkLog("[csnd] catch-cue spawn faulted %d times -> self-play off (nothing else affected)",
+                   (int)g_spawnFaults);
+        } else {
+            TwkLog("[csnd] catch-cue spawn faulted (stale cue after a map switch?) -- cache dropped, will re-resolve");
+        }
         return false;
     }
     g_lastSelfPlayT = CsNow();      // arms the suppression of a late game notify
@@ -403,6 +420,7 @@ struct NotifyRec {
     int    verdict;        // -1 gate never ran (not a skater) / 0 blacklisted / 1 allowed / 2 overridden
     int    derived;        // the independent re-derivation: -1 unreadable / 0 no / 1 blacklisted
     int    follow, catchSt, catchMode, sameSkater;
+    int    local;          // mesh owner == OUR skater (0 = a peer's proxy; its sound is untouched)
     bool   muted;          // arrived after this catch was already played -- denied its cue
     bool   matched, logged;
     volatile LONG ready;   // published LAST so the pump never reads a half-written record
@@ -474,9 +492,22 @@ static void* hkPlayCatchSound(void* self, void* meshComp) {
     // the in-air flip whoosh (board+0x348 _flippingInAirLoopAudio), so returning early would
     // silently change that too. Nulling `Sound` for the duration lets everything else happen while
     // the base spawn no-ops (UGameplayStatics early-returns on a null sound).
+    // ---- ⚠️ LOCAL vs PROXY. In co-op the catch notify ALSO fires on PEERS' proxy skaters (their
+    // anim graph runs locally -- the same mechanism the MP notes call out as "the catch plays
+    // natively on proxies"). A proxy's notify must pass through UNTOUCHED:
+    //   * muting it would swallow the FRIEND's catch sound whenever it lands within the suppression
+    //     window of one of OUR self-plays, and
+    //   * letting it update g_lastPlayT would make OUR next edge think "the game already made it"
+    //     and skip self-play -- OUR catch goes silent because THEIR catch made a sound.
+    // Both are exactly the "worse with multiple players" report. Unknown local skater (no trick yet)
+    // is treated as local: nothing can have self-played before the first trick anyway.
+    void* owner   = meshComp ? twkP(meshComp, COMP_OWNER) : nullptr;
+    void* localSk = CatchTweaks_Skater();
+    const bool isLocal = !localSk || !owner || owner == localSk;
+
     bool  muted = false;
     void* soundSaved = nullptr;
-    if (g_on && g_selfPlay && g_suppressMs > 0 && g_lastSelfPlayT > 0.0 && self &&
+    if (isLocal && g_on && g_selfPlay && g_suppressMs > 0 && g_lastSelfPlayT > 0.0 && self &&
         (tNow - g_lastSelfPlayT) * 1000.0 < (double)g_suppressMs) {
         __try {
             soundSaved = *(void**)((uint8_t*)self + NTF_SOUND);
@@ -488,7 +519,8 @@ static void* hkPlayCatchSound(void* self, void* meshComp) {
         } __except (EXCEPTION_EXECUTE_HANDLER) { muted = false; }
     }
     t_playRan++;
-    if (!muted) g_lastPlayT = tNow;   // the game is making the sound, so self-play must stand down
+    if (isLocal && !muted) g_lastPlayT = tNow;   // OUR sound is being made -- self-play stands down.
+                                                 // A proxy's never counts (see the local/proxy note).
     t_inNotify++;
     t_verdict = -1;
     t_shouldThis = nullptr;
@@ -513,7 +545,9 @@ static void* hkPlayCatchSound(void* self, void* meshComp) {
                    "notify. Volume/anchor fixes off; the blacklist fix and diagnosis continue.", volStock);
             g_okFollow = 0;
         }
-        if (g_on && g_okVol) {
+        // Volume/anchor edits are LOCAL-ONLY: the user's 300% boost stretching a peer's catch sound
+        // would be surprising, and a peer's sound should stay exactly as their game authored it.
+        if (isLocal && g_on && g_okVol) {
             float want = volStock * ((float)g_volPct / 100.0f);
             const float floorV = (float)g_minVolPct / 100.0f;
             if (want < floorV) want = floorV;
@@ -529,7 +563,7 @@ static void* hkPlayCatchSound(void* self, void* meshComp) {
         // The stock spawn anchors the one-shot at a FIXED WORLD POINT (bFollow clear -> the base
         // takes SpawnSoundAtLocation at the mesh's position), so at skating speed the skater rides
         // away from it while it plays. Setting bit0 attaches it to the mesh instead.
-        if (g_on && g_follow && g_okFollow && followStock >= 0 && !(followStock & 1)) {
+        if (isLocal && g_on && g_follow && g_okFollow && followStock >= 0 && !(followStock & 1)) {
             __try {
                 folSaved = *(uint32_t*)((uint8_t*)self + NTF_FOLLOW);
                 *(uint32_t*)((uint8_t*)self + NTF_FOLLOW) = folSaved | 1u;
@@ -554,8 +588,8 @@ static void* hkPlayCatchSound(void* self, void* meshComp) {
                       __except (EXCEPTION_EXECUTE_HANDLER) {} }
 
     __try {
-        void* skater = meshComp ? twkP(meshComp, COMP_OWNER) : nullptr;
-        if (skater) g_lastNotifySkater = skater;
+        void* skater = owner;
+        if (skater && isLocal) g_lastNotifySkater = skater;   // never let a proxy become the fallback
         if (volTouched)                                     InterlockedIncrement(&g_uiQuiet);
         if (self && !twkP(self, NTF_SOUND))                 InterlockedIncrement(&g_uiNullCue);
         if (t_verdict == 0)                                 InterlockedIncrement(&g_uiBlacklisted);
@@ -571,7 +605,7 @@ static void* hkPlayCatchSound(void* self, void* meshComp) {
             n.trickDef   = skater ? twkP(skater, SK_CUR_FLIP_DEF) : nullptr;
             n.volStock   = volStock;   n.volApplied = volApplied;   n.pitch = pitch;
             n.verdict    = t_verdict;
-            n.derived    = DerivedVerdict(skater);
+            n.derived    = DerivedVerdict(skater, n.trickDef);
             n.follow     = followStock;
             n.catchSt    = skater ? twkB(skater, SK_CATCH_ORIENT_ST) : -1;
             n.catchMode  = skater ? twkB(skater, SK_CATCH_MODE) : -1;
@@ -579,6 +613,7 @@ static void* hkPlayCatchSound(void* self, void* meshComp) {
             // gate hook). Agreement confirms both arities on a live case; disagreement means one of
             // them is wrong.
             n.sameSkater = (t_shouldThis && skater) ? (t_shouldThis == skater ? 1 : 0) : -1;
+            n.local   = isLocal ? 1 : 0;
             n.muted   = muted;
             n.matched = false; n.logged = false;
             InterlockedExchange(&n.ready, 1);   // full barrier: publishes the record, never half of it
@@ -641,9 +676,10 @@ void CatchSound_PumpFrame() {
                 char vol[48];
                 if (n.volApplied >= 0.0f) snprintf(vol, sizeof(vol), "%.2f->%.2f", n.volStock, n.volApplied);
                 else                      snprintf(vol, sizeof(vol), "%.2f", n.volStock);
-                TwkLog("[csnd] notify: %s%s | trick='%s' cue='%s' vol=%s pitch=%.2f followStock=%d "
+                TwkLog("[csnd] notify: %s%s%s | trick='%s' cue='%s' vol=%s pitch=%.2f followStock=%d "
                        "catchState=%d mode=%s ours=%d sameSkater=%d",
                        verdict, n.muted ? " -- LATE, we already played it, so muted" : "",
+                       n.local ? "" : " [PEER proxy -- untouched]",
                        trick, cue, vol, n.pitch, n.follow & 1, n.catchSt,
                        IsManual(n.catchMode) ? "manual" : "auto", n.derived, n.sameSkater);
             }
@@ -672,6 +708,24 @@ void CatchSound_PumpFrame() {
         // ---- 2. the catch edge
         void* skater = CatchTweaks_Skater();
         if (!skater) skater = g_lastNotifySkater;
+        // ---- map switch / respawn = a NEW PAWN. Everything remembered about the old world is now
+        // dangling: the cached cue pointer may have been GC'd with the old level (a stale spawn is
+        // the "sound stopped after switching maps" shape -- one SEH fault used to kill self-play for
+        // the whole session), and a pending edge's skater is gone. Reset and re-resolve.
+        {
+            static void* prevSkater = nullptr;
+            if (skater && prevSkater && skater != prevSkater) {
+                g_catchCue = nullptr; g_cueTried = false;          // re-resolve by name, fresh world
+                g_lastNotifySkater = nullptr;
+                g_lastCatchSt = 0;
+                g_lastPlayT = g_lastSelfPlayT = -1000.0;
+                for (int i = 0; i < kEdgeRing; i++) g_edges[i].live = false;
+                g_okSelfPlay = 1;                                   // a fault on the OLD world is stale
+                InterlockedExchange(&g_spawnFaults, 0);
+                TwkLog("[csnd] new skater (map switch/respawn) -- state reset, cue re-resolve armed");
+            }
+            if (skater) prevSkater = skater;
+        }
         if (skater) DumpBlacklist(skater);
         // The edge VERDICT is only meaningful when the notify ring is being filled: with diag off
         // there are no records to match against and every edge would read as "no notify". The edge
@@ -703,9 +757,12 @@ void CatchSound_PumpFrame() {
                 e.selfDone = true;
                 if (fabs(g_lastPlayT - e.t) <= win) continue;      // the game already made it
                 // Honour the designers' own silence list on this path too, or self-play would simply
-                // reintroduce the unwanted ollie sound. In practice no catch edge fires on a plain
-                // ollie, so this is a guard rather than a fix.
-                if (DerivedVerdict(e.skater) == 1) { InterlockedIncrement(&g_uiBlacklisted); continue; }
+                // reintroduce the unwanted ollie sound. Judged on the def CAPTURED AT THE EDGE --
+                // catch edges DO fire on ollies (field-measured, contra the earlier note), and the
+                // current-def re-read was stale by resolution time (see DerivedVerdict).
+                // An unreadable verdict (-1) also declines: better one missing sound on a weird frame
+                // than an ollie click the user asked to remove.
+                if (DerivedVerdict(e.skater, e.trickDef) != 0) { InterlockedIncrement(&g_uiBlacklisted); continue; }
                 if (PlayCatchCue(e.skater)) InterlockedIncrement(&g_uiSelfPlayed);
             }
         }
