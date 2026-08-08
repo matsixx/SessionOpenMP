@@ -16,7 +16,6 @@
 //   run_out       low-air missed-trick bails become the native run-out
 //   catch_level   board levels out when it hits your foot (restores a removed feature)
 //   grind_pop     read-only probe on the grind-exit pop pipeline (measurement, changes nothing)
-//   cloth_physics cloth wind boost (stronger flap + standstill breeze) + cloth/material recon dump
 //
 // A SEPARATE UE4SS C++ mod (Mods\SessionTweaks\dlls\main.dll), deliberately not part of the
 // multiplayer mod: gameplay feel and co-op ship together by the user's distribution choice, but they
@@ -40,7 +39,6 @@
 #include "catch_level.h"
 #include "catch_sound.h"
 #include "grind_pop.h"
-#include "cloth_physics.h"
 #include "MinHook.h"
 #include "ue4ss_abi.h"
 #include "ui/menu_ext.h"
@@ -76,7 +74,6 @@ static void saveSettings() {
     CatchLevel_SaveConfig(buf, sizeof(buf));
     CatchSound_SaveConfig(buf, sizeof(buf));
     GrindPop_SaveConfig(buf, sizeof(buf));
-    ClothPhys_SaveConfig(buf, sizeof(buf));
     f = fopen(g_iniPath, "w");
     if (!f) { TwkLog("[tweaks] settings save FAILED (cannot write %s)", g_iniPath); return; }
     fwrite(buf, 1, strlen(buf), f);
@@ -106,7 +103,6 @@ static void readConfig(const char* dir) {
     CatchLevel_ReadConfig(buf);
     CatchSound_ReadConfig(buf);
     GrindPop_ReadConfig(buf);
-    ClothPhys_ReadConfig(buf);
     // No ini yet: write one holding the defaults just loaded. Without the multiplayer mod there is
     // no menu to change a setting through, so the file IS the interface -- and a file that lists
     // every key at its current value is the only way to discover what can be configured. Writing it
@@ -128,7 +124,6 @@ static void resetAllDefaults() {
     CatchLevel_ResetDefaults();
     CatchSound_ResetDefaults();
     GrindPop_ResetDefaults();
-    ClothPhys_ResetDefaults();
     TwkLog("[tweaks] settings reset to defaults");
 }
 
@@ -145,8 +140,6 @@ static void drawSection(const OmpMenuApi* api, void*) {
     CatchSound_DrawMenu(api);
     api->Separator();
     GrindPop_DrawMenu(api);
-    api->Separator();
-    ClothPhys_DrawMenu(api);
     // The same reset the pause menu offers, so neither surface is the only way to get back.
     if (api->version >= 2 && api->Button) {
         api->Separator();
@@ -301,7 +294,6 @@ void Tweaks_PumpFrame() {
     CatchLevel_PumpFrame();          // catch-triggered board leveling
     CatchSound_PumpFrame();          // catch-sound telemetry (the fixes live in the hooks, not here)
     GrindPop_PumpFrame();            // grind-exit pop records: names resolved and logged out here
-    ClothPhys_PumpFrame();           // runs a cloth/material dump when the F1 button requested one
     if (g_dirty && (LONGLONG)GetTickCount64() - g_dirtyMs > 2000) {
         InterlockedExchange(&g_dirty, 0);
         saveSettings();
@@ -319,7 +311,7 @@ public:
     SessionTweaks() {
         ModName = STR("SessionTweaks");
         // Version history is kept with the releases, not in the source.
-        ModVersion = STR("2.14.0");
+        ModVersion = STR("2.14.1");
         ModDescription = STR("Gameplay fixes: real-stick-sweep scoop speed, wider manual catch window, darkslide-aware catch fix, run out on missed tricks");
         ModAuthors = STR("matsix");
         char dir[MAX_PATH]{};
@@ -328,7 +320,7 @@ public:
         char path[MAX_PATH];
         snprintf(path, sizeof(path), "%sSessionTweaks.log", dir);
         g_log = fopen(path, "w");
-        TwkLog("=== SessionTweaks 2.14.0 loading (UE4SS C++ mod) ===");
+        TwkLog("=== SessionTweaks 2.14.1 loading (UE4SS C++ mod) ===");
         readConfig(dir);
     }
     ~SessionTweaks() override {
@@ -346,7 +338,6 @@ public:
         CatchLevel_Install();
     CatchSound_Install();
         GrindPop_Install();
-        ClothPhys_Install();
         RunOut_Install();
         // Registration is attempted once now (host usually loaded already; mods.txt order) and
         // re-offered from the frame pump until the host appears, or forever if it never does:

@@ -216,7 +216,6 @@ if(EXISTS "${UE4SS_LIB}")
             src/tweaks/catch_level.cpp
             src/tweaks/catch_sound.cpp
             src/tweaks/grind_pop.cpp
-            src/tweaks/cloth_physics.cpp
             ${MINHOOK_SRC}/src/buffer.c
             ${MINHOOK_SRC}/src/hook.c
             ${MINHOOK_SRC}/src/trampoline.c
