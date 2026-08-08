@@ -40,6 +40,9 @@ ChatTuning& Chat_Tuning();
 // ---- render thread -----------------------------------------------------------------------------
 void Chat_Draw();                       // called every frame from the Present hook
 bool Chat_IsOpen();                     // true = the box owns the keyboard (the overlay gate reads this)
+// The box is open AND holds text: what everyone else's "..." bubble runs on. Atomic like IsOpen --
+// written by the render thread's draw, read by the game thread's publish.
+bool Chat_IsTyping();
 void Chat_SetOpen(bool open);
 // True when there is anything on screen -- open, or recent lines still fading. The Present hook only
 // pays for an ImGui frame when something actually wants to draw.

@@ -53,6 +53,10 @@ struct Slot {
     bool        rejectedSpoken = false;
     // Said once per peer: held unspawned awaiting the lobby roster's vouch (see the spawn gate).
     bool        unvouchedSpoken = false;
+    // This peer is composing a chat message (their latest sampled snapshot says so). Drives the
+    // "..." bubble over their skater; read through PeerTyping(), which also gates out quiet and
+    // away peers so a dropped connection cannot leave the dots hanging over a frozen skater.
+    bool        peerTyping = false;
     // This peer has the replay editor open (their latest sampled snapshot says so). Drives the
     // per-peer packet choice in the publish loop: a scrubbing peer gets RESULTS, everyone else
     // keeps DRIVERS. Latched from the stream, so a quiet peer keeps their last known state.
@@ -136,6 +140,7 @@ static Slot* slotFor(int peerIdx, uint64_t nowUs) {
         s.used = true; s.peerIdx = peerIdx; s.lastPacketUs = nowUs; s.quietHandled = false;
         memset(&s.cosmetics, 0, sizeof(s.cosmetics));   // padding too -- it is memcmp'd for changes
         s.haveCosmetics = false; s.wornForActor = nullptr; s.peerReplaying = false;
+        s.peerTyping = false;
         s.rejectedSpoken = false; s.unvouchedSpoken = false;
         s.replayHidden = false; s.boardNear = true; s.replayConcealedActor = nullptr;
         s.away = false; s.joinAnnounced = false;
@@ -285,6 +290,16 @@ bool PeerMap(int slot, char* out, int cap) {
     if (!s.used || !s.haveCosmetics) return false;
     strncpy_s(out, (size_t)cap, s.cosmetics.mapName, _TRUNCATE);
     return out[0] != 0;
+}
+
+// Is this peer composing a chat message? False for quiet peers (a dropped connection must not
+// leave "..." hanging) and for away peers (no skater on screen to hang it over).
+bool PeerTyping(int peerId) {
+    if (peerId < 0) return false;
+    for (auto& s : g_slots)
+        if (s.used && s.peerIdx == peerId)
+            return s.peerTyping && !s.quietHandled && !s.away;
+    return false;
 }
 
 void* PeerActorById(int peerId) {
@@ -480,6 +495,7 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
         repl::State own;
         if (gatherOwn(ownPawn, own)) {
             g_ownLast = own; g_haveOwn = true;
+            own.typing = (g_cfg.isTyping && g_cfg.isTyping()) ? 1 : 0;
             // Sender-side crank edge probe: one line per rising edge and per def-identity change, so
             // the log can distinguish "the crank never left this machine" from "it was sent and the
             // receiver gated it to zero".
@@ -739,6 +755,7 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
         // peers we are actually driving count: a quiet or departed peer's last known flag must not
         // keep us paying for a pose lane nobody is watching.
         s.peerReplaying = out.replaying != 0;
+        s.peerTyping    = out.typing != 0;
         if (out.replaying) anyPeerReplaying = true;
 
         if (!s.proxy.actor()) {

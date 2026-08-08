@@ -621,6 +621,14 @@ static void publishNameplates() {
             if (const char* said = liveChatBubble(peerId, ms, &age)) {
                 strncpy_s(it.msg, said, _TRUNCATE);
                 it.msgAgeMs = age;
+            } else if (session::PeerTyping(peerId)) {
+                // The typing indicator: one dot, two, three, repeat -- synthesized fresh every
+                // frame (age 0 keeps it fully opaque; the flag dropping is what removes it). A real
+                // message always wins the bubble: the words beat the fact that words are coming.
+                const int dots = 1 + (int)((ms / 350) % 3);
+                for (int d = 0; d < dots; d++) it.msg[d] = '.';
+                it.msg[dots] = 0;
+                it.msgAgeMs = 0;
             }
         }
         // Whose board decides, and whether it decides at all, is the player's setting. The default
@@ -1169,6 +1177,7 @@ public:
             // Version skew has no other symptom than a player who never appears, so it is said in the
             // chat box -- the one surface already on screen during play. Fires once per peer.
             sc.onNotice = [](const char* text) { Chat_System(text); };
+            sc.isTyping = []() { return Chat_IsTyping(); };
             sc.onVersionMismatch = [](int) {
                 Chat_System("A player here is running a different SessionOpenMP version, so you will not "
                             "see each other. Run update.bat in the game folder to get the latest.");

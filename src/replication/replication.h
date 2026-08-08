@@ -179,6 +179,10 @@ struct State {
     // scrubbing, live receivers get results rather than drivers: visually exact, but no extrapolation
     // on loss. Acceptable because audio rides the transported sound funnel rather than anim notifies.
     bool replaying = false;
+    // The sender's chat box is open with text in it. Rides a spare flag bit like `replaying`, so it
+    // costs nothing and travels with every snapshot -- the receiver shows an animated "..." bubble
+    // over their skater while it holds.
+    uint8_t typing = 0;
     // FSkateboardingAnimParams::PushSpeedMultiplier. Pushing is a TAP -- tap faster and this rises --
     // and it is read by the ANIM BLUEPRINT off the character, not off the anim instance, so the driver
     // blob can never carry it. Without it a proxy animates every push at 1.0x while its transported

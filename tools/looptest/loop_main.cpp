@@ -232,6 +232,17 @@ static bool codecCheck() {
     // where a new bit lands on top of an old one. `s.replaying` is false here, so this asserts the
     // default does not leak on while its four neighbours (checked above) are set.
     if (o.replaying) { printf("  codec: replaying set on a packet that never asked for it\n"); bad++; }
+    // `typing` rides f2 bit 128, the same spare-bit shape: assert both directions so a new bit can
+    // neither appear from nothing nor land on top of a neighbour.
+    if (o.typing) { printf("  codec: typing set on a packet that never asked for it\n"); bad++; }
+    {
+        State t = s; t.typing = 1;
+        uint8_t tp[1400]; uint64_t tu = 0; State to{};
+        const int tn = Pack(t, 7, tp, sizeof(tp));
+        if (tn <= 0 || !Unpack(tp, tn, to, &tu) || !to.typing || to.replaying) {
+            printf("  codec: typing bit did not round-trip cleanly\n"); bad++;
+        }
+    }
 
     // ---- THE POSE LANE, tested in the shape it actually ships in. When the sender has a pose it
     // drops the driver blob and feet, which are inert during replay playback, so "full drivers AND a

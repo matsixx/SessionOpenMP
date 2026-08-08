@@ -239,7 +239,7 @@ int Pack(const State& s, uint64_t senderUs, uint8_t* out, int cap) {
                      | (s.relOk ? 8 : 0) | (s.feetOk ? 16 : 0) | (s.feetWorld ? 32 : 0)
                      | (s.onBoard ? 64 : 0) | (s.bailing ? 128 : 0));
     const uint8_t f2 = (uint8_t)((s.grounded ? 1 : 0) | (s.crankOn ? 2 : 0) | (trick ? 4 : 0)
-                     | (grind ? 8 : 0) | (s.replaying ? 16 : 0)
+                     | (grind ? 8 : 0) | (s.replaying ? 16 : 0) | (s.typing ? 128 : 0)
                      | (s.handOk ? 32 : 0) | (s.handWorld ? 64 : 0));
     w.u8(f1); w.u8(f2);
     w.u8(s.pushFlags); w.u8(s.pushState); w.u8(s.brakeState); w.u8(s.boardMode);
@@ -386,6 +386,7 @@ bool Unpack(const uint8_t* d, int len, State& out, uint64_t* senderUs) {
     const bool trick = (f2 & 4) != 0;
     const bool grind = (f2 & 8) != 0;
     out.replaying = (f2 & 16) != 0;    // "I am scrubbing" -- see the pose lane in the header
+    out.typing    = (f2 & 128) ? 1 : 0;
     out.pushFlags = r.u8(); out.pushState = r.u8(); out.brakeState = r.u8(); out.boardMode = r.u8();
     out.brokenState = r.u8();
     out.pushSpeed = r.h16();

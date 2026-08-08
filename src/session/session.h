@@ -47,6 +47,9 @@ struct Config {
     // Session happenings worth a line in the chat box: a player joining, a player changing maps.
     // Plain prose, already formatted -- the UI shows it as a system line.
     void (*onNotice)(const char* text) = nullptr;
+    // Is the local player composing a chat message right now? Rides every published snapshot as one
+    // flag bit; peers render it as the "..." bubble. Null = never typing.
+    bool (*isTyping)() = nullptr;
 };
 
 struct Stats {
@@ -97,6 +100,9 @@ bool PeerAt(int slot, char* nameOut, int nameCap, void** proxyActorOut, int* pee
 // Where that peer is: the INTERNAL level name they published. Empty until their cosmetics packet has
 // landed. Resolve it for display with game::PrettyMapName.
 bool PeerMap(int slot, char* out, int cap);
+// Is this peer composing a chat message right now (their transported typing flag, gated to live,
+// present peers)? Drives the "..." bubble.
+bool PeerTyping(int peerId);
 // Resolve an identity to the actor it currently has, or null if they have left / have no proxy yet.
 // Always go through this at the moment of use. A cached actor pointer from an earlier frame is a
 // dangling pointer as soon as that peer drops, and handing one to the engine (e.g. the replay

@@ -72,7 +72,9 @@ void pushLine(const char* name, const char* text, bool mine, bool system) {
 } // namespace
 
 ChatTuning& Chat_Tuning() { return g_tune; }
-bool Chat_IsOpen() { return g_open.load(); }
+static std::atomic<bool> g_typing{false};
+bool Chat_IsOpen()   { return g_open.load(); }
+bool Chat_IsTyping() { return g_open.load() && g_typing.load(); }   // closed box can never be typing
 
 void Chat_SetOpen(bool open) {
     if (open && !g_open.load()) g_sendArmed = false;   // wait for the opening key to come up
@@ -203,6 +205,7 @@ void Chat_Draw() {
             if (!ImGui::IsAnyItemActive() && !ImGui::IsMouseClicked(0)) ImGui::SetKeyboardFocusHere();
             const bool sent = ImGui::InputText("##ompchatin", buf, sizeof(buf),
                                                ImGuiInputTextFlags_EnterReturnsTrue);
+            g_typing = buf[0] != 0;      // every drawn frame: the flag tracks the buffer exactly
             // Arm once the key that opened the box is up (both Enters -- the field accepts either).
             if (!ImGui::IsKeyDown(ImGuiKey_Enter) && !ImGui::IsKeyDown(ImGuiKey_KeypadEnter))
                 g_sendArmed = true;
@@ -215,11 +218,11 @@ void Chat_Draw() {
                     std::lock_guard<std::mutex> lk(g_mx);
                     if (g_outN < kOutMax) { strncpy_s(g_out[g_outN], p, _TRUNCATE); g_outN++; }
                 }
-                buf[0] = 0;
+                buf[0] = 0; g_typing = false;
                 g_open = false;                       // Enter sends AND closes, like every game chat
             }
             // repeat=false: a close is an EVENT, never something a held key should keep doing.
-            if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) { buf[0] = 0; g_open = false; }
+            if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) { buf[0] = 0; g_typing = false; g_open = false; }
             ImGui::TextColored(T.dim, "ENTER send    ESC cancel");
         }
     }
