@@ -49,6 +49,12 @@ static volatile LONG g_pending = OVA_NONE;  // same single-slot handoff shape as
 enum Page { PG_ROOT = 0, PG_MP = 1, PG_BROWSE = 2, PG_PLAYERS = 3, PG_PLAYER = 4, PG_NAMES = 5,
             PG_GUEST0 = 6 };
 static int  g_page        = PG_ROOT;
+// True for pages whose row list is ENTIRELY ours (as opposed to the pause root, where we append to
+// the game's own rows). Only these can safely be left to the engine's own scroll window.
+static bool pageScrollsItself() { return g_page >= PG_GUEST0; }
+// A guest page that some OTHER guest page opens is a SUB-page: it belongs to its parent's list and
+// must not also appear in the pause menu, or the split would just move the clutter up a level.
+static bool guestIsSubPage(int idx);
 static bool g_selfRefresh = false;          // true only across our own MenuRefreshItems call
 
 static void log(const char* s) { OvLog(s); }
@@ -159,14 +165,38 @@ struct GuestPage {
     OmpPageGetFn    onGet;
     void* user;
     bool  used, dead;
+    int   parent;    // guest page index this one was opened FROM, -1 = from the pause menu itself.
+                     // Set when the row is confirmed, so Back returns the way the user came in.
 };
-static const int kMaxGuestPages = 4;
+// 8: splitting a long page into categories costs one registration per category, and the parent
+// counts too. The pause menu only ever lists the pages nothing else opens.
+static const int kMaxGuestPages = 8;
 static GuestPage g_guests[kMaxGuestPages];
 static int       g_nGuests = 0;
 #ifdef _WIN32
 static CRITICAL_SECTION g_guestMx;
 static bool             g_guestMxInit = false;
 #endif
+
+// Resolved by TITLE rather than by an index the guest would have to predict: registration order is
+// the guest's business, and a name that does not match simply leaves the row inert instead of
+// opening the wrong page.
+static int guestPageByTitle(const char* title) {
+    if (!title || !*title) return -1;
+    for (int i = 0; i < g_nGuests; i++)
+        if (!g_guests[i].dead && strcmp(g_guests[i].title, title) == 0) return i;
+    return -1;
+}
+static bool guestIsSubPage(int idx) {
+    if (idx < 0 || idx >= g_nGuests) return false;
+    for (int p = 0; p < g_nGuests; p++) {
+        if (p == idx || g_guests[p].dead) continue;
+        for (int i = 0; i < g_guests[p].n; i++)
+            if (g_guests[p].items[i].kind == OMP_ITEM_PAGE &&
+                strcmp(g_guests[p].items[i].key, g_guests[idx].title) == 0) return true;
+    }
+    return false;
+}
 
 // SEH cannot live in a function with C++ unwind semantics, so the guarded calls are their own tiny
 // functions -- the same shape as overlay.cpp's extCallGuarded. A page that faults is marked dead and
@@ -201,6 +231,7 @@ static int registerPage(const char* title, const OmpPageItem2* items, int nItems
     if (g_nGuests < kMaxGuestPages) {
         GuestPage& g = g_guests[g_nGuests];
         memset(&g, 0, sizeof(g));
+        g.parent = -1;      // NOT the memset's 0 -- that is page index 0, a real page to fall back to
         strncpy_s(g.title, title, _TRUNCATE);
         g.n = (nItems < OMP_PAGEITEM_MAX) ? nItems : OMP_PAGEITEM_MAX;
         for (int i = 0; i < g.n; i++) {
@@ -788,15 +819,41 @@ static const int kMaxLoggedPages = 12;
 static uint64_t  g_loggedPages[kMaxLoggedPages] = {};
 static int       g_nLoggedPages = 0;
 
+// The page geometry that decides whether a page can scroll, logged ONCE per page and NOT behind the
+// debug flag: `defs` is `_pageItemDefinitions.Num`, the count the engine's scroll math compares
+// against `_maxVisibleItems`. CreatePageItems builds from the array we PASS but never writes that
+// field, so on our substituted pages the two disagree -- and that disagreement is the whole reason
+// the page will not scroll. Without this line the difference is invisible.
+static void dumpGeometry(void* page, const TArrayHdr* items) {
+    static uint64_t seen[8] = {}; static int nSeen = 0;
+    const uint8_t* p = (const uint8_t*)page;
+    const uint64_t id = (uint64_t)(uintptr_t)page ^ (uint64_t)(items ? items->num : 0);
+    for (int i = 0; i < nSeen; i++) if (seen[i] == id) return;
+    if (nSeen < 8) seen[nSeen++] = id; else return;
+    __try {
+        char m[240];
+        snprintf(m, sizeof(m), "[menu] geometry: our rows=%d | maxVisible=%d headerIndex=%d | "
+                 "engine defs num=%d data=%p | widgets=%d",
+                 items ? items->num : -1,
+                 *(const int32_t*)(p + off::kPageMaxVisible),
+                 *(const int32_t*)(p + off::kPageHeaderIndex),
+                 *(const int32_t*)(p + off::kPageItemDefs + 8),
+                 *(void* const*)(p + off::kPageItemDefs),
+                 *(const int32_t*)(p + off::kPageItemWidgets + 8));
+        log(m);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
 static void dumpPage(void* page, const TArrayHdr* items, uint64_t key, const char* keyName) {
     if (!omp::debug::Get().menuPages || g_nLoggedPages >= kMaxLoggedPages) return;
     for (int i = 0; i < g_nLoggedPages; i++) if (g_loggedPages[i] == key) return;
     g_loggedPages[g_nLoggedPages++] = key;
     const uint8_t* p = (const uint8_t*)page;
     char m[300];
-    snprintf(m, sizeof(m), "[menu] page '%s' items=%d maxVisible=%d headerIndex=%d",
+    snprintf(m, sizeof(m), "[menu] page '%s' items=%d maxVisible=%d headerIndex=%d defs=%d",
              keyName[0] ? keyName : "?", items ? items->num : -1,
-             *(const int32_t*)(p + off::kPageMaxVisible), *(const int32_t*)(p + off::kPageHeaderIndex));
+             *(const int32_t*)(p + off::kPageMaxVisible), *(const int32_t*)(p + off::kPageHeaderIndex),
+             *(const int32_t*)(p + off::kPageItemDefs + 8));
     log(m);
     if (!items || !items->data) return;
     for (int i = 0; i < items->num && i < 32; i++) {
@@ -901,7 +958,11 @@ static const TArrayHdr* chooseArray(void* page, const TArrayHdr* items, TArrayHd
     };
     if (g_page == PG_ROOT) {
         if (!items || !items->data || items->num < 0) return items;
-        if (items->num + 1 + g_nGuests > PauseMenu_Tuning().maxItems || items->num + 1 + g_nGuests > kRowCap) {
+        int nRootGuests = 0;
+        for (int p2 = 0; p2 < g_nGuests; p2++)
+            if (!g_guests[p2].dead && !guestIsSubPage(p2)) nRootGuests++;
+        if (items->num + 1 + nRootGuests > PauseMenu_Tuning().maxItems ||
+            items->num + 1 + nRootGuests > kRowCap) {
             static bool warned = false;
             if (!warned) { warned = true; log("[menu] pause page too long -- injection skipped, not truncated"); }
             return items;
@@ -913,7 +974,8 @@ static const TArrayHdr* chooseArray(void* page, const TArrayHdr* items, TArrayHd
         if (PauseMenu_Tuning().statusText) setRowStatus(g_rootRow, statusLine());
         add(g_rootRow, true);
         for (int p2 = 0; p2 < g_nGuests; p2++)
-            if (!g_guests[p2].dead) add(g_guestRootRows + (size_t)p2 * off::kItemSize, true);
+            if (!g_guests[p2].dead && !guestIsSubPage(p2))
+                add(g_guestRootRows + (size_t)p2 * off::kItemSize, true);
     } else if (g_page == PG_MP) {
         // The roster goes on EVERY row of this page, so the right-hand panel keeps showing it no
         // matter which row the player happens to be sitting on.
@@ -1091,7 +1153,7 @@ static const TArrayHdr* chooseArray(void* page, const TArrayHdr* items, TArrayHd
             // carries its value on the definition (index at +0x78); a slider's has to be stamped on
             // the WIDGET after it exists, so remember where this one lands.
             g_sliderRow[i] = 0.0f; g_valSet[i] = false;
-            if (g.onGet && it.kind != OMP_ITEM_ACTION) {
+            if (g.onGet && it.kind != OMP_ITEM_ACTION && it.kind != OMP_ITEM_PAGE) {
                 int iv = 0; float fv = 0.0f;
                 const int got = guestGetGuarded(&g, it.key, &iv, &fv);
                 if (got < 0) { g.dead = true; log("[menu] guest onGet FAULTED -- page disabled"); break; }
@@ -1218,7 +1280,17 @@ static void hkCreateItems(void* page, void* itemsArray, bool flag) {
             buildRows();
             if (!g_dead) {
                 use = chooseArray(page, (const TArrayHdr*)itemsArray, &ours);
-                if (use == &ours) {
+                if (use == &ours && pageScrollsItself()) dumpGeometry(page, use);
+                // The bump exists for APPENDING: on a game-owned page we add rows past the end of a
+                // list the page already sized its window for, and a row past the window is silently
+                // never created. It costs the page its SCROLLBAR, because forcing every row to build
+                // at once is precisely what "no scrolling needed" looks like to the engine.
+                // Our own full pages hand over the whole array, so they do not need it -- leaving
+                // _maxVisibleItems alone lets the engine keep its natural window and scroll the page
+                // itself. Scrolling calls RefreshItemsPanel, which re-enters this hook and rebuilds
+                // from the same substituted array at the new header index, so the engine walks its
+                // own path and only the source array differs.
+                if (use == &ours && (!PauseMenu_Tuning().nativeScroll || !pageScrollsItself())) {
                     savedVisible = *(int32_t*)(p + off::kPageMaxVisible);
                     const int32_t need = *(int32_t*)(p + off::kPageHeaderIndex) + ours.num;
                     if (savedVisible < need) { *(int32_t*)(p + off::kPageMaxVisible) = need; bumped = true; }
@@ -1431,10 +1503,42 @@ static bool handleConfirm(void* page, void* params) {
         return false;
     }
 
+    // A row inside a guest page that opens another of that guest's pages. Checked before the shared
+    // Back row so a sub-page's own rows are resolved on the page they belong to.
+    if (g_page >= PG_GUEST0) {
+        const int gi = g_page - PG_GUEST0;
+        if (gi < g_nGuests && !g_guests[gi].dead) {
+            for (int i = 0; i < g_guests[gi].n; i++) {
+                if (g_guests[gi].items[i].kind != OMP_ITEM_PAGE) continue;
+                if (itemKey != g_guestItemKeys[gi][i]) continue;
+                const int target = guestPageByTitle(g_guests[gi].items[i].key);
+                if (target < 0) return true;               // names nothing: inert, never wrong
+                g_guests[target].parent = gi;              // Back returns the way we came in
+                g_page = PG_GUEST0 + target;
+                queueSwap(page, g_guests[target].title, false, true);
+                char m[160];
+                snprintf(m, sizeof(m), "[menu] pause: entered the guest sub-page '%s'",
+                         g_guests[target].title);
+                log(m);
+                return true;
+            }
+        }
+    }
+
     // "Back" is shared by every one of our pages -- from the browser it steps back to Multiplayer,
-    // from anywhere else to the pause menu proper.
+    // from a sub-page to the page that opened it, from anywhere else to the pause menu proper.
     if (itemKey == g_mpRowKeys[kMpRowCount - 1]) {
         g_browsePolls = 0;
+        if (g_page >= PG_GUEST0) {
+            const int gi = g_page - PG_GUEST0;
+            const int up = (gi < g_nGuests) ? g_guests[gi].parent : -1;
+            if (up >= 0 && up < g_nGuests && !g_guests[up].dead) {
+                g_guests[gi].parent = -1;                  // one step per entry, never a stale chain
+                g_page = PG_GUEST0 + up;
+                queueSwap(page, g_guests[up].title, false, true);
+                return true;
+            }
+        }
         if (g_page == PG_PLAYER)  { g_page = PG_PLAYERS; queueSwap(page, "Players", false, true); return true; }
         const bool toMp = (g_page == PG_BROWSE || g_page == PG_PLAYERS || g_page == PG_NAMES);
         g_page = toMp ? PG_MP : PG_ROOT;

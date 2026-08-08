@@ -45,6 +45,14 @@ struct PauseMenuTuning {
                                 // from page navigation when something misbehaves
     bool statusText  = true;    // put session status in the footer description line
     int  maxItems    = 64;      // hard cap on the substituted array -- over it, skip; never truncate
+    bool nativeScroll = false;  // OFF: leaving _maxVisibleItems alone does NOT make our pages
+                                // scroll, it just truncates them. CreatePageItems builds
+                                // [headerIndex, min(headerIndex + _maxVisibleItems, ourNum)) from the
+                                // array we hand it and never writes _pageItemDefinitions, so the
+                                // engine's scroll math still sees the ROOT page's short list and
+                                // decides there is nothing to scroll. Until the count the scroll math
+                                // reads reflects our rows, forcing every row to build is strictly
+                                // better -- all of them at least exist.
 };
 PauseMenuTuning& PauseMenu_Tuning();
 

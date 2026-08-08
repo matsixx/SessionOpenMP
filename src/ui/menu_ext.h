@@ -83,10 +83,12 @@ typedef void (*OmpMenuDrawFn)(const OmpMenuApi* api, void* user);
 // laid out for. Beyond that the rows still build (the cap is raised) but they crowd the screen,
 // because forcing `_maxVisibleItems` up is also exactly what suppresses the native scrollbar --
 // the scroll math triggers on `_pageItemDefinitions.Num > _maxVisibleItems`. A page wanting more
-// than 14 rows should get scrolling rather than a higher cap: leave `_maxVisibleItems` alone and
-// publish the real count instead, with the row storage allocated through the engine's own allocator
-// so its element-wise destruct and free on the next activation stay legitimate.
-enum { OMP_PAGEITEM_MAX = 20 };
+// A page longer than the engine's ~14-row window does NOT scroll: UMenuPage's scroll math reads
+// `_pageItemDefinitions`, which still describes the real page underneath, not the array we hand the
+// builder -- so it concludes everything fits. Publishing our count there means owning an array the
+// engine element-wise destructs (FText refcounts included) through its own allocator. Until that is
+// worth doing, SPLIT A LONG PAGE with OMP_ITEM_PAGE rows rather than letting it run off the screen.
+enum { OMP_PAGEITEM_MAX = 48 };
 
 struct OmpPageItem {
     const char* key;      // stable ASCII id, unique within the page; becomes the row's FName
@@ -115,7 +117,12 @@ typedef const char* (*OmpPageStatusFn)(const char* key, void* user);
 //   * a SLIDER  -- the game's ProgressBar row with a min/max/step, exactly like Master Volume.
 // Registered through a SECOND export rather than by growing `OmpPageItem`, so a guest built against
 // v1 keeps working byte-for-byte. v1 registrations are simply all-action pages.
-enum { OMP_ITEM_ACTION = 0, OMP_ITEM_TOGGLE = 1, OMP_ITEM_SLIDER = 2 };
+//   * a PAGE    -- a row that opens ANOTHER page this guest registered, so a long list can be split
+//                  into categories instead of growing past what fits on screen. Set `key` to the
+//                  exact title of the page to open; that page is then reachable only through this
+//                  row and stops appearing in the pause menu itself. The host gives it a Back row
+//                  that returns HERE, not to the pause menu.
+enum { OMP_ITEM_ACTION = 0, OMP_ITEM_TOGGLE = 1, OMP_ITEM_SLIDER = 2, OMP_ITEM_PAGE = 3 };
 
 struct OmpPageItem2 {
     int         kind;         // OMP_ITEM_*
