@@ -157,13 +157,14 @@ void CatchSound_ResetDefaults() {
     g_okShould = g_okVol = g_okFollow = g_okEdge = 1;   // re-arm; a past fault is not a preference
 }
 bool  CatchSound_Enabled()           { return g_on != 0; }
-void  CatchSound_SetEnabled(bool on) { g_on = on ? 1 : 0; }
+void  CatchSound_SetEnabled(bool on) { g_on = on ? 1 : 0; TwkMarkDirty(); }
 float CatchSound_VolumePct()         { return (float)g_volPct; }
 void  CatchSound_SetVolumePct(float pct) {
     int v = (int)(pct + 0.5f);
     if (v < 25)  v = 25;                 // same clamps as ReadConfig -- one place to disagree is one
     if (v > 300) v = 300;                // too many
     g_volPct = v;
+    TwkMarkDirty();
 }
 
 // ------------------------------------------------------------------ sigs (dual-exe-verified)

@@ -339,7 +339,7 @@ void FootPlace_ResetDefaults() {
     g_ok = 1;
 }
 bool FootPlace_Enabled()           { return g_on != 0; }
-void FootPlace_SetEnabled(bool on) { g_on = on ? 1 : 0; if (on) g_ok = 1; }
+void FootPlace_SetEnabled(bool on) { g_on = on ? 1 : 0; if (on) g_ok = 1; TwkMarkDirty(); }
 
 // ------------------------------------------------------------------ helpers
 struct V3 { float x, y, z; };

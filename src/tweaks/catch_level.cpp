@@ -88,7 +88,13 @@ static const float kMaxDelayMs = 5.0f;   // see CatchLevelDelayMs -- above this 
 static int   g_on         = 0;       // CatchLevel: DEFAULT OFF -- unproven offsets, see the header
 static int   g_ok         = 1;       // runtime health, NEVER persisted
 static float g_targetDeg  = -999.0f; // CatchLevelTargetDeg: -999 = use the trick's authored value
-static float g_responseMs = 120.0f;  // CatchLevelResponseMs: how fast it eases flat
+// CatchLevelResponseMs: the ease's TIME CONSTANT -- how fast it eases flat.
+// ⚠️ 35, not 120+. This number changed MEANING when the ease became frame-rate independent. It used
+// to scale a fixed 25%-of-the-remainder-per-TICK step, which at 120 fps works out to a ~29 ms time
+// constant; as a true time constant, the old default was roughly 4x slower than the behaviour it
+// replaced, and levelling stopped finishing inside the catch-to-landing window. 35 ms reproduces
+// what the per-tick version actually did at a high frame rate, and now does it at any frame rate.
+static float g_responseMs = 35.0f;
 // CatchLevelDelayMs: wait after the catch. FIELD RESULT: raising this only ever makes levelling fire
 // LESS often -- it is time taken out of the window between the catch and the landing, and the ease
 // needs that window. Kept as a knob because 1-5 ms occasionally helps it settle, but CAPPED so it can
@@ -105,7 +111,13 @@ static int    g_traceLevel = 0;        // CatchLevelTrace -- per-frame tug-of-wa
 void CatchLevel_ReadConfig(const char* buf) {
     g_on         = TwkIniInt(buf, "CatchLevel", 0);
     g_targetDeg  = (float)TwkIniInt(buf, "CatchLevelTargetDeg", -999);
-    g_responseMs = (float)TwkIniInt(buf, "CatchLevelResponseMs", 120);
+    g_responseMs = (float)TwkIniInt(buf, "CatchLevelResponseMs", 35);
+    // A value saved under the old meaning is not wrong, it is just interpreted differently now -- and
+    // as a time constant it is slow enough to stop levelling finishing. Say so rather than silently
+    // behaving worse than the version before it.
+    if (g_responseMs > 80.0f)
+        TwkLog("[level] CatchLevelResponseMs=%.0f is a TIME CONSTANT now, not a per-frame step -- at "
+               "this value the ease will not finish before you land. Try 30-60.", g_responseMs);
     g_delayMs    = (float)TwkIniInt(buf, "CatchLevelDelayMs", 0);
     if (g_delayMs < 0.0f) g_delayMs = 0.0f;
     if (g_delayMs > kMaxDelayMs) {
@@ -128,13 +140,13 @@ void CatchLevel_SaveConfig(char* buf, size_t cap) {
     TwkIniSetInt(buf, cap, "CatchLevelDelayMs",    (int)g_delayMs);
 }
 void CatchLevel_ResetDefaults() {
-    g_on = 0; g_targetDeg = -999.0f; g_responseMs = 120.0f; g_delayMs = 0.0f; g_maxMs = 900.0f;
+    g_on = 0; g_targetDeg = -999.0f; g_responseMs = 35.0f; g_delayMs = 0.0f; g_maxMs = 900.0f;
     g_ok = 1;                        // re-arm: a past fault is not a preference
 }
 bool  CatchLevel_Enabled()             { return g_on != 0; }
 // Switching it ON is also an explicit "try again": otherwise a runtime kill would leave the toggle
 // looking enabled while nothing happened.
-void  CatchLevel_SetEnabled(bool on)   { g_on = on ? 1 : 0; if (on) g_ok = 1; }
+void  CatchLevel_SetEnabled(bool on)   { g_on = on ? 1 : 0; if (on) g_ok = 1; TwkMarkDirty(); }
 
 // ------------------------------------------------------------------ sig (dual-exe-verified)
 // FlipTricksHandler::GetBoardExtraPitchAngle -- Epic 0x10234c0 / Steam 0xfe3630. Used ONLY as the
@@ -444,7 +456,7 @@ void CatchLevel_DrawMenu(const OmpMenuApi* api) {
         // A runtime pause must be VISIBLE, or the box says on while nothing happens.
         if (!g_ok) api->TextDisabled("PAUSED by a fault this session -- untick and retick to retry");
         float r = g_responseMs;
-        if (api->SliderFloat("Ease speed (ms)", &r, 20.0f, 500.0f, "%.0f")) { g_responseMs = r; TwkMarkDirty(); }
+        if (api->SliderFloat("Ease speed (ms)", &r, 15.0f, 200.0f, "%.0f")) { g_responseMs = r; TwkMarkDirty(); }
         float d = g_delayMs;
         // 0..5, not 0..400: the field result is that raising this only makes levelling fire less
         // often, so the slider no longer offers a range that quietly breaks the feature.

@@ -105,14 +105,16 @@ void FlipSpeed_ResetDefaults() {
     g_respectSync = 0;
 }
 bool FlipSpeed_Enabled() { return g_on != 0; }
-void FlipSpeed_SetEnabled(bool on) { g_on = on ? 1 : 0; }
+void FlipSpeed_SetEnabled(bool on) { g_on = on ? 1 : 0; TwkMarkDirty(); }
 float FlipSpeed_VelMin() { return (float)g_velMin; }
 float FlipSpeed_VelMax() { return (float)g_velMax; }
 void  FlipSpeed_SetVelMin(float v) {
     g_velMin = (int)v; if (g_velMax <= g_velMin) g_velMax = g_velMin + 10;
+    TwkMarkDirty();
 }
 void  FlipSpeed_SetVelMax(float v) {
     g_velMax = (int)v; if (g_velMax <= g_velMin) g_velMin = g_velMax - 10;
+    TwkMarkDirty();
 }
 
 // ------------------------------------------------------------------ the hook

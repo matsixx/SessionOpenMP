@@ -96,11 +96,12 @@ void PitchRange_SaveConfig(char* buf, size_t cap) {
 }
 void PitchRange_ResetDefaults() { g_on = 1; g_maxAng = 80.0f; }
 bool  PitchRange_Enabled()             { return g_on != 0; }
-void  PitchRange_SetEnabled(bool on)   { g_on = on ? 1 : 0; }
+void  PitchRange_SetEnabled(bool on)   { g_on = on ? 1 : 0; TwkMarkDirty(); }
 float PitchRange_MaxAngleDeg()         { return g_maxAng; }
 void  PitchRange_SetMaxAngleDeg(float d) {
     if (d < 65.0f) d = 65.0f;   if (d > 89.0f) d = 89.0f;   // same clamps as ReadConfig
     g_maxAng = d;
+    TwkMarkDirty();
 }
 
 // ------------------------------------------------------------------ sigs (dual-exe-verified)
