@@ -140,13 +140,13 @@ static int  g_on   = 1;    // GrindPopLog: the probe itself
 static int  g_flat = 1;    // GrindPopLogFlat: also log non-grind tricks, for the baseline comparison
 // Give the grind-exit pitch mode the input term the flat trick mode has. Ships OFF so the first
 // session with it is an A/B: the pitch-mode log lines are produced either way.
-static int  g_pitchFix   = 0;    // GrindPitchFix
-static int  g_pitchScale = 100;  // GrindPitchScale, percent of the player's extra pitch angle
+static int  g_pitchFix   = 1;    // GrindPitchFix -- on by default (field-tuned)
+static int  g_pitchScale = 120;  // GrindPitchScale, percent of the player's extra pitch angle
 // Restore the pop's tail-down swing on grind exits. Ships OFF; the blend is how far to move from
 // whatever the game left (the grind's static pose, or its floored swing) toward the trick's own
 // full swing, so a grind whose authored pose points the other way can be dialled back.
-static int  g_popSwing      = 0;    // GrindPopSwing
-static int  g_popSwingBlend = 100;  // GrindPopSwingBlend, percent
+static int  g_popSwing      = 1;    // GrindPopSwing -- on by default (field-tuned)
+static int  g_popSwingBlend = 50;   // GrindPopSwingBlend, percent
 // Which grinds get the swing back. Comma-separated, matched as a case-insensitive SUBSTRING of the
 // grind definition's name, so one entry covers the FS_/BS_ pair and any suffix the assets carry.
 // Editable because the asset names are the game's, not ours -- an entry that matches nothing is
@@ -162,10 +162,10 @@ static char           g_uiGrind[64] = {0};
 void GrindPop_ReadConfig(const char* buf) {
     g_on         = TwkIniInt(buf, "GrindPopLog", 1);
     g_flat       = TwkIniInt(buf, "GrindPopLogFlat", 1);
-    g_pitchFix   = TwkIniInt(buf, "GrindPitchFix", 0);
-    g_pitchScale = TwkIniInt(buf, "GrindPitchScale", 100);
-    g_popSwing      = TwkIniInt(buf, "GrindPopSwing", 0);
-    g_popSwingBlend = TwkIniInt(buf, "GrindPopSwingBlend", 100);
+    g_pitchFix   = TwkIniInt(buf, "GrindPitchFix", 1);
+    g_pitchScale = TwkIniInt(buf, "GrindPitchScale", 120);
+    g_popSwing      = TwkIniInt(buf, "GrindPopSwing", 1);
+    g_popSwingBlend = TwkIniInt(buf, "GrindPopSwingBlend", 50);
     TwkIniStr(buf, "GrindPopSwingGrinds", g_swingGrinds, sizeof(g_swingGrinds), "smith,feeble,willy,50-50");
     TwkLog("[gpop] config: GrindPopLog=%d GrindPopLogFlat=%d GrindPitchFix=%d GrindPitchScale=%d "
            "GrindPopSwing=%d GrindPopSwingBlend=%d GrindPopSwingGrinds='%s'",
@@ -651,8 +651,8 @@ void  GrindPop_SetSwingEnabled(bool on) { g_popSwing = on ? 1 : 0; TwkMarkDirty(
 float GrindPop_SwingBlend() { return (float)g_popSwingBlend; }
 void  GrindPop_SetSwingBlend(float pct) { g_popSwingBlend = (int)pct; TwkMarkDirty(); }
 void GrindPop_ResetDefaults() {
-    g_on = 1; g_flat = 1; g_pitchFix = 0; g_pitchScale = 100;
-    g_popSwing = 0; g_popSwingBlend = 100;
+    g_on = 1; g_flat = 1; g_pitchFix = 1; g_pitchScale = 120;
+    g_popSwing = 1; g_popSwingBlend = 50;
     TwkMarkDirty();
 }
 
