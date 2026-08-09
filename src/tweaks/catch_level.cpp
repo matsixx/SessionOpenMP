@@ -72,7 +72,13 @@ enum {
     DEF_CATCH_ALIGN_SMOOTH= 0x278,  // -> CatchPitchAlignSmoothing (authored, unread)
     PITCH_MODE_SETTLE     = 2,      // the mode whose target the settle uses
 };
-static const float kStepAlpha = 0.25f;   // fraction of the remaining distance per tick -- NEVER 0
+// ⚠️ The ease is a time constant, NOT a fixed fraction per tick. It used to take 25% of the
+// remaining distance every TICK, which converges twice as fast at 120 fps as at 60 -- the same
+// frame-rate dependence the flick measurement had. `alpha = 1 - exp(-dt/tau)` makes a given
+// CatchLevelResponseMs mean the same thing on any machine. Never 0: the interpolator treats a zero
+// current-time as its fixed point and would never move.
+static const float kMinAlpha = 0.02f;
+static const float kMaxDelayMs = 5.0f;   // see CatchLevelDelayMs -- above this it only hurts
 
 // ------------------------------------------------------------------ knobs (ALL above the reader)
 // User intent and runtime health are kept apart. `g_on` is the user's setting and the only thing
@@ -83,19 +89,33 @@ static int   g_on         = 0;       // CatchLevel: DEFAULT OFF -- unproven offs
 static int   g_ok         = 1;       // runtime health, NEVER persisted
 static float g_targetDeg  = -999.0f; // CatchLevelTargetDeg: -999 = use the trick's authored value
 static float g_responseMs = 120.0f;  // CatchLevelResponseMs: how fast it eases flat
-static float g_delayMs    = 0.0f;    // CatchLevelDelayMs: wait after the catch (0 = immediate; the
+// CatchLevelDelayMs: wait after the catch. FIELD RESULT: raising this only ever makes levelling fire
+// LESS often -- it is time taken out of the window between the catch and the landing, and the ease
+// needs that window. Kept as a knob because 1-5 ms occasionally helps it settle, but CAPPED so it can
+// no longer be turned up into a setting that quietly breaks the feature.
+static float g_delayMs    = 0.0f;    // (0 = immediate; the
                                      // authored CatchPitchAlignDelay is 0.5s and would feel mid-trick)
 static float g_maxMs      = 900.0f;  // CatchLevelMaxMs: hard stop so it can never stay armed
 static int   g_log        = 1;       // CatchLevelLog: one block per trick
 static volatile LONG g_faults = 0;
 static volatile LONG g_uiLevels = 0;
 
+static int    g_traceLevel = 0;        // CatchLevelTrace -- per-frame tug-of-war trace
+
 void CatchLevel_ReadConfig(const char* buf) {
     g_on         = TwkIniInt(buf, "CatchLevel", 0);
     g_targetDeg  = (float)TwkIniInt(buf, "CatchLevelTargetDeg", -999);
     g_responseMs = (float)TwkIniInt(buf, "CatchLevelResponseMs", 120);
     g_delayMs    = (float)TwkIniInt(buf, "CatchLevelDelayMs", 0);
+    if (g_delayMs < 0.0f) g_delayMs = 0.0f;
+    if (g_delayMs > kMaxDelayMs) {
+        TwkLog("[level] CatchLevelDelayMs %.0f is past the %.0f ms cap -- clamped. Raising it only "
+               "eats the catch-to-landing window and makes levelling fire less often.",
+               g_delayMs, kMaxDelayMs);
+        g_delayMs = kMaxDelayMs;
+    }
     g_maxMs      = (float)TwkIniInt(buf, "CatchLevelMaxMs", 900);
+    g_traceLevel = TwkIniInt(buf, "CatchLevelTrace", 0);
     g_log        = TwkIniInt(buf, "CatchLevelLog", 1);
     if (g_responseMs < 20.0f) g_responseMs = 20.0f;
     TwkLog("[level] config: CatchLevel=%d TargetDeg=%.0f ResponseMs=%.0f DelayMs=%.0f MaxMs=%.0f Log=%d",
@@ -149,10 +169,19 @@ static double g_armT       = 0.0;
 static int    g_lastCatch  = 0;         // for the rising edge
 static double g_catchT     = -1.0;      // when the catch engaged (-1 = not yet)
 static bool   g_levelling  = false;
+static float  g_startedMs  = 0.0f;   // when the ease began, relative to the catch (for the log)
+static bool   g_reachedLevel = false; // hit tolerance at least once this trick (logging + re-take)
+static float  g_wroteWant  = -1000.0f; // what we asked for last frame, to compare against what returns
 static bool   g_loggedTrick= false;
 static bool   g_sawLive    = false;   // the pitch block has read non-zero at least once, ever
 static int    g_deadCatches= 0;       // consecutive all-zero catches while never having seen live
-static double NowSec() { return GetTickCount64() / 1000.0; }
+// QPC, not GetTickCount64: the latter steps in ~15.6 ms, which is coarser than a frame at 120 fps,
+// so both the ease's dt and the "ms after the catch" figures were quantised to garbage.
+static double NowSec() {
+    static LARGE_INTEGER f{}; if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    LARGE_INTEGER t; QueryPerformanceCounter(&t);
+    return (double)t.QuadPart / (double)f.QuadPart;
+}
 
 // Learn the real component. Read-only with respect to the game: the original always runs, unchanged.
 // The `comp+0x340 == skater` check is a DIAGNOSTIC, not a gate -- `this+0x208` is believed to be the
@@ -205,6 +234,8 @@ static void* hkExtraPitch(void* self, void* trickDef, uint64_t inputType, void* 
             g_lastCatch   = twkB(skater, SK_CATCH_ORIENT_STATE);
             g_catchT      = -1.0;
             g_levelling   = false;
+            g_reachedLevel = false;
+            g_wroteWant = -1000.0f;
             g_loggedTrick = false;
             if (g_log)
                 TwkLog("[level] trick armed: authored CatchTargetPitch=%.2f (align smoothing %.2f)",
@@ -293,8 +324,10 @@ void CatchLevel_PumpFrame() {
                 *(float*)((uint8_t*)comp + MC_PITCH_START)  = pitchNow;
                 *(float*)((uint8_t*)comp + MC_PITCH_TARGET) = pitchNow;
                 if (g_log)
-                    TwkLog("[level] released at %.2f (%s) -- setpoint parked, the board is the game's again",
-                           pitchNow, FootPlace_SettingUpTrick() ? "setting up the next trick" : "landed");
+                    TwkLog("[level] RELEASED at %.2f, %.1f deg from %.2f (%s) -- setpoint parked",
+                           pitchNow, fabsf(pitchNow - ((g_targetDeg > -180.0f) ? g_targetDeg : g_authored)),
+                           (g_targetDeg > -180.0f) ? g_targetDeg : g_authored,
+                           FootPlace_SettingUpTrick() ? "setting up the next trick" : "landed");
             }
             g_skater = nullptr;
             return;
@@ -302,25 +335,70 @@ void CatchLevel_PumpFrame() {
 
         const double sinceCatch = (now - g_catchT) * 1000.0;
         if (sinceCatch < (double)g_delayMs) return;
-        if (sinceCatch > (double)g_maxMs) { g_skater = nullptr; return; }
+        if (sinceCatch > (double)g_maxMs) {
+            if (g_levelling && g_log)
+                TwkLog("[level] GAVE UP at %.2f (target %.2f) -- CatchLevelMaxMs %.0f reached",
+                       pitchNow, (g_targetDeg > -180.0f) ? g_targetDeg : g_authored, g_maxMs);
+            g_skater = nullptr; return;
+        }
         if (!g_on || !g_ok) return;
 
         const float want = (g_targetDeg > -180.0f) ? g_targetDeg : g_authored;
-        if (fabsf(pitchNow - want) < 0.25f) {                          // arrived
-            if (g_levelling && g_log) TwkLog("[level] levelled to %.2f (%.0f ms after the catch)", pitchNow, sinceCatch);
-            g_skater = nullptr;
+        // ⚠️ BEING LEVEL RIGHT NOW IS NOT THE SAME AS BEING DONE, and treating it as done is what
+        // made this fire only some of the time. This used to disarm the whole feature the moment the
+        // pitch was within tolerance -- including on the FIRST eligible frame, before any levelling
+        // had happened. The board is still turning and settling at the catch, so it passes through
+        // level routinely; whether the feature ran at all came down to where the pitch happened to be
+        // on that one frame. Nothing brought it back afterwards either, so a board that drifted off
+        // level a frame later stayed off.
+        // Now: within tolerance means "nothing to do THIS frame", not "finished". The arm is held
+        // until the board is genuinely no longer ours -- landing, a new trick, or CatchLevelMaxMs.
+        if (fabsf(pitchNow - want) < 0.25f) {
+            if (g_levelling && !g_reachedLevel) {
+                g_reachedLevel = true;
+                if (g_log)
+                    TwkLog("[level] LEVELLED to %.2f in %.0f ms (started +%.0f ms after the catch) "
+                           "-- holding until landing", pitchNow, sinceCatch - g_startedMs, g_startedMs);
+            }
             return;
+        }
+        if (g_reachedLevel) {                    // drifted back off level: take it again, quietly
+            g_reachedLevel = false;
+            if (g_log) TwkLog("[level] drifted to %.2f -- levelling again", pitchNow);
         }
         // Re-arm the game's integrator and aim it at level. Setpoint only -- the pose stays the
         // game's to write. currentTime is a FRACTION of totalTime, never 0 (the fixed point).
-        const float resp = g_responseMs / 1000.0f;
+        // Time since the previous tick, for the frame-rate-independent ease. Clamped: a hitch must
+        // not turn into a jump, and a zero/negative dt must not stall the approach.
+        static double lastTick = 0.0;
+        float dt = (lastTick > 0.0) ? (float)(now - lastTick) : (1.0f / 60.0f);
+        lastTick = now;
+        if (!(dt > 0.0f) || dt > 0.1f) dt = 1.0f / 60.0f;
+
+        const float tau = g_responseMs / 1000.0f;
+        float alpha = 1.0f - expf(-dt / tau);
+        if (alpha < kMinAlpha) alpha = kMinAlpha; else if (alpha > 1.0f) alpha = 1.0f;
+        const float resp = tau;
+        // Setpoint only. `_pitchExtraAngle` is deliberately NOT touched: that is the FLIP TRICK's
+        // pitch -- the boned/rocket angle from the pop flick -- and it has nothing to do with
+        // catching. Writing it was tried against a suspected tug-of-war, changed the convergence rate
+        // by nothing at all, and meddled with an unrelated system; do not reach for it again.
         *(uint8_t*)((uint8_t*)comp + MC_PITCH_MODE)       = (uint8_t)PITCH_MODE_SETTLE;
         *(float*)  ((uint8_t*)comp + MC_PITCH_START)      = pitchNow;
         *(float*)  ((uint8_t*)comp + MC_PITCH_TARGET)     = want;
         *(float*)  ((uint8_t*)comp + MC_PITCH_TOTAL_TIME) = resp;
-        *(float*)  ((uint8_t*)comp + MC_PITCH_CUR_TIME)   = resp * kStepAlpha;
+        *(float*)  ((uint8_t*)comp + MC_PITCH_CUR_TIME)   = resp * alpha;
+        // Whether our setpoint SURVIVES to the next frame is the whole question, and no summary can
+        // answer it: this prints what came back against what we wrote, so an overwrite by the game is
+        // visible as a value that is not ours rather than inferred from a convergence rate.
+        if (g_traceLevel && g_wroteWant > -1000.0f)
+            TwkLog("[level] t+%4.0fms pitch=%6.2f | came back: mode=%d tgt=%7.2f extra=%7.2f "
+                   "| we wrote %6.2f (alpha %.3f, dt %.1f ms)",
+                   sinceCatch, pitchNow, mode, target, extra, g_wroteWant, alpha, dt * 1000.0f);
+        g_wroteWant = want;
         if (!g_levelling) {
             g_levelling = true;
+            g_startedMs = (float)sinceCatch;
             InterlockedIncrement(&g_uiLevels);
             if (g_log) TwkLog("[level] levelling %.2f -> %.2f", pitchNow, want);
         }
@@ -368,7 +446,9 @@ void CatchLevel_DrawMenu(const OmpMenuApi* api) {
         float r = g_responseMs;
         if (api->SliderFloat("Ease speed (ms)", &r, 20.0f, 500.0f, "%.0f")) { g_responseMs = r; TwkMarkDirty(); }
         float d = g_delayMs;
-        if (api->SliderFloat("Wait after catch (ms)", &d, 0.0f, 400.0f, "%.0f")) { g_delayMs = d; TwkMarkDirty(); }
+        // 0..5, not 0..400: the field result is that raising this only makes levelling fire less
+        // often, so the slider no longer offers a range that quietly breaks the feature.
+        if (api->SliderFloat("Wait after catch (ms)", &d, 0.0f, kMaxDelayMs, "%.0f")) { g_delayMs = d; TwkMarkDirty(); }
         float t = (g_targetDeg > -180.0f) ? g_targetDeg : 0.0f;
         if (api->SliderFloat("Level angle (deg)", &t, -20.0f, 20.0f, "%.0f")) { g_targetDeg = t; TwkMarkDirty(); }
         snprintf(b, sizeof(b), "%s   levels applied: %d",
