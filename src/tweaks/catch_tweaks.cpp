@@ -44,6 +44,7 @@
 #include "catch_tweaks.h"
 #include "flip_speed.h"
 #include "catch_level.h"
+#include "foot_steer.h"      // the filtered steer, so a driven board agrees with the feet
 #include <cmath>
 #include "MinHook.h"
 
@@ -66,6 +67,17 @@ enum {
     IAH_DS_CANCEL           = 0x60,    // _shouldCancelSingleStickInputForDarkSlide (the input-eater)
     IAH_DS_WINDOW           = 0x61,    // _isInDarkSlideWindow
     CODB_INPUT_DEADZONE     = 0x30,    // UCatchOrientsDatabase::CatchOrientInputDeadZone (ships 0.2)
+    // ---- the game's built-in boned ollie lives HERE, in authored catch-orient data.
+    // Measured before it was found: holding both sticks in the air pushes the BOARD up to ~36 cm
+    // forward of the skater while the character mesh does not move at all, decaying back as the
+    // sticks centre; the legs follow only because the feet are IK'd to the deck. That is why it
+    // looks like a leg pose and why no foot/bone/stance symbol exists to find.
+    CODB_ORIENTS            = 0x70,    // TArray<FCatchOrientDefinition> (data +0x0, Num +0x8)
+    CO_DEF_STRIDE           = 180,     // sizeof(FCatchOrientDefinition)
+    CO_BACK_SETTINGS        = 0x4,     // FCatchOrientDefinition::BackSideSettings  (88 B)
+    CO_FRONT_SETTINGS       = 0x5c,    // FCatchOrientDefinition::FrontSideSettings (88 B)
+    // FCatchOrientSettings::{Left,Right}BoardRelativeOffset_{RGS,SWS} -- FVectors, the displacement
+    COS_OFF_L_RGS = 0x28, COS_OFF_R_RGS = 0x34, COS_OFF_L_SWS = 0x40, COS_OFF_R_SWS = 0x4c,
     SK_CATCH_MODE           = 0x63d,   // ECatchMode -- THIS is the menu's Catch Mode
     SK_CATCH_ORIENT_STATE   = 0x63e,   // ECatchOrientState -- nonzero = a catch actually ENGAGED
     SK_BOARD                = 0x568,   // ASkaterCharacterBase -> _skateboard (ASkateboardEx*)
@@ -96,6 +108,15 @@ static int   g_dsAngleDeg  = 60;      // DarkslideZoneDeg: the reservation is ho
                                       // the board is within this many degrees of grip-down (180);
                                       // elsewhere it is masked = native press-time catching
 static int   g_catchDiag   = 0;       // log every catch decision (verbose; for future catch work)
+// The game's own boned ollie, ADJUSTED rather than replaced. It is authored catch-orient data --
+// board-offset vectors that shove the deck forward while both sticks are held, the legs following
+// because the feet are IK'd to the deck. Driving those vectors from the sticks instead was built and
+// rejected; scaling what the game already does keeps its timing, its smoothing and its gating and
+// changes only how far and in which direction. Data-only, fully restored when back at stock.
+// 0 removes the bone entirely, 100 is stock. The add is in cm on the offset's raw components --
+// which one reads as "up" is a question for the headset, exactly like the foot axes were.
+static int   g_boneScale = 100;             // BoneScalePct
+static int   g_boneAdd[3] = { 0, 0, 0 };    // BoneAddX / BoneAddY / BoneAddZ
 // FlipCatchTrace -- read-only: measures how far the BOARD turns across a catch, so "it finished a
 // second flip" is a number instead of an impression. Costs nothing when no catch is pressed.
 static int   g_flipTrace   = 0;   // FlipCatchTrace -- diagnostic, off by default
@@ -175,6 +196,15 @@ void CatchTweaks_ReadConfig(const char* buf) {
     g_catchBeatsDS = TwkIniInt(buf, "CatchBeatsDarkslide", 1);
     g_dsAngleDeg   = TwkIniInt(buf, "DarkslideZoneDeg", 60);
     g_catchDiag    = TwkIniInt(buf, "CatchDiag", 0);
+    g_boneScale     = TwkIniInt(buf, "BoneScalePct", 100);
+    g_boneAdd[0]    = TwkIniInt(buf, "BoneAddX", 0);
+    g_boneAdd[1]    = TwkIniInt(buf, "BoneAddY", 0);
+    g_boneAdd[2]    = TwkIniInt(buf, "BoneAddZ", 0);
+    if (g_boneScale < 0) g_boneScale = 0; else if (g_boneScale > 300) g_boneScale = 300;
+    for (int i = 0; i < 3; i++) {
+        if (g_boneAdd[i] < -100) g_boneAdd[i] = -100;
+        else if (g_boneAdd[i] > 100) g_boneAdd[i] = 100;
+    }
     g_flipTrace    = TwkIniInt(buf, "FlipCatchTrace", 0);
     g_flipTraceVerbose = TwkIniInt(buf, "FlipCatchTraceVerbose", 0);
     g_stopFlip     = TwkIniInt(buf, "CatchStopsFlip", 1);
@@ -189,8 +219,10 @@ void CatchTweaks_ReadConfig(const char* buf) {
     if (g_dsAngleDeg < 10)  g_dsAngleDeg = 10;
     if (g_dsAngleDeg > 170) g_dsAngleDeg = 170;
     TwkLog("[catch] config: CatchWindow=%d CatchWindowMult=%.2f ManualCatchMode=%d "
-           "CatchBeatsDarkslide=%d DarkslideZoneDeg=%d CatchDiag=%d",
-           g_catchFix, g_catchMult, g_manualMode, g_catchBeatsDS, g_dsAngleDeg, g_catchDiag);
+           "CatchBeatsDarkslide=%d DarkslideZoneDeg=%d CatchDiag=%d | bone scale=%d%% "
+           "add=%d/%d/%d cm",
+           g_catchFix, g_catchMult, g_manualMode, g_catchBeatsDS, g_dsAngleDeg, g_catchDiag,
+           g_boneScale, g_boneAdd[0], g_boneAdd[1], g_boneAdd[2]);
 }
 
 void CatchTweaks_SaveConfig(char* buf, size_t cap) {
@@ -201,6 +233,10 @@ void CatchTweaks_SaveConfig(char* buf, size_t cap) {
     TwkIniSetInt(buf, cap, "CatchStopsFlip",      g_stopFlip);
     TwkIniSetInt(buf, cap, "CatchStopFlipDeg",    g_stopFlipDeg);
     TwkIniSetInt(buf, cap, "CatchSnapMs",         g_snapMs);
+    TwkIniSetInt(buf, cap, "BoneScalePct",        g_boneScale);
+    TwkIniSetInt(buf, cap, "BoneAddX",            g_boneAdd[0]);
+    TwkIniSetInt(buf, cap, "BoneAddY",            g_boneAdd[1]);
+    TwkIniSetInt(buf, cap, "BoneAddZ",            g_boneAdd[2]);
 }
 
 // ------------------------------------------------------------------ sigs (dual-exe-verified)
@@ -220,6 +256,96 @@ static bool    g_widened  = false;
 // transition, so without this a slider change sits inert until the mode is toggled -- which made an
 // A/B of the window silently test nothing at all.
 static float   g_appliedMult = 0.0f;
+
+// ---- the built-in boned ollie: zero the authored board offsets, restore them exactly on release.
+// Same shape as the pre-catch-angle walk below -- save originals, write, put them back -- because
+// the failure mode of a half-restored asset is a game that stays modified after the toggle is off.
+static const int kBoardOffsets[4] = { COS_OFF_L_RGS, COS_OFF_R_RGS, COS_OFF_L_SWS, COS_OFF_R_SWS };
+struct OrientSave { uint8_t* settings; float off[4][3]; };
+static OrientSave g_orientSave[256];
+static int  g_nOrientSave = 0;
+static bool g_boneAdjusted = false;
+
+// Originals are captured ONCE, before anything is written, so the asset can always be put back
+// exactly however many times the value has been driven since.
+static bool captureOrients(void* codb) {
+    if (g_nOrientSave > 0) return true;
+    if (!codb) return false;
+    uint8_t* arr = (uint8_t*)twkP(codb, CODB_ORIENTS);
+    const int n = twkI(codb, CODB_ORIENTS + 8);
+    if (!arr || n <= 0 || n > 128) return false;        // an implausible count is a wrong pointer
+    for (int i = 0; i < n; i++) {
+        uint8_t* def = arr + (size_t)i * CO_DEF_STRIDE;
+        for (int h = 0; h < 2; h++) {
+            if (g_nOrientSave >= 256) break;
+            uint8_t* st = def + (h == 0 ? CO_BACK_SETTINGS : CO_FRONT_SETTINGS);
+            OrientSave& s = g_orientSave[g_nOrientSave];
+            bool ok = true;
+            for (int v = 0; v < 4 && ok; v++)
+                for (int c = 0; c < 3; c++) {
+                    const float f = twkF(st, kBoardOffsets[v] + c * 4);
+                    if (!(f > -1000.0f && f < 1000.0f)) { ok = false; break; }
+                    s.off[v][c] = f;
+                }
+            if (!ok) continue;                          // never write through a read we distrust
+            s.settings = st;
+            g_nOrientSave++;
+        }
+    }
+    if (g_nOrientSave > 0)
+        TwkLog("[catch] catch-orient board offsets captured on %d settings blocks (%d definitions) "
+               "-- originals held for exact restore", g_nOrientSave, n);
+    return g_nOrientSave > 0;
+}
+// Always FROM THE SAVED ORIGINAL, never from the live value: that is what makes a per-frame write
+// idempotent instead of compounding. Per-slot too, so the authored differences between sides and
+// stances survive the scaling instead of being flattened to one number.
+static void writeOrientsScaled(int scalePct, const int add[3]) {
+    const float k = (float)scalePct * 0.01f;
+    for (int i = 0; i < g_nOrientSave; i++) {
+        OrientSave& s = g_orientSave[i];
+        if (!s.settings) continue;
+        for (int q = 0; q < 4; q++)
+            for (int c = 0; c < 3; c++)
+                *(float*)(s.settings + kBoardOffsets[q] + c * 4) = s.off[q][c] * k + (float)add[c];
+    }
+}
+static void restoreOrients() {
+    for (int i = 0; i < g_nOrientSave; i++) {
+        OrientSave& s = g_orientSave[i];
+        if (!s.settings) continue;
+        for (int q = 0; q < 4; q++)
+            for (int c = 0; c < 3; c++)
+                *(float*)(s.settings + kBoardOffsets[q] + c * 4) = s.off[q][c];
+    }
+}
+
+// At stock (100% and no add) the game's own values are left completely alone, and anything written
+// earlier is put back. Otherwise the adjusted values are re-derived from the originals each frame,
+// so moving a slider takes effect immediately and repeated writes cannot accumulate.
+static void applyBoardOffsets(void* codb) {
+    const bool adjust = (g_boneScale != 100) ||
+                        g_boneAdd[0] || g_boneAdd[1] || g_boneAdd[2];
+    if (!adjust && !g_boneAdjusted) return;
+    __try {
+        if (!adjust) {
+            restoreOrients();
+            TwkLog("[catch] boned ollie back to stock on %d catch-orient settings blocks", g_nOrientSave);
+            g_nOrientSave = 0; g_boneAdjusted = false;
+            return;
+        }
+        if (!captureOrients(codb)) return;
+        writeOrientsScaled(g_boneScale, g_boneAdd);
+        if (!g_boneAdjusted) {
+            g_boneAdjusted = true;
+            TwkLog("[catch] boned ollie adjusted: scale %d%%, add %d/%d/%d cm", g_boneScale,
+                   g_boneAdd[0], g_boneAdd[1], g_boneAdd[2]);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        TwkLog("[catch] caught fatal touching the catch-orient board offsets -> bone left at stock");
+        g_boneScale = 100; g_boneAdd[0] = g_boneAdd[1] = g_boneAdd[2] = 0;
+    }
+}
 
 static void applyCatchWindow(void* tricksDb, bool widen) {
     if (!tricksDb) return;
@@ -348,6 +474,9 @@ static bool hkCanCatchOrient(void* self, void* b, void* c, void* d) {
                 applyCatchWindow(twkP(self, IAH_TRICKS_DB), false);
                 applyCatchWindow(twkP(self, IAH_TRICKS_DB), true);
             }
+            // The bone adjustment is independent of catch MODE -- it is authored data, not a manual
+            // catch behaviour -- so it follows its own knobs only.
+            applyBoardOffsets(twkP(self, IAH_CATCH_ORIENTS_DB));
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             g_catchFix = 0;
             TwkLog("[catch] caught fatal in the widen gate -> window fix off");
@@ -553,7 +682,21 @@ void CatchTweaks_SetEnabled(bool on) { g_catchFix = on ? 1 : 0; TwkMarkDirty(); 
 void CatchTweaks_ResetDefaults() {
     g_catchFix = 1; g_catchMult = 2.0f; g_catchBeatsDS = 1; g_dsAngleDeg = 60; g_catchDiag = 0;
     g_stopFlip = 1; g_stopFlipDeg = 168; g_snapMs = 90;
+    g_boneScale = 100; g_boneAdd[0] = g_boneAdd[1] = g_boneAdd[2] = 0;
     TwkMarkDirty();
+}
+float CatchTweaks_BoneScalePct() { return (float)g_boneScale; }
+void  CatchTweaks_SetBoneScalePct(float v) {
+    int s = (int)v; if (s < 0) s = 0; else if (s > 300) s = 300;
+    g_boneScale = s; TwkMarkDirty();
+}
+float CatchTweaks_BoneAdd(int axis) {
+    return (axis >= 0 && axis < 3) ? (float)g_boneAdd[axis] : 0.0f;
+}
+void  CatchTweaks_SetBoneAdd(int axis, float v) {
+    if (axis < 0 || axis > 2) return;
+    int a = (int)v; if (a < -100) a = -100; else if (a > 100) a = 100;
+    g_boneAdd[axis] = a; TwkMarkDirty();
 }
 float CatchTweaks_WindowMultPct() { return g_catchMult * 100.0f; }
 bool  CatchTweaks_StopsFlip() { return g_stopFlip != 0; }
@@ -578,7 +721,19 @@ void CatchTweaks_DrawMenu(const OmpMenuApi* api) {
         api->Unindent();
     }
     if (g_startCatchDef) {
-        bool ds = g_catchBeatsDS != 0;
+    float bs = (float)g_boneScale;
+    if (api->SliderFloat("Boned ollie (%)", &bs, 0.0f, 300.0f, "%.0f")) CatchTweaks_SetBoneScalePct(bs);
+    api->SameLine(); api->TextDisabled("(100 = stock, 0 = no bone at all)");
+    {
+        api->Indent();
+        float ax = (float)g_boneAdd[0], ay = (float)g_boneAdd[1], az = (float)g_boneAdd[2];
+        if (api->SliderFloat("Bone add X (cm)", &ax, -100.0f, 100.0f, "%.0f")) CatchTweaks_SetBoneAdd(0, ax);
+        if (api->SliderFloat("Bone add Y (cm)", &ay, -100.0f, 100.0f, "%.0f")) CatchTweaks_SetBoneAdd(1, ay);
+        if (api->SliderFloat("Bone add Z (cm)", &az, -100.0f, 100.0f, "%.0f")) CatchTweaks_SetBoneAdd(2, az);
+        api->TextDisabled("added on top of the scaled bone -- raise whichever axis lifts the deck");
+        api->Unindent();
+    }
+    bool ds = g_catchBeatsDS != 0;
         if (api->Checkbox("Catch input beats dark slides", &ds)) { g_catchBeatsDS = ds ? 1 : 0; TwkMarkDirty(); }
         api->SameLine(); api->TextDisabled("(fixes eaten catch inputs; manual only)");
         if (ds) {

@@ -131,6 +131,9 @@ float ScoopSpeed_FlickStartMag = 0.10f;
 // A gesture that never gets this far out is not a flick; reporting a speed for it would let a nudge
 // of the stick register as a fast one just because it happened quickly.
 float ScoopSpeed_FlickMinPeak  = 0.18f;
+// How far the stick must actually TRAVEL for the measurement to mean anything. Below this we report
+// no measurement and the caller keeps the game's own value -- never the slowest setting.
+static const float kFlickMinRise = 0.25f;
 static void trackMag(MagTrack& M, float x, float y, double t) {
     if (M.n >= kMagHist) {                       // keep the recent half, same shape as StickTracker
         const int keep = kMagHist / 2;
@@ -202,7 +205,11 @@ bool ScoopSpeed_FlickMeasure(bool rightStick, float windowSec, float* outSpeed, 
     const double span = M.t[peak] - M.t[start];
     if (span <= 0.0) return false;
     const float rise = M.m[peak] - M.m[start];
-    if (rise <= 0.0f) return false;
+    // ⚠️ A TINY RISE IS NOT A SLOW FLICK, IT IS NO FLICK. Field case: a controller whose magnitude sat
+    // pinned at 1.00 for the whole window -- never returning toward centre -- yielded a rise of ~0.01
+    // and a "speed" of 0.1 u/s, which mapped to the BOTTOM of the range and made every trick slower
+    // than vanilla. The gesture has to have actually travelled before its duration means anything.
+    if (rise < kFlickMinRise) return false;
     if (outSpeed) *outSpeed = rise / (float)span;
     return true;
 }
@@ -236,6 +243,14 @@ static void trackOne(StickTracker& T, float x, float y, double t) {
     }
     T.lastAngle = ang; T.lastSampleT = t; T.haveLast = true;
 }
+// ---- live stick POSITION, for foot_steer ------------------------------------------------------
+// Both trackers above keep derivatives (angular sweep, radial speed). A consumer that wants where
+// the stick simply IS gets it from here for the same reason flip_speed takes its flick measure from
+// here: only one detour may exist on InputHandler::Tick. Stamped, so a centred stick stays
+// distinguishable from an input tick that has stopped running.
+static float  g_rawL[2] = { 0.0f, 0.0f }, g_rawR[2] = { 0.0f, 0.0f };
+static double g_rawT = 0.0;
+
 static void trackStick(void* handler) {
     const double t = nowSeconds();
     const float lx = twkF(handler, IH_FRAME_RAW_LEFT),  ly = twkF(handler, IH_FRAME_RAW_LEFT + 4);
@@ -244,6 +259,22 @@ static void trackStick(void* handler) {
     trackOne(g_trkR, rx, ry, t);
     trackMag(g_magL, lx, ly, t);
     trackMag(g_magR, rx, ry, t);
+    g_rawL[0] = lx; g_rawL[1] = ly;
+    g_rawR[0] = rx; g_rawR[1] = ry;
+    g_rawT = t;
+}
+
+bool ScoopSpeed_StickRaw(bool rightStick, float* x, float* y) {
+    if (x) *x = 0.0f;
+    if (y) *y = 0.0f;
+    if (g_rawT <= 0.0 || nowSeconds() - g_rawT > 0.25) return false;   // no live input tick
+    const float* s = rightStick ? g_rawR : g_rawL;
+    // twkF hands back an implausible sentinel on a bad read. A consumer that turns this into a
+    // position offset must never see one, so an out-of-range pair is "no measurement", not data.
+    if (!(fabsf(s[0]) <= 1.5f) || !(fabsf(s[1]) <= 1.5f)) return false;
+    if (x) *x = s[0];
+    if (y) *y = s[1];
+    return true;
 }
 static bool gestureFresh(const StickTracker& T) {
     return T.nSamples > 1 && (nowSeconds() - T.velT[T.nSamples - 1]) <= g_trackWindow;

@@ -31,6 +31,10 @@ void ScoopSpeed_SetEnabled(bool on);
 // Returns false when there is no live input tick to read.
 bool ScoopSpeed_FlickMeasure(bool rightStick, float windowSec, float* outSpeed, float* outPeak,
                              float* outFrameMs);
+// Where the stick IS this tick (-1..1 per axis), off the same samples. False when the input tick is
+// not running or the read came back implausible -- a consumer turning this into a position must be
+// able to tell "centred" from "unknown".
+bool ScoopSpeed_StickRaw(bool rightStick, float* x, float* y);
 // Where the push is considered to start, and how far out a gesture must reach to count as a flick.
 // Live so they can be tuned against real samples rather than guessed at.
 extern float ScoopSpeed_FlickStartMag, ScoopSpeed_FlickMinPeak;

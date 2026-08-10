@@ -26,6 +26,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <cmath>
 
 void TwkLog(const char* fmt, ...);            // tweaks_mod.cpp; writes SessionTweaks.log
 
@@ -57,6 +58,90 @@ uint8_t* TwkScanExe(const char* sig);
 static inline float TwkActorZ(const void* actor) {
     void* root = actor ? twkP(actor, 0x130) : nullptr;
     return root ? twkF(root, 0x1d8) : -999999.0f;
+}
+
+// Rotate a vector by a quaternion (x,y,z,w) and by its inverse. A DELTA between two component
+// bases is pure rotation -- the translation half of a ComponentToWorld never enters it, which is
+// why a delta can cross spaces that an absolute position could not.
+static inline void TwkQuatRotate(const float q[4], const float v[3], float out[3]) {
+    const float vx = v[0], vy = v[1], vz = v[2];      // read first: out may alias v
+    const float tx = 2.0f * (q[1] * vz - q[2] * vy);
+    const float ty = 2.0f * (q[2] * vx - q[0] * vz);
+    const float tz = 2.0f * (q[0] * vy - q[1] * vx);
+    out[0] = vx + q[3] * tx + (q[1] * tz - q[2] * ty);
+    out[1] = vy + q[3] * ty + (q[2] * tx - q[0] * tz);
+    out[2] = vz + q[3] * tz + (q[0] * ty - q[1] * tx);
+}
+static inline void TwkQuatInvRotate(const float q[4], const float v[3], float out[3]) {
+    const float c[4] = { -q[0], -q[1], -q[2], q[3] };  // conjugate == inverse for a unit quaternion
+    TwkQuatRotate(c, v, out);
+}
+
+// Quaternion product, standard Hamilton order to match TwkQuatRotate above: the result rotates by
+// `b` first and then by `a`, so `TwkQuatMul(extra, current, out)` applies `extra` in the PARENT
+// frame -- which is how a rotation about a world-stable axis is layered onto a local orientation.
+static inline void TwkQuatMul(const float a[4], const float b[4], float out[4]) {
+    const float ax = a[0], ay = a[1], az = a[2], aw = a[3];
+    const float bx = b[0], by = b[1], bz = b[2], bw = b[3];
+    out[0] = aw * bx + ax * bw + ay * bz - az * by;
+    out[1] = aw * by - ax * bz + ay * bw + az * bx;
+    out[2] = aw * bz + ax * by - ay * bx + az * bw;
+    out[3] = aw * bw - ax * bx - ay * by - az * bz;
+}
+static inline void TwkQuatAxisAngle(const float axis[3], float deg, float out[4]) {
+    float n = sqrtf(axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]);
+    if (!(n > 1e-6f)) { out[0] = out[1] = out[2] = 0.0f; out[3] = 1.0f; return; }
+    const float h = deg * 0.008726646f;                       // (pi/180)/2
+    const float s = sinf(h) / n;
+    out[0] = axis[0] * s; out[1] = axis[1] * s; out[2] = axis[2] * s; out[3] = cosf(h);
+}
+
+// FRotator <-> FQuat, Unreal's own formulas (Pitch/Yaw/Roll in degrees, quat as x,y,z,w).
+// ⚠️ The standing "no euler round-trips" rule exists because the GAME's conversion pair is not
+// self-inverse. This pair is, by construction -- it is the engine's own math written out both ways,
+// so a value can go quat -> rotator -> quat without drifting. Never mix these with the game's.
+static inline void TwkRotatorToQuat(const float rot[3], float out[4]) {
+    const float k = 0.008726646f;                             // (pi/180)/2
+    const float sp = sinf(rot[0] * k), cp = cosf(rot[0] * k); // Pitch
+    const float sy = sinf(rot[1] * k), cy = cosf(rot[1] * k); // Yaw
+    const float sr = sinf(rot[2] * k), cr = cosf(rot[2] * k); // Roll
+    out[0] =  cr * sp * sy - sr * cp * cy;
+    out[1] = -cr * sp * cy - sr * cp * sy;
+    out[2] =  cr * cp * sy - sr * sp * cy;
+    out[3] =  cr * cp * cy + sr * sp * sy;
+}
+static inline void TwkQuatToRotator(const float q[4], float out[3]) {
+    const float X = q[0], Y = q[1], Z = q[2], W = q[3];
+    const float sing = Z * X - W * Y;
+    const float yawY = 2.0f * (W * Z + X * Y);
+    const float yawX = 1.0f - 2.0f * (Y * Y + Z * Z);
+    const float R2D = 57.29577951f;
+    if (sing < -0.4999995f) {                                  // straight down
+        out[0] = -90.0f;
+        out[1] = atan2f(yawY, yawX) * R2D;
+        out[2] = -out[1] - (2.0f * atan2f(X, W) * R2D);
+    } else if (sing > 0.4999995f) {                            // straight up
+        out[0] = 90.0f;
+        out[1] = atan2f(yawY, yawX) * R2D;
+        out[2] = out[1] - (2.0f * atan2f(X, W) * R2D);
+    } else {
+        float s = 2.0f * sing;
+        if (s > 1.0f) s = 1.0f; else if (s < -1.0f) s = -1.0f;
+        out[0] = asinf(s) * R2D;
+        out[1] = atan2f(yawY, yawX) * R2D;
+        out[2] = atan2f(-2.0f * (W * X + Y * Z), 1.0f - 2.0f * (X * X + Y * Y)) * R2D;
+    }
+}
+
+// A component's ComponentToWorld rotation (USceneComponent+0x1c0, FQuat x,y,z,w). False when the
+// result is not a unit quaternion: that means the pointer was not a component, and a basis built
+// from it would throw whatever it rotates clean out of the rig rather than fail visibly.
+static inline bool TwkCompQuat(const void* comp, float q[4]) {
+    if (!comp) return false;
+    q[0] = twkF(comp, 0x1c0); q[1] = twkF(comp, 0x1c4);
+    q[2] = twkF(comp, 0x1c8); q[3] = twkF(comp, 0x1cc);
+    const float n = q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3];
+    return n > 0.98f && n < 1.02f;
 }
 
 // Line-based ini int lookup. Comment lines (';' '#' '[') are skipped BEFORE matching: a whole-file

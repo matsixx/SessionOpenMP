@@ -75,7 +75,9 @@
 // scan silently fails (field-caught this session). catch_level owns GetBoardExtraPitchAngle,
 // scoop_speed owns InputHandler::Tick, grind_pop owns JumpForTrick/PitchBoard, run_out owns Bail,
 // and OpenMP owns NativeUpdateAnimation when a co-op session arms -- which is the other reason to
-// hook UpdateFootAnchors rather than its caller.
+// hook UpdateFootAnchors rather than its caller. THIS module owns UpdateFootAnchors, so foot_steer
+// is CALLED from inside the hook below rather than installing a second detour on it; both write the
+// same two sockets, and both write deltas, so their contributions accumulate into one write.
 // 🛑 `_left/_rightFootBodyInstance` (+0x770/+0x778) are read for their POINTER VALUE ONLY, as a
 // costume-change signal, and never dereferenced: `FBodyInstance+0x8` is a TWeakObjectPtr (two int32s,
 // not an address), so a raw walk returns plausible floats that are lies rather than faulting.
@@ -85,6 +87,7 @@
 #include <climits>
 #include "ui/menu_ext.h"
 #include "foot_place.h"
+#include "foot_steer.h"       // shares this hook: only one detour may exist on UpdateFootAnchors
 #include "catch_tweaks.h"     // CatchTweaks_Skater() -- the live skater, without a hook of our own
 #include <cmath>
 #include "MinHook.h"
@@ -590,16 +593,25 @@ static void hkUpdateFootAnchors(void* self, double dt, void* a, void* b) {
         const float mmL = regL + (swL - regL) * sw;
         const float mmR = regR + (swR - regR) * sw;
         g_uiCrank = t; g_uiSwitch = sw;
-        if (mmL == 0.0f && mmR == 0.0f) return;
+        // Everything that moves these sockets is a DELTA, so the contributions accumulate into one
+        // vector per foot and land in a single write. The placement nudge is only the Z of it.
+        // ⚠️ Foot steering has to be able to move the feet on its own: an early-out on the placement
+        // numbers alone would leave it working only while a placement slider happened to be non-zero,
+        // which is a silent and very confusing failure.
+        float dL[3] = { 0.0f, 0.0f, -mmL / 10.0f };                 // cm; a positive slider lowers it
+        float dR[3] = { 0.0f, 0.0f, -mmR / 10.0f };
+        const bool steered = FootSteer_AddOffset(self, realDt, dL, dR);
+        if (dL[0] == 0.0f && dL[1] == 0.0f && dL[2] == 0.0f &&
+            dR[0] == 0.0f && dR[1] == 0.0f && dR[2] == 0.0f) return;
         // The PROVEN write: a constant offset on what the game just computed. Field verdict on the
         // 2.19.x absolute-height mode: "locks the feet and makes them stable" is THIS path; absolute
         // placement jittered and clipped. Offset preserves the animation's micro-motion; replacing
         // the height fought it. Positive slider = lower foot.
-        const float dL = mmL / 10.0f, dR = mmR / 10.0f;             // cm
-        const float zL0 = twkF(self, AN_L_SOCK_LOC + 8), zR0 = twkF(self, AN_R_SOCK_LOC + 8);
-        *(float*)((uint8_t*)self + AN_L_SOCK_LOC + 8) = zL0 - dL;
-        *(float*)((uint8_t*)self + AN_R_SOCK_LOC + 8) = zR0 - dR;
-        const float appL = -dL, appR = -dR;
+        for (int i = 0; i < 3; i++) {
+            *(float*)((uint8_t*)self + AN_L_SOCK_LOC + i * 4) = twkF(self, AN_L_SOCK_LOC + i * 4) + dL[i];
+            *(float*)((uint8_t*)self + AN_R_SOCK_LOC + i * 4) = twkF(self, AN_R_SOCK_LOC + i * 4) + dR[i];
+        }
+        const float appL = dL[2], appR = dR[2];
         g_uiAppliedL = appL;
         // ⚠️ UNCONDITIONAL first line, then 1 Hz. Round 4 logged only on a riding<->cranking
         // TRANSITION, so with the crouch signal reading 0 the hook printed NOTHING and "it does not
@@ -609,13 +621,22 @@ static void hkUpdateFootAnchors(void* self, double dt, void* a, void* b) {
         const double now = NowSec();
         if (nth == 1 || now - g_lastCorrLog > 1.0) {
             g_lastCorrLog = now;
+            // The steering contribution is shown SEPARATELY from the placement nudge (its Z is
+            // backed out of the total), so a foot in the wrong place names which of the two put it
+            // there instead of costing a round to find out.
+            char steerTxt[112]; steerTxt[0] = 0;
+            if (steered)
+                snprintf(steerTxt, sizeof(steerTxt),
+                         " | steer L(%+.1f,%+.1f,%+.1f) R(%+.1f,%+.1f,%+.1f) cm",
+                         dL[0], dL[1], dL[2] + mmL / 10.0f,
+                         dR[0], dR[1], dR[2] + mmR / 10.0f);
             // Raw candidates stay in the line (-1 = its gate is closed): if the crouch is ever
             // wrong again, the SAME log names which field moved instead of costing another round.
             TwkLog("[foot] applying: crouch=%.2f (%s) [cranking=%d] stance=%.2f (%s) | "
-                   "total L=%.1f R=%.1f mm | applied L=%+.2f R=%+.2f cm | shoe '%s'",
+                   "total L=%.1f R=%.1f mm | applied L=%+.2f R=%+.2f cm | shoe '%s'%s",
                    t, (t > 0.05f) ? "setup" : "riding", (int)cranking,
                    sw, (sw > 0.5f) ? "switch" : "regular", mmL, mmR, appL, appR,
-                   g_curShoe[0] ? g_curShoe : "?");
+                   g_curShoe[0] ? g_curShoe : "?", steerTxt);
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         g_ok = 0;
