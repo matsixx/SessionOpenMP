@@ -35,9 +35,6 @@ bool ScoopSpeed_FlickMeasure(bool rightStick, float windowSec, float* outSpeed, 
 // not running or the read came back implausible -- a consumer turning this into a position must be
 // able to tell "centred" from "unknown".
 bool ScoopSpeed_StickRaw(bool rightStick, float* x, float* y);
-// Where the push is considered to start, and how far out a gesture must reach to count as a flick.
-// Live so they can be tuned against real samples rather than guessed at.
-extern float ScoopSpeed_FlickStartMag, ScoopSpeed_FlickMinPeak;
 // Log the raw magnitude samples behind the last `windowSec`.
 void ScoopSpeed_DumpFlick(bool rightStick, float windowSec);
 

@@ -124,24 +124,28 @@ static double nowSeconds() {
 // with NO magnitude gate: the interesting part of a flick is the climb from the centre, which is
 // entirely below `g_trackMinMag` and never reaches the tracker at all.
 static const int kMagHist = 96;
-struct MagTrack { double t[kMagHist]; float m[kMagHist]; int n; };
+struct MagTrack { double t[kMagHist]; float x[kMagHist], y[kMagHist], m[kMagHist]; int n; };
 static MagTrack g_magL = {}, g_magR = {};
 // Below this the stick is still in the centre region -- the push is considered to start here.
-float ScoopSpeed_FlickStartMag = 0.10f;
+
 // A gesture that never gets this far out is not a flick; reporting a speed for it would let a nudge
 // of the stick register as a fast one just because it happened quickly.
-float ScoopSpeed_FlickMinPeak  = 0.18f;
+
 // How far the stick must actually TRAVEL for the measurement to mean anything. Below this we report
 // no measurement and the caller keeps the game's own value -- never the slowest setting.
-static const float kFlickMinRise = 0.25f;
+static const float kStillStep      = 0.004f;  // per-sample movement below this = the stick is at rest
+static const float kFlickMinTravel = 0.10f;   // total 2D travel a gesture must cover to be measured
 static void trackMag(MagTrack& M, float x, float y, double t) {
     if (M.n >= kMagHist) {                       // keep the recent half, same shape as StickTracker
         const int keep = kMagHist / 2;
         memmove(M.t, M.t + (kMagHist - keep), keep * sizeof(M.t[0]));
+        memmove(M.x, M.x + (kMagHist - keep), keep * sizeof(M.x[0]));
+        memmove(M.y, M.y + (kMagHist - keep), keep * sizeof(M.y[0]));
         memmove(M.m, M.m + (kMagHist - keep), keep * sizeof(M.m[0]));
         M.n = keep;
     }
     M.t[M.n] = t;
+    M.x[M.n] = x; M.y[M.n] = y;
     M.m[M.n] = sqrtf(x * x + y * y);
     M.n++;
 }
@@ -167,12 +171,16 @@ void ScoopSpeed_DumpFlick(bool rightStick, float windowSec) {
     const double now = nowSeconds();
     char line[400]; int len = 0;
     len += snprintf(line + len, sizeof(line) - len, "[flick] %c:", rightStick ? 'R' : 'L');
-    for (int i = 0; i < M.n && len < (int)sizeof(line) - 24; i++) {
+    // x,y and not just the magnitude: a magnitude of 1.00 could be (1,0), (0,0.71,0.71) or a
+    // normalised direction, and those mean completely different things about the device. Every
+    // fourth sample, so the line still fits.
+    for (int i = 0; i < M.n && len < (int)sizeof(line) - 26; i++) {
         if (now - M.t[i] > windowSec) continue;
-        len += snprintf(line + len, sizeof(line) - len, " %.0f:%.2f",
-                        (now - M.t[i]) * 1000.0, M.m[i]);
+        if ((M.n - 1 - i) % 4 && i != M.n - 1) continue;
+        len += snprintf(line + len, sizeof(line) - len, " %.0f:(%+.2f,%+.2f)",
+                        (now - M.t[i]) * 1000.0, M.x[i], M.y[i]);
     }
-    TwkLog("%s   (ms-ago:magnitude, newest last)", line);
+    TwkLog("%s   (ms-ago:(x,y), newest last)", line);
 }
 
 bool ScoopSpeed_FlickMeasure(bool rightStick, float windowSec, float* outSpeed, float* outPeak,
@@ -188,31 +196,35 @@ bool ScoopSpeed_FlickMeasure(bool rightStick, float windowSec, float* outSpeed, 
     int first = M.n - 1;                                     // oldest sample still inside the window
     while (first > 0 && (now - M.t[first - 1]) <= windowSec) first--;
     if (first >= M.n - 1) return false;
-    if (outFrameMs)                                          // mean sample spacing = the frame time
+    if (outFrameMs)
         *outFrameMs = (float)((M.t[M.n - 1] - M.t[first]) / (M.n - 1 - first) * 1000.0);
+    for (int i = first; i < M.n; i++) if (M.m[i] > (outPeak ? *outPeak : 0.0f) && outPeak) *outPeak = M.m[i];
 
-    int peak = first;                                        // where the push topped out
-    for (int i = first; i < M.n; i++) if (M.m[i] > M.m[peak]) peak = i;
-    if (outPeak) *outPeak = M.m[peak];
-    // ⚠️ FALSE, not "speed 0". A caller maps the speed onto its range, so returning 0 for an
-    // unmeasurable gesture silently requests the SLOWEST setting -- the opposite of "we don't know".
-    // Every bail below says "no measurement" so the caller can keep the game's own value.
-    if (M.m[peak] < ScoopSpeed_FlickMinPeak) return false;             // never pushed far enough to be a flick
-
-    int start = peak;                                        // back to where that push began
-    while (start > first && M.m[start - 1] < M.m[start] && M.m[start - 1] > ScoopSpeed_FlickStartMag) start--;
-    if (start > first && M.m[start - 1] <= ScoopSpeed_FlickStartMag) start--;   // include the sample below it
-    const double span = M.t[peak] - M.t[start];
+    // MEASURE THE 2D PATH THE STICK TRAVELLED, not how far it got from centre. Distance travelled is
+    // the gesture regardless of where it started, so this reads a push out from rest and a movement
+    // made while already deflected identically; dividing by the burst's own duration keeps it
+    // frame-rate independent. The radial version it replaced also rejected genuine flicks whose peak
+    // was only ~0.25, which is where this game's tricks actually fire.
+    int start = M.n - 1;                                     // walk back over the current movement
+    for (int i = M.n - 1; i > first; i--) {
+        const float dx = M.x[i] - M.x[i - 1], dy = M.y[i] - M.y[i - 1];
+        if (dx * dx + dy * dy < kStillStep * kStillStep) break;   // the stick was at rest here
+        start = i - 1;
+    }
+    float path = 0.0f;
+    for (int i = start + 1; i < M.n; i++) {
+        const float dx = M.x[i] - M.x[i - 1], dy = M.y[i] - M.y[i - 1];
+        path += sqrtf(dx * dx + dy * dy);
+    }
+    const double span = M.t[M.n - 1] - M.t[start];
     if (span <= 0.0) return false;
-    const float rise = M.m[peak] - M.m[start];
-    // ⚠️ A TINY RISE IS NOT A SLOW FLICK, IT IS NO FLICK. Field case: a controller whose magnitude sat
-    // pinned at 1.00 for the whole window -- never returning toward centre -- yielded a rise of ~0.01
-    // and a "speed" of 0.1 u/s, which mapped to the BOTTOM of the range and made every trick slower
-    // than vanilla. The gesture has to have actually travelled before its duration means anything.
-    if (rise < kFlickMinRise) return false;
-    if (outSpeed) *outSpeed = rise / (float)span;
+    // A gesture has to have actually gone somewhere before its duration means anything. Below this
+    // there is no measurement and the caller keeps the game's own value -- never the slowest setting.
+    if (path < kFlickMinTravel) return false;
+    if (outSpeed) *outSpeed = path / (float)span;
     return true;
 }
+
 
 static void trackOne(StickTracker& T, float x, float y, double t) {
     const float mag = sqrtf(x * x + y * y);
