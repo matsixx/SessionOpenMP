@@ -36,6 +36,9 @@ float FootSteer_AxisY();        void FootSteer_SetAxisY(float a);
 // about. Degrees at full stick (0 = position only); axis 0..5 = +X/+Y/+Z then the same negated.
 float FootSteer_TwistDeg();     void FootSteer_SetTwistDeg(float deg);
 float FootSteer_TwistAxis();    void FootSteer_SetTwistAxis(float a);
+// Riding switch turns you around relative to the board, so the control reads backwards unless it is
+// mirrored with you. Bit 1 = flip sideways, bit 2 = flip forward/back (and the twist); 3 = both.
+float FootSteer_SwitchInvert(); void FootSteer_SetSwitchInvert(float v);
 const char* FootSteer_FrameName();
 
 // The FILTERED steer for one stick (-1..1), i.e. what the feet are actually doing after the rate

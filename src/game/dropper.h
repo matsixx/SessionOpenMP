@@ -109,6 +109,54 @@ void  DestroyRemote(void* actor, void (*logf)(const char*));
 bool  IsRemote(void* actor);
 int   RemoteCount();
 
+// ---- THE SESSION'S OWN COPIES OF THE LEVEL'S PROPS -------------------------------------------------
+// The level's benches and barriers are NOT moved for a session. Instead each client HIDES its own
+// (which its save has arranged its own way) and everyone spawns a fresh copy at the prop's MAP
+// DEFAULT -- so every machine reconstructs the same starting layout with nothing transferred, because
+// "where the map put it" is the same everywhere by definition.
+// What that buys, and why the previous three attempts failed without it: a session prop is an actor
+// WE own, exactly like a peer's inventory object. Nothing writes to the game's own level actors, so
+// there is no drift correction fighting the game, no restoring poses on the way out, and no need to
+// know where a bench "should" be at leave time -- the copy is simply destroyed and the original
+// unhidden.
+// They are deliberately left PICKABLE, so anybody can rearrange them. That is safe only because of
+// the Save hook (see game_syms.h): a pickable prop of ours can otherwise be called back into the
+// local player's inventory and written into their profile.
+// Identity is the ORIGINAL actor's name, which is baked into the map package and therefore the same
+// on every install -- the one shared handle available for an object every client spawns for itself.
+bool  SessionWorldBegin(void* ownPawn, const char* actorName, void (*logf)(const char*));
+void* SessionWorldCopy(const char* actorName);       // our spawned copy, or null
+bool  SessionWorldPose(const char* actorName, float loc[3], float quat[4]);   // where OUR copy is now
+void  SessionWorldEnd(void (*logf)(const char*));    // destroy every copy, unhide every original
+// Put the hide back. The originals are real LEVEL actors, so things other than us have opinions about
+// their visibility -- the replay editor's exit pass restores whatever it has registered, which
+// un-hides every one of them and leaves the player looking at their own arrangement standing inside
+// the session's. Cheap enough to simply re-assert on a slow beat rather than trying to enumerate
+// everything that might interfere.
+void  ReassertSessionWorldHidden();
+int   SessionWorldCount();
+// Actor names of the level props THIS player's save has moved -- our contribution to the session's
+// set. A prop nobody has ever moved is already at its map default on every machine and needs no copy.
+int   MovedWorldNames(char out[][64], int cap);
+// Is the local player holding this actor RIGHT NOW? (`_selectedObjects`, the dropper's own list.)
+// Picking a session prop up is what claims it: a discrete, observable event, rather than a guess made
+// by comparing poses that disagree -- which is how two clients ended up in a tug of war.
+bool  IsSelectedLocally(void* actor);
+// Where an actor is right now.
+bool  ActorPose(void* actor, float loc[3], float quat[4]);
+// THE HARD SAVE GUARD. Strip every actor of ours out of the manager's `_allObjects` and report how
+// many went. Called from the Save hook, immediately before the game writes the player's profile:
+// session props are deliberately pickable, so one can be selected and land in that array between our
+// polls, and this is the only point at which "it is not in the list the save reads" is a guarantee
+// rather than a race. Returns the number removed -- non-zero is worth a line, because it means the
+// race was real.
+int   PurgeOursFromSaveList();
+// Is that guarantee actually in place? Session props are only left PICKABLE when it is. Without the
+// hook the feature degrades to look-but-do-not-touch rather than risking somebody's profile -- a
+// missing symbol must cost a capability, never safety.
+void  SetSaveGuardArmed(bool armed);
+bool  SaveGuardArmed();
+
 // ---- THE MAP DEFAULT -------------------------------------------------------------------------------
 // Where the LEVEL put a prop, as opposed to where this player's save moved it to. Captured at the one
 // moment it is knowable: `UObjectDropperPersistentHandler::Load` walks the save and moves each prop it
@@ -131,6 +179,8 @@ struct Stats {
     int driftFixes = 0;         // settled objects the game moved and we put back
     int madeMovable = 0;        // props flipped out of Static mobility so a write can land at all
     int skipWorld = 0;          // the level's own props, left alone on purpose
+    int sessionWorld = 0;       // level props currently swapped for a session copy
+    int worldMissing = 0;       // names a peer contributed that this install's map does not have
     int mapDefaults = 0;        // props whose map-default pose we captured at the Load seam
     int mapDefaultMissed = 0;   // ...and ones we could not read, which would be a silent hole
     int resolvedByName = 0;     // ids the catalogue's own lookup missed and a name walk found

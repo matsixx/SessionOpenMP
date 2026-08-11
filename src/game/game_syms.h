@@ -393,6 +393,13 @@ struct Syms {
     PickableOfFn      DropperPickableOf = nullptr;
     ActorDestroyFn    ActorDestroy     = nullptr;
     void*             DropperLoad      = nullptr;   // HOOKED, never called directly
+    // UObjectDropperPersistentHandler::Save -- HOOKED, never called. THE HARD SAVE GUARD. A prop we
+    // spawn for a session is a real dropped object as far as the game is concerned, and the session
+    // ones are deliberately PICKABLE so anyone can move them -- which means one can be selected, land
+    // in `_allObjects` and be written into the player's own profile. The per-enumeration purge is a
+    // race against exactly that; this is the guarantee. Nothing else in this feature can damage
+    // something the player cannot get back.
+    void*             DropperSave      = nullptr;   // HOOKED, never called directly
     void*             ActorSetLocation = nullptr;   // HOOKED, never called directly
     int  resolved = 0, total = 0;
 };

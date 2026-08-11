@@ -372,7 +372,9 @@ static void buildUI() {
         } else {
             ImGui::TextDisabled("no session yet");
         }
-        if (st.myId[0]) { ImGui::SameLine(); ImGui::TextDisabled("   id: %s", st.myId); }
+        // The local EOS ProductUserId is deliberately NOT shown. It is an address peers can reach
+        // this machine at, and with relays turned off that reaches an IP -- so putting it on screen
+        // is a hazard for anyone streaming. It stays in the log, where sharing it is a deliberate act.
 
         ImGui::Separator();
         // ---- YOUR NAME. The one place in the mod you can actually type: the pause menu can show

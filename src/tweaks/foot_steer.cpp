@@ -65,6 +65,7 @@
 // USkaterAnimInstance, all PDB-exact. The ones foot_place also carries are named identically there.
 enum {
     AN_ON_BOARD      = 0x300,   // IsOnBoard -- hard gate, never steer while walking
+    AN_IS_SWITCH     = 0x303,   // IsSkatingSwitch (plain bool, no asset gate)
     // ⛔ The game's built-in boned ollie is NOT the stance system (EFootPositionType +0x305 reads a
     // constant through one) and NOT HipOffset (+0x3dc reads (0,0,0) throughout). Both were measured
     // and both are dead ends; the probes for them are gone. What a bone actually does is push the
@@ -150,6 +151,14 @@ static int   g_twistAxis  = 4;      // FootSteerTwistAxis -- -Y of the chosen fr
 // measured, not assumed. An offset written into a socket the graph is ignoring does nothing, and
 // comes back the instant the alpha does, which reads as the foot fighting you. Following the alpha
 // makes this module fade exactly as the game's own IK fades.
+// Riding switch turns you around relative to the board, so the axes the offsets are built on no
+// longer match your own sense of forward and the control reads backwards. Bit 1 = flip the stick's
+// X contribution, bit 2 = flip its Y (and the twist with it); 3 = both, i.e. the whole control
+// rotated 180 like you are. Blended, not switched: stance can change mid-air off a half-cab, and a
+// sign that flips on a frame boundary would snap the foot -- the same lesson foot placement learned
+// for its own switch values.
+static int   g_switchInv  = 3;      // FootSteerSwitchInvert
+static float g_swBlend    = 0.0f;   // 0 = regular, 1 = switch
 static int   g_followIK   = 1;      // FootSteerFollowIK
 static const float kAlphaMin = 0.02f;   // below this the socket is meaningless -- do not write at all
 
@@ -177,8 +186,10 @@ void FootSteer_ReadConfig(const char* buf) {
     g_frame      = TwkIniInt(buf, "FootSteerFrame", 3);
     g_axisX      = TwkIniInt(buf, "FootSteerAxisX", 1);
     g_axisY      = TwkIniInt(buf, "FootSteerAxisY", 0);
-    g_twistDeg   = (float)TwkIniInt(buf, "FootSteerTwistDeg", 25);
-    g_twistAxis  = TwkIniInt(buf, "FootSteerTwistAxis", 1);
+    g_twistDeg   = (float)TwkIniInt(buf, "FootSteerTwistDeg", 5);
+    g_twistAxis  = TwkIniInt(buf, "FootSteerTwistAxis", 4);
+    g_switchInv  = TwkIniInt(buf, "FootSteerSwitchInvert", 3);
+    if (g_switchInv < 0 || g_switchInv > 3) g_switchInv = 3;
     g_followIK   = TwkIniInt(buf, "FootSteerFollowIK", 1);
     // Divide-by-zero and reach-nothing guards, before anything can use the values.
     if (g_deadzone < 0.0f)   g_deadzone = 0.0f;   else if (g_deadzone > 0.90f) g_deadzone = 0.90f;
@@ -189,16 +200,17 @@ void FootSteer_ReadConfig(const char* buf) {
     if (g_frame < 0 || g_frame > 3) g_frame = 3;
     if (g_axisX < 0 || g_axisX > 5) g_axisX = 1;
     if (g_axisY < 0 || g_axisY > 5) g_axisY = 0;
-    if (g_twistAxis < 0 || g_twistAxis > 5) g_twistAxis = 1;
+    if (g_twistAxis < 0 || g_twistAxis > 5) g_twistAxis = 4;
     if (g_twistDeg < 0.0f) g_twistDeg = 0.0f; else if (g_twistDeg > 90.0f) g_twistDeg = 90.0f;
     // Every parsed key echoed: a value disagreeing with the ini has to be visible before any of the
     // behaviour built on it is worth interpreting.
     TwkLog("[steer] config: FootSteer=%d Probe=%d ProbeAxis=%d ProbeCm=%d ReachCm=%.0f "
            "ResponseMs=%.0f ReturnMs=%.0f Deadzone=%.2f FlickVeto=%.1f BlankMs=%d CatchVeto=%d "
-           "Frame=%d AxisX=%d AxisY=%d FollowIK=%d (air only, position only)",
+           "Frame=%d AxisX=%d AxisY=%d TwistDeg=%.0f TwistAxis=%d SwitchInvert=%d FollowIK=%d "
+           "(air only)",
            g_on, g_probe, g_probeAxis, g_probeCm, g_reachCm, g_responseMs, g_returnMs,
            g_deadzone, g_flickVeto, g_blankMs, g_catchVeto, g_frame, g_axisX, g_axisY,
-           g_followIK);
+           g_twistDeg, g_twistAxis, g_switchInv, g_followIK);
 }
 
 void FootSteer_SaveConfig(char* buf, size_t cap) {
@@ -218,6 +230,7 @@ void FootSteer_SaveConfig(char* buf, size_t cap) {
     TwkIniSetInt(buf, cap, "FootSteerAxisY",       g_axisY);
     TwkIniSetInt(buf, cap, "FootSteerTwistDeg",    (int)g_twistDeg);
     TwkIniSetInt(buf, cap, "FootSteerTwistAxis",   g_twistAxis);
+    TwkIniSetInt(buf, cap, "FootSteerSwitchInvert", g_switchInv);
     TwkIniSetInt(buf, cap, "FootSteerFollowIK",    g_followIK);
 }
 
@@ -252,7 +265,10 @@ static bool   g_rotHeld[2] = { false, false };
 // the very DeltaTime the samples are timed against.
 struct Sample {
     float t;
-    int   st;           // bit0 air, bit1 catch, bit2 crank
+    int   st;           // bit0 air, bit1 catch(any), bit2 crank, bit3 switch
+    // The three catch indications SEPARATELY. The veto tests only the per-FOOT pair; if a stance
+    // sets the state byte without them, that is exactly why it does not fire there.
+    int   cS, cL, cR;
     float aL, aR;       // foot IK alphas -- 0 means the graph is ignoring the socket entirely
     float sL[3], sR[3];
     float lx, ly, rx, ry;
@@ -283,12 +299,17 @@ static void dumpSamples() {
     float aLmin = 9e9f, aLmax = -9e9f, aRmin = 9e9f, aRmax = -9e9f;
     float auMin = 9e9f, auMax = -9e9f, gapMax = 0.0f;
     int nAir = 0, nCatch = 0, nCrank = 0, nAlpha0 = 0;
+    // Counted SEPARATELY and over airborne samples only: the veto reads the per-foot pair, so a
+    // stance where only the state byte is set is a stance where the veto never fires.
+    int nSwitch = 0, nCatchS = 0, nCatchL = 0, nCatchR = 0;
     float deckMin = 9e9f, deckMax = -9e9f;   // the board's travel relative to you: a bone shows here
     for (int i = 0; i < g_nBuf; i++) {
         const Sample& s = g_buf[i];
         if (s.st & 2) nCatch++;  if (s.st & 4) nCrank++;
         if (!(s.st & 1)) continue;
         nAir++;
+        if (s.st & 8) nSwitch++;
+        if (s.cS > 0) nCatchS++;  if (s.cL > 0) nCatchL++;  if (s.cR > 0) nCatchR++;
         if (s.aL < aLmin) aLmin = s.aL;  if (s.aL > aLmax) aLmax = s.aL;
         if (s.aR < aRmin) aRmin = s.aR;  if (s.aR > aRmax) aRmax = s.aR;
         if (s.aL <= 0.0f && s.aR <= 0.0f) nAlpha0++;
@@ -305,10 +326,14 @@ static void dumpSamples() {
     if (nAir == 0) { aLmin = aLmax = aRmin = aRmax = auMin = auMax = 0.0f; }
     TwkLog("[steer] air: %d samples over %.2f s%s | AIRBORNE=%d of them | foot IK alpha L %.2f..%.2f "
            "R %.2f..%.2f (%d airborne samples with NO ik) | auto-adjust Z %.2f..%.2f cm | worst "
-           "target gap %.1f cm | catch=%d crank=%d | board %.1f..%.1f cm from you%s",
+           "target gap %.1f cm | crank=%d | AIRBORNE catch: state=%d Lfoot=%d Rfoot=%d%s | "
+           "switch=%d | board %.1f..%.1f cm from you%s",
            g_nBuf, g_buf[g_nBuf - 1].t, g_bufFull ? " (TRUNCATED)" : "", nAir,
-           aLmin, aLmax, aRmin, aRmax, nAlpha0, auMin, auMax, gapMax, nCatch, nCrank,
-           deckMin, deckMax, (deckMax > 8.0f) ? "  <-- THE GAME'S BONE FIRED" : "");
+           aLmin, aLmax, aRmin, aRmax, nAlpha0, auMin, auMax, gapMax, nCrank,
+           nCatchS, nCatchL, nCatchR,
+           // The whole question in one tag: the veto only reads the per-foot pair.
+           (nCatchS > 0 && nCatchL == 0 && nCatchR == 0) ? "  <-- STATE ONLY, VETO CANNOT FIRE" : "",
+           nSwitch, deckMin, deckMax, (deckMax > 8.0f) ? "  <-- THE GAME'S BONE FIRED" : "");
     // A decimated trace rather than everything: the shape over the stretch is what is being read,
     // and 250 lines per trick would bury it.
     const int want = 12;
@@ -319,14 +344,15 @@ static void dumpSamples() {
         const Sample& s = g_buf[i];
         if (s.fL < 0.0f) strcpy(fl, "-"); else snprintf(fl, sizeof(fl), "%.1f", s.fL);
         if (s.fR < 0.0f) strcpy(fr, "-"); else snprintf(fr, sizeof(fr), "%.1f", s.fR);
-        TwkLog("[steer]   t=%.2f %c%c%c a(%.2f,%.2f) sockL(%.1f,%.1f,%.1f) sockR(%.1f,%.1f,%.1f) "
+        TwkLog("[steer]   t=%.2f %c%c%c%c a(%.2f,%.2f) sockL(%.1f,%.1f,%.1f) sockR(%.1f,%.1f,%.1f) "
                "stickL(%+.2f,%+.2f) stickR(%+.2f,%+.2f) flick(%s,%s) autoZ(%+.2f,%+.2f) "
-               "gap(%.1f,%.1f) deckX(%.1f) meshX(%.1f)",
+               "gap(%.1f,%.1f) catch(s=%d,L=%d,R=%d) deckX(%.1f) meshX(%.1f)",
                s.t, (s.st & 1) ? 'A' : '.', (s.st & 2) ? 'C' : '.', (s.st & 4) ? 'K' : '.',
+               (s.st & 8) ? 'W' : '.',
                s.aL, s.aR,
                s.sL[0], s.sL[1], s.sL[2], s.sR[0], s.sR[1], s.sR[2],
                s.lx, s.ly, s.rx, s.ry, fl, fr, s.autoL, s.autoR, s.gapL, s.gapR,
-               s.deckX, s.meshX);
+               s.cS, s.cL, s.cR, s.deckX, s.meshX);
     }
     g_nBuf = 0; g_bufFull = false;
 }
@@ -503,8 +529,21 @@ bool FootSteer_AddOffset(void* a, float dt, float outL[3], float outR[3]) {
         // whole hold -- correct, because that gesture belongs to the game's own boned ollie. An
         // edge-triggered version was tried so foot control would work through an ollie too; it was
         // rejected in the headset. Foot control is for flip tricks; the bone owns the ollie.
-        const bool catchNowL = (g_catchVeto != 0) && (catchL > 0);
-        const bool catchNowR = (g_catchVeto != 0) && (catchR > 0);
+        // ⚠️ ON AN OLLIE THE BONE OWNS BOTH FEET, and the per-foot flags cannot express that.
+        // Measured across the four stances: the game flags only ONE foot for an ollie's catch
+        // orient, and in SWITCH and FAKIE it is the opposite foot from the stick being held --
+        //   NLS nollie: state=53 Rfoot=53, right stick held  -> the held foot was flagged, blanked
+        //   SWS ollie : state=63 Lfoot=60 Rfoot=9, RIGHT held -> unflagged, steered 5 cm
+        //   FKS ollie : state=62 Lfoot=0 Rfoot=62, LEFT held  -> unflagged, steered 29.5 cm
+        // Regular and nollie only looked correct because the flagged foot happened to be the one
+        // under the thumb. So: an ollie (no flip, no rotation) with ANY catch indication surrenders
+        // BOTH feet. A flip trick keeps the per-foot split, so catching with one foot still leaves
+        // the other one yours -- which is the whole point of that split.
+        const bool ollieLike = !(flipping > 0) && !(rotating > 0);
+        const bool anyCatch  = (catchSt > 0) || (catchL > 0) || (catchR > 0);
+        const bool bothFeet  = ollieLike && anyCatch;
+        const bool catchNowL = (g_catchVeto != 0) && ((catchL > 0) || bothFeet);
+        const bool catchNowR = (g_catchVeto != 0) && ((catchR > 0) || bothFeet);
         // ⚠️ THE STATE GATE AND THE APPLY GATE ARE SEPARATE. Folding the feature toggle into the
         // state test would mean the probe recorded nothing whenever steering was off -- which is
         // exactly the configuration a measurement round runs in.
@@ -518,6 +557,20 @@ bool FootSteer_AddOffset(void* a, float dt, float outL[3], float outR[3]) {
         if (step > 1.0f) step = 1.0f;
         g_ease += ((applying ? 1.0f : 0.0f) - g_ease) * step;
         if (g_ease < 0.001f) g_ease = 0.0f; else if (g_ease > 0.999f) g_ease = 1.0f;
+
+        // Stance, on the SAME ramp and for the same reason: you can land into switch off a half-cab,
+        // and a sign that flips on a frame boundary would snap the foot across. Riding the blend
+        // through zero instead just returns the foot to neutral and takes it out the other way.
+        const int swNow = twkB(a, AN_IS_SWITCH);
+        g_swBlend += (((swNow > 0) ? 1.0f : 0.0f) - g_swBlend) * step;
+        if (g_swBlend < 0.001f) g_swBlend = 0.0f; else if (g_swBlend > 0.999f) g_swBlend = 1.0f;
+        // +1 regular, -1 fully switch, for whichever components are configured to flip.
+        const float invX = (g_switchInv & 1) ? (1.0f - 2.0f * g_swBlend) : 1.0f;
+        const float invY = (g_switchInv & 2) ? (1.0f - 2.0f * g_swBlend) : 1.0f;
+        // Applied HERE, at the point of use -- never to the stored steer, or the rate limiter would
+        // see the flip as a step change and chase its own sign.
+        const float lX = g_footL.s[0] * invX, lY = g_footL.s[1] * invY;
+        const float rX = g_footR.s[0] * invX, rY = g_footR.s[1] * invY;
 
         const bool blankL = updateFoot(g_footL, false, armed, catchNowL, dt, now);
         const bool blankR = updateFoot(g_footR, true,  armed, catchNowR, dt, now);
@@ -553,10 +606,8 @@ bool FootSteer_AddOffset(void* a, float dt, float outL[3], float outR[3]) {
             if (wL > 0.0f) buildDelta(a, g_probeAxis, -1, 1.0f, 0.0f, (float)g_probeCm * g_ease * wL, dL);
             if (wR > 0.0f) buildDelta(a, g_probeAxis, -1, 1.0f, 0.0f, (float)g_probeCm * g_ease * wR, dR);
         } else if (g_ease > 0.0f) {
-            if (wL > 0.0f)
-                buildDelta(a, g_axisX, g_axisY, g_footL.s[0], g_footL.s[1], g_reachCm * g_ease * wL, dL);
-            if (wR > 0.0f)
-                buildDelta(a, g_axisX, g_axisY, g_footR.s[0], g_footR.s[1], g_reachCm * g_ease * wR, dR);
+            if (wL > 0.0f) buildDelta(a, g_axisX, g_axisY, lX, lY, g_reachCm * g_ease * wL, dL);
+            if (wR > 0.0f) buildDelta(a, g_axisX, g_axisY, rX, rY, g_reachCm * g_ease * wR, dR);
         }
         if (dL[0] != 0.0f || dL[1] != 0.0f || dL[2] != 0.0f ||
             dR[0] != 0.0f || dR[1] != 0.0f || dR[2] != 0.0f) {
@@ -570,11 +621,11 @@ bool FootSteer_AddOffset(void* a, float dt, float outL[3], float outR[3]) {
         float axis[3] = { 0, 0, 0 };
         const bool haveAxis = (!probing && g_twistDeg > 0.0f && g_ease > 0.0f)
                               ? frameAxis(a, g_twistAxis, axis) : false;
-        applyTwist(a, AN_L_SOCK_ROT, 0, axis,
-                   haveAxis ? g_footL.s[1] * g_twistDeg * g_ease * wL : 0.0f);
-        applyTwist(a, AN_R_SOCK_ROT, 1, axis,
-                   haveAxis ? g_footR.s[1] * g_twistDeg * g_ease * wR : 0.0f);
-        if (haveAxis && (g_footL.s[1] != 0.0f || g_footR.s[1] != 0.0f)) wrote = true;
+        // The twist takes the same inverted Y, so "push forward, toe forward" still means forward
+        // from where YOU are standing when you are riding switch.
+        applyTwist(a, AN_L_SOCK_ROT, 0, axis, haveAxis ? lY * g_twistDeg * g_ease * wL : 0.0f);
+        applyTwist(a, AN_R_SOCK_ROT, 1, axis, haveAxis ? rY * g_twistDeg * g_ease * wR : 0.0f);
+        if (haveAxis && (lY != 0.0f || rY != 0.0f)) wrote = true;
 
 
         // ---- sampling
@@ -587,7 +638,9 @@ bool FootSteer_AddOffset(void* a, float dt, float outL[3], float outR[3]) {
                     s.t  = (float)(now - g_armT0);
                     s.st = (air ? 1 : 0) |
                            (((catchSt > 0) || (catchL > 0) || (catchR > 0)) ? 2 : 0) |
-                           ((cranking > 0) ? 4 : 0);
+                           ((cranking > 0) ? 4 : 0) |
+                           ((swNow > 0) ? 8 : 0);
+                    s.cS = catchSt; s.cL = catchL; s.cR = catchR;
                     s.aL = twkF(a, AN_L_ALPHA);   s.aR = twkF(a, AN_R_ALPHA);
                     for (int i = 0; i < 3; i++) {
                         s.sL[i] = twkF(a, AN_L_SOCK_LOC + i * 4);
@@ -727,6 +780,11 @@ void  FootSteer_SetTwistDeg(float deg) {
     if (deg < 0.0f) deg = 0.0f; else if (deg > 90.0f) deg = 90.0f;
     g_twistDeg = deg; TwkMarkDirty();
 }
+float FootSteer_SwitchInvert() { return (float)g_switchInv; }
+void  FootSteer_SetSwitchInvert(float v) {
+    int s = (int)(v + 0.5f); if (s < 0) s = 0; else if (s > 3) s = 3;
+    g_switchInv = s; TwkMarkDirty();
+}
 float FootSteer_TwistAxis()   { return (float)g_twistAxis; }
 void  FootSteer_SetTwistAxis(float a) {
     int v = (int)(a + 0.5f); if (v < 0) v = 0; else if (v > 5) v = 5;
@@ -743,10 +801,13 @@ const char* FootSteer_FrameName() {
 
 void FootSteer_ResetDefaults() {
     g_on = 0; g_probe = 1; g_probeAxis = 0; g_probeCm = 0;
-    g_reachCm = 12.0f; g_responseMs = 300.0f; g_returnMs = 150.0f;
-    g_deadzone = 0.25f; g_flickVeto = 10.0f; g_blankMs = 250; g_catchVeto = 1;
+    // ⚠️ These must track the field-tuned values at the top of the file. They drifted once already:
+    // the statics were updated when each number was settled in the headset and these were not, so
+    // "Reset to defaults" would have quietly restored the pre-tuning feel.
+    g_reachCm = 30.0f; g_responseMs = 300.0f; g_returnMs = 150.0f;
+    g_deadzone = 0.05f; g_flickVeto = 10.0f; g_blankMs = 250; g_catchVeto = 1;
     g_frame = 3; g_axisX = 1; g_axisY = 0;
-    g_twistDeg = 25.0f; g_twistAxis = 1; g_followIK = 1;
+    g_twistDeg = 5.0f; g_twistAxis = 4; g_switchInv = 3; g_followIK = 1;
     TwkMarkDirty();
 }
 
@@ -787,6 +848,9 @@ void FootSteer_DrawMenu(const OmpMenuApi* api) {
         if (api->SliderFloat("Foot twist (deg)", &tw, 0.0f, 90.0f, "%.0f")) FootSteer_SetTwistDeg(tw);
         api->SameLine(); api->TextDisabled("(push up = toe forward, pull back = toe back)");
         if (api->SliderFloat("Twist about axis", &ta, 0.0f, 5.0f, "%.0f")) FootSteer_SetTwistAxis(ta);
+        float si = (float)g_switchInv;
+        if (api->SliderFloat("Invert when switch", &si, 0.0f, 3.0f, "%.0f")) FootSteer_SetSwitchInvert(si);
+        api->SameLine(); api->TextDisabled("(0 none, 1 sideways, 2 forward/back, 3 both)");
         bool fik = g_followIK != 0;
         if (api->Checkbox("Fade with the game's foot IK", &fik)) { g_followIK = fik ? 1 : 0; TwkMarkDirty(); }
         api->SameLine(); api->TextDisabled("(off = fight it, for A/B)");

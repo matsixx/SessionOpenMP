@@ -24,7 +24,10 @@ namespace omp { namespace dropsync {
 // and needs its own letter. OMPL and OMPM are RETIRED and must never be reused -- a stale build has
 // to reject these packets, not misparse a record whose length it disagrees about.
 static const uint32_t kMagic = 0x4E504D4Fu;   // "OMPN"
-enum : uint8_t { kSet = 1, kPlace = 2, kMove = 3, kRemove = 4 };
+// kWorldSet/kWorldMove are LATER ADDITIONS and need no magic bump: an older build's `default:`
+// ignores an unknown subtype, so a mixed pair simply does not share the level's props -- the
+// extension path replaysync's kAck established.
+enum : uint8_t { kSet = 1, kPlace = 2, kMove = 3, kRemove = 4, kWorldSet = 5, kWorldMove = 6 };
 
 // Under the transport's ~1 KB message convention with room to spare for the name table.
 static const int kMaxPacket = 1000;
@@ -185,6 +188,54 @@ int SendSet(int peerIdx, uint8_t gen, uint64_t authKey, const Rec* recs, int n, 
     return parts;
 }
 
+int SendWorldSet(int peerIdx, uint8_t gen, const char* const* names, int n) {
+    if (!g_send || !names || n <= 0) return 0;
+    int sent = 0;
+    for (int at = 0; at < n; ) {
+        uint8_t pkt[kMaxPacket];
+        Wr w{ pkt, kMaxPacket, 0, true };
+        w.u32(kMagic); w.u8(kWorldSet); w.u8(gen);
+        const int countAt = w.n;
+        w.u8(0);
+        int took = 0, wrote = 0;
+        for (int i = at; i < n && wrote < kWorldNameBatch; i++) {
+            const int l = names[i] ? (int)strlen(names[i]) : 0;
+            took++;
+            if (!validName(names[i], l)) continue;    // consumed, not written
+            if (w.n + 1 + l > kMaxPacket) { took--; break; }
+            w.u8((uint8_t)l); w.b(names[i], l);
+            wrote++;
+        }
+        if (!w.ok || took == 0) break;
+        // The COUNT is what actually went in. A count that disagrees with the payload is how a
+        // reader walks off the end of a packet.
+        pkt[countAt] = (uint8_t)wrote;
+        if (wrote > 0) { g_send(peerIdx, pkt, w.n, true); g_st.sent++; sent++; }
+        at += took;
+    }
+    return sent;
+}
+
+int SendWorldMove(int peerIdx, uint8_t gen, const char* name, const float loc[3], const float quat[4],
+                  bool claim) {
+    if (!g_send || !name) return 0;
+    const int l = (int)strlen(name);
+    if (!validName(name, l)) return 0;
+    uint8_t pkt[kMaxPacket];
+    Wr w{ pkt, kMaxPacket, 0, true };
+    w.u32(kMagic); w.u8(kWorldMove); w.u8(gen);
+    w.u8((uint8_t)l); w.b(name, l);
+    for (int i = 0; i < 3; i++) w.f32(loc[i]);
+    for (int i = 0; i < 4; i++) w.f32(quat[i]);
+    w.u8(claim ? 1 : 0);
+    if (!w.ok) return 0;
+    // UNRELIABLE while held (a superseded drag pose is worthless), RELIABLE on release: that last one
+    // is where the prop actually ends up, and losing it would leave everyone else a step behind.
+    g_send(peerIdx, pkt, w.n, !claim);
+    g_st.sent++;
+    return 1;
+}
+
 int SendPlace(int peerIdx, uint8_t gen, const Rec& r) {
     if (!g_send) return 0;
     const int l = (int)strlen(r.id);
@@ -249,6 +300,8 @@ struct PeerIn {
     uint8_t  asmGen = 0; int nextPart = -1, partCount = 0;
     Rec      scratch[kRecsPerPacket];                // decoded place/move records for this packet
     uint16_t ids[256];
+    char     worldBuf[kWorldNameBatch][kMaxNameLen + 1];
+    const char* worldPtr[kWorldNameBatch];
 };
 static PeerIn g_in[kPeers];
 
@@ -368,6 +421,41 @@ bool OnPacket(int peerIdx, const uint8_t* d, int len, Update& out) {
         for (int i = 0; i < n; i++) if (!readRec(r, in.scratch[i], nullptr, 0)) { g_st.rejected++; return false; }
         if (r.n != len) { g_st.rejected++; return false; }
         out.nMove = n; out.move = in.scratch;
+        g_st.recv++;
+        return true;
+    }
+    case kWorldSet: {
+        const int n = (int)r.u8();
+        if (!r.ok || n <= 0 || n > kWorldNameBatch) { g_st.rejected++; return false; }
+        for (int i = 0; i < n; i++) {
+            const int l = (int)r.u8();
+            if (!r.ok || l <= 0 || l > kMaxNameLen) { g_st.rejected++; return false; }
+            if (!r.b(in.worldBuf[i], l)) { g_st.rejected++; return false; }
+            in.worldBuf[i][l] = 0;
+            if (!validName(in.worldBuf[i], l)) { g_st.rejected++; return false; }
+            in.worldPtr[i] = in.worldBuf[i];
+        }
+        if (r.n != len) { g_st.rejected++; return false; }
+        out.nWorldSet = n; out.worldSet = in.worldPtr;
+        g_st.recv++;
+        return true;
+    }
+    case kWorldMove: {
+        const int l = (int)r.u8();
+        if (!r.ok || l <= 0 || l > kMaxNameLen) { g_st.rejected++; return false; }
+        if (!r.b(in.worldBuf[0], l)) { g_st.rejected++; return false; }
+        in.worldBuf[0][l] = 0;
+        if (!validName(in.worldBuf[0], l)) { g_st.rejected++; return false; }
+        float loc[3], quat[4];
+        for (int i = 0; i < 3; i++) loc[i]  = r.f32();
+        for (int i = 0; i < 4; i++) quat[i] = r.f32();
+        const bool claim = (r.u8() & 1) != 0;
+        if (!r.ok || r.n != len) { g_st.rejected++; return false; }
+        if (!finite3(loc, kWorldLimit) || !unitQuat(quat)) { g_st.rejected++; return false; }
+        out.haveWorldMove = true; out.worldMoveName = in.worldBuf[0];
+        memcpy(out.worldMoveLoc, loc, sizeof(loc));
+        memcpy(out.worldMoveQuat, quat, sizeof(quat));
+        out.worldMoveClaim = claim;
         g_st.recv++;
         return true;
     }

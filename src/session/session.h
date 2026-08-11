@@ -57,6 +57,7 @@ struct Stats {
     uint32_t published = 0, received = 0, appliedFrames = 0;
     float    publishHz = 0;
     int      dropOwn = 0, dropRemote = 0;   // dropped objects: ours published / peers' standing here
+    int      dropWorld = 0;                 // level props swapped for a shared session copy
 };
 
 // Called once per game frame. `ownPawn` may be null (menus, loading) -- everything degrades to a no-op.

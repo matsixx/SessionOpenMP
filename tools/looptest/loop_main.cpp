@@ -1059,6 +1059,47 @@ static bool dropSyncCheck() {
     if (!OnPacket(3, g_dropPkts[0].data(), (int)g_dropPkts[0].size(), up) || up.nRemove != 3 ||
         up.remove[2] != 65535) { printf("  drop: remove round-trip wrong\n"); return false; }
 
+    // ---- THE LEVEL'S OWN PROPS. Membership is names only; a move is one prop's pose from whoever is
+    // holding it. An unsendable name must be skipped WITHOUT corrupting the count, or the reader walks
+    // off the end of the packet.
+    {
+        const char* q[4] = { "STM_NYC_TrashCan_9", "PBP_OBJ_AveBench_C", "Bench With Spaces_2", "" };
+        g_dropPkts.clear();
+        ForgetPeer(7);
+        if (SendWorldSet(7, 3, q, 4) != 1) { printf("  drop: world set did not send\n"); return false; }
+        if (!OnPacket(7, g_dropPkts[0].data(), (int)g_dropPkts[0].size(), up) || up.nWorldSet != 3) {
+            printf("  drop: world set round-trip wrong (%d names, want 3)\n", up.nWorldSet); return false;
+        }
+        if (strcmp(up.worldSet[0], q[0]) != 0 || strcmp(up.worldSet[2], q[2]) != 0) {
+            printf("  drop: world set names wrong\n"); return false;
+        }
+        const float wl[3] = { -1234.5f, 6789.25f, 12.5f };
+        const float wq[4] = { 0.5f, 0.5f, 0.5f, 0.5f };
+        g_dropPkts.clear();
+        if (SendWorldMove(7, 3, q[0], wl, wq, true) != 1) { printf("  drop: world move did not send\n"); return false; }
+        if (!OnPacket(7, g_dropPkts[0].data(), (int)g_dropPkts[0].size(), up) || !up.haveWorldMove ||
+            !up.worldMoveClaim || strcmp(up.worldMoveName, q[0]) != 0) {
+            printf("  drop: world move round-trip wrong\n"); return false;
+        }
+        for (int k = 0; k < 3; k++) if (up.worldMoveLoc[k] != wl[k]) {
+            printf("  drop: world move position %d changed\n", k); return false;
+        }
+        // A release must be distinguishable from a hold: it is the packet that hands the prop back.
+        g_dropPkts.clear();
+        SendWorldMove(7, 3, q[0], wl, wq, false);
+        if (!OnPacket(7, g_dropPkts[0].data(), (int)g_dropPkts[0].size(), up) || up.worldMoveClaim) {
+            printf("  drop: a released world prop still reads as claimed\n"); return false;
+        }
+        // ...and a hostile pose must not reach a spawn.
+        g_dropPkts.clear();
+        const float badQ[4] = { 1.9f, 0.f, 0.f, 0.f };
+        SendWorldMove(7, 3, q[0], wl, badQ, false);
+        ForgetPeer(7);
+        if (!g_dropPkts.empty() && OnPacket(7, g_dropPkts[0].data(), (int)g_dropPkts[0].size(), up)) {
+            printf("  drop: a non-unit world rotation was accepted\n"); return false;
+        }
+    }
+
     // ---- TRUNCATION. No strict prefix of a valid packet may ever parse, and no packet with trailing
     // bytes may either -- the bounds cursor's whole promise against hostile input.
     g_dropPkts.clear();
@@ -1066,6 +1107,10 @@ static bool dropSyncCheck() {
     SendPlace(4, 1, set[0]);
     SendMove(4, 1, set, 6);
     SendRemove(4, 1, ids, 3);
+    { const char* w2[2] = { "STM_NYC_TrashCan_9", "PBP_OBJ_AveBench_C" };
+      SendWorldSet(4, 1, w2, 2);
+      const float wl2[3] = {1.f,2.f,3.f}, wq2[4] = {0.f,0.f,0.f,1.f};
+      SendWorldMove(4, 1, w2[0], wl2, wq2, true); }
     int prefixesTried = 0;
     for (auto& p : g_dropPkts) {
         for (int cut = 1; cut < (int)p.size(); cut++) {

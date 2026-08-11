@@ -79,6 +79,21 @@ int SendPlace(int peerIdx, uint8_t gen, const Rec& r);
 int SendMove(int peerIdx, uint8_t gen, const Rec* recs, int n);
 int SendRemove(int peerIdx, uint8_t gen, const uint16_t* ids, int n);
 
+// ---- THE LEVEL'S OWN PROPS ---------------------------------------------------------------------
+// A separate, tiny lane, deliberately NOT part of the object set above. A session prop is not owned
+// by anybody: every client spawns its own copy at the map default, so the STARTING layout needs no
+// transfer at all -- only membership does, and then whoever picks one up says where it went.
+//   kWorldSet   the actor NAMES this player's save has moved. Unioned by everyone; each name becomes
+//               one session copy on every machine. Names, not poses: the pose is the map default,
+//               which every client computes from its own copy of the level.
+//   kWorldMove  one prop's pose, sent by whoever is holding it. `claim` is true while they still have
+//               it. Only the holder ever sends, so there is exactly one writer per prop at all times
+//               and nothing has to be arbitrated afterwards.
+static const int kWorldNameBatch = 10;
+int SendWorldSet(int peerIdx, uint8_t gen, const char* const* names, int n);
+int SendWorldMove(int peerIdx, uint8_t gen, const char* name, const float loc[3], const float quat[4],
+                  bool claim);
+
 // ---- receiver ----------------------------------------------------------------------------------
 // What one received packet asks the caller to do. Pointers are into dropsync's own storage and are
 // valid until the next OnPacket for that peer.
@@ -91,6 +106,14 @@ struct Update {
     int     nPlace     = 0;   const Rec*      place  = nullptr;
     int     nMove      = 0;   const Rec*      move   = nullptr;
     int     nRemove    = 0;   const uint16_t* remove = nullptr;
+    // The level's own props. `worldSet` is a membership list; a world MOVE is one prop's pose from
+    // whoever is holding it.
+    int         nWorldSet = 0; const char* const* worldSet = nullptr;
+    bool        haveWorldMove = false;
+    const char* worldMoveName = nullptr;
+    float       worldMoveLoc[3] = {0,0,0};
+    float       worldMoveQuat[4] = {0,0,0,1};
+    bool        worldMoveClaim = false;
 };
 // False = not ours, malformed, truncated, or from a peer index we cannot track. Never partially
 // applies: `out` is only filled from a packet that parsed completely.

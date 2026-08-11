@@ -48,6 +48,7 @@ bool CatchTweaks_TravelVel(float* vx, float* vy, float* vz);
 void CatchTweaks_PumpFrame();
 // A registered catch ends the flip at griptape-up instead of letting it spin another revolution.
 bool CatchTweaks_StopsFlip();  void CatchTweaks_SetStopsFlip(bool on);
+bool CatchTweaks_AnyRevolution();  void CatchTweaks_SetAnyRevolution(bool on);
 // Tune the game's own boned ollie. It is authored catch-orient data -- FCatchOrientSettings carries
 // four BoardRelativeOffset vectors that shove the board forward of the skater while both sticks are
 // held, the legs following because the feet are IK'd to the deck. Lives here because this module

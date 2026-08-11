@@ -38,6 +38,11 @@ struct Flags {
     // its EVALUATION is usable. If a peer skates live under this flag, the driver lane works in
     // replay and the pose lane can shrink to the sender side only. Both clients need it on.
     bool replayDriverTest = false;
+    // The level's-own-props handover, traced leg by leg: claimed locally, published, received,
+    // driving. That state machine spans two machines, and three rounds went on guessing which leg
+    // was missing before it was written -- the feature is unfinished, so it will be wanted again.
+    // Capped internally, so turning it on cannot flood a log.
+    bool dropWorld        = false;
 };
 
 // Header-only: one shared instance across every translation unit that includes this.

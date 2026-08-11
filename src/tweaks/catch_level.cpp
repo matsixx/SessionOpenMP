@@ -50,6 +50,7 @@
 #include "tweaks_common.h"
 #include "ui/menu_ext.h"
 #include "catch_level.h"
+#include "catch_tweaks.h"    // CatchTweaks_Skater() -- so a proxy's component is never adopted
 #include "foot_place.h"
 #include <cmath>
 #include "MinHook.h"
@@ -207,7 +208,15 @@ void* CatchLevel_MovementComponent() { return g_realComp; }
 static void hkSetPitch(void* self, double angle) {
     __try {
         void* comp = (void*)((uint8_t*)self - SUBOBJ_TO_COMP);
-        if (comp != g_realComp) {
+        // ⚠️ Adopt OUR skater's component only. This fires for every skater, so in a co-op session a
+        // remote player's component would be adopted here and then written to -- both by the
+        // levelling in this module and by catch_tweaks' flip-rate stop, which takes this same
+        // pointer. The owner check was already computed for the log below; here it is a gate.
+        // Unknown local skater = accept, so solo is unaffected.
+        void* const mineC = CatchTweaks_Skater();
+        void* const ownerC = twkP(comp, MC_OWNER_SKATER);
+        const bool oursC = !(mineC && ownerC && mineC != ownerC);
+        if (oursC && comp != g_realComp) {
             const bool first = (g_realComp == nullptr);
             g_realComp = comp;
             if (first && g_log) {

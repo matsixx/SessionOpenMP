@@ -229,7 +229,17 @@ static double g_armT = 0.0;
 static bool   g_armFalling = false;
 
 static void* hkBail(void* skater, void* reason, uint64_t b1, uint64_t b2) {
-    if (g_runOut && g_setOnFoot && skater) {
+    // ⚠️ OUR skater only. Bail is per-skater, and in a co-op session SessionOpenMP deliberately calls
+    // the game's own Bail on remote players' proxies to replicate their bails -- so this hook fires
+    // for them. Everything below WRITES (ragdoll, on-foot mode, a velocity restore, a queued
+    // rotation), and a remote player must bail exactly as their own machine intended.
+    // Unknown local skater (before the catch system has run once) = solo behaviour, not off.
+    // The two bail-CHECK markers are deliberately left ungated: they only bump a re-entrancy counter
+    // around the original call, and with this gate in place a foreign check can no longer reach any
+    // decision of ours.
+    void* const mineB = CatchTweaks_Skater();
+    const bool ours = !(mineB && skater && mineB != skater);
+    if (ours && g_runOut && g_setOnFoot && skater) {
         __try {
             const uint64_t callerRva = (uint64_t)_ReturnAddress() - (uint64_t)GetModuleHandleA(nullptr);
             const bool fromCatch = g_catchOrientRva &&

@@ -56,7 +56,6 @@ struct MpUiState {
     bool  armed = false;
     int   peers = 0, proxies = 0;
     float pubHz = 0;
-    char  myId[40] = {0};
     char  myMap[40] = {0};      // the local INTERNAL level name -- the roster resolves it to a label
     char  bound[64] = {0};      // direct UDP: the local "ip:port" we are actually listening on, so a
                                 // host can read their own port back instead of trusting they typed it

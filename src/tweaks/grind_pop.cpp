@@ -51,6 +51,7 @@
 #include "tweaks_common.h"
 #include "ui/menu_ext.h"
 #include "grind_pop.h"
+#include "catch_tweaks.h"    // CatchTweaks_Skater() -- remote players keep vanilla
 #include "tweaks_mod.h"
 #include <cmath>
 #include <cctype>
@@ -309,9 +310,20 @@ static inline float argF(double d) {
     return f;
 }
 
+// ⚠️ OUR skater only. Both hooks below fire per skater, so in a co-op session they run for remote
+// players' proxies too -- and both of them WRITE. The pointer handed in is the skater on one path
+// and its movement component on the other, so rather than guess, either identity is accepted: the
+// object itself, or its +0x340 owner back-pointer. Unknown local skater = solo behaviour, not off.
+enum { MC_OWNER_SKATER_GP = 0x340 };
+static bool grindPopIsOurs(void* p) {
+    void* const mine = CatchTweaks_Skater();
+    if (!mine || !p) return true;
+    return (p == mine) || (twkP(p, MC_OWNER_SKATER_GP) == mine);
+}
+
 static char hkJumpForTrick(void* mc, double a2, double a3, double a4) {
     Rec* r = nullptr;
-    if (g_ok && g_on && mc) {
+    if (g_ok && g_on && mc && grindPopIsOurs(mc)) {
         __try {
             const LONG i = InterlockedIncrement(&g_wr) - 1;
             r = &g_recs[((i % kRecs) + kRecs) % kRecs];
@@ -430,8 +442,11 @@ static void hkPitchBoard(void* self, uint8_t mode, double a3) {
         const int   state = twkB(self, PB_STATE);
         float added = 0.0f;
         // The identity gate: the pitch sub-object's +0x208 is the skater. If that is not a pointer we
-        // are not looking at what we think we are, and nothing is written.
-        const bool identified = (twkP(self, PB_SKATER) != nullptr);
+        // are not looking at what we think we are, and nothing is written. It must also be OUR
+        // skater -- a validity check alone passes a remote player's proxy straight through.
+        void* const pbSk = twkP(self, PB_SKATER);
+        void* const minePB = CatchTweaks_Skater();
+        const bool identified = (pbSk != nullptr) && !(minePB && pbSk != minePB);
         // BOTH discriminators, or this fires on flat ground: mode 4 is the trick-END pitch generally,
         // and only state 3 is the grind. The grind def is checked too, exactly as the game's own
         // grind path does before it reads the authored curve.

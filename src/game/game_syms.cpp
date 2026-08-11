@@ -243,6 +243,8 @@ static const SigEntry kSigs[] = {
     // HOOK TARGETS, never called: the map-default seam. See the typedef comments.
     // UObjectDropperPersistentHandler::Load  Epic 0x10bf6c0 / Steam 0x107fab0 (sigmake)
     { "DropperLoad",          "4C 8B DC 55 57 41 57 49 8D AB B8 FE FF FF 48 81 EC 30 02 00 00 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 85 00 01 00 00", false },
+    // UObjectDropperPersistentHandler::Save  Epic 0x10d2030 / Steam 0x1092420 (sigmake)
+    { "DropperSave",          "4C 8B DC 55 56 41 56 49 8D 6B A1 48 81 EC B0 00 00 00 48 83 79 40 00 44 0F B6 F2 48 8B F1 0F 84 ?? ?? ?? ??", false },
     // AActor::SetActorLocation              Epic 0x29cdde0 / Steam 0x29906d0 (sigmake). Keeps the
     // RootComponent (+0x130) and ComponentToWorld (+0x1d0) displacements concrete -- they ARE the
     // identity of the function, and they corroborate off::kActorRootComp / kCompPos.
@@ -590,6 +592,7 @@ const Syms& Resolve(void (*logf)(const char*)) {
     g_syms.DropperObjInfoById = (ObjInfoByIdFn)   found[i++];
     g_syms.DropperPickableOf  = (PickableOfFn)    found[i++];
     g_syms.DropperLoad        =                     found[i++];   // hooked, never called directly
+    g_syms.DropperSave        =                     found[i++];   // hooked, never called directly
     g_syms.ActorSetLocation   =                     found[i++];   // hooked, never called directly
     g_syms.ActorDestroy       = (ActorDestroyFn)  found[i++];
 

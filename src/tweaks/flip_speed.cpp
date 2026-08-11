@@ -125,6 +125,59 @@ static const char* SIG_FLIP_MULT =
     "48 8B C4 48 89 58 08 48 89 68 10 48 89 70 18 57 41 56 41 57 48 81 EC F0 00 00 00 0F 29 70 D8 "
     "4D 8B F9";
 typedef float (*FlipMultFn)(void*, void*, unsigned char, void*);
+
+enum {
+    FTH_SKATER     = 0x08,    // FlipTricksHandler -> skater  (the base the stock code uses)
+    FTH_INPUT_HANDLER = 0x18,  // FlipTricksHandler -> InputHandler (the base the stock loop uses)
+    FTH_TRICKS_DB  = 0x28,    // ... -> UTricksDatabase
+    DB_FLIP_MIN    = 0x170,   // UTricksDatabase::FlipSpeedMinMultiplier
+    DB_FLIP_MAX    = 0x174,   // ... MaxMultiplier
+    SK_ADV_FLIP    = 0x9d0,   // ASkaterCharacterBase::_advancedSettings.FlipSpeedMultiplier
+    SK_FLIP_MODE   = 0x64f,   // _boardFlipSpeedMode (2 = magnitude, 3 = angle; else no mapping)
+    SK_SYNC_FLAGS  = 0x711,   // bit 0x20 = _isSyncFlipsScoopsEnabled
+    // FInputData (36 B) -- the game's OWN record of the gesture, handed to us as arg 4. This is the
+    // data the game itself matched to recognise the trick, so reading the flick from here works
+    // wherever tricks work: no separate sampling of the stick, nothing to differ between machines.
+    FID_INPUT = 0x00, FID_LSTICK = 0x08, FID_RSTICK = 0x10,
+    FID_ANGLE = 0x18, FID_TOTAL_TIME = 0x20, FID_STRIDE = 0x24,
+};
+
+// ---- the game's own entry match ------------------------------------------------------------------
+// The recorded EInputType is NOT comparable raw. GetBoardFlipSpeedMultiplier's own loop normalises
+// each entry by stance first and compares THAT:
+//     IsSkatingGoofy(skater) -> goofy ; IsSkatingSwitch(skater) -> sw
+//     ConvertToCurrentInputModeInput(inputHandler, rawType, sw, goofy) ; cmp result, expectedType
+// Comparing raw only agrees in regular stance. On goofy nothing matched, the lookup fell through to
+// a guess, and it picked a different row of the array entirely -- one that had been active 300+ ms
+// instead of the flick's own 17-25 ms. Same controller, same gesture, different entry, so every
+// derived number was incomparable between two players. Call the game's functions and the entry is
+// the one the game itself chose.
+static const char* SIG_IS_GOOFY =
+    "48 83 EC 28 48 8B 01 FF 90 ?? ?? ?? ?? 3C 01 0F 94 C0 48 83 C4 28 C3";
+static const char* SIG_IS_SWITCH =
+    "0F B6 81 98 05 00 00 2C 02 A8 FD 0F 94 C0 C3";
+static const char* SIG_CONVERT_INPUT =
+    "48 83 EC 28 0F B6 41 20 45 84 C9 ?? ?? 3C 02 ?? ?? 45 84 C0 ?? ?? 0F B6 CA E8 ?? ?? ?? ?? "
+    "0F B6 D0";
+typedef bool          (*IsStanceFn)(void*);
+typedef unsigned char (*ConvertInputFn)(void*, unsigned int, unsigned int, unsigned int);
+static IsStanceFn     g_isGoofy = nullptr, g_isSwitch = nullptr;
+static ConvertInputFn g_convertInput = nullptr;
+// Normalise a recorded type the way the game does. Falls back to the raw value when the functions
+// are unavailable, which is the old behaviour rather than no behaviour.
+static unsigned char NormalisedType(void* fth, unsigned char raw) {
+    if (!g_convertInput || !g_isGoofy || !g_isSwitch) return raw;
+    unsigned char out = raw;
+    __try {
+        void* skater = twkP(fth, FTH_SKATER);
+        void* ih     = twkP(fth, FTH_INPUT_HANDLER);
+        if (!skater || !ih) return raw;
+        const unsigned int goofy = g_isGoofy(skater) ? 1u : 0u;
+        const unsigned int sw    = g_isSwitch(skater) ? 1u : 0u;
+        out = g_convertInput(ih, raw, sw, goofy);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return raw; }
+    return out;
+}
 static void* g_orig = nullptr, *g_start = nullptr;
 static bool  g_installed = false;
 static int   g_ok = 1;                       // runtime health, NEVER persisted
@@ -137,16 +190,6 @@ static char g_lastTrick[80] = "?";
 const char* FlipSpeed_LastTrickName() { return g_lastTrick; }
 static volatile LONG g_trickSerial = 0;
 LONG FlipSpeed_TrickSerial() { return g_trickSerial; }
-
-enum {
-    FTH_SKATER     = 0x08,    // FlipTricksHandler -> skater  (the base the stock code uses)
-    FTH_TRICKS_DB  = 0x28,    // ... -> UTricksDatabase
-    DB_FLIP_MIN    = 0x170,   // UTricksDatabase::FlipSpeedMinMultiplier
-    DB_FLIP_MAX    = 0x174,   // ... MaxMultiplier
-    SK_ADV_FLIP    = 0x9d0,   // ASkaterCharacterBase::_advancedSettings.FlipSpeedMultiplier
-    SK_FLIP_MODE   = 0x64f,   // _boardFlipSpeedMode (2 = magnitude, 3 = angle; else no mapping)
-    SK_SYNC_FLAGS  = 0x711,   // bit 0x20 = _isSyncFlipsScoopsEnabled
-};
 
 static float hkFlipMult(void* self, void* def, unsigned char inputType, void* inputs) {
     float stock = 1.0f;
@@ -185,11 +228,105 @@ static float hkFlipMult(void* self, void* def, unsigned char inputType, void* in
         const float maxM = twkF(db, DB_FLIP_MAX) * twkF(skater, SK_ADV_FLIP);
         if (!(maxM > minM) || !(minM > 0.0f) || minM > 10.0f || maxM > 10.0f) return stock;
 
-        // EInputType mirrors left/right at +50 (measured across every pairing the scoop logs ever
-        // produced), so the expected type names its own stick -- no stance logic needed.
-        const bool rightStick = (inputType >= 50);
+        // ⚠️ WHICH STICK IS DECIDED BY THE MATCHED ENTRY'S OWN DATA, further down -- NOT by the
+        // trick definition's expected type. The EInputType left/right mirror at +50 describes the
+        // RAW type, and the game normalises by stance before it means anything: in goofy the flick is
+        // performed with the other stick, so deriving it from the expected type sampled the wrong
+        // tracker and produced flip speeds that felt nothing like the regular-stance ones. This is
+        // only the starting guess for the case where the entry carries no usable stick data.
+        bool rightStick = (inputType >= 50);
+
+        // ---- the flick, from the GAME'S OWN INPUT RECORD -------------------------------------------
+        // ⚠️ Read this, not our own stick sampling. Sampling InputHandler's raw stick fields ourselves
+        // works on some machines and not others: one field log had the left stick's Y pinned at
+        // exactly -1.00 for a whole session while the game recognised every trick perfectly, so the
+        // player's gesture simply was not in the field we were reading there. The array the game hands
+        // us is the record it MATCHED to pick the trick, and it already carries both the stick
+        // position and TotalTime -- the duration of the gesture as the game measured it.
+        float gameSpeed = 0.0f, gameMag = 0.0f, gameTime = 0.0f;
+        float entryLm = 0.0f, entryRm = 0.0f;
+        bool  gameExact = false;
+        if (inputs) {
+            void* data = twkP(inputs, 0);
+            const int n = twkI(inputs, 8);
+            if (data && n > 0 && n < 64) {
+                // ⚠️ DO NOT REQUIRE THE RAW TYPE TO MATCH. The game's own loop converts each recorded
+                // type through IsSkatingGoofy / IsSkatingSwitch / ConvertToCurrentInputModeInput and
+                // compares the CONVERTED value, so the raw byte only equals the expected type in
+                // regular stance on the default input mode. Matching it raw meant every trick on any
+                // other stance or mode found nothing, fell through to "no flick measurement", and
+                // returned the game's own multiplier -- which looks like the feature working (the
+                // game's analog still varies) while none of these sliders do anything at all.
+                //
+                // Rather than reproduce that conversion, pick by what a flick IS: the FASTEST
+                // gesture in the array, displacement over its own duration.
+                // ⚠️ NOT the largest displacement. A stick being HELD reads at full magnitude and
+                // beats a quick flick at half -- measured, that selected a 333-483 ms hold at
+                // magnitude 1.0 over the actual flick, and handed back a multiplier below the game's
+                // own on every trick. Biggest is not fastest, and the flick is the fast one.
+                int best = -1; float bestMag = 0.0f, bestSpeed = 0.0f;
+                for (int i = 0; i < n; i++) {
+                    const uint8_t* e = (const uint8_t*)data + (size_t)i * FID_STRIDE;
+                    const float tt = twkF(e, FID_TOTAL_TIME);
+                    if (!(tt > 0.001f)) continue;
+                    const float lx = twkF(e, FID_LSTICK),  ly = twkF(e, FID_LSTICK + 4);
+                    const float rx = twkF(e, FID_RSTICK),  ry = twkF(e, FID_RSTICK + 4);
+                    const float lm = sqrtf(lx * lx + ly * ly), rm = sqrtf(rx * rx + ry * ry);
+                    const float m  = (lm > rm) ? lm : rm;
+                    const float sp = m / tt;
+                    const bool exact = (NormalisedType(self, twkB(e, FID_INPUT)) == inputType);
+                    // An exact match still wins if there is one; otherwise the fastest gesture does.
+                    if ((exact && !gameExact) || ((exact == gameExact) && sp > bestSpeed)) {
+                        best = i; bestMag = m; bestSpeed = sp; gameExact = exact;
+                    }
+                }
+                if (best >= 0) {
+                    const uint8_t* e = (const uint8_t*)data + (size_t)best * FID_STRIDE;
+                    gameMag  = bestMag;
+                    gameTime = twkF(e, FID_TOTAL_TIME);
+                    if (gameMag > 0.05f) gameSpeed = (gameMag / gameTime) * 10.0f;
+                    // The hand that actually did it: whichever of this entry's two sticks holds the
+                    // displacement. True in any stance, so nothing here has to know about goofy.
+                    const float lx = twkF(e, FID_LSTICK), ly = twkF(e, FID_LSTICK + 4);
+                    const float rx = twkF(e, FID_RSTICK), ry = twkF(e, FID_RSTICK + 4);
+                    const float lm = sqrtf(lx * lx + ly * ly), rm = sqrtf(rx * rx + ry * ry);
+                    if (lm > rm * 1.25f)      rightStick = false;
+                    else if (rm > lm * 1.25f) rightStick = true;
+                    entryLm = lm; entryRm = rm;
+                }
+            }
+        }
+
+        // ⚠️ SIZE THE LOOKBACK FROM THE GAME'S OWN GESTURE AGE. A fixed 250 ms window assumes the
+        // flick just happened -- true if you flick and release, false if you flick and HOLD, where
+        // the movement is already off the left edge of the window and all we can see is the stick
+        // parked at full deflection. Measured: one player's window opened with the stick already at
+        // (0.00,-1.00) and the game reporting a 333-483 ms gesture, so their flick predated
+        // everything we looked at. TotalTime is that age, so it is exactly the right lookback.
+        float lookback = (float)g_windowMs / 1000.0f;
+        if (gameTime > lookback) lookback = gameTime * 1.3f;      // a margin for the run-up
+        if (lookback > 1.5f) lookback = 1.5f;                     // never unbounded
+        // ⚠️ DO NOT CHOOSE A STICK. Every rule tried for that was a stance assumption in disguise --
+        // the trick definition's expected type, then the matched entry's own stick fields -- and each
+        // one broke a different combination of goofy / switch / nollie / fakie, because which thumb
+        // performs a flick changes with all of them. There is nothing to decide: measure BOTH and
+        // take whichever actually moved. That is the flick by definition, in every stance, and it is
+        // how the raw-sampling version behaved before any of this selection logic existed.
         float speed = 0.0f, peak = 0.0f, frameMs = 0.0f;
-        if (!ScoopSpeed_FlickMeasure(rightStick, (float)g_windowMs / 1000.0f, &speed, &peak, &frameMs)) {
+        float lSpeed = 0.0f, lPeak = 0.0f, rSpeed = 0.0f, rPeak = 0.0f, fm = 0.0f;
+        const bool okL = ScoopSpeed_FlickMeasure(false, lookback, &lSpeed, &lPeak, &frameMs);
+        const bool okR = ScoopSpeed_FlickMeasure(true,  lookback, &rSpeed, &rPeak, &fm);
+        const bool sampled = okL || okR;
+        rightStick = (rSpeed > lSpeed);
+        speed = rightStick ? rSpeed : lSpeed;
+        peak  = rightStick ? rPeak  : lPeak;
+        // With the window sized correctly, our own sampling is the better measure: it finds the
+        // MOVEMENT BURST inside the gesture, so a flick scores the same whether it was released or
+        // held afterwards. The game's record stays as the fallback for when we have no samples --
+        // it cannot separate the flick from the hold, because TotalTime covers both.
+        const bool fromGame = (!sampled && gameSpeed > 0.0f);
+        if (fromGame) speed = gameSpeed;
+        if (!fromGame && !sampled) {
             // No usable gesture: the game's own value stands. Mapping an unknown onto our range would
             // quietly ask for the slowest flip on every trick we failed to measure.
             if (g_log) {
@@ -200,9 +337,9 @@ static float hkFlipMult(void* self, void* def, unsigned char inputType, void* in
             return stock;
         }
         if (g_log) ScoopSpeed_DumpFlick(rightStick, (float)g_windowMs / 1000.0f);
-        const float measure = g_usePeak ? (peak * 1000.0f) : speed;   // peak is 0..1, scale to match
+        const float measure = g_usePeak ? (peak * 1000.0f) : speed;
         const float lo = (float)g_velMin, hi = (float)g_velMax;
-        float ratio = (measure * 10.0f - lo) / (hi - lo);
+        float ratio = ((fromGame ? measure : measure * 10.0f) - lo) / (hi - lo);
         if (ratio < 0.0f) ratio = 0.0f; else if (ratio > 1.0f) ratio = 1.0f;
         const float ours = minM + ratio * (maxM - minM);
 
@@ -217,10 +354,18 @@ static float hkFlipMult(void* self, void* def, unsigned char inputType, void* in
             // The frame time is logged BESIDE the flick so frame-rate dependence is a comparison
             // anyone can make from one log rather than a claim: the same flick at 8 ms and at 16 ms
             // per frame must read the same number.
-            TwkLog("[flip] #%ld '%s' type=%u stick=%c mode=%u | flick %.2f u/s peak %.2f "
-                   "(frame %.1f ms) | stock %.3f -> ours %.3f (ratio %.3f of %.3f..%.3f)",
+            TwkLog("[flip] #%ld '%s' type=%u stick=%c mode=%u | %s: %.0f "
+                   "(game mag %.2f / %.0f ms, lookback %.0f ms, entry L%.2f R%.2f%s; "
+                   "flick L%.0f R%.0f -> %c, peak %.2f) | "
+                   "stock %.3f -> ours %.3f "
+                   "(ratio %.3f of %.3f..%.3f)",
                    n, trick, (unsigned)inputType, rightStick ? 'R' : 'L', (unsigned)mode,
-                   speed, peak, frameMs, stock, ours, ratio, minM, maxM);
+                   fromGame ? (gameExact ? "GAME RECORD" : "GAME RECORD~") : (gameExact ? "sampled" : "sampled~"),
+                   fromGame ? speed : speed * 10.0f,
+                   gameMag, gameTime * 1000.0f, lookback * 1000.0f, entryLm, entryRm,
+                   gameExact ? "" : " NO EXACT TYPE MATCH", lSpeed * 10.0f, rSpeed * 10.0f,
+                   rightStick ? 'R' : 'L', peak,
+                   stock, ours, ratio, minM, maxM);
         }
         return ours;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -231,6 +376,15 @@ static float hkFlipMult(void* self, void* def, unsigned char inputType, void* in
 }
 
 void FlipSpeed_Install() {
+    g_isGoofy      = (IsStanceFn)TwkScanExe(SIG_IS_GOOFY);
+    g_isSwitch     = (IsStanceFn)TwkScanExe(SIG_IS_SWITCH);
+    g_convertInput = (ConvertInputFn)TwkScanExe(SIG_CONVERT_INPUT);
+    if (!g_isGoofy || !g_isSwitch || !g_convertInput)
+        TwkLog("[flip] stance-conversion sigs NOT FOUND (goofy=%p switch=%p convert=%p) -- input "
+               "types compared RAW, which only agrees in regular stance",
+               (void*)g_isGoofy, (void*)g_isSwitch, (void*)g_convertInput);
+    else
+        TwkLog("[flip] input types normalised by stance, as the game does (goofy/switch/convert resolved)");
     g_installed = true;
     g_start = TwkScanExe(SIG_FLIP_MULT);
     if (!g_start) {

@@ -238,7 +238,7 @@ int EnumerateOwn(ObjRec* out, void** actorsOut, int cap) {
         // inventory -- one the player actually owns -- is ours to publish. A bench belongs to the map:
         // every player already has it, syncing it was tried and withdrawn, and touching it here is
         // what once made one vanish off a joiner's screen.
-        if (!isStorable(actor)) { g_st.skipWorld++; continue; }
+        if (!isStorable(actor)) { g_st.skipWorld++; NoteMapDefault(actor); continue; }
         const char* cls = classNameOf(actor);
         if (!cls || !cls[0]) { g_st.skipNoClass++; continue; }
         void* root = rdPtr(actor, off::kActorRootComp);
@@ -618,6 +618,219 @@ void DestroyRemote(void* actor, void (*logf)(const char*)) {
 #endif
 }
 
+bool ActorPose(void* actor, float loc[3], float quat[4]) {
+#ifdef _WIN32
+    void* root = rdPtr(actor, off::kActorRootComp);
+    return root && rd((uint8_t*)root + off::kCompPos, loc, 12)
+                && rd((uint8_t*)root + off::kCompQuat, quat, 16);
+#else
+    (void)actor; (void)loc; (void)quat; return false;
+#endif
+}
+static bool ActorPoseOf(void* a, float l[3], float q[4]) { return ActorPose(a, l, q); }
+
+bool IsSelectedLocally(void* actor) {
+#ifdef _WIN32
+    if (!actor) return false;
+    void* m = Manager();
+    TArrayHdr a;
+    if (!m || !readArray(m, off::kDropMgrSelected, &a)) return false;
+    for (int i = 0; i < a.num; i++) {
+        void* p = nullptr;
+        if (rd(&a.data[i], &p, sizeof(p)) && p == actor) return true;
+    }
+    return false;
+#else
+    (void)actor; return false;
+#endif
+}
+
+// ---- THE SESSION'S OWN COPIES (see the header) -------------------------------------------------
+struct SessionWorld {
+    char  name[64];
+    void* original;      // the level's own actor, hidden for the session
+    void* copy;          // ours, spawned at the map default
+};
+static SessionWorld g_sw[128];
+static int          g_swN = 0;
+int SessionWorldCount() { return g_swN; }
+static bool g_saveGuard = false;
+void SetSaveGuardArmed(bool armed) { g_saveGuard = armed; }
+bool SaveGuardArmed() { return g_saveGuard; }
+
+static SessionWorld* swFind(const char* name) {
+    for (int i = 0; i < g_swN; i++) if (_stricmp(g_sw[i].name, name) == 0) return &g_sw[i];
+    return nullptr;
+}
+void* SessionWorldCopy(const char* name) { SessionWorld* w = swFind(name); return w ? w->copy : nullptr; }
+
+#ifdef _WIN32
+// The level's own actor with this name, proven to be a dropper prop and not one of ours. The name
+// came off the wire and ANY_PACKAGE matches any class, so it is a peer's choice until checked.
+static void* levelActorByName(const char* name) {
+    const Syms& S = Get();
+    if (!name || !name[0] || !S.StaticFindObject) return nullptr;
+    wchar_t wide[64];
+    int k = 0;
+    for (; k < 63 && name[k]; k++) wide[k] = (wchar_t)(uint8_t)name[k];
+    wide[k] = 0;
+    void* obj = nullptr;
+    __try { obj = S.StaticFindObject(nullptr, (void*)(intptr_t)-1, wide, 0); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { g_st.faults++; return nullptr; }
+    if (!obj || IsRemote(obj) || !IsObjectOfClass(obj, "Actor")) return nullptr;
+    void* comp = nullptr;
+    if (S.DropperPickableOf) {
+        __try { comp = S.DropperPickableOf(obj); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { g_st.faults++; return nullptr; }
+    }
+    return comp ? obj : nullptr;
+}
+#endif
+
+bool SessionWorldBegin(void* ownPawn, const char* actorName, void (*logf)(const char*)) {
+#ifdef _WIN32
+    const Syms& S = Get();
+    if (!ownPawn || !actorName || !actorName[0]) return false;
+    if (swFind(actorName)) return true;                       // already standing
+    if (g_swN >= (int)(sizeof(g_sw) / sizeof(g_sw[0]))) return false;
+    void* orig = levelActorByName(actorName);
+    if (!orig) { g_st.worldMissing++; return false; }
+
+    // WHERE THE MAP PUT IT. Captured at the Load seam if this player's save moved it; otherwise the
+    // actor is standing on its default right now, so reading it IS the answer. Every client resolves
+    // the same world position from its own data, which is why no pose has to travel for the layout.
+    float loc[3], quat[4];
+    if (!MapDefaultOf(orig, loc, quat) && !ActorPoseOf(orig, loc, quat)) return false;
+
+    void* cls = rdPtr(orig, off::kObjClassPrivate);
+    void* world = S.GetWorld(ownPawn);
+    if (!cls || !world || !S.SpawnActor) return false;
+
+    float rot0[3] = { 0, 0, 0 };
+    uint8_t params[0x80]; memset(params, 0, sizeof(params));
+    void* p = nullptr;
+    unsigned long xcode = 0;
+    __try { p = S.SpawnActor(world, cls, loc, rot0, params); }
+    __except (xcode = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) { p = nullptr; }
+    if (!p) {
+        g_st.spawnFails++;
+        if (logf) { char m[200]; snprintf(m, sizeof(m), "[drop/world] could not spawn a session copy of"
+            " '%s'%s", actorName, xcode ? " (FAULTED)" : ""); logf(m); }
+        return false;
+    }
+
+    // Registered as one of ours FIRST: every "is this actor mine?" answer -- the save purge included
+    // -- has to be right from the actor's first frame.
+    if (g_remoteN < kMaxObjects) g_remote[g_remoteN++] = p;
+    __try { if (S.SetReplicates) S.SetReplicates(p, false); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { g_st.faults++; }
+    // Left PICKABLE so anybody can rearrange it -- but only when the save guard is actually hooked.
+    // Without it a session prop could be called back into this player's inventory and written to
+    // their profile, so the feature gives up its capability instead of their save.
+    if (!g_saveGuard) clearPickable(p);
+    purgeFromAllObjects(p);
+    makeMovable(p);
+    __try { S.SetActorLocRot(p, loc, quat, false, nullptr, 0); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { g_st.faults++; }
+
+    // ...and the player's own copy steps aside. Visual AND collision, or it stays a solid obstacle
+    // exactly where the session copy now stands.
+    __try {
+        if (S.SetActorCollision) S.SetActorCollision(orig, false);
+        if (S.SetActorHidden)    S.SetActorHidden(orig, true);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { g_st.faults++; }
+
+    SessionWorld& w = g_sw[g_swN++];
+    g_st.sessionWorld = g_swN;
+    strncpy_s(w.name, sizeof(w.name), actorName, _TRUNCATE);
+    w.original = orig; w.copy = p;
+    g_st.spawned++;
+    return true;
+#else
+    (void)ownPawn; (void)actorName; (void)logf; return false;
+#endif
+}
+
+void ReassertSessionWorldHidden() {
+#ifdef _WIN32
+    const Syms& S = Get();
+    for (int i = 0; i < g_swN; i++) {
+        __try {
+            if (S.SetActorHidden)    S.SetActorHidden(g_sw[i].original, true);
+            if (S.SetActorCollision) S.SetActorCollision(g_sw[i].original, false);
+        } __except (EXCEPTION_EXECUTE_HANDLER) { g_st.faults++; }
+    }
+#endif
+}
+
+bool SessionWorldPose(const char* name, float loc[3], float quat[4]) {
+    SessionWorld* w = swFind(name);
+    return w && w->copy && ActorPoseOf(w->copy, loc, quat);
+}
+
+void SessionWorldEnd(void (*logf)(const char*)) {
+#ifdef _WIN32
+    if (!g_swN) return;
+    const Syms& S = Get();
+    const int n = g_swN;
+    for (int i = 0; i < g_swN; i++) {
+        if (g_sw[i].copy) DestroyRemote(g_sw[i].copy, logf);
+        __try {
+            if (S.SetActorHidden)    S.SetActorHidden(g_sw[i].original, false);
+            if (S.SetActorCollision) S.SetActorCollision(g_sw[i].original, true);
+        } __except (EXCEPTION_EXECUTE_HANDLER) { g_st.faults++; }
+    }
+    g_swN = 0; g_st.sessionWorld = 0;
+    if (logf) { char m[160]; snprintf(m, sizeof(m),
+        "[drop/world] session over -- %d level prop(s) back to your own arrangement", n); logf(m); }
+#else
+    (void)logf;
+#endif
+}
+
+int PurgeOursFromSaveList() {
+#ifdef _WIN32
+    void* m = Manager();
+    TArrayHdr a;
+    if (!m || !readArray(m, off::kDropMgrAllObjects, &a)) return 0;
+    int removed = 0;
+    for (int i = 0; i < a.num; ) {
+        void* actor = nullptr;
+        if (!rd(&a.data[i], &actor, sizeof(actor))) { i++; continue; }
+        if (!actor || !IsRemote(actor)) { i++; continue; }
+        if (removeFromArray(a, m, off::kDropMgrAllObjects, i)) { removed++; g_st.purgedFromAll++; continue; }
+        i++;
+    }
+    return removed;
+#else
+    return 0;
+#endif
+}
+
+int MovedWorldNames(char out[][64], int cap) {
+#ifdef _WIN32
+    void* m = Manager();
+    TArrayHdr a;
+    if (!m || cap <= 0 || !readArray(m, off::kDropMgrAllObjects, &a)) return 0;
+    int n = 0;
+    for (int i = 0; i < a.num && n < cap; i++) {
+        void* actor = nullptr;
+        if (!rd(&a.data[i], &actor, sizeof(actor)) || !actor) continue;
+        if (IsRemote(actor) || isStorable(actor)) continue;    // ours, or an inventory prop
+        // FIRST SIGHT IS THE DEFAULT. The Load seam only sees props the SAVE moves; one the player
+        // rearranges during play was never in that file, so without this its "default" would be
+        // wherever they had just dragged it -- and a session rejoin would stand its copy there.
+        // First-write-wins, so a prop Load already recorded keeps the better answer.
+        NoteMapDefault(actor);
+        if (!ObjectName(actor, out[n], 64) || !out[n][0]) continue;
+        n++;
+    }
+    return n;
+#else
+    (void)out; (void)cap; return 0;
+#endif
+}
+
 // ---- THE MAP DEFAULT (see the header) ----------------------------------------------------------
 // Actor-keyed, so it dies with the world like every other actor pointer we hold. Sized for the whole
 // level rather than for a session's worth of props: this records what the MAP has, which is a
@@ -661,6 +874,7 @@ bool MapDefaultOf(void* actor, float loc[3], float quat[4]) {
 
 void Forget() {
     g_mapDefN = 0; g_st.mapDefaults = 0;   // actor-keyed: they died with the level
+    g_swN = 0;                             // ...and so did the session's copies and originals
     g_remoteN = 0; g_hiddenN = 0; g_clsCacheN = 0;
     // The resolve cache holds UClass pointers from TryLoad. A class stays valid while something
     // references it, and after a world change nothing of ours does -- so it is dropped rather than
@@ -671,6 +885,7 @@ void Forget() {
 }
 
 void ResetAll(void (*logf)(const char*)) {
+    SessionWorldEnd(logf);          // copies destroyed, the player's own props unhidden
     while (g_remoteN > 0) DestroyRemote(g_remote[g_remoteN - 1], logf);
     RestoreOwnSet(logf);
     Forget();

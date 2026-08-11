@@ -212,7 +212,6 @@ static void publishUi() {
     g_ui.lobby   = omp::LobbyStatus();
     g_ui.armed   = g_armed;
     g_ui.peers   = st.peers; g_ui.proxies = st.proxiesAlive; g_ui.pubHz = st.publishHz;
-    strncpy_s(g_ui.myId, omp::MyId(), _TRUNCATE);
     // Read the bound endpoint back from the socket rather than echoing what was typed: a host should
     // see the port they ACTUALLY got, not the one they asked for.
     strncpy_s(g_ui.bound, (omp::Current() == omp::BK_UDP) ? omp::DirectBoundTo() : "", _TRUNCATE);
@@ -751,7 +750,10 @@ static void GameThreadFrame() {
         lastLog = ms;
         const session::Stats st = session::GetStats();
         if (st.peers || st.proxiesAlive) {
-            char m[200];
+            // Wide enough for the LONGEST line here, which is the dropped-object one. It was 200 and
+            // silently lost its tail -- the world counters this feature is diagnosed by never
+            // printed at all, and a truncated diagnostic reads exactly like a working one.
+            char m[420];
             snprintf(m, sizeof(m), "[mod] peers=%d proxies=%d pubHz=%.0f published=%u received=%u applied=%u pawn=%p",
                      st.peers, st.proxiesAlive, st.publishHz, st.published, st.received, st.appliedFrames, g_ownPawn);
             logLine(m);
@@ -772,12 +774,15 @@ static void GameThreadFrame() {
                 snprintf(m, sizeof(m),
                          "[drop] array=%d own=%d (skip: world=%d remote=%d hidden=%d noClass=%d"
                          " noRoot=%d) remote=%d | spawned=%d failed=%d notInstalled=%d destroyed=%d"
-                         " drift=%d movable=%d byName=%d purged=%d faults=%d mapDefaults=%d/%d",
+                         " drift=%d movable=%d byName=%d purged=%d faults=%d mapDefaults=%d/%d"
+                         " | world: session=%d missing=%d guard=%s",
                          d.arrayNum, st.dropOwn, d.skipWorld, d.skipRemote, d.skipHidden,
                          d.skipNoClass, d.skipNoRoot,
                          st.dropRemote, d.spawned, d.spawnFails, d.unknownIds, d.destroyed,
                          d.driftFixes, d.madeMovable, d.resolvedByName, d.purgedFromAll, d.faults,
-                         d.mapDefaults, d.mapDefaultMissed);
+                         d.mapDefaults, d.mapDefaultMissed,
+                         st.dropWorld, d.worldMissing,
+                         game::dropper::SaveGuardArmed() ? "on" : "OFF(look-only)");
                 logLine(m);
                 // The wire, both directions on one line: sets out vs sets in is the single comparison
                 // that says which end of the lane lost a set.
@@ -1115,6 +1120,40 @@ static void InstallMapDefaultSeam() {
         logLine("[drop/map] *** map-default seam hook FAILED -- map defaults unavailable");
 }
 
+// ---- THE HARD SAVE GUARD ----------------------------------------------------------------------------
+// Session copies of the level's props are deliberately PICKABLE -- that is what lets anybody rearrange
+// them -- and a pickable prop of ours can be selected, which puts it in the manager's `_allObjects`,
+// which is the list the save is written from. The per-poll purge is a race against exactly that
+// window. This is not: whatever the state of the world, our actors are out of that list at the moment
+// the game writes the file.
+static void (*o_DropperSave)(void*, unsigned char) = nullptr;
+static void hkDropperSave(void* handler, unsigned char flag) {
+    const int removed = game::dropper::PurgeOursFromSaveList();
+    if (removed > 0) {
+        char m[170];
+        snprintf(m, sizeof(m), "[drop/save] pulled %d of our object(s) out of the save list before"
+                 " writing -- your profile keeps only your own", removed);
+        logLine(m);
+    }
+    o_DropperSave(handler, flag);
+}
+static void InstallSaveGuard() {
+    const game::Syms& S = game::Get();
+    if (!S.DropperSave) {
+        logLine("[drop/save] *** DropperSave unresolved -- session props stay UNPICKABLE for safety");
+        game::dropper::SetSaveGuardArmed(false);
+        return;
+    }
+    if (MH_CreateHook(S.DropperSave, (void*)&hkDropperSave, (void**)&o_DropperSave) == MH_OK &&
+        MH_EnableHook(S.DropperSave) == MH_OK) {
+        game::dropper::SetSaveGuardArmed(true);
+        logLine("[drop/save] save guard hooked (our objects can never reach your profile)");
+    } else {
+        game::dropper::SetSaveGuardArmed(false);
+        logLine("[drop/save] *** save guard hook FAILED -- session props stay UNPICKABLE for safety");
+    }
+}
+
 static void InstallPoseSeam() {
     const game::Syms& S = game::Get();
     if (!S.MeshFinalizeBones) { logLine("[mod] MeshFinalizeBones unresolved -- peers will not animate in replay"); return; }
@@ -1280,7 +1319,7 @@ public:
         // Unarmed cost: one branch per frame.
         // ORDER MATTERS: without the rename guard, the first proxy spawn is a GUARANTEED
         // LowLevelFatalError -- so no guard means no anchor, which means no sessions at all.
-        if (InstallRenameGuard()) { InstallAnimApplyHook(); InstallReplayGuard(); InstallMarkerGuard(); InstallPoseSeam(); InstallMapDefaultSeam(); InstallReplayCamGuard(); InstallEngineTickAnchor(); }
+        if (InstallRenameGuard()) { InstallAnimApplyHook(); InstallReplayGuard(); InstallMarkerGuard(); InstallPoseSeam(); InstallMapDefaultSeam(); InstallSaveGuard(); InstallReplayCamGuard(); InstallEngineTickAnchor(); }
         else logLine("[mod] *** sessions DISABLED (rename guard missing)");
         // Pause must not freeze the world: in overlay mode YOUR pause stops your own skater and every
         // proxy in your world, so you cannot watch anyone while the menu is open. Unconditional -- it

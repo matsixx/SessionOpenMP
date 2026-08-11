@@ -386,12 +386,26 @@ static float hkScoopSpeed(void* handler, uint64_t bArg, void* inputs, void* d) {
                 }
             }
         }
-        // which stick scooped: arc EInputType >= 50 = right (measured +50 left/right mirror);
-        // no arc -> larger fresh gesture wins (scoop = rotational, pop flick = radial)
+        // Which stick scooped. The entry's OWN stick fields decide it: whichever of LeftStick /
+        // RightStick actually holds the displacement is the one that moved, which is true in any
+        // stance and any input mode.
+        // ⚠️ The EInputType >= 50 left/right mirror is only the FALLBACK now, and only when the sticks
+        // are too close to call. That byte is the RAW recorded type, and the game normalises it
+        // through IsSkatingGoofy / IsSkatingSwitch / ConvertToCurrentInputModeInput before it means
+        // anything -- so raw it is only reliable in regular stance on the default input mode. The
+        // same assumption in flip_speed made that feature silently do nothing for anyone else.
         int scoopStick = -1;
         if (pick >= 0) {
-            const int ty = twkB(data + pick * FID_STRIDE, FID_INPUT);
-            if (ty >= 0) scoopStick = (ty >= 50) ? 1 : 0;
+            const uint8_t* e = data + pick * FID_STRIDE;
+            const float lx = twkF(e, FID_LSTICK), ly = twkF(e, FID_LSTICK + 4);
+            const float rx = twkF(e, FID_RSTICK), ry = twkF(e, FID_RSTICK + 4);
+            const float lm = sqrtf(lx * lx + ly * ly), rm = sqrtf(rx * rx + ry * ry);
+            if (lm > rm * 1.25f)      scoopStick = 0;
+            else if (rm > lm * 1.25f) scoopStick = 1;
+            else {                                   // too close to call: fall back to the type byte
+                const int ty = twkB(e, FID_INPUT);
+                if (ty >= 0) scoopStick = (ty >= 50) ? 1 : 0;
+            }
         }
         const StickTracker* T = nullptr;
         if      (scoopStick == 0) T = &g_trkL;

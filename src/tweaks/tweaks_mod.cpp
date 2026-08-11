@@ -197,6 +197,7 @@ static const char* const kTwkGSwingAmt = "TwkGrindSwingAmt";
 static const char* const kTwkPitch    = "TwkPitchRange";
 static const char* const kTwkPitchAmt = "TwkPitchSpread";
 static const char* const kTwkStopFlip = "TwkCatchStopsFlip";
+static const char* const kTwkAnyRev   = "TwkCatchAnyRevolution";
 static const char* const kTwkFlip     = "TwkFlipSpeed";
 static const char* const kTwkFlipMin  = "TwkFlipVelMin";
 static const char* const kTwkFlipMax  = "TwkFlipVelMax";
@@ -209,6 +210,7 @@ static const char* const kTwkSteerAxX = "TwkFootSteerAxisX";
 static const char* const kTwkSteerAxY = "TwkFootSteerAxisY";
 static const char* const kTwkSteerTw  = "TwkFootSteerTwistDeg";
 static const char* const kTwkSteerTwA = "TwkFootSteerTwistAxis";
+static const char* const kTwkSteerSw  = "TwkFootSteerSwitchInv";
 static const char* const kTwkBone     = "TwkBoneScalePct";
 static const char* const kTwkBoneX    = "TwkBoneAddX";
 static const char* const kTwkBoneY    = "TwkBoneAddY";
@@ -236,6 +238,7 @@ static void pageValue(const char* key, int iv, float fv, void*) {
     else if (!strcmp(key, kTwkSndVol))   CatchSound_SetVolumePct(fv);
     else if (!strcmp(key, kTwkLevel))    CatchLevel_SetEnabled(iv != 0);
     else if (!strcmp(key, kTwkStopFlip)) CatchTweaks_SetStopsFlip(iv != 0);
+    else if (!strcmp(key, kTwkAnyRev))   CatchTweaks_SetAnyRevolution(iv != 0);
     else if (!strcmp(key, kTwkGPitch))    GrindPop_SetPitchEnabled(iv != 0);
     else if (!strcmp(key, kTwkGPitchAmt)) GrindPop_SetPitchScale(fv);
     else if (!strcmp(key, kTwkGSwing))    GrindPop_SetSwingEnabled(iv != 0);
@@ -254,6 +257,7 @@ static void pageValue(const char* key, int iv, float fv, void*) {
     else if (!strcmp(key, kTwkSteerAxY))  FootSteer_SetAxisY(fv);
     else if (!strcmp(key, kTwkSteerTw))   FootSteer_SetTwistDeg(fv);
     else if (!strcmp(key, kTwkSteerTwA))  FootSteer_SetTwistAxis(fv);
+    else if (!strcmp(key, kTwkSteerSw))   FootSteer_SetSwitchInvert(fv);
     else if (!strcmp(key, kTwkBone))      CatchTweaks_SetBoneScalePct(fv);
     else if (!strcmp(key, kTwkBoneX))     CatchTweaks_SetBoneAdd(0, fv);
     else if (!strcmp(key, kTwkBoneY))     CatchTweaks_SetBoneAdd(1, fv);
@@ -274,6 +278,7 @@ static int pageGet(const char* key, int* oi, float* of, void*) {
     else if (!strcmp(key, kTwkSndVol))   { *of = CatchSound_VolumePct();       return 1; }
     else if (!strcmp(key, kTwkLevel))    { *oi = CatchLevel_Enabled() ? 1 : 0; return 1; }
     else if (!strcmp(key, kTwkStopFlip)) { *oi = CatchTweaks_StopsFlip() ? 1 : 0; return 1; }
+    else if (!strcmp(key, kTwkAnyRev))   { *oi = CatchTweaks_AnyRevolution() ? 1 : 0; return 1; }
     else if (!strcmp(key, kTwkGPitch))    { *oi = GrindPop_PitchEnabled() ? 1 : 0; return 1; }
     else if (!strcmp(key, kTwkGPitchAmt)) { *of = GrindPop_PitchScale();           return 1; }
     else if (!strcmp(key, kTwkGSwing))    { *oi = GrindPop_SwingEnabled() ? 1 : 0; return 1; }
@@ -292,6 +297,7 @@ static int pageGet(const char* key, int* oi, float* of, void*) {
     else if (!strcmp(key, kTwkSteerAxY))  { *of = FootSteer_AxisY();              return 1; }
     else if (!strcmp(key, kTwkSteerTw))   { *of = FootSteer_TwistDeg();           return 1; }
     else if (!strcmp(key, kTwkSteerTwA))  { *of = FootSteer_TwistAxis();          return 1; }
+    else if (!strcmp(key, kTwkSteerSw))   { *of = FootSteer_SwitchInvert();            return 1; }
     else if (!strcmp(key, kTwkBone))      { *of = CatchTweaks_BoneScalePct();          return 1; }
     else if (!strcmp(key, kTwkBoneX))     { *of = CatchTweaks_BoneAdd(0);              return 1; }
     else if (!strcmp(key, kTwkBoneY))     { *of = CatchTweaks_BoneAdd(1);              return 1; }
@@ -338,6 +344,7 @@ static const OmpPageItem2 kTwkCatchItems[] = {
     { OMP_ITEM_SLIDER, kTwkDsZone, "  Dark slide zone (deg)", "How far from grip-down a dark slide is still reserved",
       nullptr, nullptr, 10.0f, 170.0f, 10.0f },
     { OMP_ITEM_TOGGLE, kTwkStopFlip, "Catch ends the flip",   "A caught board stops at griptape-up instead of spinning another full flip" },
+    { OMP_ITEM_TOGGLE, kTwkAnyRev,  "Catch levels the board",  "A caught board ends its flip flat under your foot, whatever revolution it was on" },
     { OMP_ITEM_TOGGLE, kTwkLevel,   "Level board on catch",   "Eases the board flat when it hits your foot" },
     { OMP_ITEM_TOGGLE, kTwkCatchSnd, "Catch sound fix",       "A catch sound on every catch, and never too quiet" },
     { OMP_ITEM_SLIDER, kTwkSndVol,  "  Catch sound (%)",      "100 = the game's own volume",
@@ -372,6 +379,8 @@ static const OmpPageItem2 kTwkFeetItems[] = {
     // never touched, and the page has no room for rows nobody adjusts.
     { OMP_ITEM_SLIDER, kTwkSteerTw,  "  Foot twist (deg)",    "Push up and the toe swings forward, pull back and it swings back; 0 = move only",
       nullptr, nullptr, 0.0f, 90.0f, 5.0f },
+    { OMP_ITEM_SLIDER, kTwkSteerSw,  "  Invert when switch",  "Mirrors the control with you when riding switch: 0 none, 1 sideways, 2 forward/back, 3 both",
+      nullptr, nullptr, 0.0f, 3.0f, 1.0f },
     { OMP_ITEM_SLIDER, kTwkBone,     "Boned ollie (%)",      "The game's own bone: 100 is stock, 0 removes it, higher shoves the board further",
       nullptr, nullptr, 0.0f, 300.0f, 10.0f },
     { OMP_ITEM_SLIDER, kTwkBoneX,    "  Bone add X (cm)",    "Added on top of the scaled bone",
@@ -464,7 +473,7 @@ public:
     SessionTweaks() {
         ModName = STR("SessionTweaks");
         // Version history is kept with the releases, not in the source.
-        ModVersion = STR("2.35.1");
+        ModVersion = STR("2.40.0");
         ModDescription = STR("Gameplay fixes: real-stick-sweep scoop speed, wider manual catch window, darkslide-aware catch fix, run out on missed tricks");
         ModAuthors = STR("matsix");
         char dir[MAX_PATH]{};
@@ -473,7 +482,7 @@ public:
         char path[MAX_PATH];
         snprintf(path, sizeof(path), "%sSessionTweaks.log", dir);
         g_log = fopen(path, "w");
-        TwkLog("=== SessionTweaks 2.35.1 loading (UE4SS C++ mod) ===");
+        TwkLog("=== SessionTweaks 2.40.0 loading (UE4SS C++ mod) ===");
         readConfig(dir);
     }
     ~SessionTweaks() override {
