@@ -52,7 +52,8 @@ add_custom_command(TARGET omp_ping POST_BUILD
             "${EOS_SDK}/Bin/EOSSDK-Win64-Shipping.dll" "$<TARGET_FILE_DIR:omp_ping>")
 
 # M2: the replication core -- game-free, judged by omp_looptest before any game loads it.
-add_library(omp_replication STATIC src/replication/replication.cpp src/replication/replaysync.cpp)
+add_library(omp_replication STATIC src/replication/replication.cpp src/replication/replaysync.cpp
+                                   src/replication/dropsync.cpp)
 target_include_directories(omp_replication PUBLIC src)
 
 add_executable(omp_looptest tools/looptest/loop_main.cpp)
@@ -61,7 +62,8 @@ target_link_libraries(omp_looptest PRIVATE omp_replication)
 # M2.2: the game layer -- symbol table + its offline verifier (runs on disk, no game needed).
 add_library(omp_game STATIC src/game/game_syms.cpp src/game/proxy.cpp src/game/gather.cpp src/ui/mp_name.cpp
                             src/ui/mp_prefs.cpp
-                            src/game/cosmetics.cpp src/game/audio.cpp src/game/pose.cpp src/game/spectate.cpp)
+                            src/game/cosmetics.cpp src/game/audio.cpp src/game/pose.cpp src/game/spectate.cpp
+                            src/game/dropper.cpp)
 target_include_directories(omp_game PUBLIC src)
 target_link_libraries(omp_game PUBLIC omp_replication)
 
@@ -110,7 +112,9 @@ if(EXISTS "${UE4SS_LIB}")
         src/transport/udp_transport.cpp
         src/replication/replication.cpp
         src/replication/replaysync.cpp
+        src/replication/dropsync.cpp
         src/game/game_syms.cpp
+        src/game/dropper.cpp
         src/game/proxy.cpp
         src/game/gather.cpp
         src/game/cosmetics.cpp
@@ -218,6 +222,7 @@ if(EXISTS "${UE4SS_LIB}")
             src/tweaks/catch_sound.cpp
             src/tweaks/pitch_range.cpp
             src/tweaks/foot_place.cpp
+            src/tweaks/foot_steer.cpp
             src/tweaks/grind_pop.cpp
             ${MINHOOK_SRC}/src/buffer.c
             ${MINHOOK_SRC}/src/hook.c

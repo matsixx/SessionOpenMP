@@ -18,7 +18,10 @@
 #include "../game/audio.h"
 #include "../game/pose.h"
 #include "../game/spectate.h"
+#include "../game/dropper.h"
+#include "../ui/mp_prefs.h"
 #include "../replication/replaysync.h"
+#include "../replication/dropsync.h"
 #include <cstring>
 #include <cstdio>
 
@@ -83,6 +86,29 @@ struct Slot {
     // ---- replay sync: this peer's own state history, transferred on request, shown in OUR replay.
     bool        syncOn = false;          // the menu's wish; the transfer/buffer state lives in replaysync
     uint64_t    syncReqSentUs = 0;       // when we asked -- anchors their buffer's newest to our clock
+    // Their stable identity, hashed, as it rides their set packets -- the SHARED policy's tiebreak.
+    // Unknown until their first set lands, and "unknown" deliberately means "not in the running":
+    // a peer with the feature off never sends one and can never be picked as the canonical set.
+    uint64_t    dropAuthKey = 0;
+    bool        haveDropAuth = false;
+    // ---- dropped objects: the props THIS peer has in OUR world. The wire updates this table (ids,
+    // target poses, what is new and what is gone); Frame does every game call from it. Splitting it
+    // that way keeps actor spawning on the engine-tick anchor where the proxy spawn already lives,
+    // and means a burst of packets cannot spawn a burst of actors mid-pump.
+    struct DropObj {
+        bool     used = false;
+        uint16_t id = 0;
+        void*    actor = nullptr;        // null = not spawned yet
+        char     cls[64] = {0};          // needed until it is spawned; kept for the log after
+        bool     spawnFailed = false;    // resolved to nothing here: never retried, never re-logged
+        float    tgtLoc[3] = {0,0,0}, tgtQuat[4] = {0,0,0,1};
+        float    curLoc[3] = {0,0,0}, curQuat[4] = {0,0,0,1};
+        bool     seeded = false;         // cur == tgt at least once (a fresh object is never slid in)
+        bool     dead = false;           // the wire says it is gone; Frame destroys it and frees the slot
+    };
+    DropObj     drop[dropsync::kMaxSetRecords];
+    bool        dropGenSeen = false;
+    uint8_t     dropGen = 0;
 };
 
 // When the local player ENTERED playback (mode 2), our clock. The replay timeline's END is this
@@ -106,7 +132,43 @@ static bool     g_anyPeerReplaying = false;   // somebody is scrubbing and needs
 static repl::State g_ownLast;      // last successfully gathered own state (for spawn placement)
 static bool        g_haveOwn = false;
 
-void Init(void (*logf)(const char*)) { g_logf = logf; replaysync::SetSendFn(&Send); }
+// ---- DROPPED OBJECTS, our own side. See session.h for what the policy means.
+static uint8_t  g_dropPolicy = 2;             // Shared -- the default the menu row starts on
+static bool     g_dropResend = false;         // a new peer, or our world changed: full resync now
+static uint8_t  g_dropGen = 0;                // bumped whenever OUR localIds stop meaning what they meant
+static uint16_t g_dropNextId = 1;
+static bool     g_dropAdopted = false;        // we are the one hiding our own saved set
+// Our published set, as of the last enumeration: the diff baseline. Keyed by ACTOR pointer, which is
+// stable for as long as the object exists and dies with the world (which is exactly when the
+// generation bumps), so no id ever outlives its meaning.
+struct OwnDrop {
+    void*    actor = nullptr;
+    uint16_t id = 0;
+    char     cls[64] = {0};
+    float    loc[3] = {0,0,0}, quat[4] = {0,0,0,1};
+    bool     seen = false;                    // marked during a diff pass; unmarked = gone
+};
+static OwnDrop g_ownDrop[game::dropper::kMaxObjects];
+static int     g_ownDropN = 0;
+static int     g_dropSpawnCapSaid = 0;
+
+uint8_t DropPolicy() { return g_dropPolicy; }
+
+void Init(void (*logf)(const char*)) {
+    g_logf = logf;
+    replaysync::SetSendFn(&Send);
+    dropsync::SetSendFn(&Send);
+}
+
+// Our dropped-object ids stop meaning what they meant: a world change (every actor died with it), a
+// session reset, a policy change. Bump the generation, forget the baseline, and tell everyone.
+static void dropNewGeneration(const char* why) {
+    g_dropGen++;
+    g_ownDropN = 0; g_dropNextId = 1;
+    g_dropResend = true;
+    if (g_logf && why) { char m[140]; snprintf(m, sizeof(m), "[drop] generation %u (%s)",
+                         (unsigned)g_dropGen, why); g_logf(m); }
+}
 void ResetAll() {
     int n = 0;
     for (auto& s : g_slots) if (s.used) {
@@ -121,6 +183,12 @@ void ResetAll() {
     }
     if (n && g_logf) { char m[120]; snprintf(m, sizeof(m), "[session] reset -- %d peer slot(s) released", n); g_logf(m); }
     replaysync::DropAll(); g_playbackEnteredUs = 0;
+    // Peers' props go with them, and OUR OWN SET COMES BACK. Leaving a session with your park still
+    // hidden would look exactly like the mod deleted it.
+    game::dropper::ResetAll(g_logf);
+    g_dropAdopted = false;
+    dropsync::ResetAll();
+    dropNewGeneration("session reset");
 }
 // NOT ResetAll: this runs from the mod's destructor, i.e. DLL unload, where the game may already be
 // tearing itself down -- and Retire touches actors, the replay camera and the audio system. Hiding a
@@ -145,11 +213,83 @@ static Slot* slotFor(int peerIdx, uint64_t nowUs) {
         s.replayHidden = false; s.boardNear = true; s.replayConcealedActor = nullptr;
         s.away = false; s.joinAnnounced = false;
         s.syncOn = false; s.syncReqSentUs = 0;
+        for (auto& d : s.drop) d = Slot::DropObj();
+        s.dropGenSeen = false; s.dropGen = 0;
+        s.dropAuthKey = 0; s.haveDropAuth = false;
+        dropsync::ForgetPeer(peerIdx);
         g_cosResend = true;                          // they need OUR look too, now rather than in 10 s
+        g_dropResend = true;                         // ...and our dropped objects, for the same reason
         if (g_logf) { char m[120]; snprintf(m, sizeof(m), "[session] stream opened for peer %d", peerIdx); g_logf(m); }
         return &s;
     }
     return nullptr;                                  // full: drop rather than steal another peer's slot
+}
+
+// ---- DROPPED OBJECTS: wire -> the peer's object table. No game calls here (see the Slot comment).
+static Slot::DropObj* dropFind(Slot& s, uint16_t id) {
+    for (auto& d : s.drop) if (d.used && d.id == id) return &d;
+    return nullptr;
+}
+static Slot::DropObj* dropAlloc(Slot& s, uint16_t id) {
+    if (Slot::DropObj* e = dropFind(s, id)) return e;
+    for (auto& d : s.drop) if (!d.used) { d = Slot::DropObj(); d.used = true; d.id = id; return &d; }
+    return nullptr;                                   // their set is bigger than the cap: ignore the rest
+}
+static void dropSetTarget(Slot::DropObj& d, const dropsync::Rec& r, bool withClass) {
+    memcpy(d.tgtLoc,  r.loc,  sizeof(d.tgtLoc));
+    memcpy(d.tgtQuat, r.quat, sizeof(d.tgtQuat));
+    if (withClass && r.id[0]) strncpy_s(d.cls, sizeof(d.cls), r.id, _TRUNCATE);
+    d.dead = false;
+}
+// Mark every object this peer still has for destruction. Frame does the destroying; a peer whose
+// packets stop arriving keeps its objects (they are still THERE in their world) until it is released.
+static void dropMarkAllDead(Slot& s) { for (auto& d : s.drop) if (d.used) d.dead = true; }
+
+static void applyDropUpdate(Slot& s, const dropsync::Update& up, int peerIdx) {
+    if (up.haveAuth) { s.dropAuthKey = up.authKey; s.haveDropAuth = true; }
+    if (up.genReset) {
+        // Their ids stopped meaning what they meant (their world changed, or they reset). Everything
+        // we hold for them is stale by definition -- including the ACTORS, which are still standing
+        // in our world and must go.
+        dropMarkAllDead(s);
+        s.dropGenSeen = true; s.dropGen = up.gen;
+    }
+    if (up.setReady) {
+        int n = 0;
+        const dropsync::Rec* set = dropsync::SetRecords(peerIdx, &n);
+        // The other half of the publish line above. A set that arrives and a set that publishes are
+        // the two facts that, together, say which side of the wire lost it.
+        static int lastN = -1; static uint8_t lastGen = 0xff;
+        if (g_logf && (n != lastN || up.gen != lastGen)) {
+            lastN = n; lastGen = up.gen;
+            char m[220];
+            snprintf(m, sizeof(m), "[drop] peer %d set gen=%u: %d object(s)%s%s", peerIdx,
+                     (unsigned)up.gen, n, n ? " -- first is " : "", n ? set[0].id : "");
+            g_logf(m);
+        }
+        // MARK AND SWEEP against the full set: what is in it lives, what is not is gone. This is the
+        // one message that may delete, which is why an incomplete set is never applied (dropsync only
+        // reports setReady once every part of a generation has landed).
+        for (auto& d : s.drop) if (d.used) d.dead = true;
+        for (int i = 0; i < n; i++) {
+            Slot::DropObj* d = dropAlloc(s, set[i].localId);
+            if (!d) break;
+            dropSetTarget(*d, set[i], true);
+        }
+    }
+    for (int i = 0; i < up.nPlace; i++) {
+        Slot::DropObj* d = dropAlloc(s, up.place[i].localId);
+        if (d) dropSetTarget(*d, up.place[i], true);
+    }
+    for (int i = 0; i < up.nMove; i++) {
+        // A move for an id we do not know is not an error and not a spawn: a kMove carries no class
+        // name, so there is nothing to spawn FROM. The next set or place brings it, at its current
+        // pose, and the drag simply becomes visible a beat later.
+        if (Slot::DropObj* d = dropFind(s, up.move[i].localId)) dropSetTarget(*d, up.move[i], false);
+    }
+    for (int i = 0; i < up.nRemove; i++)
+        if (Slot::DropObj* d = dropFind(s, up.remove[i])) d->dead = true;
+
 }
 
 void OnPacket(int peerIdx, const uint8_t* data, int len, uint64_t nowUs) {
@@ -159,6 +299,19 @@ void OnPacket(int peerIdx, const uint8_t* data, int len, uint64_t nowUs) {
     if (replaysync::IsSyncPacket(data, len)) {
         replaysync::OnPacket(peerIdx, data, len, nowUs, g_logf);
         return;
+    }
+    // ---- DROPPED OBJECTS. Routed before the snapshot path like every other lane: the snapshot
+    // Unpack is the FALLBACK branch, and an unrecognised magic there trips the once-per-peer
+    // "different SessionOpenMP version" warning. Nothing here touches the game -- it only updates the
+    // slot's object table, which Frame then turns into spawns, moves and removals.
+    if (dropsync::IsPacket(data, len)) {
+        if (g_dropPolicy == 0) return;
+        dropsync::Update up;
+        if (!dropsync::OnPacket(peerIdx, data, len, up)) return;
+        Slot* ds = slotFor(peerIdx, nowUs);
+        if (!ds) return;
+        applyDropUpdate(*ds, up, peerIdx);
+        return;                                            // NOT a snapshot: no stream push, no liveness
     }
     // Several message types share this transport, routed by magic. Cosmetics are rare and large; the
     // 60 Hz snapshot stays small and self-contained.
@@ -414,7 +567,326 @@ void ForgetProxies() {
     g_settleUntilMs = 0;                 // re-armed by Frame, which owns the clock
     g_lastOwnPawn   = nullptr;
     g_ownMap[0]     = 0;
+    // Every dropped object died with the world -- OURS and the ones we spawned for peers -- so the
+    // pointers are dropped WITHOUT being touched, and our ids stop meaning anything. Peers' props
+    // come back on their next resync beat; the new set they send is for whatever level THEY are in,
+    // and the away gate is what keeps it out of ours if that is not this one.
+    for (auto& s : g_slots) {
+        for (auto& d : s.drop) d = Slot::DropObj();
+        s.dropGenSeen = false;
+    }
+    game::dropper::Forget();
+    g_dropAdopted = false;               // the hidden list went with the world; nothing to restore
+    dropNewGeneration("world changed");
     if (g_logf) g_logf("[session] world changed -- all proxy pointers dropped, spawning held until the world settles");
+}
+
+// ==== DROPPED OBJECTS =================================================================================
+// Our own stable identity, hashed. FNV-1a rather than the string itself so the key is a fixed 8 bytes
+// on the wire and one comparison to rank; distinct ids collide with vanishing probability, and a
+// collision would cost a session two visible sets rather than anything unsafe. 0 = we do not know who
+// we are yet, which is treated as "not in the running" at both ends.
+// The PREFERENCE id, not the transport's: it is 128 random bits generated once per install and kept
+// in the preferences file, so it is the same key on every backend AND across restarts, where MyId()
+// is a lobby-session artefact ("shm:1" is whichever process claimed a mailbox slot first). Which
+// player's park is the shared one should not depend on who launched first.
+static uint64_t dropOwnAuthKey() {
+    const char* id = MpPrefs_PeerId();
+    if (!id || !id[0]) id = MyId();                    // before prefs init (headless tests)
+    if (!id || !id[0]) return 0;
+    uint64_t h = 1469598103934665603ull;
+    for (const char* p = id; *p; p++) { h ^= (uint8_t)(unsigned char)*p; h *= 1099511628211ull; }
+    return h ? h : 1;                                  // never collide with the "unknown" sentinel
+}
+
+static void dropSendToAll(int kind, int nPeers, uint8_t gen,
+                          const dropsync::Rec* recs, int n, const uint16_t* ids) {
+    PeerStats ps;
+    for (int i = 0; i < nPeers; i++) {
+        if (!GetStats(i, &ps) || ps.state == 5) continue;
+        if (kind == 0) {
+            // A set is ALL OR NOTHING (a half-received one applies as "everything else was
+            // deleted"), so SendSet refuses rather than truncating -- and a refusal must not be
+            // silent, or a big park simply never appears for anyone with no line to explain it.
+            if (dropsync::SendSet(i, gen, dropOwnAuthKey(), recs, n, SendBudget()) == 0 && n > 0) {
+                static bool said = false;
+                if (!said) { said = true; if (g_logf) { char m[200]; snprintf(m, sizeof(m),
+                    "[drop] %d objects need more packets than this wire takes at once (budget %d)"
+                    " -- peers will not see them", n, SendBudget()); g_logf(m); } }
+            }
+        }
+        else if (kind == 1) { for (int k = 0; k < n; k++) dropsync::SendPlace(i, gen, recs[k]); }
+        else if (kind == 2) dropsync::SendMove(i, gen, recs, n);
+        else                dropsync::SendRemove(i, gen, ids, n);
+    }
+}
+
+// Enumerate our own visible set, diff it against the baseline, and publish what changed. This is the
+// whole sender: place, duplicate, drag, stick-to-ground, revert and call-back are all just an added,
+// removed or moved entry, so none of them needs its own hook.
+static void dropPublishOwn(uint64_t nowUs, int nPeers, bool forceResync) {
+    using namespace game;
+    // STATIC, not stack: 256 objects across five buffers is ~100 KB, which is a lot to put on the
+    // game thread's frame several times a second. Safe because everything here runs on that one
+    // thread, like the rest of the session.
+    static dropper::ObjRec recs[dropper::kMaxObjects];
+    static void*           actors[dropper::kMaxObjects];
+    const int n = dropper::EnumerateOwn(recs, actors, dropper::kMaxObjects);
+
+    static dropsync::Rec place[dropper::kMaxObjects]; int nPlace = 0;
+    static dropsync::Rec move [dropper::kMaxObjects]; int nMove  = 0;
+    static uint16_t      gone [dropper::kMaxObjects]; int nGone  = 0;
+
+    for (int i = 0; i < g_ownDropN; i++) g_ownDrop[i].seen = false;
+    for (int i = 0; i < n; i++) {
+        OwnDrop* e = nullptr;
+        for (int k = 0; k < g_ownDropN; k++) if (g_ownDrop[k].actor == actors[i]) { e = &g_ownDrop[k]; break; }
+        if (!e) {
+            if (g_ownDropN >= dropper::kMaxObjects) continue;
+            e = &g_ownDrop[g_ownDropN++];
+            *e = OwnDrop();
+            e->actor = actors[i];
+            e->id = g_dropNextId++;
+            strncpy_s(e->cls, sizeof(e->cls), recs[i].id, _TRUNCATE);
+            memcpy(e->loc, recs[i].loc, sizeof(e->loc));
+            memcpy(e->quat, recs[i].quat, sizeof(e->quat));
+            e->seen = true;
+            dropsync::Rec& r = place[nPlace++];
+            strncpy_s(r.id, sizeof(r.id), e->cls, _TRUNCATE);
+            r.localId = e->id;
+            memcpy(r.loc, e->loc, sizeof(r.loc)); memcpy(r.quat, e->quat, sizeof(r.quat));
+            continue;
+        }
+        e->seen = true;
+        const float dx = recs[i].loc[0]-e->loc[0], dy = recs[i].loc[1]-e->loc[1], dz = recs[i].loc[2]-e->loc[2];
+        float qd = 0; for (int k = 0; k < 4; k++) { const float d = recs[i].quat[k]-e->quat[k]; qd += d*d; }
+        const float eps = dropper::g_tun.moveEpsCm;
+        if (dx*dx + dy*dy + dz*dz > eps*eps || qd > dropper::g_tun.moveEpsQuat * dropper::g_tun.moveEpsQuat) {
+            memcpy(e->loc, recs[i].loc, sizeof(e->loc));
+            memcpy(e->quat, recs[i].quat, sizeof(e->quat));
+            dropsync::Rec& r = move[nMove++];
+            r.id[0] = 0; r.localId = e->id;
+            memcpy(r.loc, e->loc, sizeof(r.loc)); memcpy(r.quat, e->quat, sizeof(r.quat));
+        }
+    }
+    // Compact out what is gone. In place and order-preserving, so the baseline never grows holes.
+    int w = 0;
+    for (int k = 0; k < g_ownDropN; k++) {
+        if (g_ownDrop[k].seen) { if (w != k) g_ownDrop[w] = g_ownDrop[k]; w++; }
+        else if (nGone < dropper::kMaxObjects) gone[nGone++] = g_ownDrop[k].id;
+    }
+    g_ownDropN = w;
+
+    if (nPeers <= 0) return;
+    if (forceResync) {
+        // The set supersedes every delta this pass would have sent -- it IS the current state.
+        static dropsync::Rec full[dropper::kMaxObjects];
+        for (int k = 0; k < g_ownDropN; k++) {
+            strncpy_s(full[k].id, sizeof(full[k].id), g_ownDrop[k].cls, _TRUNCATE);
+            full[k].localId = g_ownDrop[k].id;
+            memcpy(full[k].loc, g_ownDrop[k].loc, sizeof(full[k].loc));
+            memcpy(full[k].quat, g_ownDrop[k].quat, sizeof(full[k].quat));
+        }
+        // Say WHAT is being published, not just how much. The class name is the id the receiver looks
+        // up, so seeing the actual strings is what distinguishes "we published nothing" from "we
+        // published something the other end could not resolve". Only on a change, so the 6 s
+        // heartbeat does not become a log flood.
+        static int lastSaidN = -1; static uint8_t lastSaidGen = 0xff;
+        if (g_logf && (g_ownDropN != lastSaidN || g_dropGen != lastSaidGen)) {
+            lastSaidN = g_ownDropN; lastSaidGen = g_dropGen;
+            char names[220] = {0};
+            for (int k = 0; k < g_ownDropN && k < 6; k++) {
+                if (names[0]) strncat_s(names, ", ", _TRUNCATE);
+                strncat_s(names, g_ownDrop[k].cls, _TRUNCATE);
+            }
+            char m[320];
+            snprintf(m, sizeof(m), "[drop] publishing set gen=%u: %d object(s) to %d peer(s)%s%s",
+                     (unsigned)g_dropGen, g_ownDropN, nPeers, g_ownDropN ? " -- " : "", names);
+            g_logf(m);
+        }
+        dropSendToAll(0, nPeers, g_dropGen, full, g_ownDropN, nullptr);
+        return;
+    }
+    if (nPlace) dropSendToAll(1, nPeers, g_dropGen, place, nPlace, nullptr);
+    if (nMove)  dropSendToAll(2, nPeers, g_dropGen, move,  nMove,  nullptr);
+    if (nGone)  dropSendToAll(3, nPeers, g_dropGen, nullptr, nGone, gone);
+}
+
+static void dropFrame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, int nPeers, uint64_t dropUs) {
+    using namespace game;
+    static uint64_t lastFrameUs = 0, lastEnumUs = 0, lastResyncUs = 0;
+    const float dt = lastFrameUs ? (float)((double)sinceUs(nowUs, lastFrameUs) / 1.0e6) : 0.f;
+    lastFrameUs = nowUs;
+
+    // The player's own setting is the source of truth, read every frame rather than copied at
+    // startup, so a change from either menu takes effect on the next tick with no apply step.
+    {
+        const uint8_t pol = (uint8_t)MpPrefs_DropMode();
+        if (pol != g_dropPolicy) {
+            g_dropPolicy = pol;
+            g_dropResend = true;                 // what we contribute just changed
+            if (g_logf) { char m[120]; snprintf(m, sizeof(m), "[drop] policy -> %s",
+                          pol == 0 ? "Off" : pol == 1 ? "Live only" : "Shared"); g_logf(m); }
+        }
+    }
+    const bool wanted = (g_dropPolicy != 0);
+    if (!wanted || !dropper::Available() || !dropper::Manager()) {
+        // Turned off, unavailable, or no manager in this level yet: leave the world exactly as we
+        // found it. Both of these are no-ops when there is nothing to undo.
+        if (g_dropAdopted || dropper::RemoteCount() > 0) {
+            for (auto& s : g_slots) for (auto& d : s.drop) d = Slot::DropObj();
+            dropper::ResetAll(g_logf);      // also puts the level's own props back
+            g_dropAdopted = false;
+        }
+        if (wanted && !dropper::Available()) {
+            static bool said = false;
+            if (!said) { said = true; if (g_logf)
+                g_logf("[drop] object-dropper symbols unavailable -- dropped objects will not sync"); }
+        }
+        g_st.dropOwn = 0; g_st.dropRemote = 0;   // stale counters read as a working feature
+        return;
+    }
+
+    // ---- WHO IS CANONICAL. Lowest authority key among us and every peer who is present and has told
+    // us theirs. A peer we cannot rank (no set yet, or the feature off on their side) is simply not in
+    // the running, so the worst case while a session settles is that both sets are briefly visible --
+    // never that somebody's park vanishes because of a key we guessed at.
+    // THE HOST OWNS THE SHARED WORLD, whenever the wire can say who that is. Ranking by key alone was
+    // deterministic but arbitrary: the same player won every session regardless of who hosted, so
+    // whoever happened to hold the lower key always kept their park and the other player always lost
+    // theirs -- in both directions, which is exactly backwards from "join someone's game and skate
+    // THEIR spot". The lowest key stays as the fallback for wires with no host concept (shared memory
+    // is symmetric by construction, and EOS before the owner has resolved), where it is still the
+    // right answer: deterministic, identical on both machines, and needing no agreement protocol.
+    const uint64_t myKey = dropOwnAuthKey();
+    const char* ownerId = LobbyOwnerId();
+    const char* myWireId = MyId();
+    const bool hostKnown = ownerId && ownerId[0] && myWireId && myWireId[0];
+    bool anyPresent = false, iAmCanonical = true;
+    int  rankedAgainst = 0, canonicalPeer = -1;
+    uint64_t lowestKey = myKey;
+    for (auto& s : g_slots) {
+        if (!s.used || s.away || sinceUs(nowUs, s.lastPacketUs) >= dropUs) continue;
+        anyPresent = true;
+        if (hostKnown) {
+            const char* theirId = PeerIdStr(s.peerIdx);
+            if (theirId && theirId[0] && _stricmp(theirId, ownerId) == 0) canonicalPeer = s.peerIdx;
+            continue;
+        }
+        if (!s.haveDropAuth || !s.dropAuthKey || !myKey) continue;
+        rankedAgainst++;
+        if (s.dropAuthKey < lowestKey) { lowestKey = s.dropAuthKey; canonicalPeer = s.peerIdx; iAmCanonical = false; }
+    }
+    if (hostKnown) iAmCanonical = (_stricmp(ownerId, myWireId) == 0);
+    // HOST MIGRATION. When the host walks out, EOS hands the lobby to somebody else -- but for a
+    // moment in between nobody owns it, and falling back to the key rule for those few frames would
+    // flip the canonical player twice: everyone's park would vanish and come back for no reason a
+    // player could see. So once a host has been known in this session, the last decision is HELD
+    // through the gap and only a newly resolved owner can change it.
+    {
+        static bool everHadHost = false, heldCanonical = true;
+        if (hostKnown) { everHadHost = true; heldCanonical = iAmCanonical; }
+        else if (everHadHost && anyPresent) iAmCanonical = heldCanonical;
+        if (!anyPresent) everHadHost = false;            // session over: start clean next time
+    }
+    // Is the answer above WORTH ACTING ON YET? Straight after joining, no host has resolved and no
+    // peer key has arrived, so the default "canonical = me" is a guess, not a decision. Acting on it
+    // published our own placement of the level's furniture to the real host in that window -- they
+    // ended up with our bench positions. Inventory props are unaffected: publishing those early is
+    // harmless, and withholding them would just delay the set everyone is waiting for.
+    const bool authoritySettled = hostKnown || rankedAgainst > 0 || !anyPresent;
+    // THE DECISION, said out loud whenever it changes. Without this, "nobody adopted" and "everybody
+    // thought they were canonical" look identical from a log -- and the second one is the failure
+    // where two peers' keys never reached each other, which is a wire problem, not a policy one.
+    {
+        static int lastRanked = -1, lastCanon = -2; static bool lastMine = true;
+        if (g_logf && (rankedAgainst != lastRanked || canonicalPeer != lastCanon || iAmCanonical != lastMine)) {
+            lastRanked = rankedAgainst; lastCanon = canonicalPeer; lastMine = iAmCanonical;
+            char m[240];
+            if (hostKnown)
+                snprintf(m, sizeof(m), "[drop] canonical set: %s -- the session HOST%s",
+                         iAmCanonical ? "MINE" : "a peer's",
+                         (!iAmCanonical && canonicalPeer < 0)
+                             ? " (who is not on our peer list yet)" : "");
+            else
+                snprintf(m, sizeof(m), "[drop] canonical set: %s -- no host on this wire, so lowest key"
+                         " wins (mine %016llX, ranked against %d)", iAmCanonical ? "MINE" : "a peer's",
+                         (unsigned long long)myKey, rankedAgainst);
+            g_logf(m);
+        }
+    }
+    // ---- ADOPTION. Only under the SHARED policy, only with somebody actually here, and only when
+    // somebody else is canonical. Visual + collision, never a save.
+    const bool wantAdopt = (g_dropPolicy == 2) && anyPresent && !iAmCanonical;
+    if (wantAdopt != g_dropAdopted) {
+        if (wantAdopt) dropper::HideOwnSet(g_logf);
+        else           dropper::RestoreOwnSet(g_logf);
+        g_dropAdopted = wantAdopt;
+        g_dropResend = true;                     // what we contribute just changed
+    }
+
+    // ---- PUBLISH. Every frame while the local player is actually in the dropper (that is when
+    // objects move); a slow poll otherwise, because a set that nobody is editing cannot change.
+    const bool active = dropper::LocalActive();
+    const uint64_t enumPeriod = active ? 33000ull : 250000ull;
+    const bool resyncDue = g_dropResend || !lastResyncUs || sinceUs(nowUs, lastResyncUs) > 6000000ull;
+    if (!lastEnumUs || sinceUs(nowUs, lastEnumUs) >= enumPeriod || resyncDue) {
+        lastEnumUs = nowUs;
+        dropPublishOwn(nowUs, nPeers, resyncDue);
+        if (resyncDue) { lastResyncUs = nowUs; g_dropResend = false; }
+    }
+
+    // ---- APPLY. Every game call for peers' objects happens here, on the engine-tick anchor the
+    // proxy spawn already rides -- never inside the packet pump.
+    int liveRemote = 0;
+    for (auto& s : g_slots) {
+        if (!s.used) continue;
+        // A peer in ANOTHER level: their props describe a world that is not ours, exactly like their
+        // body position does. Their table is kept (nothing is forgotten), the actors are not.
+        const bool elsewhere = s.away;
+        for (auto& d : s.drop) {
+            if (!d.used) continue;
+            if (d.dead || elsewhere) {
+                if (d.actor) dropper::DestroyRemote(d.actor, g_logf);
+                d.actor = nullptr;
+                if (d.dead) d = Slot::DropObj();
+                continue;
+            }
+            if (!d.actor) {
+                if (d.spawnFailed || !ownPawn || nowMs < g_settleUntilMs) continue;
+                {
+                    dropper::ObjRec r;
+                    strncpy_s(r.id, sizeof(r.id), d.cls, _TRUNCATE);
+                    memcpy(r.loc, d.tgtLoc, sizeof(r.loc)); memcpy(r.quat, d.tgtQuat, sizeof(r.quat));
+                    d.actor = dropper::SpawnRemote(ownPawn, r, g_logf);
+                    if (!d.actor) {
+                        // Not installed here, or the world-wide cap is full. Either way this record is
+                        // settled: retrying every frame would be a spawn storm behind a one-line log.
+                        d.spawnFailed = true;
+                        if (dropper::RemoteCount() >= dropper::kMaxObjects && !g_dropSpawnCapSaid) {
+                            g_dropSpawnCapSaid = 1;
+                            if (g_logf) { char m[180]; snprintf(m, sizeof(m),
+                                "[drop] %d peer objects is the cap -- later ones are not being spawned",
+                                dropper::kMaxObjects); g_logf(m); }
+                        }
+                        continue;
+                    }
+                }
+                memcpy(d.curLoc, d.tgtLoc, sizeof(d.curLoc));
+                memcpy(d.curQuat, d.tgtQuat, sizeof(d.curQuat));
+                d.seeded = true;
+            }
+            if (!d.seeded) {
+                memcpy(d.curLoc, d.tgtLoc, sizeof(d.curLoc));
+                memcpy(d.curQuat, d.tgtQuat, sizeof(d.curQuat));
+                d.seeded = true;
+            }
+            dropper::DriveRemote(d.actor, d.tgtLoc, d.tgtQuat, d.curLoc, d.curQuat, dt);
+            liveRemote++;
+        }
+    }
+    g_st.dropOwn = g_ownDropN;
+    g_st.dropRemote = liveRemote;
 }
 
 void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
@@ -616,6 +1088,11 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
         }
     }
 
+    // ---- 1.6 DROPPED OBJECTS. Its own lane, and deliberately not folded into the drive loop below:
+    // a peer's props stand in the world whether or not their snapshot stream is currently sampling,
+    // so nothing here may ride the `continue`s that gate a skater.
+    dropFrame(ownPawn, nowUs, nowMs, nPeers, dropUs);
+
     // ---- 2. DRIVE each peer's proxy from its own stream, sampled at OUR clock.
     int alive = 0;
     bool anyPeerReplaying = false;
@@ -635,6 +1112,13 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
         if (departed || quietForUs > dropUs) {
             s.proxy.Retire(g_logf);     // hide them first -- Forget only drops pointers
             s.proxy.Forget(); s.used = false;
+            // Their props leave with them. Nobody else will ever hold these pointers.
+            for (auto& d : s.drop) {
+                if (d.actor) game::dropper::DestroyRemote(d.actor, g_logf);
+                d = Slot::DropObj();
+            }
+            dropsync::ForgetPeer(s.peerIdx);
+            s.haveDropAuth = false; s.dropAuthKey = 0;
             if (g_logf) { char m[140];
                 if (departed) snprintf(m, sizeof(m), "[session] peer %d released (they left)", s.peerIdx);
                 else          snprintf(m, sizeof(m), "[session] peer %d released (quiet %llums, no goodbye)",

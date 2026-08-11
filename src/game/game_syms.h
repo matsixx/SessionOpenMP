@@ -210,6 +210,33 @@ using ProjectToScreenFn = bool  (*)(void* playerController, const float* world, 
 // client pixels whenever a resolution scale is set -- so the screen position has to be normalised here
 // and un-normalised against whatever the render thread's display size turns out to be.
 using ViewportSizeFn    = void  (*)(void* playerController, int* outX, int* outY);
+// ---- THE OBJECT DROPPER ----------------------------------------------------------------------------
+// UObjectDropperObjectsDatabase::GetObjectInformationByID(this, FName id) -> FObjectDropperObjectInformation*
+// The game's OWN id -> object lookup: it walks every category, takes each entry's class soft path,
+// runs FSoftObjectPath::GetAssetName() on it and compares the resulting FName -- so the id it matches
+// is the CLASS name ("BP_Whatever_C"), and a null return is exactly "this install does not have that
+// object" (a DLC the peer owns and we do not). FName rides by value in rdx as its 8 raw bytes.
+using ObjInfoByIdFn     = void* (*)(void* database, uint64_t objectId);
+// AObjectDropperManager::GetObjectDropperObjectComponent(AActor*) -> UObjectDropperPickableObject*
+// Despite the class qualifier it takes the ACTOR as `this` and is simply
+// GetComponentByClass(UObjectDropperPickableObject::StaticClass()) with a re-check of the result --
+// so it doubles as "is this actor a dropped object at all?". Needed to reach _isCurrentlyPickable on
+// the objects we spawn for peers; see kPickableIsPickable.
+using PickableOfFn      = void* (*)(void* actor);
+// AActor::Destroy(bNetForce, bShouldModifyLevel) -> bool. Unlike skater proxies -- which are forgotten
+// rather than destroyed because destroying one mid-session crashes the client -- dropped objects are
+// plain props with no components anyone else drives, and they ACCUMULATE: every peer's set arrives on
+// every map change and at every rejoin, so leaving them hidden would pile up statues for the session.
+using ActorDestroyFn    = bool  (*)(void* actor, bool netForce, bool shouldModifyLevel);
+// UObjectDropperPersistentHandler::Load -- HOOKED, never called. It is the one moment at which the
+// level's own props are still where the MAP put them: Load walks the player's save and moves each
+// prop it names to the saved pose, so anything captured before it runs is the map default and
+// anything captured after is that player's own arrangement. Nothing else at runtime can tell the two
+// apart, which is why "put this bench back" and "show me the host's layout instead of mine" both
+// depend on this seam.
+// AActor::SetActorLocation(this, const FVector*, bool bSweep, FHitResult*, ETeleportType) -- HOOKED,
+// never called, and only ACTIVE while inside Load: it is how Load moves each prop, so intercepting
+// it there captures the pre-move pose of exactly the props that need a default, and no others.
 
 struct Syms {
     SpawnActorFn     SpawnActor        = nullptr;
@@ -357,6 +384,16 @@ struct Syms {
     // ---- the floating player names. Optional: missing = no nameplates, nothing else changes.
     ProjectToScreenFn ProjectToScreen  = nullptr;
     ViewportSizeFn    GetViewportSize  = nullptr;
+    // ---- the object dropper. All optional: missing = dropped-object sync announces itself off.
+    // AObjectDropperManager is a SINGLETON and `_instance` is a static global, so the address is
+    // DECODED from the RIP displacement of the two tiny accessors that read it (see the bind block) --
+    // and both must decode to the same address before either is believed.
+    void**            DropperInstance  = nullptr;   // &AObjectDropperManager::_instance
+    ObjInfoByIdFn     DropperObjInfoById = nullptr;
+    PickableOfFn      DropperPickableOf = nullptr;
+    ActorDestroyFn    ActorDestroy     = nullptr;
+    void*             DropperLoad      = nullptr;   // HOOKED, never called directly
+    void*             ActorSetLocation = nullptr;   // HOOKED, never called directly
     int  resolved = 0, total = 0;
 };
 
@@ -807,6 +844,38 @@ namespace off {
     // vtable slots on UPrimitiveComponent (PDB: linear +0x610, angular 0x10 before it in 4 vtables)
     constexpr int kVtblSetLinearVel   = 0x610;
     constexpr int kVtblSetAngularVel  = 0x620;
+
+    // ---- THE OBJECT DROPPER (PDB: pdbmembers AObjectDropperManager / ...ObjectsDatabase).
+    // The first two are corroborated independently of the PDB by the two accessors we sig: IsActive's
+    // body IS `_instance && _instance[0x490] != 0`, and GetObjectsDatabase's IS `_instance[0x220]`.
+    constexpr int kDropMgrDatabase    = 0x220;   // AObjectDropperManager::_objectsDatabase
+    constexpr int kDropMgrMode        = 0x490;   // _currentMode (EObjectDropperModes u8; 0 = inactive)
+    constexpr int kDropMgrAllObjects  = 0x498;   // _allObjects TArray<AActor*> -- EVERY dropped object
+                                                 // in the world. Diffing it is how placements, moves,
+                                                 // duplicates and call-backs are all detected at once.
+    constexpr int kDropMgrSelected    = 0x4d8;   // _selectedObjects TArray<AActor*> (being dragged)
+    constexpr int kDropDbCategories   = 0x30;    // UObjectDropperObjectsDatabase::_objectCategories
+    constexpr int kDropCatStride      = 0x28;    // sizeof FObjectDropperObjectCategory
+    constexpr int kDropCatObjects     = 0x18;    // FObjectDropperObjectCategory::_objectList
+    constexpr int kDropInfoStride     = 0x90;    // sizeof FObjectDropperObjectInformation
+    // FObjectDropperObjectInformation::_objectClass is a TSoftClassPtr at +0, whose FSoftObjectPath
+    // sits at +0x10 inside it (the FWeakObjectPtr + TagAtLastTest come first). That path is what
+    // GetObjectInformationByID itself calls GetAssetName on, and what TryLoad turns into the UClass.
+    constexpr int kDropInfoClassPath  = 0x10;
+    // ---- MOBILITY. A dropped prop sits at its DEFAULT mobility -- Static -- whenever the dropper is
+    // closed, and UE silently ignores a move on a Static component: the write is accepted, the
+    // transform does not change, and nothing reports it. That is why a peer's object appeared where it
+    // was first spawned and then never moved again, and why opening the local dropper made it jump to
+    // the right place (the game flips every prop to Movable on activation).
+    // Read out of UObjectDropperPickableObject::OnObjectDropperActivated, which caches
+    // RootComponent[+0x14f] into _defaultObjectMobilityType and then vcalls slot +0x500 with 2.
+    constexpr int kCompMobility       = 0x14f;   // USceneComponent::Mobility (EComponentMobility, u8)
+    constexpr int kVtblSetMobility    = 0x500;   // USceneComponent::SetMobility(EComponentMobility)
+    constexpr int kMobilityMovable    = 2;       // EComponentMobility::Movable
+    // UObjectDropperPickableObject::_isCurrentlyPickable. Cleared on every object we spawn for a peer:
+    // a mod-spawned prop still carries the real component, so the LOCAL dropper would happily
+    // highlight it, pick it up and call it back -- into the local player's own inventory and save.
+    constexpr int kPickableIsPickable = 0xb1;
 }
 
 // Crank def identity = its INDEX in the shared UTricksDatabase::_crankList. Both the gather and the

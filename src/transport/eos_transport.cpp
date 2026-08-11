@@ -72,6 +72,15 @@ static EOS_HLobby     g_lobbyH = nullptr;
 static EOS_HLobbySearch g_search = nullptr;
 static volatile LONG  g_lobbyStatus = 0;    // 0 idle, 1 busy, 2 hosting, 3 joined, -1 failed
 static char           g_lobbyId[256] = {0};
+// The lobby OWNER's PUID. Up here with the other lobby state because the create/join callbacks are
+// defined long before the browser section and both have to establish who the host is -- see
+// onJoinLobby, where not doing so left the owner unknown for whole sessions.
+static uint64_t       nowMs();           // defined below; the join callback arms a recheck with it
+static char           g_lobbyOwner[64] = {0};
+static uint64_t       g_ownerRecheckAtMs = 0;
+static int            g_ownerRechecksLeft = 0;
+static const uint64_t kOwnerRecheckMs = 2000;
+static const int      kOwnerRechecks  = 5;    // ~10 s of chances, then stop asking
 // ---- private-game codes. Declared here, with the other lobby state, because onCreateLobby reads
 // them and it is defined long before the browser section.
 static char  g_adCode[16] = {0};   // what WE advertise while hosting ("" = public)
@@ -226,6 +235,11 @@ static void EOS_CALL onCreateLobby(const EOS_Lobby_CreateLobbyCallbackInfo* d) {
     if (d->ResultCode == EOS_EResult::EOS_Success) {
         strncpy_s(g_lobbyId, d->LobbyId, _TRUNCATE);
         InterlockedExchange(&g_lobbyStatus, 2);
+        // We just created it, so we own it -- that is what a successful create MEANS, and it needs no
+        // lookup. Seeding it here rather than waiting for a refresh matters because the lobby cache
+        // does not have the owner yet at this moment, so the query would answer nothing and leave the
+        // host of a brand-new session unidentifiable to everything that asks who the host is.
+        strncpy_s(g_lobbyOwner, g_myId, _TRUNCATE);
         strncpy_s(g_myCode, g_adCode, _TRUNCATE);
         Log("[lobby] HOSTING lobby %s (bucket %s)%s%s", g_lobbyId, kBucket,
             g_myCode[0] ? " PRIVATE, code " : " (public)", g_myCode);
@@ -259,6 +273,15 @@ static void EOS_CALL onJoinLobby(const EOS_Lobby_JoinLobbyCallbackInfo* d) {
         InterlockedExchange(&g_lobbyStatus, 3);
         Log("[lobby] JOINED lobby %s", g_lobbyId);
         rosterAddAll(g_lobbyId);                         // everyone already inside becomes a peer NOW
+        // WHO OWNS IT? Ownership was previously only ever examined when the MEMBERSHIP CHANGED -- and
+        // joining a lobby that nobody then enters or leaves produces no such change, so the owner
+        // stayed unknown for the entire session. Anything keyed on "who is the host" (kick, and the
+        // shared dropped-object set) silently fell back to its no-host behaviour.
+        // Asked once here, and then re-asked on a bounded timer, because the local lobby cache may
+        // not have the owner yet this instant -- the same race the create path hits.
+        refreshOwnership();
+        if (!g_lobbyOwner[0]) { g_ownerRecheckAtMs = nowMs() + kOwnerRecheckMs;
+                                g_ownerRechecksLeft = kOwnerRechecks; }
     } else {
         InterlockedExchange(&g_lobbyStatus, -1);
         Log("[lobby] join failed: %s", EOS_EResult_ToString(d->ResultCode)); NoteAuthResult(d->ResultCode, "join");
@@ -297,13 +320,8 @@ static const uint64_t kLoginTimeoutMs = 15000;
 static const uint64_t kBrowseTimeoutMs = 15000;   // generous: a cold search over a relay is slow
 static uint32_t      g_searchGen   = 0;     // bumped by every startSearch; rides in the Find ClientData
 static uint64_t      g_browseStartMs = 0;   // when the live browse began (0 = none) -- for the timeout
-static char          g_lobbyOwner[64] = {0};  // the lobby owner's PUID, refreshed with ownership
 // Re-examine ownership after the backend refuses a publish we believed we were entitled to make.
 // See onUpdateLobby: migration is a race, and membership events are the only other trigger.
-static uint64_t      g_ownerRecheckAtMs = 0;
-static int           g_ownerRechecksLeft = 0;
-static const uint64_t kOwnerRecheckMs = 2000;
-static const int      kOwnerRechecks  = 5;    // ~10 s of chances, then stop asking
 
 void SetLobbyAd(const char* hostName, const char* mapName) {
     if (hostName) strncpy_s(g_adHost, hostName, _TRUNCATE);
@@ -371,9 +389,18 @@ static void refreshOwnership() {
     oo.ApiVersion = EOS_LOBBYDETAILS_GETLOBBYOWNER_API_LATEST;
     EOS_ProductUserId owner = EOS_LobbyDetails_GetLobbyOwner(det, &oo);
     char id[64] = {0}; int32_t n = sizeof(id);
-    const bool mine = owner && EOS_ProductUserId_ToString(owner, id, &n) == EOS_EResult::EOS_Success
-                            && !_stricmp(id, g_myId);
-    strncpy_s(g_lobbyOwner, id, _TRUNCATE);          // "" if it could not be resolved -- say so, do not guess
+    const bool resolved = owner && EOS_ProductUserId_ToString(owner, id, &n) == EOS_EResult::EOS_Success
+                                && id[0];
+    // AN UNKNOWN OWNER IS NOT EVIDENCE THAT WE ARE NOT THE OWNER. Treating it as one demoted the real
+    // host to guest: GetLobbyOwner reads the LOCAL cache, which is not populated the instant a lobby
+    // is created, so the first refresh after hosting resolved nothing, `mine` came out false, and the
+    // branch below moved status 2 -> 3. Symptom: host a fresh game and NOBODY is the host in it --
+    // no kick, and the dropped-object authority has nobody to point at. Same discipline as the
+    // NotOwner handling below, from the other side: act on what the service actually SAID, and when
+    // it said nothing, change nothing.
+    if (!resolved) { EOS_LobbyDetails_Release(det); return; }
+    const bool mine = !_stricmp(id, g_myId);
+    strncpy_s(g_lobbyOwner, id, _TRUNCATE);
     if (mine && st != 2) {
         // We just inherited the lobby. Take the join CODE with it, or a private game silently becomes
         // one nobody -- including us -- can tell anyone how to enter. The advertised name and map are
@@ -620,8 +647,27 @@ static bool startSearch(bool browse, const char* code = nullptr) {
     Log("[lobby] %s bucket %s ...", browse ? "browsing" : "searching", kBucket);
     return true;
 }
+// Picking a different session while already in one MEANS "take me there". Refusing was a silent dead
+// click -- the round-350 lesson -- and worse, staying in the old lobby leaves us on two rosters at
+// once, which is how ownership and the peer list end up describing different games. So: leave the
+// current one first, then go. `LobbyLeave` clears our id and status synchronously (the EOS call
+// finishes on its own), so the join below starts from a clean membership.
+// An operation already IN FLIGHT (status 1) is still refused: that one has not decided yet.
+void LobbyLeave();                       // defined below; the join paths need it first
+static bool leaveCurrentBeforeJoining(const char* what) {
+    if (g_lobbyStatus == 1) {
+        Log("[lobby] %s refused: an earlier lobby operation is still in flight", what);
+        return false;
+    }
+    if (g_lobbyStatus >= 2 && g_lobbyId[0]) {
+        Log("[lobby] leaving %s first, to %s", g_lobbyId, what);
+        LobbyLeave();
+    }
+    return true;
+}
 bool LobbyJoin() {
-    if (!g_plat || !g_me || g_lobbyStatus == 1 || g_lobbyStatus >= 2) return false;
+    if (!g_plat || !g_me) return false;
+    if (!leaveCurrentBeforeJoining("join another session")) return false;
     InterlockedExchange(&g_lobbyStatus, 1);
     return startSearch(false);
 }
@@ -629,7 +675,7 @@ bool LobbyJoin() {
 // and a player already hosting may well want to see who else is out there.
 bool LobbyJoinByCode(const char* code) {
     if (!g_plat || !g_me || !code || !*code) return false;
-    if (g_lobbyStatus == 1 || g_lobbyStatus >= 2) return false;
+    if (!leaveCurrentBeforeJoining("join by code")) return false;
     strncpy_s(g_joinCode, code, _TRUNCATE);
     InterlockedExchange(&g_lobbyStatus, 1);
     if (startSearch(false, g_joinCode)) return true;
@@ -660,7 +706,7 @@ bool LobbyBrowse() {
 bool LobbyJoinAt(int i) {
     if (!g_plat || !g_me || !g_search) return false;
     if (i < 0 || i >= g_nBrowse) return false;
-    if (g_lobbyStatus == 1 || g_lobbyStatus >= 2) return false;
+    if (!leaveCurrentBeforeJoining("join the session you picked")) return false;
     EOS_LobbySearch_CopySearchResultByIndexOptions ro{};
     ro.ApiVersion = EOS_LOBBYSEARCH_COPYSEARCHRESULTBYINDEX_API_LATEST; ro.LobbyIndex = (uint32_t)i;
     EOS_HLobbyDetails det = nullptr;

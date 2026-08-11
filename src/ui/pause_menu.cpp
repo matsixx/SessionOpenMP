@@ -356,6 +356,14 @@ static uint64_t  g_nameDistKey = 0, g_bubbleDistKey = 0;
 // is finished (they cannot be stamped any earlier -- see stampValues). -1 = not on this page.
 static int       g_nameModeAt = -1, g_nameDistAt = -1, g_bubbleDistAt = -1;
 static const int kMpNamesAfter = 0;      // directly under "Your name": both are about who you see
+// ---- DROPPED OBJECTS. A three-state MultiOption on the multiplayer page: off / live edits only /
+// share one set. It sits with "Player names" rather than with the connect buttons because it is about
+// what you SEE in a session, not about how you get into one.
+static uint8_t   g_dropRow[0x90];
+static FTextBlob g_dropOpts[3];
+static uint64_t  g_dropKey = 0;
+static int       g_dropAt  = -1;         // widget index within the LAST build; -1 = not on this page
+static const int kMpDropAfter = 0;       // beside "Player names", under "Your name"
 // ---- the posture row. An INFO row (label + right-hand value) rebuilt on every page build, like the
 // lobby rows, so it reports the LIVE configuration rather than whatever was true at startup. Its
 // strings come from the transport, so a future backend describes itself and this code does not grow a
@@ -590,6 +598,16 @@ static void buildRows() {
         if (!buildRow(g_namesOpenRow, "OmpNames", "Player names",
                       "Names and chat bubbles above the other players", &g_namesOpenKey))
             g_namesOpenKey = 0;
+        // Dropped objects. Built alongside the names page's rows and failing just as independently:
+        // this row is a preference, and the buttons that connect you to a session must never depend
+        // on one having built.
+        static const char* kDropOpts[3] = { "Off", "Live edits only", "Share one set" };
+        if (!buildOptionRow(g_dropRow, "OmpDropMode", "Dropped objects",
+                            "Whether the rails and ramps you place with the object dropper are shared. "
+                            "Share one set shows everybody the same objects: your own are hidden for "
+                            "the session and come back when you leave -- nothing is ever deleted.",
+                            kDropOpts, 3, &g_dropKey, g_dropOpts))
+            g_dropKey = 0;
         static const char* kModeOpts[3] = { "Off", "Off board only", "Always" };
         if (!buildOptionRow(g_nameModeRow, "OmpNameMode", "Show names",
                             "When to show a player's name above their head. Off board only keeps "
@@ -980,7 +998,7 @@ static const TArrayHdr* chooseArray(void* page, const TArrayHdr* items, TArrayHd
         // The roster goes on EVERY row of this page, so the right-hand panel keeps showing it no
         // matter which row the player happens to be sitting on.
         buildRosterText();
-        g_privacyAt = -1;
+        g_privacyAt = -1; g_dropAt = -1;
         for (int i = 0; i < kMpRowCount; i++) {
             uint8_t* row = g_mpRows + (size_t)i * off::kItemSize;
             setRowRoster(row);
@@ -997,6 +1015,15 @@ static const TArrayHdr* chooseArray(void* page, const TArrayHdr* items, TArrayHd
             if (i == kMpNamesAfter && g_namesOpenKey) {
                 setRowRoster(g_namesOpenRow);
                 add(g_namesOpenRow, true);
+            }
+            if (i == kMpDropAfter && g_dropKey) {
+                setRowRoster(g_dropRow);
+                // The value goes on the DEFINITION here (so the row reads right even if the stamp is
+                // skipped) and onto the widget in stampValues, which is the only point at which it
+                // survives the rebuild.
+                *(int32_t*)(g_dropRow + off::kItemMultiStart) = MpPrefs_DropMode();
+                g_dropAt = n;
+                add(g_dropRow, true);
             }
             if (i == kMpBrowseAfter) { setRowRoster(g_browseOpenRow); add(g_browseOpenRow, true); }
             // "Players" sits with the session actions, and only means anything while hosting.
@@ -1212,6 +1239,15 @@ static void stampValues(void* page) {
                 S.MenuMultiSetIndex(widget, MpPrefs_HideAddress() ? 1 : 0);
         }
         g_privacyAt = -1;                                 // one shot per build, like the guest pass
+    }
+    // The dropped-objects row, same page and same argument as the privacy toggle.
+    if (g_dropAt >= 0 && S.MenuMultiSetIndex) {
+        const TArrayHdr* pw = (const TArrayHdr*)((uint8_t*)page + off::kPageItemWidgets);
+        if (pw->data && g_dropAt < pw->num) {
+            if (void* widget = ((void**)pw->data)[g_dropAt])
+                S.MenuMultiSetIndex(widget, MpPrefs_DropMode());
+        }
+        g_dropAt = -1;
     }
     // The player-names page, same argument: a slider's value can ONLY live on the widget, and the
     // definition's option index does not survive DeserializePage.
@@ -1716,6 +1752,10 @@ static bool handleValueChange(void* params, bool isSlider) {
         // cannot churn the settings file either.
         if (g_nameModeKey && k == g_nameModeKey && !isSlider) {
             MpPrefs_SetNameMode(*(const int32_t*)((const uint8_t*)params + off::kChangeParamsNew));
+            return true;
+        }
+        if (g_dropKey && k == g_dropKey && !isSlider) {
+            MpPrefs_SetDropMode(*(const int32_t*)((const uint8_t*)params + off::kChangeParamsNew));
             return true;
         }
         if (isSlider && (k == g_nameDistKey || k == g_bubbleDistKey)) {

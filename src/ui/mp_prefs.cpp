@@ -33,6 +33,10 @@ static char     g_peerId[33] = {0};      // 32 hex chars + terminator; empty unt
 static int      g_nameMode    = MPNAME_OFFBOARD;
 static int      g_nameDistM   = 120;
 static int      g_bubbleDistM = 35;
+// Dropped objects: SHARED by default. One canonical set is the only arrangement in which everyone is
+// looking at the same spot, and it takes nothing away permanently -- your own props are hidden for
+// the session and come straight back.
+static int      g_dropMode    = MPDROP_SHARED;
 
 static void say(const char* s) { if (g_log) g_log(s); }
 
@@ -51,6 +55,8 @@ static void saveAll() {
     fprintf(f, "NameMode=%d\n", g_nameMode);
     fprintf(f, "NameDistM=%d\n", g_nameDistM);
     fprintf(f, "BubbleDistM=%d\n", g_bubbleDistM);
+    fprintf(f, "# Dropped objects: 0 off, 1 only what is placed during the session, 2 share one set.\n");
+    fprintf(f, "DropMode=%d\n", g_dropMode);
     // PeerId is an IDENTITY, not a preference: deleting the line makes this install a different
     // person to everyone who has played with it. Written last, with a warning above it.
     fprintf(f, "# PeerId identifies this install to peers on non-EOS transports. Deleting it is\n"
@@ -92,6 +98,18 @@ void MpPrefs_SetHideAddress(bool on) {
 // game-thread publish reads them straight out of here every frame. Each one clamps, so a hand-edited
 // or corrupt file can never produce a slider position the menu could not have produced.
 int  MpPrefs_NameMode()    { return g_nameMode; }
+int  MpPrefs_DropMode()    { return g_dropMode; }
+void MpPrefs_SetDropMode(int mode) {
+    mode = clampI(mode, MPDROP_OFF, MPDROP_SHARED);
+    if (mode == g_dropMode) return;
+    g_dropMode = mode;
+    saveAll();
+    char m[140];
+    snprintf(m, sizeof(m), "[prefs] dropped objects: %s",
+             (mode == MPDROP_OFF) ? "off" : (mode == MPDROP_LIVE) ? "live edits only"
+                                                                  : "share one set");
+    say(m);
+}
 int  MpPrefs_NameDistM()   { return g_nameDistM; }
 int  MpPrefs_BubbleDistM() { return g_bubbleDistM; }
 
@@ -144,6 +162,7 @@ void MpPrefs_Init(const char* dir, void (*logf)(const char*)) {
             else if (!_stricmp(key, "NameMode"))    g_nameMode    = clampI(atoi(val), MPNAME_OFF, MPNAME_ALWAYS);
             else if (!_stricmp(key, "NameDistM"))   g_nameDistM   = clampI(atoi(val), MPNAME_DIST_MIN, MPNAME_DIST_MAX);
             else if (!_stricmp(key, "BubbleDistM")) g_bubbleDistM = clampI(atoi(val), MPBUBBLE_DIST_MIN, MPBUBBLE_DIST_MAX);
+            else if (!_stricmp(key, "DropMode"))    g_dropMode    = clampI(atoi(val), MPDROP_OFF, MPDROP_SHARED);
             else if (!_stricmp(key, "PeerId")) {
                 // Only accept a well-formed one. A truncated or hand-edited id would still "work"
                 // right up until it collided with somebody, which is the worst time to find out.

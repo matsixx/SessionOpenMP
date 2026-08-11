@@ -18,6 +18,7 @@
 // internals on the clean profile.
 #include "../../src/replication/replication.h"
 #include "../../src/replication/replaysync.h"
+#include "../../src/replication/dropsync.h"
 #include "../../src/replication/anim_fields.h"
 #include <cstdio>
 #include <cstring>
@@ -936,6 +937,218 @@ static bool syncTransferCheck() {
     return true;
 }
 
+// ---- the DROPPED-OBJECT gate (OMPL). Its data deliberately VIOLATES the codec's assumptions rather
+// than illustrating them -- the round-352 lesson, whose gate invented feet near the body and so shared
+// the very assumption it existed to check. So: a FULL 256-object set (many parts), names at the length
+// cap, many distinct names (a name table per part), coordinates kilometres out and negative,
+// non-identity quats, and objects sitting exactly on top of each other. Then the things that go wrong
+// on a real wire: a missing part (which must NOT complete an assembly, because a partial set applies
+// as "everything else was deleted"), a generation change, and truncation.
+static std::vector<std::vector<uint8_t>> g_dropPkts;
+static void dropLoopSend(int, const void* data, int len, bool) {
+    g_dropPkts.emplace_back((const uint8_t*)data, (const uint8_t*)data + len);
+}
+static void dropMakeRec(omp::dropsync::Rec& r, int i) {
+    // 63 characters: the cap, so a name one byte longer would be refused and this one must not be.
+    snprintf(r.id, sizeof(r.id), "BP_ObjectDropper_LongAssetNameForTheCap_%019d_C", i % 37);
+    r.localId = (uint16_t)(i + 1);
+    // Coincident every 8th, and far out with mixed signs: nothing here may be inferred from position.
+    const float k = (float)((i / 8) * 137);
+    r.loc[0] = (i % 2 ? -1.f : 1.f) * (120000.f + k);
+    r.loc[1] = -843210.5f + k;
+    r.loc[2] = (float)(i % 5) * 0.25f;
+    const float a = (float)i * 0.37f;
+    r.quat[0] = sinf(a) * 0.5f; r.quat[1] = cosf(a) * 0.5f;
+    r.quat[2] = sinf(a * 2.f) * 0.5f;
+    float n = r.quat[0]*r.quat[0] + r.quat[1]*r.quat[1] + r.quat[2]*r.quat[2];
+    r.quat[3] = sqrtf(n < 1.f ? 1.f - n : 0.f);
+}
+static bool dropSyncCheck() {
+    using namespace omp::dropsync;
+    SetSendFn(&dropLoopSend);
+    ResetAll();
+
+    Rec set[kMaxSetRecords];
+    for (int i = 0; i < kMaxSetRecords; i++) dropMakeRec(set[i], i);
+
+    // ---- a full set: every part must parse alone, and only the LAST may complete the assembly.
+    g_dropPkts.clear();
+    const int parts = SendSet(0, 7, 0xABCDEF0123456789ull, set, kMaxSetRecords, 0);
+    if (parts < 2) { printf("  drop: a 256-object set should need several parts, got %d\n", parts); return false; }
+    Update up; int completedAt = -1;
+    for (size_t i = 0; i < g_dropPkts.size(); i++) {
+        if (!OnPacket(0, g_dropPkts[i].data(), (int)g_dropPkts[i].size(), up)) {
+            printf("  drop: part %d of a set we built ourselves did not parse\n", (int)i); return false;
+        }
+        if (!up.haveAuth || up.authKey != 0xABCDEF0123456789ull) {
+            printf("  drop: authority key lost on part %d\n", (int)i); return false;
+        }
+        if (up.setReady) completedAt = (int)i;
+    }
+    if (completedAt != (int)g_dropPkts.size() - 1) {
+        printf("  drop: set completed at part %d of %d -- an incomplete set must never apply\n",
+               completedAt, (int)g_dropPkts.size()); return false;
+    }
+    int n = 0; const Rec* got = SetRecords(0, &n);
+    if (!got || n != kMaxSetRecords) { printf("  drop: assembled %d of %d records\n", n, kMaxSetRecords); return false; }
+    for (int i = 0; i < n; i++) {
+        if (strcmp(got[i].id, set[i].id) != 0 || got[i].localId != set[i].localId) {
+            printf("  drop: record %d identity wrong ('%s' id %u)\n", i, got[i].id, got[i].localId); return false;
+        }
+        for (int k = 0; k < 3; k++) if (got[i].loc[k] != set[i].loc[k]) {
+            // f32 on the wire, so this is EXACT equality on purpose: a placed object has to land
+            // where its owner put it, and "close enough" is how a rail ends up half inside a ledge.
+            printf("  drop: record %d position %d changed (%.4f -> %.4f)\n", i, k,
+                   (double)set[i].loc[k], (double)got[i].loc[k]); return false;
+        }
+        for (int k = 0; k < 4; k++) if (fabsf(got[i].quat[k] - set[i].quat[k]) > 1e-6f) {
+            printf("  drop: record %d rotation %d changed\n", i, k); return false;
+        }
+    }
+
+    // ---- the EMPTY set. A peer who calls back their last object must be able to say so, or it
+    // stands in everyone else's world forever.
+    g_dropPkts.clear();
+    if (SendSet(1, 3, 1, nullptr, 0, 0) != 1) { printf("  drop: an empty set must still be one packet\n"); return false; }
+    if (!OnPacket(1, g_dropPkts[0].data(), (int)g_dropPkts[0].size(), up) || !up.setReady) {
+        printf("  drop: the empty set did not complete\n"); return false;
+    }
+    SetRecords(1, &n);
+    if (n != 0) { printf("  drop: the empty set assembled %d records\n", n); return false; }
+
+    // ---- A MISSING PART. Reliable transport should not lose one, but a set applied half-received
+    // deletes everything the missing part carried, so the assembly must simply refuse to finish.
+    g_dropPkts.clear();
+    SendSet(2, 1, 5, set, kMaxSetRecords, 0);
+    const size_t nParts = g_dropPkts.size();
+    bool ready = false;
+    for (size_t i = 0; i < nParts; i++) {
+        if (i == 1) continue;                                  // dropped
+        OnPacket(2, g_dropPkts[i].data(), (int)g_dropPkts[i].size(), up);
+        if (up.setReady) ready = true;
+    }
+    if (ready) { printf("  drop: an incomplete set COMPLETED -- it would have deleted the missing part\n"); return false; }
+    for (size_t i = 0; i < nParts; i++) {                      // the resend heals it
+        OnPacket(2, g_dropPkts[i].data(), (int)g_dropPkts[i].size(), up);
+        ready = ready || up.setReady;
+    }
+    if (!ready) { printf("  drop: a complete resend after a loss never completed\n"); return false; }
+
+    // ---- generation change: the receiver must be TOLD, before anything in the packet is applied.
+    g_dropPkts.clear();
+    SendSet(2, 2, 5, set, 4, 0);
+    if (!OnPacket(2, g_dropPkts[0].data(), (int)g_dropPkts[0].size(), up) || !up.genReset) {
+        printf("  drop: a new generation did not report genReset\n"); return false;
+    }
+
+    // ---- the deltas.
+    g_dropPkts.clear();
+    if (SendPlace(3, 9, set[5]) != 1) { printf("  drop: SendPlace failed\n"); return false; }
+    if (!OnPacket(3, g_dropPkts[0].data(), (int)g_dropPkts[0].size(), up) || up.nPlace != 1 ||
+        strcmp(up.place[0].id, set[5].id) != 0 || up.place[0].localId != set[5].localId) {
+        printf("  drop: place round-trip wrong\n"); return false;
+    }
+    g_dropPkts.clear();
+    if (SendMove(3, 9, set, 40) != 2) { printf("  drop: 40 moves should batch into 2 packets\n"); return false; }
+    int moved = 0;
+    for (auto& p : g_dropPkts) { if (OnPacket(3, p.data(), (int)p.size(), up)) moved += up.nMove; }
+    if (moved != 40) { printf("  drop: %d of 40 moves arrived\n", moved); return false; }
+    g_dropPkts.clear();
+    uint16_t ids[3] = { 1, 2, 65535 };
+    if (SendRemove(3, 9, ids, 3) != 1) { printf("  drop: SendRemove failed\n"); return false; }
+    if (!OnPacket(3, g_dropPkts[0].data(), (int)g_dropPkts[0].size(), up) || up.nRemove != 3 ||
+        up.remove[2] != 65535) { printf("  drop: remove round-trip wrong\n"); return false; }
+
+    // ---- TRUNCATION. No strict prefix of a valid packet may ever parse, and no packet with trailing
+    // bytes may either -- the bounds cursor's whole promise against hostile input.
+    g_dropPkts.clear();
+    SendSet(4, 1, 5, set, 12, 0);
+    SendPlace(4, 1, set[0]);
+    SendMove(4, 1, set, 6);
+    SendRemove(4, 1, ids, 3);
+    int prefixesTried = 0;
+    for (auto& p : g_dropPkts) {
+        for (int cut = 1; cut < (int)p.size(); cut++) {
+            ForgetPeer(9);
+            prefixesTried++;
+            if (OnPacket(9, p.data(), cut, up)) {
+                printf("  drop: a %d-byte PREFIX of a %d-byte packet parsed\n", cut, (int)p.size());
+                return false;
+            }
+        }
+        std::vector<uint8_t> fat = p; fat.push_back(0x5a);
+        ForgetPeer(9);
+        if (OnPacket(9, fat.data(), (int)fat.size(), up)) {
+            printf("  drop: a packet with a trailing byte parsed\n"); return false;
+        }
+    }
+
+    // ---- HOSTILE VALUES. Each one is what an object would be spawned FROM, so each must be refused
+    // at the codec rather than at the spawn.
+    {
+        Rec bad = set[0];
+        const uint32_t nanBits = 0x7fc00000u;                  // quiet NaN, built from bits: the
+        float nanF; memcpy(&nanF, &nanBits, 4);                // compiler rejects a literal 0.0f/0.0f
+        bad.loc[1] = nanF;
+        g_dropPkts.clear(); SendPlace(5, 1, bad);
+        ForgetPeer(5);
+        if (!g_dropPkts.empty() && OnPacket(5, g_dropPkts[0].data(), (int)g_dropPkts[0].size(), up)) {
+            printf("  drop: a NaN position was accepted\n"); return false;
+        }
+        bad = set[0]; bad.loc[0] = 5.0e9f;                     // far outside any level
+        g_dropPkts.clear(); SendPlace(5, 1, bad);
+        ForgetPeer(5);
+        if (!g_dropPkts.empty() && OnPacket(5, g_dropPkts[0].data(), (int)g_dropPkts[0].size(), up)) {
+            printf("  drop: a position 50000 km out was accepted\n"); return false;
+        }
+        bad = set[0]; bad.quat[0] = 1.9f; bad.quat[1] = bad.quat[2] = bad.quat[3] = 0.f;
+        g_dropPkts.clear(); SendPlace(5, 1, bad);
+        ForgetPeer(5);
+        if (!g_dropPkts.empty() && OnPacket(5, g_dropPkts[0].data(), (int)g_dropPkts[0].size(), up)) {
+            printf("  drop: a non-unit quaternion was accepted\n"); return false;
+        }
+        // A control character in the name. Printable ASCII is allowed on purpose (a real asset can be
+        // called "Bench 01"), so this is the line that must still hold.
+        bad = set[0]; snprintf(bad.id, sizeof(bad.id), "BP_Evil%c_C", 0x01);
+        g_dropPkts.clear();
+        if (SendPlace(5, 1, bad) != 0) { printf("  drop: a name with a control byte was SENT\n"); return false; }
+        // ...and a legitimately odd one must NOT be refused, or one such object silently takes the
+        // whole set with it.
+        Rec spaced = set[0]; snprintf(spaced.id, sizeof(spaced.id), "BP_Bench 01-Flat_C");
+        g_dropPkts.clear();
+        ForgetPeer(5);
+        if (SendPlace(5, 1, spaced) != 1 ||
+            !OnPacket(5, g_dropPkts[0].data(), (int)g_dropPkts[0].size(), up) || up.nPlace != 1 ||
+            strcmp(up.place[0].id, spaced.id) != 0) {
+            printf("  drop: a name with a space and a dash was refused\n"); return false;
+        }
+    }
+
+    // ---- ONE UNSENDABLE RECORD MUST NOT TAKE THE SET WITH IT. The receiver rejects a whole packet
+    // over one bad name, and the authority key rides in that packet, so the sender drops just the
+    // record. This is the asymmetry that made a single odd object look like "sharing does not work".
+    {
+        Rec mixed[8];
+        for (int i = 0; i < 8; i++) dropMakeRec(mixed[i], i);
+        snprintf(mixed[3].id, sizeof(mixed[3].id), "BP_Bad%c_C", 0x07);
+        g_dropPkts.clear();
+        ForgetPeer(6);
+        if (SendSet(6, 4, 99, mixed, 8, 0) != 1) { printf("  drop: the mixed set did not send\n"); return false; }
+        if (!OnPacket(6, g_dropPkts[0].data(), (int)g_dropPkts[0].size(), up) || !up.setReady) {
+            printf("  drop: a set carrying one unsendable record was REJECTED WHOLE\n"); return false;
+        }
+        SetRecords(6, &n);
+        if (n != 7) { printf("  drop: mixed set assembled %d records, want 7\n", n); return false; }
+        if (!up.haveAuth || up.authKey != 99) { printf("  drop: the authority key was lost with it\n"); return false; }
+    }
+
+    ResetAll();
+    SetSendFn(nullptr);
+    printf("  drop sync: %d-object set in %d parts, empty set, lost part, deltas, %d prefixes, "
+           "hostile values  PASS\n", kMaxSetRecords, parts, prefixesTried);
+    return true;
+}
+
 int main(int argc, char**) {
     const bool dbg = argc > 1;                      // any arg = per-second clock internals, clean profile
     printf("SessionOpenMP replication loop test\n");
@@ -945,6 +1158,7 @@ int main(int argc, char**) {
     if (!extrapCoherenceCheck()) { printf("\nEXTRAP COHERENCE FAIL\n"); return 1; }
     if (!animLerpCheck()) { printf("\nANIM LERP FAIL\n"); return 1; }
     if (!syncTransferCheck()) { printf("\nSYNC TRANSFER FAIL\n"); return 1; }
+    if (!dropSyncCheck()) { printf("\nDROP SYNC FAIL\n"); return 1; }
     printf("%-13s %8s %8s %8s %6s %7s %7s %7s %7s\n",
            "profile", "outEwma", "outMax", "delay", "alpha", "starve", "resync", "extrap", "verdict");
     bool allPass = true;

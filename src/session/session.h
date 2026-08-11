@@ -56,6 +56,7 @@ struct Stats {
     int      peers = 0, proxiesAlive = 0;
     uint32_t published = 0, received = 0, appliedFrames = 0;
     float    publishHz = 0;
+    int      dropOwn = 0, dropRemote = 0;   // dropped objects: ours published / peers' standing here
 };
 
 // Called once per game frame. `ownPawn` may be null (menus, loading) -- everything degrades to a no-op.
@@ -126,5 +127,20 @@ void  RestoreHiddenAfterReplay(void (*logf)(const char*));
 bool SetPeerReplaySync(int peerId, bool on);
 // 0 off, 1 transferring, 2 ready (showing), 3 failed -- for the menu row / logging.
 int  PeerReplaySyncState(int peerId);
+
+// ---- DROPPED OBJECTS (Session's object dropper -- LB off the board). See game/dropper.h for the
+// model. The policy is the "Dropped Objects" pause-menu row, and it decides ONLY what happens to the
+// sets everyone had SAVED before the session; live placements always replicate above Off.
+//   0 Off     -- nothing syncs at all.
+//   1 Live    -- only objects placed, moved or removed DURING the session. Nobody's saved set
+//                travels, so a peer can grind a rail that is simply not there for you.
+//   2 Shared  -- one player's saved set is the world (the lowest stable id among everyone present,
+//                so every machine picks the SAME one without a host concept and it survives a host
+//                leaving). Everyone else hides their own saved set for the duration -- visually and
+//                for collision; no save is ever written -- and gets it back on leaving.
+// The policy itself lives in the preferences (MpPrefs_DropMode) so it survives a restart and either
+// menu can write it from its own thread; Frame reads it every tick, so there is no apply step and no
+// second copy to keep in sync. This is the read-back, for logging and the overlay.
+uint8_t DropPolicy();
 
 }} // namespace omp::session

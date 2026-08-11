@@ -32,6 +32,14 @@ static int g_sent[64] = {};
 static int g_roster = 0;
 void Send(int peerIdx, const void*, int, bool) { if (peerIdx >= 0 && peerIdx < 64) g_sent[peerIdx]++; }
 int  SendBudget() { return 0; }   // no wire: replay-sync bursts uncapped (and unexercised) here
+// The dropped-object lane hashes this into its authority key. A fixed answer is right for a headless
+// test: there is no game, so nothing ever adopts or hides a set here.
+const char* MyId() { return "test:self"; }
+// No lobby, so no host: the dropped-object authority falls back to its lowest-key rule, which is
+// exactly the path a host-less wire (shared memory) takes for real.
+const char* LobbyOwnerId() { return ""; }
+const char* PeerIdStr(int) { return ""; }
+bool LobbyIsHost() { return false; }
 TrustLevel BackendTrust() { return TRUST_NONE; }  // no wire can vouch: the spawn gate stays open here
 TrustLevel PeerTrust(int) { return TRUST_NONE; }
 bool GetStats(int idx, PeerStats* out) {

@@ -223,6 +223,32 @@ static const SigEntry kSigs[] = {
     // HOOK TARGET: ASkaterCharacter::PopulateMarkerInfo  Epic 0xffe090 / Steam 0xfbdec0 (sigmake).
     // Keeps the -0x4f0 sub-object displacement concrete. See the Syms field comment for the guard.
     { "PopulateMarkerInfo",   "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 40 C6 02 01 48 8B DA 48 8B 81 10 FB FF FF 48 8B F9 48 85 C0 ?? ?? 0F B6 88 20 0E 00 00", false },
+    // --- THE OBJECT DROPPER. All optional: without them dropped-object sync announces itself off.
+    // The first two are DATA-REFERENCE SITES, not symbols we call: both are three-instruction
+    // accessors whose whole body is a read of the static `AObjectDropperManager::_instance`, and the
+    // bind block decodes each one's RIP displacement to get the global's address.
+    // Deliberate exception to "never wildcard a displacement": the RIP disp is precisely the field
+    // that differs between the two exes (Epic 0x3cca559 / Steam its own), so it MUST be wildcarded --
+    // identity comes from the member displacements left concrete, 0x490 and 0x220, which are also the
+    // two offsets the decode corroborates. Two independent sites are used rather than one because
+    // they must agree: a decode that lands somewhere else is a mis-sig, and silence is not an option.
+    // AObjectDropperManager::IsActive           Epic 0x10be780 / Steam 0x107eb70 (sigmake)
+    { "DropperActiveSite",    "48 8B 05 ?? ?? ?? ?? 48 85 C0 ?? ?? C3 80 B8 90 04 00 00 00 0F 95 C0 C3", false },
+    // AObjectDropperManager::GetObjectsDatabase Epic 0x10b8620 / Steam 0x1078a10 (sigmake)
+    { "DropperDbSite",        "48 8B 05 ?? ?? ?? ?? 48 85 C0 ?? ?? C3 48 8B 80 20 02 00 00 C3", false },
+    // UObjectDropperObjectsDatabase::GetObjectInformationByID  Epic 0x10b83a0 / Steam 0x1078790
+    { "DropperObjInfoById",   "48 89 5C 24 20 48 89 54 24 10 55 56 57 41 54 41 55 41 56 41 57 48 83 EC 30 48 8B DA 4C 8B E9 33 D2 89 54 24 70 39 51 38", false },
+    // AObjectDropperManager::GetObjectDropperObjectComponent  Epic 0x10b80a0 / Steam 0x1078490
+    { "DropperPickableOf",    "40 53 48 83 EC 20 48 8B D9 48 85 C9 ?? ?? E8 ?? ?? ?? ?? 48 8B D0 48 8B CB E8 ?? ?? ?? ?? 48 8B D8 48 85 C0 ?? ?? E8 ?? ?? ?? ??", false },
+    // HOOK TARGETS, never called: the map-default seam. See the typedef comments.
+    // UObjectDropperPersistentHandler::Load  Epic 0x10bf6c0 / Steam 0x107fab0 (sigmake)
+    { "DropperLoad",          "4C 8B DC 55 57 41 57 49 8D AB B8 FE FF FF 48 81 EC 30 02 00 00 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 85 00 01 00 00", false },
+    // AActor::SetActorLocation              Epic 0x29cdde0 / Steam 0x29906d0 (sigmake). Keeps the
+    // RootComponent (+0x130) and ComponentToWorld (+0x1d0) displacements concrete -- they ARE the
+    // identity of the function, and they corroborate off::kActorRootComp / kCompPos.
+    { "ActorSetLocation",     "48 81 EC F8 00 00 00 48 8B 89 30 01 00 00 48 85 C9 0F 84 ?? ?? ?? ?? 0F 10 99 D0 01 00 00 F3 0F 10 02", false },
+    // AActor::Destroy  Epic 0x29b7a70 / Steam 0x297a350 (sigmake)
+    { "ActorDestroy",         "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 48 89 7C 24 20 41 56 48 83 EC 20 33 F6 41 0F B6 E8", false },
 };
 static const int kSigN = (int)(sizeof(kSigs) / sizeof(kSigs[0]));
 
@@ -534,6 +560,38 @@ const Syms& Resolve(void (*logf)(const char*)) {
         say(m);
     }
     g_syms.PopulateMarkerInfo = found[i++];
+    // The dropper singleton: two DATA-REFERENCE SITES, each `mov rax,[rip+disp32]` (48 8B 05) as its
+    // first instruction, so the global is at site + 7 + disp. Both are decoded and must AGREE -- one
+    // site could match the wrong three-instruction accessor in a future build and still look fine on
+    // its own; two that disagree say so out loud and neither is used.
+    {
+        const uint8_t* siteA = (const uint8_t*)found[i++];   // IsActive
+        const uint8_t* siteB = (const uint8_t*)found[i++];   // GetObjectsDatabase
+        auto decodeRip = [](const uint8_t* p) -> void** {
+            if (!p || p[0] != 0x48 || p[1] != 0x8B || p[2] != 0x05) return nullptr;
+            int32_t disp = 0; memcpy(&disp, p + 3, 4);
+            return (void**)(p + 7 + disp);
+        };
+        void** a = decodeRip(siteA);
+        void** b = decodeRip(siteB);
+        char m[220];
+        if (a && b && a == b) {
+            g_syms.DropperInstance = a;
+            snprintf(m, sizeof(m), "[sym] %-22s -> exe+%p (decoded, both sites agree)",
+                     "DropperInstance", (void*)((uint8_t*)a - base));
+        } else if (a || b) {
+            snprintf(m, sizeof(m), "[sym] %-22s !! SITES DISAGREE (%p vs %p) -- dropper sync stays off",
+                     "DropperInstance", (void*)a, (void*)b);
+        } else {
+            snprintf(m, sizeof(m), "[sym] %-22s !! NOT DECODED -- dropper sync stays off", "DropperInstance");
+        }
+        say(m);
+    }
+    g_syms.DropperObjInfoById = (ObjInfoByIdFn)   found[i++];
+    g_syms.DropperPickableOf  = (PickableOfFn)    found[i++];
+    g_syms.DropperLoad        =                     found[i++];   // hooked, never called directly
+    g_syms.ActorSetLocation   =                     found[i++];   // hooked, never called directly
+    g_syms.ActorDestroy       = (ActorDestroyFn)  found[i++];
 
     // LOCKSTEP CHECK. The block above is POSITIONAL, and a table entry added without its assignment --
     // or vice versa -- shifts every later symbol onto the wrong address SILENTLY: sigs still resolve

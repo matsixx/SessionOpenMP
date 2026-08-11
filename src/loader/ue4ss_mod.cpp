@@ -34,6 +34,8 @@
 #include "game/audio.h"
 #include "game/pose.h"
 #include "game/spectate.h"
+#include "game/dropper.h"
+#include "replication/dropsync.h"
 #include "ui/overlay.h"
 #include "ui/pause_menu.h"
 #include "ui/version_tag.h"
@@ -756,6 +758,36 @@ static void GameThreadFrame() {
             // Audio, both directions on one line. SEND: what the funnel captured, how much of it was
             // ours, how many loops are live. RECV: what was played for peers and what could not be
             // (a cue this install does not have is named once, separately).
+            // Dropped objects. `own` is what we publish, `remote` what is standing here for peers,
+            // and `purged` counts remote props pulled back out of the game's own _allObjects -- the
+            // guard that keeps a peer's rail out of the local save file. purged climbing steadily is
+            // normal (it is re-asserted every enumeration); own or remote stuck at 0 with a peer in
+            // the dropper is what names the broken half.
+            const game::dropper::Stats d = game::dropper::St();
+            const dropsync::Stats ds = dropsync::St();
+            if (session::DropPolicy() && (st.dropOwn || st.dropRemote || d.arrayNum || ds.recv)) {
+                // `array` is what the GAME says it has; `own` is what we published. The four skips
+                // account for every object in between, so a gap can be attributed instead of guessed
+                // at -- own < array with all skips at 0 means the array shrank under us mid-walk.
+                snprintf(m, sizeof(m),
+                         "[drop] array=%d own=%d (skip: world=%d remote=%d hidden=%d noClass=%d"
+                         " noRoot=%d) remote=%d | spawned=%d failed=%d notInstalled=%d destroyed=%d"
+                         " drift=%d movable=%d byName=%d purged=%d faults=%d mapDefaults=%d/%d",
+                         d.arrayNum, st.dropOwn, d.skipWorld, d.skipRemote, d.skipHidden,
+                         d.skipNoClass, d.skipNoRoot,
+                         st.dropRemote, d.spawned, d.spawnFails, d.unknownIds, d.destroyed,
+                         d.driftFixes, d.madeMovable, d.resolvedByName, d.purgedFromAll, d.faults,
+                         d.mapDefaults, d.mapDefaultMissed);
+                logLine(m);
+                // The wire, both directions on one line: sets out vs sets in is the single comparison
+                // that says which end of the lane lost a set.
+                snprintf(m, sizeof(m),
+                         "[drop/wire] sent=%d (sets=%d recs=%d unsendable=%d) | recv=%d"
+                         " (sets=%d recs=%d) rejected=%d partsDropped=%d",
+                         ds.sent, ds.setsSent, ds.setRecordsSent, ds.unsendable,
+                         ds.recv, ds.setsRecv, ds.setRecordsRecv, ds.rejected, ds.partsDropped);
+                logLine(m);
+            }
             const game::audio::Stats a = game::audio::GetStats();
             snprintf(m, sizeof(m),
                      "[audio] sent: cap=%u loops=%u(live %u) shots=%u rej=%u nfySkip=%u | recv:"
@@ -1033,6 +1065,56 @@ static void hkMeshFinalizeBones(void* mesh) {
     game::pose::OnFinalizeBones(mesh, GetTickCount64());
     o_MeshFinalizeBones(mesh);
 }
+// ---- THE MAP-DEFAULT SEAM ---------------------------------------------------------------------------
+// `UObjectDropperPersistentHandler::Load` applies the player's saved arrangement of the level's own
+// props. Before it runs, every prop is where the MAP put it; after it, they are where that player
+// left them -- and nothing later can tell the two apart, because each player's copy of the level is
+// already arranged their own way by the time anything else gets to look.
+// So Load is bracketed with a flag, and `AActor::SetActorLocation` -- which is how Load moves each
+// prop -- captures the pose it is ABOUT to overwrite, but only while that flag is set. Outside that
+// one moment the hook is a single predictable branch, and it fires for exactly the props whose
+// default differs from where they now stand.
+// MEASUREMENT ONLY: nothing consumes the table yet. It is the piece two withdrawn features both
+// needed, being proven on its own before anything is built on top of it.
+static void (*o_DropperLoad)(void*) = nullptr;
+static void hkDropperLoad(void* handler) {
+    game::dropper::SetInPersistentLoad(true);
+    o_DropperLoad(handler);
+    game::dropper::SetInPersistentLoad(false);
+    char m[160];
+    snprintf(m, sizeof(m), "[drop/map] the dropper applied this player's save -- captured %d map"
+             " default(s)", game::dropper::MapDefaultCount());
+    logLine(m);
+}
+static bool (*o_ActorSetLocation)(void*, const void*, bool, void*, unsigned char) = nullptr;
+static bool hkActorSetLocation(void* actor, const void* newLoc, bool sweep, void* hit,
+                               unsigned char teleport) {
+    if (game::dropper::InPersistentLoad()) game::dropper::NoteMapDefault(actor);
+    return o_ActorSetLocation(actor, newLoc, sweep, hit, teleport);
+}
+static void InstallMapDefaultSeam() {
+    const game::Syms& S = game::Get();
+    // Both or neither: the flag without the capture records nothing, and the capture without the flag
+    // would fire for every SetActorLocation in the game. Say which one is missing -- "it silently did
+    // nothing" is the failure mode this whole feature exists to remove.
+    if (!S.DropperLoad || !S.ActorSetLocation) {
+        char m[190];
+        snprintf(m, sizeof(m), "[drop/map] not hooked (%s%s%s unresolved) -- map defaults unavailable",
+                 S.DropperLoad ? "" : "DropperLoad",
+                 (!S.DropperLoad && !S.ActorSetLocation) ? " and " : "",
+                 S.ActorSetLocation ? "" : "ActorSetLocation");
+        logLine(m);
+        return;
+    }
+    if (MH_CreateHook(S.DropperLoad, (void*)&hkDropperLoad, (void**)&o_DropperLoad) == MH_OK &&
+        MH_EnableHook(S.DropperLoad) == MH_OK &&
+        MH_CreateHook(S.ActorSetLocation, (void*)&hkActorSetLocation, (void**)&o_ActorSetLocation) == MH_OK &&
+        MH_EnableHook(S.ActorSetLocation) == MH_OK)
+        logLine("[drop/map] map-default seam hooked (level props' original poses will be captured)");
+    else
+        logLine("[drop/map] *** map-default seam hook FAILED -- map defaults unavailable");
+}
+
 static void InstallPoseSeam() {
     const game::Syms& S = game::Get();
     if (!S.MeshFinalizeBones) { logLine("[mod] MeshFinalizeBones unresolved -- peers will not animate in replay"); return; }
@@ -1198,7 +1280,7 @@ public:
         // Unarmed cost: one branch per frame.
         // ORDER MATTERS: without the rename guard, the first proxy spawn is a GUARANTEED
         // LowLevelFatalError -- so no guard means no anchor, which means no sessions at all.
-        if (InstallRenameGuard()) { InstallAnimApplyHook(); InstallReplayGuard(); InstallMarkerGuard(); InstallPoseSeam(); InstallReplayCamGuard(); InstallEngineTickAnchor(); }
+        if (InstallRenameGuard()) { InstallAnimApplyHook(); InstallReplayGuard(); InstallMarkerGuard(); InstallPoseSeam(); InstallMapDefaultSeam(); InstallReplayCamGuard(); InstallEngineTickAnchor(); }
         else logLine("[mod] *** sessions DISABLED (rename guard missing)");
         // Pause must not freeze the world: in overlay mode YOUR pause stops your own skater and every
         // proxy in your world, so you cannot watch anyone while the menu is open. Unconditional -- it

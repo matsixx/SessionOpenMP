@@ -51,6 +51,14 @@ void MpPrefs_SetBubbleDistM(int metres);
 // The slider limits, so the menu row and the setter's clamp cannot drift apart.
 enum { MPNAME_DIST_MIN = 10, MPNAME_DIST_MAX = 250, MPBUBBLE_DIST_MIN = 5, MPBUBBLE_DIST_MAX = 100 };
 
+// ---- DROPPED OBJECTS (the object dropper). What happens to the props everyone already had SAVED on
+// the map when a session starts; live placements replicate above Off either way. See session.h.
+// Stored here so the choice survives a restart, like the nameplate settings; the game-thread publish
+// copies it into the session every frame, so there is one source of truth and either menu can write it.
+enum { MPDROP_OFF = 0, MPDROP_LIVE = 1, MPDROP_SHARED = 2 };
+int  MpPrefs_DropMode();                 // MPDROP_* -- default MPDROP_SHARED
+void MpPrefs_SetDropMode(int mode);
+
 // Bumped by the setters whose value the TRANSPORT has to be told about. The game thread applies
 // those when this changes, so a menu can write from any thread without ever calling into the SDK
 // itself. The nameplate settings above deliberately do NOT bump it: nothing about them reaches EOS,
