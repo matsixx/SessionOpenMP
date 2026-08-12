@@ -192,7 +192,7 @@ static const SigEntry kSigs[] = {
     { "IntroUiRange",         "48 89 5C 24 18 56 48 83 EC 50 48 83 B9 70 06 00 00 00 48 8B F2 48 8B D9 0F 85 ?? ?? ?? ??", false },
     // RANGE MARKER: UPauseMenuPageContainer::NativeOnInitialized  Epic 0x107a8a0 / Steam 0x103ac20
     { "PauseInitRange",       "48 89 5C 24 10 48 89 6C 24 18 48 89 74 24 20 57 48 83 EC 50 48 8B F9 E8 ?? ?? ?? ??", false },
-    // FMemory::Malloc  Epic 0x123e750 / Steam 0x11ff180   ·   FMemory::Free  Epic 0x1231ff0 / Steam 0x11f29d0
+    // FMemory::Malloc  Epic 0x123e750 / Steam 0x11ff180   /   FMemory::Free  Epic 0x1231ff0 / Steam 0x11f29d0
     { "MemMalloc",            "48 89 5C 24 08 57 48 83 EC 20 48 8B F9 8B DA 48 8B 0D ?? ?? ?? ?? 48 85 C9 ?? ??", false },
     { "MemFree",              "48 85 C9 ?? ?? 53 48 83 EC 20 48 8B D9 48 8B 0D ?? ?? ?? ?? 48 85 C9 ?? ?? E8 ?? ?? ?? ??", false },
     // NOT A FUNCTION START -- a CALL SITE. This is 61 bytes of

@@ -41,11 +41,11 @@
 // function that computes the foot anchors, it runs INSIDE NativeUpdateAnimation (call site
 // 0xf5f1b9), and it has exactly one xref. Phase is the whole point: the anim update recomputes the
 // foot from scratch every frame, so anything written from the input tick is gone before it renders.
-// ⛔ ARITY read at the call site, not assumed: `lea r9,[rbp-0x70] · movaps xmm1,xmm11 · lea
-// r8,[rbp-0x60] · mov rcx,rdi` => (this, FLOAT dt, void*, void*). The float is declared `double` and
+// ARITY read at the call site, not assumed: `lea r9,[rbp-0x70] / movaps xmm1,xmm11 / lea
+// r8,[rbp-0x60] / mov rcx,rdi` => (this, FLOAT dt, void*, void*). The float is declared `double` and
 // forwarded UNCONVERTED, so the bits sit in the LOW 32 -- reinterpret, never convert.
 //
-// ⚠️ THIS MODULE OWNS THAT DETOUR. `foot_steer` installs no hook of its own and is CALLED from here
+// THIS MODULE OWNS THAT DETOUR. `foot_steer` installs no hook of its own and is CALLED from here
 // instead, because MinHook overwrites the prologue and a second scan of a hooked function silently
 // fails. Its offsets are applied through the same single write below.
 // =====================================================================================================
@@ -66,7 +66,7 @@ enum {
     AN_CATCH_ST    = 0x312,   // CatchOrientState -- non-zero while a catch owns the feet
     AN_AUTOADJUST  = 0x3e8,   // FootIKAutoAdjust  <-- the fix
     AN_GROUNDED    = 0x5fa,
-    // ⛔ MEASURED FACTS from a REMOVED feature (second-foot smoothing, 2026-08-11). Kept because
+    // MEASURED FACTS from a REMOVED feature (second-foot smoothing, 2026-08-11). Kept because
     // each one cost a test round and any future foot work will hit them again:
     //   * HasLeftFootCatchOrient (+0x313) / HasRightFootCatchOrient (+0x314) read ZERO through real
     //     catches. "Which foot caught" is the SKATER's ECatchOrientState +0x63e (1 = left,
@@ -127,7 +127,7 @@ static bool SuppressWanted(void* anim) {
 }
 
 static void hkUpdateFootAnchors(void* self, double dt, void* a, void* b) {
-    // ⚠️ OUR SKATER ONLY, and decided BEFORE the original runs, because the fix writes on the way in.
+    // OUR SKATER ONLY, and decided BEFORE the original runs, because the fix writes on the way in.
     // This hook fires once per SKATER, and in a co-op session that includes remote players' proxies:
     // without the gate our writes land on their feet and every per-frame static foot_steer keeps
     // gets driven alternately by us and by them. Measured: the rate doubles with one proxy, and a
@@ -169,7 +169,7 @@ static void hkUpdateFootAnchors(void* self, double dt, void* a, void* b) {
 
     // ---- foot_steer rides this hook. It has no detour of its own, so its offsets are applied here.
     __try {
-        // ⚠️ `dt` is a FLOAT forwarded through a `double` parameter (the thunk rule keeps the bits
+        // `dt` is a FLOAT forwarded through a `double` parameter (the thunk rule keeps the bits
         // unconverted for the original), so the float sits in the LOW 32 BITS. Casting reads garbage
         // -- it once gave ~0 and froze a blend at zero. REINTERPRET, never convert.
         uint64_t dtBits; memcpy(&dtBits, &dt, 8);

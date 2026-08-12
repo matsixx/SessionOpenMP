@@ -152,7 +152,7 @@ static void trackMag(MagTrack& M, float x, float y, double t) {
 // The FLICK, measured as the gesture it actually is: how far the stick travelled from where the push
 // began to where it peaked, over how long that took.
 //
-// ⚠️ THE OBVIOUS VERSION IS FRAME-RATE DEPENDENT, which is the whole bug this replaces. Taking the
+// THE OBVIOUS VERSION IS FRAME-RATE DEPENDENT, which is the whole bug this replaces. Taking the
 // fastest rate over sample pairs at least `lo` seconds apart sounds frame-rate independent -- it
 // divides by real time -- but the CLOSEST usable pair is bounded by the frame interval, so the
 // highest speed it can report is one full stick throw in that interval. At 60 fps that ceiling is
@@ -389,7 +389,7 @@ static float hkScoopSpeed(void* handler, uint64_t bArg, void* inputs, void* d) {
         // Which stick scooped. The entry's OWN stick fields decide it: whichever of LeftStick /
         // RightStick actually holds the displacement is the one that moved, which is true in any
         // stance and any input mode.
-        // ⚠️ The EInputType >= 50 left/right mirror is only the FALLBACK now, and only when the sticks
+        // The EInputType >= 50 left/right mirror is only the FALLBACK now, and only when the sticks
         // are too close to call. That byte is the RAW recorded type, and the game normalises it
         // through IsSkatingGoofy / IsSkatingSwitch / ConvertToCurrentInputModeInput before it means
         // anything -- so raw it is only reliable in regular stance on the default input mode. The

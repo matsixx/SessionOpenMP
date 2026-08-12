@@ -104,7 +104,7 @@ enum {
     MC_LFOOT_CATCH          = 0x538,   // USkateboardExMovementComponent::_leftFootCatchInfo
     MC_RFOOT_CATCH          = 0x540,   //   "                            _rightFootCatchInfo
     FCFI_RATIO              = 0x004,   // FCatchFootInfo::CatchRatio (type byte sits at +0)
-    // The catch's TIMING, on the same component. ⚠️ These read as garbage (-1.6e25) through
+    // The catch's TIMING, on the same component. These read as garbage (-1.6e25) through
     // `skater+0x550`, which is a different class -- reach them through CatchLevel's learned
     // component, whose owner back-pointer at +0x340 proves it is ours.
     MC_CATCH_TOTAL_TIME     = 0x54c,   // _catchTotalTime
@@ -129,12 +129,12 @@ enum {
     TDB_FLIP_TRICKS         = 0x2c0,   // UTricksDatabase -> _flipTricks TArray<UFlipTrickDefinition*>
     DEF_FLIP_PRECATCH_ANGLE = 0x258,   // UFlipTrickDefinition::BoardFlipPreCatchAngle     (default 60)
     DEF_ROT_PRECATCH_ANGLE  = 0x25c,
-    // ⚠️ ALIVE, despite an earlier note in this project calling it dead data. It is the divisor for
+    // ALIVE, despite an earlier note in this project calling it dead data. It is the divisor for
     // the SECOND foot's catch ratio in USkateboardExMovementComponent::UpdateFeetCatchInfo
     // (0xfdee40): `[rdi+0x54c] _catchTotalTime / [rsi+0x268]`, clamped to 1, written to that foot's
     // CatchRatio. The "no references" reading came from a linear disassembler that had stopped after
     // ~20 lines of a 0xb66-byte function.
-    // ⛔ NOT WRITTEN. OtherFootCatchTime -- kept only as the documented offset; see the note above
+    // NOT WRITTEN. OtherFootCatchTime -- kept only as the documented offset; see the note above
     // the catch-window walk for why scaling it was removed.
     DEF_OTHER_FOOT_TIME     = 0x268,   // UFlipTrickDefinition::OtherFootCatchTime (ships 0.15)
 };
@@ -159,7 +159,7 @@ static int   g_catchDiag   = 0;       // log every catch decision (verbose; for 
 // changes only how far and in which direction. Data-only, fully restored when back at stock.
 // 0 removes the bone entirely, 100 is stock. The add is in cm on the offset's raw components --
 // which one reads as "up" is a question for the headset, exactly like the foot axes were.
-// ⛔ OtherFootCatchTime (+0x268) is left STOCK. Scaling it was tried and removed at the
+// OtherFootCatchTime (+0x268) is left STOCK. Scaling it was tried and removed at the
 // user's request -- "it doesn't seem to help much". It gates only when the second foot
 // ATTACHES, so it cannot stop that foot travelling, and the large values needed to look
 // like a hold left it still descending at touchdown and clipped it through the deck.
@@ -187,7 +187,7 @@ static int   g_flickFoot = 1;
 // the dispatcher can hand the two vectors over either way round, so identity is taken by POINTER
 // against the InputHandler's own left/right fields.
 static int   g_flickPhys = 0, g_flickFresh = 0;
-// ⚠️ SetCatchOrient is called EVERY FRAME for the whole duration of a catch, not once at the start
+// SetCatchOrient is called EVERY FRAME for the whole duration of a catch, not once at the start
 // (measured: ~30 consecutive calls per catch). So the corrected foot must be LATCHED for the whole
 // catch -- the first cut forced it only while a fixed freshness window lasted, the window expired
 // mid-catch, and the orient reverted to the game's foot with the catch still running. That reads in
@@ -682,7 +682,7 @@ static void* g_startCatchDef = nullptr;
 // How far the deck is from FLAT, measured as ROLL ABOUT ITS OWN LONG AXIS. Returns 180 when flat
 // (griptape up) and 0 when fully inverted, matching what the rest of this file expects.
 //
-// ⚠️ The previous version used the deck's up-vector against world up (`1 - 2(qx^2+qy^2)`), which is a
+// The previous version used the deck's up-vector against world up (`1 - 2(qx^2+qy^2)`), which is a
 // single number with roll AND pitch folded into it. Two consequences, both observed: the flip was
 // stopped while the board was still visibly rolled, because 12 deg "off vertical" can be entirely
 // roll; and it sometimes did not fire at all, because "Level board on catch" and the game's own
@@ -793,7 +793,7 @@ static void* hkCatchDefault(void* self, double dt, void* frontStick, void* backS
     // as single-stick, then put it straight back. Same save/zero/call/restore shape as the
     // dark-slide mask above, and on pointers we were already handed.
     // A mask deliberately left in place across the dispatcher, unwound on a later call.
-    // ⚠️ ONLY the InAirHandler's own tracker byte is held across calls -- never a stick pointer.
+    // ONLY the InAirHandler's own tracker byte is held across calls -- never a stick pointer.
     // The stick args are the caller's temporaries (see the restore below), so a pointer to one is
     // dangling by the next call.
     static int   pendHadOff = -1, pendHadVal = 0, pendFrames = 0; static void* pendSelf = nullptr;
@@ -807,7 +807,7 @@ static void* hkCatchDefault(void* self, double dt, void* frontStick, void* backS
 
     // ---- remember WHICH PHYSICAL STICK made the fresh flick, for the flicked-foot fix.
     //
-    // ⚠️ MEASURED: the `frontStick`/`backStick` arguments are COPIES, not pointers into the
+    // MEASURED: the `frontStick`/`backStick` arguments are COPIES, not pointers into the
     // InputHandler -- the stick-held log has been printing `aliases InputHandler: no` all along. So
     // neither pointer identity nor the game's own front/back trackers can name a PHYSICAL stick
     // here. The edge is therefore detected on the InputHandler's own raw left/right vectors with our
@@ -866,7 +866,7 @@ static void* hkCatchDefault(void* self, double dt, void* frontStick, void* backS
                 savedMask[0] = twkF(maskedStick, 0); savedMask[1] = twkF(maskedStick, 4);
                 *(float*)maskedStick = 0.0f;
                 *((float*)maskedStick + 1) = 0.0f;
-                // ⚠️ AND THE TRACKER, which is the field that actually gates this. A catch needs
+                // AND THE TRACKER, which is the field that actually gates this. A catch needs
                 // BOTH sticks released and then re-input; the "was it pushed" flags are written in
                 // this function's own epilogue from LAST frame's sticks, so zeroing only the live
                 // vector leaves a stored 1 saying the stick is still held and the edge is refused
@@ -882,7 +882,7 @@ static void* hkCatchDefault(void* self, double dt, void* frontStick, void* backS
     __try { r = ((CatchDefaultFn)g_origCatchDef)(self, dt, frontStick, backStick, a5, a6, a7); }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         if (InterlockedIncrement(&g_faults) == 1) TwkLog("[catch] caught fatal in CheckForCatchOrient_Default -> recovered");
-        // ⚠️ Restore on the FAULT path too. Bailing out with the stick still zeroed would leave the
+        // Restore on the FAULT path too. Bailing out with the stick still zeroed would leave the
         // player's held input centred for the rest of the frame, which reads as the stick dying.
         if (maskedStick) {
             __try {
@@ -920,7 +920,7 @@ static void* hkCatchDefault(void* self, double dt, void* frontStick, void* backS
             // The flicked stick is recorded at the TOP of this function (before the mask), so there
             // is nothing to record here -- just keep it fresh across the verdict.
             if (verdict != 0 && g_flickPhys != 0) g_flickFresh = 30;
-            // ⛔ The STICK VECTOR is ALWAYS restored before returning, and its pointer is NEVER kept.
+            // The STICK VECTOR is ALWAYS restored before returning, and its pointer is NEVER kept.
             // `aliases InputHandler: no` above is the proof of why: these are the caller's own
             // FVector2D TEMPORARIES, not fields on a persistent object. Holding the pointer and
             // writing two floats through it on a LATER call wrote into a stack frame that had long
@@ -1049,7 +1049,7 @@ typedef void (*SetCatchOrientFn)(void*, uint8_t, float, float);
 static void* g_origSetOrient  = nullptr;
 static void* g_startSetOrient = nullptr;
 
-// ⚠️ REAL TRICKS ONLY -- latched over the air.
+// REAL TRICKS ONLY -- latched over the air.
 // The BONED OLLIE IS A CATCH ORIENT: holding the sticks in the air sets an orient state, and that
 // state selects the FCatchOrientDefinition whose BoardRelativeOffset vectors shove the board. So a
 // hook that rewrites 1<->2 unconditionally also overrides which orient an ORDINARY OLLIE uses -- and
@@ -1084,7 +1084,7 @@ static bool CatchIsSwitch() {
 // goofy alone or to goofy XOR switch; both contradict a measured case.
 static bool CatchStanceInverts() { return CatchIsGoofy() && !CatchIsSwitch(); }
 
-// ⚠️ READ-ONLY. The latch is maintained in CatchTweaks_PumpFrame, every frame. It used to be updated
+// READ-ONLY. The latch is maintained in CatchTweaks_PumpFrame, every frame. It used to be updated
 // HERE, but this runs only from the hook -- i.e. only on a non-zero orient state -- so after a flip
 // trick it could stay set through the landing and into the next air, overriding an ordinary ollie's
 // orient and tilting the board the wrong way exactly once before self-correcting.
@@ -1109,7 +1109,7 @@ static void hkSetCatchOrient(void* self, uint8_t state, float pitchRatio, float 
             const bool isMine = (!mine || self == mine);
             // Only ever touch a real flip/rotation catch. On an ollie the orient is the game's own
             // board control (the bone) and must be left exactly as authored.
-            // ⚠️ TWO-FOOT ORIENTS MUST BE NARROWED TOO, not just 1<->2 swapped. MEASURED: a catch
+            // TWO-FOOT ORIENTS MUST BE NARROWED TOO, not just 1<->2 swapped. MEASURED: a catch
             // taken while the other stick is held (the mid-scoop catch) emits state 5 or 10 -- BOTH
             // feet -- and the first cut only rewrote 1<->2, so those passed through untouched and
             // both feet caught at once, in every stance. That is what "it catches with the wrong
@@ -1382,7 +1382,7 @@ static void TraceFeetCatch(void* skater, void* comp, float ang) {
     // Written every frame because the movement tick recomputes it (UpdateFeetCatchInfo runs in the
     // physics pass, ahead of this animation-phase hook), so this follows rather than fights it.
     // Released the moment IsLanding goes true.
-    // ⛔ REMOVED: forcing the per-foot CatchRatio (lead=1, other=0) to pick the catching foot.
+    // REMOVED: forcing the per-foot CatchRatio (lead=1, other=0) to pick the catching foot.
     // It did NOT change which foot catches AND it destroyed the catch outright -- measured
     // `L orient=no peak ratio 0.00 | R orient=no peak ratio 0.00  <-- NO FOOT CAUGHT` on every
     // attempt, and the un-caught foot then passed through the deck on landing. The ratio is an
@@ -1427,7 +1427,7 @@ void CatchTweaks_PumpFrame() {
     // Belt-and-braces latch release: the state==0 call is the normal end of a catch, but if the
     // setter simply STOPS being called instead, the latch would otherwise persist into the next one.
     if (g_flickLatch != 0 && ++g_latchIdle > 10) { g_flickLatch = 0; g_latchIdle = 0; }
-    // ⚠️ THE "was this air a trick" LATCH IS MAINTAINED HERE, EVERY FRAME -- not only when
+    // THE "was this air a trick" LATCH IS MAINTAINED HERE, EVERY FRAME -- not only when
     // SetCatchOrient happens to be called. It used to be updated inside CatchAirIsTrick(), which the
     // hook calls only for a NON-ZERO orient state, so after a flip trick the latch could stay set
     // through the landing and into the NEXT air: that ollie was then treated as a trick, its orient
@@ -1440,7 +1440,7 @@ void CatchTweaks_PumpFrame() {
             else if (twkB(an, AN_GROUNDED) > 0)                         g_airWasTrick = 0;
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    // ⚠️ The FIX (g_stopFlip) lives in here alongside the diagnostic trace, so this must not early-out
+    // The FIX (g_stopFlip) lives in here alongside the diagnostic trace, so this must not early-out
     // on the trace flag -- doing so silently disabled the fix the moment logging was turned off for
     // release. Each part checks its own switch below.
     if (!g_flipTrace && !g_stopFlip) return;
@@ -1465,7 +1465,7 @@ void CatchTweaks_PumpFrame() {
             const float delta = (prevAng >= 0.0f) ? (ang - prevAng) : 0.0f;
             if (catchState != 0 && !armed) {
                 armed = true;
-                // ⚠️ If the deck is ALREADY flat when the catch registers, do nothing at all. There is
+                // If the deck is ALREADY flat when the catch registers, do nothing at all. There is
                 // no second revolution to prevent -- the board has arrived -- and zeroing the flip
                 // rate on the very frame the catch appears starves the game's own foot-catch, which
                 // advances off the board's remaining travel toward its target. Observed exactly once
@@ -1487,7 +1487,7 @@ void CatchTweaks_PumpFrame() {
                     const float remaining = (delta > 0.0f) ? (180.0f - ang) : (ang + 180.0f);
                     const float rate = twkF(comp, MC_BOARD_FLIP_RATE);
                     const float want = remaining / ((float)g_snapMs / 1000.0f);
-                    // ⚠️ TWO LIMITS, both learned from a trick that visibly bugged out. A catch can
+                    // TWO LIMITS, both learned from a trick that visibly bugged out. A catch can
                     // register a long way from grip-up -- 326 deg was logged -- and "finish it in
                     // snapMs" then demanded 3623 deg/s from a board turning at 829. The deck whips
                     // round at four times its own speed and is stopped dead: that is the glitch, not
@@ -1510,7 +1510,7 @@ void CatchTweaks_PumpFrame() {
                 }
             }
             // ---- a caught board finishes its flip flat under the foot -----------------------
-            // ⚠️ _boardFlipTargetAngle is a MAGNITUDE and does NOT share the sign of
+            // _boardFlipTargetAngle is a MAGNITUDE and does NOT share the sign of
             // _boardFlipCurrentAngle -- the logs show target +357 against current -356, and the
             // game's own ratio takes |target| and |current|. Comparing the two raw (to work out
             // which way the flip was going) is therefore meaningless, and doing it wrote garbage

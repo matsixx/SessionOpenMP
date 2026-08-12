@@ -23,7 +23,7 @@
 // basis, and it read as the foot buzzing rather than tilting. The twist is now a rotation about a
 // STABLE axis (the same frame the position offset uses), composed with the socket's orientation as
 // quaternions, so "toe forward" means the same thing at every point in the flip.
-// ⚠️ Adding degrees to a rotator whose own frame is moving is never a rotation you can reason about.
+// Adding degrees to a rotator whose own frame is moving is never a rotation you can reason about.
 //
 // ---- WHAT THIS IS AND IS NOT ----------------------------------------------------------------
 // The feet do not drive the board. Session's deck is a state machine (_boardFlipRate,
@@ -69,7 +69,7 @@ enum {
     AN_ON_BOARD      = 0x300,   // IsOnBoard -- hard gate, never steer while walking
     AN_IS_SWITCH     = 0x303,   // IsSkatingSwitch (plain bool, no asset gate)
     AN_IS_GOOFY      = 0x304,   // IsSkatingGoofy -- see the per-foot veto for why it matters
-    // ⛔ The game's built-in boned ollie is NOT the stance system (EFootPositionType +0x305 reads a
+    // The game's built-in boned ollie is NOT the stance system (EFootPositionType +0x305 reads a
     // constant through one) and NOT HipOffset (+0x3dc reads (0,0,0) throughout). Both were measured
     // and both are dead ends; the probes for them are gone. What a bone actually does is push the
     // BOARD forward relative to the skater -- up to ~36 cm, decaying back to 0 on release, against
@@ -96,7 +96,7 @@ enum {
     AN_SKATER        = 0x608,   // _skater -- the back-pointer, so no mesh chain has to be re-walked
     // ASkaterCharacterBase, then the board
     SK_MESH          = 0x280,   SK_BOARD    = 0x568,
-    // ⚠️ The flipper is the component that VISUALLY FLIPS. Building the steer basis on it makes a
+    // The flipper is the component that VISUALLY FLIPS. Building the steer basis on it makes a
     // held stick trace a circle through a kickflip, because the basis rolls with the deck. It is
     // kept only as frame 1, for comparison.
     BOARD_FLIPPER    = 0x4e8,
@@ -311,7 +311,7 @@ static double g_armT0 = 0.0;
 
 static void dumpSamples() {
     if (g_nBuf <= 0) return;
-    // ⚠️ Every statistic here is over AIRBORNE samples only. Including the grounded ease-out tail
+    // Every statistic here is over AIRBORNE samples only. Including the grounded ease-out tail
     // dragged the alpha minimum to 0 on every single air, so the summary said "0.00..1.00" whether
     // the IK cut out mid-flight or not -- it could not answer the one question it existed for.
     float aLmin = 9e9f, aLmax = -9e9f, aRmin = 9e9f, aRmax = -9e9f;
@@ -545,12 +545,12 @@ bool FootSteer_AddOffset(void* a, float dt, float outL[3], float outR[3]) {
         // ---- PER FOOT, on the LEVEL. Catching with one foot must not surrender the other, so only
         // the foot that actually caught yields (the global CatchOrientState is deliberately not part
         // of this -- it is true for the whole catch and took both feet at once).
-        // ⚠️ LEVEL, not edge, and deliberately so. Holding both sticks in an ollie engages a catch
+        // LEVEL, not edge, and deliberately so. Holding both sticks in an ollie engages a catch
         // orient and keeps these set for the whole hold, which means the feet stay out of it for the
         // whole hold -- correct, because that gesture belongs to the game's own boned ollie. An
         // edge-triggered version was tried so foot control would work through an ollie too; it was
         // rejected in the headset. Foot control is for flip tricks; the bone owns the ollie.
-        // ⚠️ ON AN OLLIE THE BONE OWNS BOTH FEET, and the per-foot flags cannot express that.
+        // ON AN OLLIE THE BONE OWNS BOTH FEET, and the per-foot flags cannot express that.
         // Measured across the four stances: the game flags only ONE foot for an ollie's catch
         // orient, and in SWITCH and FAKIE it is the opposite foot from the stick being held --
         //   NLS nollie: state=53 Rfoot=53, right stick held  -> the held foot was flagged, blanked
@@ -560,7 +560,7 @@ bool FootSteer_AddOffset(void* a, float dt, float outL[3], float outR[3]) {
         // under the thumb. So: an ollie (no flip, no rotation) with ANY catch indication surrenders
         // BOTH feet. A flip trick keeps the per-foot split, so catching with one foot still leaves
         // the other one yours -- which is the whole point of that split.
-        // ⚠️ "HAS THIS AIR FLIPPED OR ROTATED", LATCHED -- not "is an orient showing right now".
+        // "HAS THIS AIR FLIPPED OR ROTATED", LATCHED -- not "is an orient showing right now".
         // The previous test was `ollieLike && anyCatch`, i.e. it only surrendered the feet when an
         // ollie ALSO raised a catch indication. POCKET POPS do not: setting the stick diagonally and
         // popping with the other one produces no catch orient, so `anyCatch` stayed false and both
@@ -571,7 +571,7 @@ bool FootSteer_AddOffset(void* a, float dt, float outL[3], float outR[3]) {
         // moment of the pop: sampling live would call the first frames of a kickflip an ollie. The
         // latch starts false on takeoff and never becomes true for any ollie, so an ollie surrenders
         // both feet for the WHOLE air.
-        // ⚠️ ASK THE TRICK WHAT IT IS. The board's motion flags cannot answer this:
+        // ASK THE TRICK WHAT IT IS. The board's motion flags cannot answer this:
         //     pocket ollie : flip=0 rot=1     shove-it : flip=0 rot=1
         // A pop out of a diagonal pocket imparts yaw, so the game flags an ollie as ROTATING and it
         // reads identically to a shuv. Gating on `flipping || rotating` let pocket ollies steer;
@@ -604,7 +604,7 @@ bool FootSteer_AddOffset(void* a, float dt, float outL[3], float outR[3]) {
         else if (flipping > 0) g_airTrick = 1;
         else if (grounded > 0) g_airTrick = 0;   // back on the board: re-arm for the next
         const bool bothFeet = (g_airTrick == 0);
-        // ⚠️ THE PER-FOOT FLAGS NEED THE SAME STANCE CORRECTION THE CATCH DOES. HasLeft/
+        // THE PER-FOOT FLAGS NEED THE SAME STANCE CORRECTION THE CATCH DOES. HasLeft/
         // RightFootCatchOrient are derived from the orient STATE, and catch_tweaks inverts that state
         // in goofy-and-not-switch so the correct foot catches (its own measured truth table). The
         // flags therefore stop naming the physical foot in exactly that stance -- so reading them raw
@@ -618,7 +618,7 @@ bool FootSteer_AddOffset(void* a, float dt, float outL[3], float outR[3]) {
         const int  useCatchR = stanceInv ? catchL : catchR;
         const bool catchNowL = (g_catchVeto != 0) && ((useCatchL > 0) || bothFeet);
         const bool catchNowR = (g_catchVeto != 0) && ((useCatchR > 0) || bothFeet);
-        // ⚠️ THE STATE GATE AND THE APPLY GATE ARE SEPARATE. Folding the feature toggle into the
+        // THE STATE GATE AND THE APPLY GATE ARE SEPARATE. Folding the feature toggle into the
         // state test would mean the probe recorded nothing whenever steering was off -- which is
         // exactly the configuration a measurement round runs in.
         const bool stateArmed = onBoard > 0 && !veto && air;
@@ -744,7 +744,7 @@ bool FootSteer_AddOffset(void* a, float dt, float outL[3], float outR[3]) {
                     if (!(s.gapL >= 0.0f && s.gapL < 1e5f)) s.gapL = -1.0f;
                     if (!(s.gapR >= 0.0f && s.gapR < 1e5f)) s.gapR = -1.0f;
                     for (int i = 0; i < 3; i++) s.rotL[i] = twkF(a, AN_L_SOCK_ROT + i * 4);
-                    // ⚠️ The board ACTOR's root component is not a usable position source here -- it
+                    // The board ACTOR's root component is not a usable position source here -- it
                     // read static while the skater rolled away from it, so the difference just
                     // counted distance travelled. Both readings below come from components already
                     // proven live elsewhere in this module: the deck's flipper and the character
@@ -879,7 +879,7 @@ const char* FootSteer_FrameName() {
 
 void FootSteer_ResetDefaults() {
     g_on = 0; g_probe = 1; g_probeAxis = 0; g_probeCm = 0;
-    // ⚠️ These must track the field-tuned values at the top of the file. They drifted once already:
+    // These must track the field-tuned values at the top of the file. They drifted once already:
     // the statics were updated when each number was settled in the headset and these were not, so
     // "Reset to defaults" would have quietly restored the pre-tuning feel.
     g_reachCm = 30.0f; g_responseMs = 300.0f; g_returnMs = 150.0f;
@@ -910,7 +910,7 @@ void FootSteer_DrawMenu(const OmpMenuApi* api) {
         api->SameLine(); api->TextDisabled("(above this the gesture is a catch)");
         bool cv = g_catchVeto != 0;
         if (api->Checkbox("Yield to the catch", &cv)) { g_catchVeto = cv ? 1 : 0; TwkMarkDirty(); }
-        // ⚠️ The basis must not carry the board's flip. Frame 1 does, and a held stick then traces a
+        // The basis must not carry the board's flip. Frame 1 does, and a held stick then traces a
         // circle through a kickflip -- the direction it means rolls with the deck.
         float axx = (float)g_axisX, axy = (float)g_axisY;
         if (api->SliderFloat("Stick X drives axis", &axx, 0.0f, 5.0f, "%.0f")) FootSteer_SetAxisX(axx);

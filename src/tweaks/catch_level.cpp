@@ -73,7 +73,7 @@ enum {
     DEF_CATCH_ALIGN_SMOOTH= 0x278,  // -> CatchPitchAlignSmoothing (authored, unread)
     PITCH_MODE_SETTLE     = 2,      // the mode whose target the settle uses
 };
-// ⚠️ The ease is a time constant, NOT a fixed fraction per tick. It used to take 25% of the
+// The ease is a time constant, NOT a fixed fraction per tick. It used to take 25% of the
 // remaining distance every TICK, which converges twice as fast at 120 fps as at 60 -- the same
 // frame-rate dependence the flick measurement had. `alpha = 1 - exp(-dt/tau)` makes a given
 // CatchLevelResponseMs mean the same thing on any machine. Never 0: the interpolator treats a zero
@@ -90,7 +90,7 @@ static int   g_on         = 0;       // CatchLevel: DEFAULT OFF -- unproven offs
 static int   g_ok         = 1;       // runtime health, NEVER persisted
 static float g_targetDeg  = -999.0f; // CatchLevelTargetDeg: -999 = use the trick's authored value
 // CatchLevelResponseMs: the ease's TIME CONSTANT -- how fast it eases flat.
-// ⚠️ 35, not 120+. This number changed MEANING when the ease became frame-rate independent. It used
+// 35, not 120+. This number changed MEANING when the ease became frame-rate independent. It used
 // to scale a fixed 25%-of-the-remainder-per-TICK step, which at 120 fps works out to a ~29 ms time
 // constant; as a true time constant, the old default was roughly 4x slower than the behaviour it
 // replaced, and levelling stopped finishing inside the catch-to-landing window. 35 ms reproduces
@@ -208,7 +208,7 @@ void* CatchLevel_MovementComponent() { return g_realComp; }
 static void hkSetPitch(void* self, double angle) {
     __try {
         void* comp = (void*)((uint8_t*)self - SUBOBJ_TO_COMP);
-        // ⚠️ Adopt OUR skater's component only. This fires for every skater, so in a co-op session a
+        // Adopt OUR skater's component only. This fires for every skater, so in a co-op session a
         // remote player's component would be adopted here and then written to -- both by the
         // levelling in this module and by catch_tweaks' flip-rate stop, which takes this same
         // pointer. The owner check was already computed for the log below; here it is a gate.
@@ -365,7 +365,7 @@ void CatchLevel_PumpFrame() {
         if (!g_on || !g_ok) return;
 
         const float want = (g_targetDeg > -180.0f) ? g_targetDeg : g_authored;
-        // ⚠️ BEING LEVEL RIGHT NOW IS NOT THE SAME AS BEING DONE, and treating it as done is what
+        // BEING LEVEL RIGHT NOW IS NOT THE SAME AS BEING DONE, and treating it as done is what
         // made this fire only some of the time. This used to disarm the whole feature the moment the
         // pitch was within tolerance -- including on the FIRST eligible frame, before any levelling
         // had happened. The board is still turning and settling at the catch, so it passes through

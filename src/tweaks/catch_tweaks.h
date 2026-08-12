@@ -66,7 +66,7 @@ bool  CatchTweaks_SecondFootHold(); void CatchTweaks_SetSecondFootHold(bool on);
 // setter. Invert swaps the left/right parity if it reads backwards.
 bool  CatchTweaks_FlickFoot();   void CatchTweaks_SetFlickFoot(bool on);
 bool  CatchTweaks_FlickInvert(); void CatchTweaks_SetFlickInvert(bool on);
-// ⚠️ ASkaterCharacterBase::SetCatchOrient's start, or null. This module HOOKS that function, which
+// ASkaterCharacterBase::SetCatchOrient's start, or null. This module HOOKS that function, which
 // overwrites its first bytes -- so any later `TwkScanExe(SIG_SET_CATCH_ORIENT)` finds nothing (one
 // detour per address; a hook destroys its own signature). run_out uses the address as a
 // return-range anchor, so it must take it from here rather than scan for it again.

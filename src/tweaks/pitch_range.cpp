@@ -47,7 +47,7 @@
 // the theoretical maximum useful value -- saturation exactly at the recognition limit. 80 is the
 // shipped default because it FELT better in play: it leaves a little headroom below that limit, so
 // full pitch does not demand a flick right at the edge of what still reads as a flip.
-// ⚠️ T=90 would look like "even more range" and is a trap -- max pitch would then require a
+// T=90 would look like "even more range" and is a trap -- max pitch would then require a
 // STRAIGHT-UP flick, which is not a flip-trick input at all, making peak pitch unreachable.
 //
 // Peak pitch is unchanged either way: ratio still reaches 1.0, it just takes a bigger flick to get
@@ -110,7 +110,7 @@ static const char* SIG_GET_INPUT_SETTINGS =
     "80 79 20 03 ?? ?? 48 8B 41 10 48 05 A8 00 00 00 C3 80 79 77 00 B8 30 00 00 00 BA 6C 00 00 00 "
     "0F 44 C2";
 // FlipTricksHandler::GetBoardExtraPitchAngle -- Epic 0x10234c0 / Steam 0xfe3630. NOT hooked here;
-// wanted only as an address range. ⚠️ THIS SCAN IS THE FALLBACK, NOT THE PRIMARY: catch_level hooks
+// wanted only as an address range. THIS SCAN IS THE FALLBACK, NOT THE PRIMARY: catch_level hooks
 // that function, and MinHook overwrites its prologue with a jump, so this signature stops matching
 // the moment that hook is installed. Field-caught exactly that way -- "sig NOT FOUND" purely because
 // catch_level happened to install first. Ask catch_level for the address first; this scan only runs

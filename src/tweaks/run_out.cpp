@@ -229,7 +229,7 @@ static double g_armT = 0.0;
 static bool   g_armFalling = false;
 
 static void* hkBail(void* skater, void* reason, uint64_t b1, uint64_t b2) {
-    // ⚠️ OUR skater only. Bail is per-skater, and in a co-op session SessionOpenMP deliberately calls
+    // OUR skater only. Bail is per-skater, and in a co-op session SessionOpenMP deliberately calls
     // the game's own Bail on remote players' proxies to replicate their bails -- so this hook fires
     // for them. Everything below WRITES (ragdoll, on-foot mode, a velocity restore, a queued
     // rotation), and a remote player must bail exactly as their own machine intended.
@@ -427,7 +427,7 @@ void RunOut_Install() {
     if (!g_enableRagdoll) TwkLog("[runout] EnableRagDoll sig NOT FOUND -- run-out board may go to the hand");
     g_setLocRot = (SetLocRotFn)TwkScanExe(SIG_SET_ACTOR_LOCROT);
     if (!g_setLocRot) TwkLog("[runout] SetActorLocationAndRotation sig NOT FOUND -- run-out keeps the old facing");
-    // ⚠️ catch_tweaks HOOKS SetCatchOrient (the flicked-foot fix) and installs BEFORE this, so its
+    // catch_tweaks HOOKS SetCatchOrient (the flicked-foot fix) and installs BEFORE this, so its
     // first bytes are a detour by now and SIG_SET_CATCH_ORIENT no longer matches -- one detour per
     // address, a hook destroys its own signature. Take the address it already resolved, and only
     // fall back to scanning when that module did not hook it.

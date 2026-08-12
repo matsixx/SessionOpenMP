@@ -301,7 +301,7 @@ static bool NameOf(const void* obj, char* out, int cap) {
 // ---- an independent read of the blacklist, used two ways: to cross-check the hooked verdict (if
 // they disagree, one of the four inferred offsets is wrong and only the telemetry, never a fix, is
 // affected), and to dump the list by name once per session.
-// ⚠️ `def` is the trick to judge, CAPTURED BY THE CALLER AT ITS OWN MOMENT -- never re-read
+// `def` is the trick to judge, CAPTURED BY THE CALLER AT ITS OWN MOMENT -- never re-read
 // `_currentFlipTrickDef` later and judge that. Field-measured: 74 self-plays landed on blacklisted
 // ollies/nollies because the old version re-read the CURRENT def ~40 ms after the catch edge, by
 // which time the game had already cleared/replaced it -- the ollie def was gone, the walk found
@@ -493,7 +493,7 @@ static void* hkPlayCatchSound(void* self, void* meshComp) {
     // the in-air flip whoosh (board+0x348 _flippingInAirLoopAudio), so returning early would
     // silently change that too. Nulling `Sound` for the duration lets everything else happen while
     // the base spawn no-ops (UGameplayStatics early-returns on a null sound).
-    // ---- ⚠️ LOCAL vs PROXY. In co-op the catch notify ALSO fires on PEERS' proxy skaters (their
+    // ---- LOCAL vs PROXY. In co-op the catch notify ALSO fires on PEERS' proxy skaters (their
     // anim graph runs locally -- the same mechanism the MP notes call out as "the catch plays
     // natively on proxies"). A proxy's notify must pass through UNTOUCHED:
     //   * muting it would swallow the FRIEND's catch sound whenever it lands within the suppression

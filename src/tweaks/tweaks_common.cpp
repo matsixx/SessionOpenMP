@@ -27,7 +27,7 @@ static bool sigByte(const char* tok, uint8_t* out) {
     *out = (uint8_t)((hi << 4) | lo);
     return true;
 }
-// ⚠️ 128, not 64: the cap SILENTLY TRUNCATES a longer pattern rather than refusing it, so a sig that
+// 128, not 64: the cap SILENTLY TRUNCATES a longer pattern rather than refusing it, so a sig that
 // sigmake proved unique can degrade to a shorter, ambiguous prefix and match the wrong function.
 // Caught with FWeakObjectPtr::Get (88 bytes) -- its first 64 are shared verbatim with ::IsValid, and
 // only address ordering was picking the right one. A wrong pick there returns a bool where a pointer

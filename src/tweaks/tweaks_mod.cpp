@@ -318,7 +318,7 @@ static const OmpPageItem2 kTwkBoardItems[] = {
     { OMP_ITEM_SLIDER, kTwkVelMax, "  Fastest at (x10 deg/s)", "Stick speed that gives the fastest scoop",
       nullptr, nullptr, 20.0f, 300.0f, 10.0f },
     { OMP_ITEM_TOGGLE, kTwkFlip,    "Flip speed from the flick", "How fast you flick sets how fast the board flips" },
-    // ⚠️ These bounds MUST cover the shipped defaults (150 / 500), and every value here has to stay
+    // These bounds MUST cover the shipped defaults (150 / 500), and every value here has to stay
     // UNDER 1000 -- the pause menu's value field clips at four digits.
     { OMP_ITEM_SLIDER, kTwkFlipMin, "  Slowest flip at",      "Flick speed that gives the slowest flip",
       nullptr, nullptr, 20.0f, 400.0f, 10.0f },

@@ -310,7 +310,7 @@ static inline float argF(double d) {
     return f;
 }
 
-// ⚠️ OUR skater only. Both hooks below fire per skater, so in a co-op session they run for remote
+// OUR skater only. Both hooks below fire per skater, so in a co-op session they run for remote
 // players' proxies too -- and both of them WRITE. The pointer handed in is the skater on one path
 // and its movement component on the other, so rather than guess, either identity is accepted: the
 // object itself, or its +0x340 owner back-pointer. Unknown local skater = solo behaviour, not off.

@@ -1,6 +1,6 @@
 // SessionOpenMP -- a self-contained, ABI-faithful declaration of RC::CppUserModBase.
 //
-// ⚠️ PINNED TO UE4SS **v3.0.1 STABLE** (the release build installed on both Epic and Steam, and the one
+// PINNED TO UE4SS **v3.0.1 STABLE** (the release build installed on both Epic and Steam, and the one
 // the SessionCoop package ships to joiners). Transcribed from the user's copy of the release source:
 //   C:\Users\lilma\Downloads\RE-UE4SS-3.0.1\RE-UE4SS-3.0.1\UE4SS\include\Mod\CppUserModBase.hpp
 //
@@ -9,7 +9,7 @@
 // only (a) the vtable slot order and (b) where our derived fields begin -- so the same class, same
 // members in the same order, same virtuals in the same order, is transcribed here instead.
 //
-// ⛔ THIS FILE HAS ALREADY CAUSED ONE CRASH AND HIDDEN ONE BUG -- both from transcribing the WRONG
+// THIS FILE HAS ALREADY CAUSED ONE CRASH AND HIDDEN ONE BUG -- both from transcribing the WRONG
 // VERSION's header. Do not "remember" this class; READ the installed build's header every time:
 //   1. (2026-07-30) The installed UE4SS was briefly the EXPERIMENTAL branch, whose class has FIVE more
 //      virtuals (four Lua*-taking on_lua_start/on_lua_stop overloads + on_cpp_mods_loaded). UE4SS fired

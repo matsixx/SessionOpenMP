@@ -60,7 +60,7 @@ static int   g_log       = 0;      // FlipSpeedLog -- per-trick detail; diagnost
 // spans a lazy flick to about as fast as a thumb goes. Frame-rate independent, so the numbers mean
 // the same thing on any machine. (The first two shipped ranges were guesses and both saturated at
 // the top, pinning every trick to the maximum multiplier instead of tracking the flick.)
-// ⚠️ x10, not x100: the pause menu's value field CLIPS at four digits, so a 1500..5000 range was
+// x10, not x100: the pause menu's value field CLIPS at four digits, so a 1500..5000 range was
 // displayed cut off. Keep any menu-facing number in this mod under 1000.
 static int   g_velMin    = 150;    // FlipVelMin -- maps to the SLOWEST flip
 static int   g_velMax    = 500;    // FlipVelMax -- ... and to the FASTEST
@@ -228,7 +228,7 @@ static float hkFlipMult(void* self, void* def, unsigned char inputType, void* in
         const float maxM = twkF(db, DB_FLIP_MAX) * twkF(skater, SK_ADV_FLIP);
         if (!(maxM > minM) || !(minM > 0.0f) || minM > 10.0f || maxM > 10.0f) return stock;
 
-        // ⚠️ WHICH STICK IS DECIDED BY THE MATCHED ENTRY'S OWN DATA, further down -- NOT by the
+        // WHICH STICK IS DECIDED BY THE MATCHED ENTRY'S OWN DATA, further down -- NOT by the
         // trick definition's expected type. The EInputType left/right mirror at +50 describes the
         // RAW type, and the game normalises by stance before it means anything: in goofy the flick is
         // performed with the other stick, so deriving it from the expected type sampled the wrong
@@ -237,7 +237,7 @@ static float hkFlipMult(void* self, void* def, unsigned char inputType, void* in
         bool rightStick = (inputType >= 50);
 
         // ---- the flick, from the GAME'S OWN INPUT RECORD -------------------------------------------
-        // ⚠️ Read this, not our own stick sampling. Sampling InputHandler's raw stick fields ourselves
+        // Read this, not our own stick sampling. Sampling InputHandler's raw stick fields ourselves
         // works on some machines and not others: one field log had the left stick's Y pinned at
         // exactly -1.00 for a whole session while the game recognised every trick perfectly, so the
         // player's gesture simply was not in the field we were reading there. The array the game hands
@@ -250,7 +250,7 @@ static float hkFlipMult(void* self, void* def, unsigned char inputType, void* in
             void* data = twkP(inputs, 0);
             const int n = twkI(inputs, 8);
             if (data && n > 0 && n < 64) {
-                // ⚠️ DO NOT REQUIRE THE RAW TYPE TO MATCH. The game's own loop converts each recorded
+                // DO NOT REQUIRE THE RAW TYPE TO MATCH. The game's own loop converts each recorded
                 // type through IsSkatingGoofy / IsSkatingSwitch / ConvertToCurrentInputModeInput and
                 // compares the CONVERTED value, so the raw byte only equals the expected type in
                 // regular stance on the default input mode. Matching it raw meant every trick on any
@@ -260,7 +260,7 @@ static float hkFlipMult(void* self, void* def, unsigned char inputType, void* in
                 //
                 // Rather than reproduce that conversion, pick by what a flick IS: the FASTEST
                 // gesture in the array, displacement over its own duration.
-                // ⚠️ NOT the largest displacement. A stick being HELD reads at full magnitude and
+                // NOT the largest displacement. A stick being HELD reads at full magnitude and
                 // beats a quick flick at half -- measured, that selected a 333-483 ms hold at
                 // magnitude 1.0 over the actual flick, and handed back a multiplier below the game's
                 // own on every trick. Biggest is not fastest, and the flick is the fast one.
@@ -297,7 +297,7 @@ static float hkFlipMult(void* self, void* def, unsigned char inputType, void* in
             }
         }
 
-        // ⚠️ SIZE THE LOOKBACK FROM THE GAME'S OWN GESTURE AGE. A fixed 250 ms window assumes the
+        // SIZE THE LOOKBACK FROM THE GAME'S OWN GESTURE AGE. A fixed 250 ms window assumes the
         // flick just happened -- true if you flick and release, false if you flick and HOLD, where
         // the movement is already off the left edge of the window and all we can see is the stick
         // parked at full deflection. Measured: one player's window opened with the stick already at
@@ -306,7 +306,7 @@ static float hkFlipMult(void* self, void* def, unsigned char inputType, void* in
         float lookback = (float)g_windowMs / 1000.0f;
         if (gameTime > lookback) lookback = gameTime * 1.3f;      // a margin for the run-up
         if (lookback > 1.5f) lookback = 1.5f;                     // never unbounded
-        // ⚠️ DO NOT CHOOSE A STICK. Every rule tried for that was a stance assumption in disguise --
+        // DO NOT CHOOSE A STICK. Every rule tried for that was a stance assumption in disguise --
         // the trick definition's expected type, then the matched entry's own stick fields -- and each
         // one broke a different combination of goofy / switch / nollie / fakie, because which thumb
         // performs a flick changes with all of them. There is nothing to decide: measure BOTH and

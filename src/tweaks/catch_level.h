@@ -18,7 +18,7 @@ void  CatchLevel_SaveConfig(char* iniText, size_t cap);
 void  CatchLevel_ResetDefaults();
 void  CatchLevel_Install();
 // The resolved address of FlipTricksHandler::GetBoardExtraPitchAngle, or null if it was never found.
-// ⚠️ EXPOSED BECAUSE A HOOK DESTROYS ITS OWN SIGNATURE: MinHook overwrites the prologue with a jump,
+// EXPOSED BECAUSE A HOOK DESTROYS ITS OWN SIGNATURE: MinHook overwrites the prologue with a jump,
 // so once this module hooks that function a byte-signature scan for it can never match again. Any
 // later module needing the address (pitch_range wants it only as a return-address range) must take
 // it from here rather than scan for it -- scanning silently fails depending on install order.

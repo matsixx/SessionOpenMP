@@ -97,7 +97,7 @@ static inline void TwkQuatAxisAngle(const float axis[3], float deg, float out[4]
 }
 
 // FRotator <-> FQuat, Unreal's own formulas (Pitch/Yaw/Roll in degrees, quat as x,y,z,w).
-// ⚠️ The standing "no euler round-trips" rule exists because the GAME's conversion pair is not
+// The standing "no euler round-trips" rule exists because the GAME's conversion pair is not
 // self-inverse. This pair is, by construction -- it is the engine's own math written out both ways,
 // so a value can go quat -> rotator -> quat without drifting. Never mix these with the game's.
 static inline void TwkRotatorToQuat(const float rot[3], float out[4]) {
