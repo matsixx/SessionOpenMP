@@ -68,6 +68,7 @@
 enum {
     AN_ON_BOARD      = 0x300,   // IsOnBoard -- hard gate, never steer while walking
     AN_IS_SWITCH     = 0x303,   // IsSkatingSwitch (plain bool, no asset gate)
+    AN_IS_GOOFY      = 0x304,   // IsSkatingGoofy -- see the per-foot veto for why it matters
     // ⛔ The game's built-in boned ollie is NOT the stance system (EFootPositionType +0x305 reads a
     // constant through one) and NOT HipOffset (+0x3dc reads (0,0,0) throughout). Both were measured
     // and both are dead ends; the probes for them are gone. What a bone actually does is push the
@@ -603,8 +604,20 @@ bool FootSteer_AddOffset(void* a, float dt, float outL[3], float outR[3]) {
         else if (flipping > 0) g_airTrick = 1;
         else if (grounded > 0) g_airTrick = 0;   // back on the board: re-arm for the next
         const bool bothFeet = (g_airTrick == 0);
-        const bool catchNowL = (g_catchVeto != 0) && ((catchL > 0) || bothFeet);
-        const bool catchNowR = (g_catchVeto != 0) && ((catchR > 0) || bothFeet);
+        // ⚠️ THE PER-FOOT FLAGS NEED THE SAME STANCE CORRECTION THE CATCH DOES. HasLeft/
+        // RightFootCatchOrient are derived from the orient STATE, and catch_tweaks inverts that state
+        // in goofy-and-not-switch so the correct foot catches (its own measured truth table). The
+        // flags therefore stop naming the physical foot in exactly that stance -- so reading them raw
+        // vetoed the FREE foot and left the catching one steerable. Symptom: in goofy you cannot hold
+        // the other foot out, because the foot you wanted to hold is the one being surrendered while
+        // the catching foot is already planted by the animation.
+        // Same predicate as CatchStanceInverts() in catch_tweaks -- if one changes, change both.
+        // Read directly rather than via swNow -- that is declared further down, with the stance blend.
+        const bool stanceInv = (twkB(a, AN_IS_GOOFY) > 0) && (twkB(a, AN_IS_SWITCH) == 0);
+        const int  useCatchL = stanceInv ? catchR : catchL;
+        const int  useCatchR = stanceInv ? catchL : catchR;
+        const bool catchNowL = (g_catchVeto != 0) && ((useCatchL > 0) || bothFeet);
+        const bool catchNowR = (g_catchVeto != 0) && ((useCatchR > 0) || bothFeet);
         // ⚠️ THE STATE GATE AND THE APPLY GATE ARE SEPARATE. Folding the feature toggle into the
         // state test would mean the probe recorded nothing whenever steering was off -- which is
         // exactly the configuration a measurement round runs in.

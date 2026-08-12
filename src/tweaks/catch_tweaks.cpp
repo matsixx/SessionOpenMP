@@ -197,6 +197,9 @@ static int   g_flickLatch = 0;
 static int   g_latchIdle  = 0;       // frames since the last non-zero orient, to release the latch
 static int   g_flickInvert = 0;      // CatchFlickFootInvert, if the stance parity reads backwards
 static LONG  g_uiFlickFixes = 0;     // how many orients this has corrected, for the menu
+// "Was THIS AIR a flip or rotation" -- maintained EVERY FRAME in CatchTweaks_PumpFrame, not
+// from the hook (which only runs on a non-zero orient and so could leave it stale).
+static int   g_airWasTrick = 0;
 static int   g_secondFootHold = 0;   // SecondFootHold
 static int   g_boneScale = 100;             // BoneScalePct
 static int   g_boneAdd[3] = { 0, 0, 0 };    // BoneAddX / BoneAddY / BoneAddZ
@@ -1081,13 +1084,15 @@ static bool CatchIsSwitch() {
 // goofy alone or to goofy XOR switch; both contradict a measured case.
 static bool CatchStanceInverts() { return CatchIsGoofy() && !CatchIsSwitch(); }
 
-static int g_airWasTrick = 0;
+// ⚠️ READ-ONLY. The latch is maintained in CatchTweaks_PumpFrame, every frame. It used to be updated
+// HERE, but this runs only from the hook -- i.e. only on a non-zero orient state -- so after a flip
+// trick it could stay set through the landing and into the next air, overriding an ordinary ollie's
+// orient and tilting the board the wrong way exactly once before self-correcting.
+// A rising edge is still taken here so a trick that starts between pumps is not missed for a frame.
 static bool CatchAirIsTrick() {
     __try {
         void* a = FootPlace_AnimInstance();
-        if (!a) return g_airWasTrick != 0;
-        if (twkB(a, AN_FLIPPING) > 0 || twkB(a, AN_ROTATING) > 0) g_airWasTrick = 1;
-        else if (twkB(a, AN_GROUNDED) > 0)                        g_airWasTrick = 0;
+        if (a && (twkB(a, AN_FLIPPING) > 0 || twkB(a, AN_ROTATING) > 0)) g_airWasTrick = 1;
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
     return g_airWasTrick != 0;
 }
@@ -1422,6 +1427,19 @@ void CatchTweaks_PumpFrame() {
     // Belt-and-braces latch release: the state==0 call is the normal end of a catch, but if the
     // setter simply STOPS being called instead, the latch would otherwise persist into the next one.
     if (g_flickLatch != 0 && ++g_latchIdle > 10) { g_flickLatch = 0; g_latchIdle = 0; }
+    // ⚠️ THE "was this air a trick" LATCH IS MAINTAINED HERE, EVERY FRAME -- not only when
+    // SetCatchOrient happens to be called. It used to be updated inside CatchAirIsTrick(), which the
+    // hook calls only for a NON-ZERO orient state, so after a flip trick the latch could stay set
+    // through the landing and into the NEXT air: that ollie was then treated as a trick, its orient
+    // was overridden, and the board tilted the wrong way. It self-corrected because the following
+    // air did see `grounded` -- which is exactly the reported "randomly once, then fine after".
+    __try {
+        void* an = FootPlace_AnimInstance();
+        if (an) {
+            if (twkB(an, AN_FLIPPING) > 0 || twkB(an, AN_ROTATING) > 0) g_airWasTrick = 1;
+            else if (twkB(an, AN_GROUNDED) > 0)                         g_airWasTrick = 0;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
     // ⚠️ The FIX (g_stopFlip) lives in here alongside the diagnostic trace, so this must not early-out
     // on the trace flag -- doing so silently disabled the fix the moment logging was turned off for
     // release. Each part checks its own switch below.
