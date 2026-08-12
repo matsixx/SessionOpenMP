@@ -1105,21 +1105,21 @@ static bool CatchIsSwitch() {
 //     goofy=0 switch=0 -> front = raw LEFT      goofy=0 switch=1 -> front = raw RIGHT
 //     goofy=1 switch=0 -> front = raw RIGHT     goofy=1 switch=1 -> front = raw LEFT
 //
-// We key on the PHYSICAL stick, so we have to undo that swap ourselves -- but only on its goofy
-// half, which is what the headset testing found (wrong in goofy-regular alone):
-//     invert = swap && goofy = goofy && !switch && _isLeftRightFootSkater
+// We key on the PHYSICAL stick, so we simply UNDO THAT SWAP -- the predicate is the game's, exactly:
+//     invert = swap = (goofy != switch) && _isLeftRightFootSkater
+// Headset-verified in all four stances. An earlier cut inverted only the goofy half, because
+// goofy-switch had read as correct while the both-feet bug was still masking which foot caught; once
+// that was fixed, regular-switch showed up wrong too and the rule closed to the plain XOR.
 //
 // THE SETTING TERM MATTERS. `_isLeftRightFootSkater` is the control-scheme option binding the
 // sticks to LEFT/RIGHT feet instead of FRONT/BACK. With it OFF the game never swaps, so inverting
 // would be wrong -- the earlier `goofy && !switch` rule was correct only for the one value of a
 // setting the player can change in the options menu.
 //
-// What is still NOT understood is why only the goofy half needs undoing: role alone does not
-// determine the foot (a LEFT flick lands on the BACK role in both goofy-regular and regular-switch,
-// yet only goofy-regular inverts). Until that is measured, this stays as the game's predicate plus
-// the measured half -- do not "simplify" it to goofy alone or to goofy XOR switch.
+// The SETTING term is load-bearing: with _isLeftRightFootSkater off the game never swaps, so
+// inverting would be wrong. Do not reduce this to a bare stance test.
 static bool CatchStanceInverts() {
-    if (!CatchIsGoofy() || CatchIsSwitch()) return false;
+    if (CatchIsGoofy() == CatchIsSwitch()) return false;   // goofy XOR switch -- the game's own swap
     __try {
         void* a  = FootPlace_AnimInstance();
         void* sk = a ? twkP(a, AN_SKATER) : nullptr;

@@ -644,7 +644,7 @@ bool FootSteer_AddOffset(void* a, float dt, float outL[3], float outR[3]) {
         // Same predicate as CatchStanceInverts() in catch_tweaks, INCLUDING the setting term --
         // the game only swaps its stick roles while _isLeftRightFootSkater is set, so without
         // that term this would swap the flags in a stance where nothing was swapped.
-        bool stanceInv = (twkB(a, AN_IS_GOOFY) > 0) && (twkB(a, AN_IS_SWITCH) == 0);
+        bool stanceInv = (twkB(a, AN_IS_GOOFY) > 0) != (twkB(a, AN_IS_SWITCH) > 0);
         if (stanceInv) {
             void* sk2 = twkP(a, AN_SKATER);
             if (sk2 && (twkB(sk2, SK_STANCE_OPTS) & 1) == 0) stanceInv = false;
