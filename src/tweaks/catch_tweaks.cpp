@@ -47,6 +47,9 @@
 #include "foot_place.h"
 #include "foot_steer.h"      // the filtered steer, so a driven board agrees with the feet
 #include <cmath>
+
+static bool CatchIsGoofy();   // defined with the catch-orient hook, used by the flick log above it
+static bool CatchIsSwitch();
 #include "MinHook.h"
 
 // ------------------------------------------------------------------ measured offsets (PDB-confirmed)
@@ -59,6 +62,9 @@ enum {
     // `mov [rcx+0x63d], dl`, i.e. _catchMode on the SKATER. Gate on that; +0x30 does not move when
     // the setting changes.
     IAH_CATCH_ORIENT_INPUT  = 0x30,    // ECatchOrientInputMode (NOT the setting; context/scheme)
+    IAH_INPUT_HANDLER       = 0x20,    // InAirHandler -> _inputHandler (PDB)
+    IH_RAW_LEFT             = 0x24,    // InputHandler -> _frameRawLeftInput  (scoop_speed's offsets)
+    IH_RAW_RIGHT            = 0x2c,    //   "             _frameRawRightInput
     IAH_LAST_ORIENT_STATE   = 0x31,
     // +0x33/+0x34 are written in CheckForCatchOrient's EPILOGUE from that frame's inputs -- "stick
     // was pushed LAST frame" trackers, making the manual stick branch an EDGE DETECTOR: catch
@@ -79,6 +85,15 @@ enum {
     CO_FRONT_SETTINGS       = 0x5c,    // FCatchOrientDefinition::FrontSideSettings (88 B)
     // FCatchOrientSettings::{Left,Right}BoardRelativeOffset_{RGS,SWS} -- FVectors, the displacement
     COS_OFF_L_RGS = 0x28, COS_OFF_R_RGS = 0x34, COS_OFF_L_SWS = 0x40, COS_OFF_R_SWS = 0x4c,
+    // USkaterAnimInstance, reached through FootPlace_AnimInstance(). IsBoardFlipping /
+    // IsBoardRotating: neither set for a whole air = an OLLIE (incl. switch/fakie/nollie).
+    AN_FLIPPING             = 0x495,   AN_ROTATING = 0x496,
+    AN_GROUNDED             = 0x5fa,
+    // IsSkatingGoofy. In goofy the front foot is the RIGHT one, so the physical stick -> catching
+    // foot mapping inverts. MEASURED across all four combinations: the catch takes the wrong foot in
+    // goofy AND goofy-switch, and the right one in both regular variants -- so goofy flips it and
+    // switch does NOT. (Switch reverses which END of the board leads; it does not swap your feet.)
+    AN_IS_GOOFY             = 0x304,
     SK_CATCH_MODE           = 0x63d,   // ECatchMode -- THIS is the menu's Catch Mode
     SK_CATCH_ORIENT_STATE   = 0x63e,   // ECatchOrientState -- nonzero = a catch actually ENGAGED
     SK_BOARD                = 0x568,   // ASkaterCharacterBase -> _skateboard (ASkateboardEx*)
@@ -89,8 +104,17 @@ enum {
     MC_LFOOT_CATCH          = 0x538,   // USkateboardExMovementComponent::_leftFootCatchInfo
     MC_RFOOT_CATCH          = 0x540,   //   "                            _rightFootCatchInfo
     FCFI_RATIO              = 0x004,   // FCatchFootInfo::CatchRatio (type byte sits at +0)
+    // The catch's TIMING, on the same component. ⚠️ These read as garbage (-1.6e25) through
+    // `skater+0x550`, which is a different class -- reach them through CatchLevel's learned
+    // component, whose owner back-pointer at +0x340 proves it is ours.
+    MC_CATCH_TOTAL_TIME     = 0x54c,   // _catchTotalTime
+    MC_CATCH_FORCE_TIME     = 0x550,   // _catchForceFeetCatchTime -- when the feet are FORCED down
+    MC_CATCH_TO_BOARD_DELAY = 0x554,   // _catchFeetToOnSkateboardDelay
     MC_BOARD_FLIP_TARGET    = 0x778,   // _boardFlipTargetAngle
     MC_BOARD_FLIP_CUR       = 0x77c,   // _boardFlipCurrentAngle
+    AN_IS_SWITCH            = 0x303,   // USkaterAnimInstance::IsSkatingSwitch -- front foot swaps
+    AN_IS_LANDING           = 0x5fd,   // USkaterAnimInstance::IsLanding -- "the board reaches the
+                                       // ground", which is the release the second-foot hold wants
     AN_HAS_LFOOT_CATCH      = 0x313,   // USkaterAnimInstance::HasLeftFootCatchOrient
     AN_HAS_RFOOT_CATCH      = 0x314,   //   "                  HasRightFootCatchOrient
     MC_BOARD_FLIP_RATE      = 0x774,   // USkateboardExMovementComponent::_boardFlipRate. Reached
@@ -104,7 +128,15 @@ enum {
     // fields; measure the rendered geometry instead (the flipper component's quat, TwkActorZ).
     TDB_FLIP_TRICKS         = 0x2c0,   // UTricksDatabase -> _flipTricks TArray<UFlipTrickDefinition*>
     DEF_FLIP_PRECATCH_ANGLE = 0x258,   // UFlipTrickDefinition::BoardFlipPreCatchAngle     (default 60)
-    DEF_ROT_PRECATCH_ANGLE  = 0x25c,   // UFlipTrickDefinition::BoardRotationPreCatchAngle (default 60)
+    DEF_ROT_PRECATCH_ANGLE  = 0x25c,
+    // ⚠️ ALIVE, despite an earlier note in this project calling it dead data. It is the divisor for
+    // the SECOND foot's catch ratio in USkateboardExMovementComponent::UpdateFeetCatchInfo
+    // (0xfdee40): `[rdi+0x54c] _catchTotalTime / [rsi+0x268]`, clamped to 1, written to that foot's
+    // CatchRatio. The "no references" reading came from a linear disassembler that had stopped after
+    // ~20 lines of a 0xb66-byte function.
+    // ⛔ NOT WRITTEN. OtherFootCatchTime -- kept only as the documented offset; see the note above
+    // the catch-window walk for why scaling it was removed.
+    DEF_OTHER_FOOT_TIME     = 0x268,   // UFlipTrickDefinition::OtherFootCatchTime (ships 0.15)
 };
 
 // ------------------------------------------------------------------ knobs (ALL above the reader)
@@ -127,6 +159,45 @@ static int   g_catchDiag   = 0;       // log every catch decision (verbose; for 
 // changes only how far and in which direction. Data-only, fully restored when back at stock.
 // 0 removes the bone entirely, 100 is stock. The add is in cm on the offset's raw components --
 // which one reads as "up" is a question for the headset, exactly like the foot axes were.
+// ⛔ OtherFootCatchTime (+0x268) is left STOCK. Scaling it was tried and removed at the
+// user's request -- "it doesn't seem to help much". It gates only when the second foot
+// ATTACHES, so it cannot stop that foot travelling, and the large values needed to look
+// like a hold left it still descending at touchdown and clipped it through the deck.
+// `_catchTotalTime` counts UP from zero -- it is an elapsed clock, not a budget.
+// What the same measurement DID show: the catch ORIENT is one-footed (`L orient=YES R orient=no`
+// every trick) but BOTH feet are handed a catch TYPE immediately (`footType L=1 R=2`). So the other
+// foot going down is a per-foot TYPE assignment, not a timer -- clear it and it has nothing to do.
+// Held until `IsLanding`, which is the user's own release condition: "until the board actually
+// reaches the ground".
+// CatchWithStickHeld -- let a catch flick register while the OTHER stick is held (mid-scoop, or any
+// hold). A catch orient is a single-stick gesture, so the game refuses it outright when both sticks
+// are deflected; this presents the held one as centred for the duration of the decision only.
+static int   g_catchTwoStick = 1;
+// How many further calls the held stick stays masked once a catch verdict has been produced.
+// MEASURED WHY: with the mask on, the decision returns the RIGHT foot (out5=1, front) -- but
+// _Default only writes a verdict, and the dispatcher engages the catch after it returns. Restoring
+// the scoop immediately let the dispatcher re-derive from the live sticks and take the back foot.
+// 0 restores immediately (the old behaviour, for A/B).
+static int   g_heldMaskFrames = 2;
+// CatchWithFlickedFoot -- catch with the foot whose stick was flicked, instead of whichever one the
+// game picks. See the SetCatchOrient hook below for the decode; this is the on/off switch.
+static int   g_flickFoot = 1;
+// WHICH PHYSICAL STICK made the fresh flick: 0 = none/ambiguous, 1 = LEFT, 2 = RIGHT, plus a
+// freshness countdown in frames. Physical, not front/back: front/back is stance-relative naming and
+// the dispatcher can hand the two vectors over either way round, so identity is taken by POINTER
+// against the InputHandler's own left/right fields.
+static int   g_flickPhys = 0, g_flickFresh = 0;
+// ⚠️ SetCatchOrient is called EVERY FRAME for the whole duration of a catch, not once at the start
+// (measured: ~30 consecutive calls per catch). So the corrected foot must be LATCHED for the whole
+// catch -- the first cut forced it only while a fixed freshness window lasted, the window expired
+// mid-catch, and the orient reverted to the game's foot with the catch still running. That reads in
+// the headset as BOTH feet catching, one after the other.
+// 0 = not latched, else the ECatchOrientState being held (1 = left, 2 = right).
+static int   g_flickLatch = 0;
+static int   g_latchIdle  = 0;       // frames since the last non-zero orient, to release the latch
+static int   g_flickInvert = 0;      // CatchFlickFootInvert, if the stance parity reads backwards
+static LONG  g_uiFlickFixes = 0;     // how many orients this has corrected, for the menu
+static int   g_secondFootHold = 0;   // SecondFootHold
 static int   g_boneScale = 100;             // BoneScalePct
 static int   g_boneAdd[3] = { 0, 0, 0 };    // BoneAddX / BoneAddY / BoneAddZ
 // FlipCatchTrace -- read-only: measures how far the BOARD turns across a catch, so "it finished a
@@ -240,6 +311,16 @@ void CatchTweaks_ReadConfig(const char* buf) {
     g_catchBeatsDS = TwkIniInt(buf, "CatchBeatsDarkslide", 1);
     g_dsAngleDeg   = TwkIniInt(buf, "DarkslideZoneDeg", 60);
     g_catchDiag    = TwkIniInt(buf, "CatchDiag", 0);
+    g_flickFoot      = TwkIniInt(buf, "CatchWithFlickedFoot", 1);
+    g_flickInvert    = TwkIniInt(buf, "CatchFlickFootInvert", 0);
+    // 150 = the other foot takes 1.5x the shipped 0.15 s to ATTACH. Deliberately mild: this gates
+    // attachment only, and pushed far enough to look like a hold (300 was tried) it left the foot
+    // still descending at touchdown and clipped it through the deck. Holding the foot OFF the board
+    // is foot_place's catch pin, which counters the pose directly and releases on landing.
+    g_catchTwoStick  = TwkIniInt(buf, "CatchWithStickHeld", 1);
+    g_heldMaskFrames = TwkIniInt(buf, "CatchHeldMaskFrames", 2);
+    if (g_heldMaskFrames < 0) g_heldMaskFrames = 0; else if (g_heldMaskFrames > 10) g_heldMaskFrames = 10;
+    g_secondFootHold = TwkIniInt(buf, "SecondFootHold", 0);
     g_boneScale     = TwkIniInt(buf, "BoneScalePct", 100);
     g_boneAdd[0]    = TwkIniInt(buf, "BoneAddX", 0);
     g_boneAdd[1]    = TwkIniInt(buf, "BoneAddY", 0);
@@ -292,6 +373,15 @@ void CatchTweaks_SaveConfig(char* buf, size_t cap) {
     TwkIniSetInt(buf, cap, "CatchSnapMaxDeg",     g_snapMaxDeg);
     TwkIniSetInt(buf, cap, "CatchSnapMaxBoost",   g_snapMaxBoost);
     TwkIniSetInt(buf, cap, "CatchFlipAxis",       g_flipAxis);
+    TwkIniSetInt(buf, cap, "CatchWithFlickedFoot", g_flickFoot);
+    TwkIniSetInt(buf, cap, "CatchFlickFootInvert", g_flickInvert);
+    TwkIniSetInt(buf, cap, "CatchWithStickHeld",  g_catchTwoStick);
+    TwkIniSetInt(buf, cap, "CatchHeldMaskFrames", g_heldMaskFrames);
+    TwkIniSetInt(buf, cap, "SecondFootHold",      g_secondFootHold);
+    // Written back so it EXISTS in the ini to be found. A read-only key defaults silently and is
+    // indistinguishable from a key you set wrongly -- which is exactly how a dead `FootCatchDiag`
+    // left over from the foot-placement cleanup got mistaken for this one.
+    TwkIniSetInt(buf, cap, "CatchDiag",           g_catchDiag);
     TwkIniSetInt(buf, cap, "BoneScalePct",        g_boneScale);
     TwkIniSetInt(buf, cap, "BoneAddX",            g_boneAdd[0]);
     TwkIniSetInt(buf, cap, "BoneAddY",            g_boneAdd[1]);
@@ -303,6 +393,14 @@ static const char* SIG_CAN_CATCH =      // InAirHandler::CanCatchOrient
     "48 89 74 24 18 41 56 48 83 EC 70 0F 29 74 24 60 48 8B F1 48 8B 09 0F 29 7C 24 50 44 0F 29 44 24 40"; // Epic 0x1044980 / Steam 0x1004d00
 static const char* SIG_CATCH_DEFAULT =  // InAirHandler::CheckForCatchOrient_Default -- SEVEN args!
     "40 56 57 41 56 48 83 EC 50 49 8B F1 4D 8B F0 48 8B F9 E8 ?? ?? ?? ?? 84 C0 0F 84 ?? ?? ?? ??";      // Epic 0x10466c0 / Steam 0x1006a40
+// ASkaterCharacterBase::SetCatchOrient(ECatchOrientState state, float pitchRatio, float yawRatio).
+// FOUR args, all in registers -- verified against the disassembly rather than assumed: the body
+// reads nothing above shadow space, `movzx edi,dl` takes the state, `movaps xmm10,xmm2` /
+// `movaps xmm9,xmm3` take the two floats, and the epilogue is
+//     movss [rbx+0x640], xmm10 / movss [rbx+0x644], xmm9 / mov [rbx+0x63e], dil / ret
+// with no eax written, so it returns void.
+static const char* SIG_SET_CATCH_ORIENT =
+    "40 55 53 57 48 8D 6C 24 B9 48 81 EC C0 00 00 00 48 8B 81 90 05 00 00 0F B6 FA 44 0F 29 8C 24 80 00 00 00"; // Epic 0x1004120 / Steam 0xfc3f50
 
 // ------------------------------------------------------------------ the manual-catch window
 // The defs are static config (164 of them, all shipping 60/60), so this is a one-time write per
@@ -351,9 +449,20 @@ static bool captureOrients(void* codb) {
             g_nOrientSave++;
         }
     }
-    if (g_nOrientSave > 0)
+    if (g_nOrientSave > 0) {
         TwkLog("[catch] catch-orient board offsets captured on %d settings blocks (%d definitions) "
                "-- originals held for exact restore", g_nOrientSave, n);
+        // Print the authored vectors for the first few blocks. The regular/switch MIRROR is the
+        // thing the add has to respect, so it should be measured rather than assumed -- if SWS does
+        // not come back as the sign-flip of RGS, the signing above is the wrong model.
+        for (int i = 0; i < g_nOrientSave && i < 3; i++) {
+            const OrientSave& s = g_orientSave[i];
+            TwkLog("[catch]   block %d: L_RGS(%.2f,%.2f,%.2f) R_RGS(%.2f,%.2f,%.2f) "
+                   "L_SWS(%.2f,%.2f,%.2f) R_SWS(%.2f,%.2f,%.2f)", i,
+                   s.off[0][0], s.off[0][1], s.off[0][2], s.off[1][0], s.off[1][1], s.off[1][2],
+                   s.off[2][0], s.off[2][1], s.off[2][2], s.off[3][0], s.off[3][1], s.off[3][2]);
+        }
+    }
     return g_nOrientSave > 0;
 }
 // Always FROM THE SAVED ORIGINAL, never from the live value: that is what makes a per-frame write
@@ -366,6 +475,14 @@ static void writeOrientsScaled(int scalePct, const int add[3]) {
         if (!s.settings) continue;
         for (int q = 0; q < 4; q++)
             for (int c = 0; c < 3; c++)
+                // A flat add, deliberately. MEASURED authored data (logged at capture):
+                //   block 0: L_RGS(0,3,0) R_RGS(0,-7,0)  L_SWS(-15,7,0) R_SWS(-15,-3,0)
+                // The switch pair is not a sign-flip of the regular pair -- it is the feet SWAPPED
+                // and negated, and the tilt is the L-R DIFFERENCE, which is 10 in both stances. A
+                // flat add shifts both feet together and leaves that difference untouched, so it
+                // cannot tilt the board either way. Signing the add per slot was tried and reverted:
+                // it widened the spread (7 -> 9) in BOTH stances, which is a different change, not a
+                // switch fix.
                 *(float*)(s.settings + kBoardOffsets[q] + c * 4) = s.off[q][c] * k + (float)add[c];
     }
 }
@@ -663,11 +780,163 @@ static void* hkCatchDefault(void* self, double dt, void* frontStick, void* backS
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) { g_catchBeatsDS = 0; }
     }
+    // ---- CATCH WHILE THE OTHER STICK IS HELD (a scoop, a hold, anything).
+    // Measured: with the back stick held at full deflection, a clean front-stick EDGE past the
+    // deadzone (hadF 0->1 at magnitude 0.31, deadzone 0.2) is refused -- `st` never leaves 0 -- and
+    // the dark-slide reservation is provably NOT involved (dsCancel=0 dsWin=0 on every frame). The
+    // only difference from a catch that works is that the other stick is not neutral: a catch orient
+    // is a SINGLE-STICK gesture, so two sticks deflected is not a catch to the game at all.
+    // Fix: for the duration of this ONE call, present the held stick as centred so the flick reads
+    // as single-stick, then put it straight back. Same save/zero/call/restore shape as the
+    // dark-slide mask above, and on pointers we were already handed.
+    // A mask deliberately left in place across the dispatcher, unwound on a later call.
+    // ⚠️ ONLY the InAirHandler's own tracker byte is held across calls -- never a stick pointer.
+    // The stick args are the caller's temporaries (see the restore below), so a pointer to one is
+    // dangling by the next call.
+    static int   pendHadOff = -1, pendHadVal = 0, pendFrames = 0; static void* pendSelf = nullptr;
+    if (pendSelf && pendHadOff >= 0) {
+        if (--pendFrames <= 0) {
+            __try { *((uint8_t*)pendSelf + pendHadOff) = (uint8_t)pendHadVal; }
+            __except (EXCEPTION_EXECUTE_HANDLER) {}
+            pendSelf = nullptr; pendHadOff = -1;
+        }
+    }
+
+    // ---- remember WHICH PHYSICAL STICK made the fresh flick, for the flicked-foot fix.
+    //
+    // ⚠️ MEASURED: the `frontStick`/`backStick` arguments are COPIES, not pointers into the
+    // InputHandler -- the stick-held log has been printing `aliases InputHandler: no` all along. So
+    // neither pointer identity nor the game's own front/back trackers can name a PHYSICAL stick
+    // here. The edge is therefore detected on the InputHandler's own raw left/right vectors with our
+    // own one-frame history, which owes nothing to argument order or stance.
+    //
+    // Must still run BEFORE the mask block: masking zeroes stick state the game reads afterwards.
+    // Exactly one fresh edge names a foot; two together are a deliberate two-stick gesture and name
+    // nothing, so the game's own choice stands.
+    if (g_flickFoot && self && skater) {
+        __try {
+            void* mine = CatchTweaks_Skater();
+            void* ih   = twkP(self, IAH_INPUT_HANDLER);
+            if (ih && (!mine || skater == mine)) {
+                const float dzRead = twkF(twkP(self, IAH_CATCH_ORIENTS_DB), CODB_INPUT_DEADZONE);
+                const float dz = (dzRead > 0.0f && dzRead < 1.0f) ? dzRead : 0.2f;
+                const float lx = twkF(ih, IH_RAW_LEFT),  ly = twkF(ih, IH_RAW_LEFT + 4);
+                const float rx = twkF(ih, IH_RAW_RIGHT), ry = twkF(ih, IH_RAW_RIGHT + 4);
+                const int outL = (lx * lx + ly * ly) > dz * dz;
+                const int outR = (rx * rx + ry * ry) > dz * dz;
+                static int prevOutL = 0, prevOutR = 0;   // our own edge history on the RAW sticks
+                const int edgeL = outL && !prevOutL;
+                const int edgeR = outR && !prevOutR;
+                prevOutL = outL; prevOutR = outR;
+                if (edgeL != edgeR) {                    // exactly one of them edged
+                    // A fresh flick re-decides: drop any latch so the next one-footed orient latches
+                    // onto the foot just flicked rather than the previous catch's.
+                    // 60 frames only has to span flick -> catch-engage (measured ~15); the latch
+                    // covers the catch itself, so this window no longer bounds the correction.
+                    g_flickPhys = edgeL ? 1 : 2; g_flickFresh = 60; g_flickLatch = 0;
+                    if (g_catchDiag)
+                        TwkLog("[catch] flick: %s stick (L %.2f,%.2f  R %.2f,%.2f)",
+                               edgeL ? "LEFT" : "RIGHT", lx, ly, rx, ry);
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) { g_flickFoot = 0; }
+    }
+
+    float savedMask[2] = { 0.0f, 0.0f };
+    void* maskedStick = nullptr;
+    int   maskedHad = -1, savedHad = 0;
+    if (g_catchTwoStick && self) {
+        __try {
+            const float fx = twkF(frontStick, 0), fy = twkF(frontStick, 4);
+            const float bx = twkF(backStick, 0),  by = twkF(backStick, 4);
+            const float dzRead = twkF(twkP(self, IAH_CATCH_ORIENTS_DB), CODB_INPUT_DEADZONE);
+            const float dz = (dzRead > 0.0f && dzRead < 1.0f) ? dzRead : 0.2f;
+            const bool fOut = (fx * fx + fy * fy) > dz * dz;
+            const bool bOut = (bx * bx + by * by) > dz * dz;
+            const bool fEdge = fOut && twkB(self, IAH_HAD_FRONT_INPUT) == 0;
+            const bool bEdge = bOut && twkB(self, IAH_HAD_BACK_INPUT) == 0;
+            // Mask the HELD stick only, and only while the OTHER one is making a fresh edge. With
+            // both edging (a real two-stick gesture) nothing is touched.
+            if (fEdge && bOut && !bEdge)      maskedStick = backStick;
+            else if (bEdge && fOut && !fEdge) maskedStick = frontStick;
+            if (maskedStick) {
+                savedMask[0] = twkF(maskedStick, 0); savedMask[1] = twkF(maskedStick, 4);
+                *(float*)maskedStick = 0.0f;
+                *((float*)maskedStick + 1) = 0.0f;
+                // ⚠️ AND THE TRACKER, which is the field that actually gates this. A catch needs
+                // BOTH sticks released and then re-input; the "was it pushed" flags are written in
+                // this function's own epilogue from LAST frame's sticks, so zeroing only the live
+                // vector leaves a stored 1 saying the stick is still held and the edge is refused
+                // anyway. Masking both is what makes the held stick look genuinely let go.
+                maskedHad = (maskedStick == backStick) ? IAH_HAD_BACK_INPUT : IAH_HAD_FRONT_INPUT;
+                savedHad = twkB(self, maskedHad);
+                *((uint8_t*)self + maskedHad) = 0;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) { maskedStick = nullptr; g_catchTwoStick = 0; }
+    }
+
     void* r = nullptr;
     __try { r = ((CatchDefaultFn)g_origCatchDef)(self, dt, frontStick, backStick, a5, a6, a7); }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         if (InterlockedIncrement(&g_faults) == 1) TwkLog("[catch] caught fatal in CheckForCatchOrient_Default -> recovered");
+        // ⚠️ Restore on the FAULT path too. Bailing out with the stick still zeroed would leave the
+        // player's held input centred for the rest of the frame, which reads as the stick dying.
+        if (maskedStick) {
+            __try {
+                *(float*)maskedStick = savedMask[0];
+                *((float*)maskedStick + 1) = savedMask[1];
+                if (maskedHad >= 0) *((uint8_t*)self + maskedHad) = (uint8_t)savedHad;
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
         return nullptr;
+    }
+    if (maskedStick) {                      // put the held stick and its tracker straight back
+        __try {
+            // The verdict is written through the out-pointers BEFORE the restore, so this is the
+            // decision the mask actually produced -- and out5 is the catch state the dispatcher then
+            // engages (a back-stick catch logs out5=2 and st becomes 2). If the wrong foot is being
+            // caught, either this value already names the wrong one (the decision is at fault) or it
+            // names the right one and the dispatcher re-derives from the restored sticks (the
+            // restore is too early). One line separates those.
+            const int verdict = a5 ? twkB(a5, 0) : 0;
+            // Do these stick pointers ALIAS the InputHandler's own fields? If they do, holding the
+            // mask blanks the scoop for everything else reading it, and the window must stay tiny.
+            void* ih = twkP(self, IAH_INPUT_HANDLER);
+            const bool alias = ih && (maskedStick == (void*)((uint8_t*)ih + IH_RAW_LEFT) ||
+                                      maskedStick == (void*)((uint8_t*)ih + IH_RAW_RIGHT));
+            TwkLog("[catch] stick-held catch: masked %s | out5=%d out6=%d | st now %d "
+                   "(front %.2f,%.2f  held %.2f,%.2f) | aliases InputHandler: %s%s",
+                   (maskedStick == backStick) ? "BACK (scoop held)" : "FRONT",
+                   verdict, a6 ? twkB(a6, 0) : -1,
+                   skater ? twkB(skater, SK_CATCH_ORIENT_STATE) : -1,
+                   twkF(frontStick, 0), twkF(frontStick, 4),
+                   savedMask[0], savedMask[1], alias ? "YES" : "no",
+                   (verdict != 0 && g_heldMaskFrames > 0) ? "   [holding across the dispatcher]" : "");
+            // A verdict was produced: keep the mask up so the DISPATCHER also sees the held stick as
+            // released, instead of re-deriving the foot from it. No verdict = restore immediately.
+            // The flicked stick is recorded at the TOP of this function (before the mask), so there
+            // is nothing to record here -- just keep it fresh across the verdict.
+            if (verdict != 0 && g_flickPhys != 0) g_flickFresh = 30;
+            // ⛔ The STICK VECTOR is ALWAYS restored before returning, and its pointer is NEVER kept.
+            // `aliases InputHandler: no` above is the proof of why: these are the caller's own
+            // FVector2D TEMPORARIES, not fields on a persistent object. Holding the pointer and
+            // writing two floats through it on a LATER call wrote into a stack frame that had long
+            // since been reused -- a stray write into whatever locals were live at that moment.
+            // (Reported as the board tilting the wrong way in switch/fakie, which arrived with this
+            // feature.) Masking it across calls was pointless as well as unsafe: the next call gets
+            // FRESH copies, so a stale mask cannot influence it.
+            *(float*)maskedStick = savedMask[0];
+            *((float*)maskedStick + 1) = savedMask[1];
+            // Only the TRACKER is held across the dispatcher -- it lives on the InAirHandler, a real
+            // object with a stable address, which is what makes it safe to unwind on a later call.
+            // That is also the field that actually gates the catch, so the feature is unaffected.
+            if (verdict != 0 && g_heldMaskFrames > 0 && maskedHad >= 0) {
+                pendHadOff = maskedHad; pendHadVal = savedHad; pendSelf = self;
+                pendFrames = g_heldMaskFrames;
+            } else if (maskedHad >= 0) {
+                *((uint8_t*)self + maskedHad) = (uint8_t)savedHad;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
     if (dsSaved > 0) {
         __try { *(uint8_t*)((uint8_t*)self + IAH_DS_CANCEL) = (uint8_t)dsSaved; }
@@ -748,6 +1017,135 @@ static void* hkCatchDefault(void* self, double dt, void* frontStick, void* backS
     return r;
 }
 
+// ------------------------------------------------------------------ catch with the FLICKED foot
+// DECODED from USkaterAnimInstance::SetCatchOrient (Epic 0xf651d0), not inferred. It reads the
+// skater's ECatchOrientState byte (+0x63e) and derives BOTH foot flags from that byte and nothing
+// else:
+//     movzx eax, [rdx+0x63e]                 ; the orient state
+//     cmp al,1 / cmp al,5 / cmp al,0xa / cmp al,0xb  -> anim+0x313 = LEFT foot orient
+//     mov eax, 0xc24 ; bt eax, ecx                   -> anim+0x314 = RIGHT foot orient
+//   left  foot = state in { 1, 5, 10, 11 }
+//   right foot = state in { 2, 5, 10, 11 }        (0xc24 = bits 2, 5, 10, 11)
+//
+// So the catching foot is ONE BYTE, chosen upstream of everything this module used to write --
+// which is exactly why masking the stick vector, masking the input trackers, holding the mask
+// across the dispatcher and forcing the per-foot CatchRatio all failed to move it. The ratio is an
+// output of a ramp that raises both feet from a shared divisor (UpdateFeetCatchInfo, `maxss` only);
+// it cannot select a foot and writing it only destroyed the catch.
+//
+// ASkaterCharacterBase::SetCatchOrient takes that byte as its 2nd ARGUMENT and stores it, so
+// correcting it here fixes it at the source: the anim flags, the authored FCatchOrientDefinition
+// that gets looked up, and the per-foot catch info all derive from the corrected value.
+//
+// Only a ONE-FOOTED orient that named the wrong foot is swapped:
+//   * 7/8/9 are DARK SLIDES (ASkaterCharacterBase::IsInDarkSlideCatchOrientState is exactly
+//     `(state-7) <= 1 || state == 9`) -- never touched.
+//   * 5/10/11 are genuine TWO-foot orients -- never narrowed to one foot.
+//   * 0 is "no catch".
+typedef void (*SetCatchOrientFn)(void*, uint8_t, float, float);
+static void* g_origSetOrient  = nullptr;
+static void* g_startSetOrient = nullptr;
+
+// ⚠️ REAL TRICKS ONLY -- latched over the air.
+// The BONED OLLIE IS A CATCH ORIENT: holding the sticks in the air sets an orient state, and that
+// state selects the FCatchOrientDefinition whose BoardRelativeOffset vectors shove the board. So a
+// hook that rewrites 1<->2 unconditionally also overrides which orient an ORDINARY OLLIE uses -- and
+// since the regular/switch orients are mirrored, the forced one is wrong in switch and the board
+// tilts the opposite way. (Reported: switch ollie, holding a stick, the wrong end drops. The bone
+// data itself was stock; what was wrong was which orient got applied.)
+// Latched because the flip has already stopped by the time the catch registers, so an instantaneous
+// test reads false exactly when it matters. An ollie sets neither flag for the whole air, which is
+// what makes the latch a valid ollie test.
+// Stance, read fresh (you can change it between runs, and a cached value would be stale).
+// Failure to read counts as NOT goofy: that is the mapping that was already correct, so a bad read
+// degrades to the previously-working behaviour instead of inverting it.
+static bool CatchIsGoofy() {
+    __try {
+        void* a = FootPlace_AnimInstance();
+        return a && twkB(a, AN_IS_GOOFY) > 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+static bool CatchIsSwitch() {
+    __try {
+        void* a = FootPlace_AnimInstance();
+        return a && twkB(a, AN_IS_SWITCH) > 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+// The stance correction, as a COMPLETE MEASURED TRUTH TABLE -- all four combinations were tested in
+// the headset once the both-feet bug (which masked this) was fixed:
+//     regular + regular  -> correct      regular + switch -> correct
+//     GOOFY   + regular  -> WRONG        goofy   + switch -> correct
+// So the mapping inverts for goofy ONLY while not switch. Deliberately written as the table rather
+// than as a theory: "which foot leads" would predict regular-switch to be wrong too, and it is not,
+// so the underlying reason is NOT understood -- only the behaviour is. Do not "simplify" this to
+// goofy alone or to goofy XOR switch; both contradict a measured case.
+static bool CatchStanceInverts() { return CatchIsGoofy() && !CatchIsSwitch(); }
+
+static int g_airWasTrick = 0;
+static bool CatchAirIsTrick() {
+    __try {
+        void* a = FootPlace_AnimInstance();
+        if (!a) return g_airWasTrick != 0;
+        if (twkB(a, AN_FLIPPING) > 0 || twkB(a, AN_ROTATING) > 0) g_airWasTrick = 1;
+        else if (twkB(a, AN_GROUNDED) > 0)                        g_airWasTrick = 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    return g_airWasTrick != 0;
+}
+
+static void hkSetCatchOrient(void* self, uint8_t state, float pitchRatio, float yawRatio) {
+    uint8_t use = state;
+    if (state == 0) { g_flickLatch = 0; g_latchIdle = 0; }   // catch ended -- release the latch
+    else {
+        __try {
+            g_latchIdle = 0;
+            // Co-op: this fires per skater and the flick record is the LOCAL player's sticks, so a
+            // proxy must keep the vanilla selection rather than inherit our foot.
+            void* mine = CatchTweaks_Skater();
+            const bool isMine = (!mine || self == mine);
+            // Only ever touch a real flip/rotation catch. On an ollie the orient is the game's own
+            // board control (the bone) and must be left exactly as authored.
+            // ⚠️ TWO-FOOT ORIENTS MUST BE NARROWED TOO, not just 1<->2 swapped. MEASURED: a catch
+            // taken while the other stick is held (the mid-scoop catch) emits state 5 or 10 -- BOTH
+            // feet -- and the first cut only rewrote 1<->2, so those passed through untouched and
+            // both feet caught at once, in every stance. That is what "it catches with the wrong
+            // foot" actually was; it never responded to a stance flip because it was never a stance
+            // bug. Dark slides (7/8/9) stay untouched, and an OLLIE is excluded by CatchAirIsTrick()
+            // so the boned ollie's own two-stick orient (11) is never narrowed.
+            const bool oneFoot = (state == 1 || state == 2);
+            const bool twoFoot = (state == 5 || state == 10 || state == 11);
+            if (g_flickFoot && isMine && (oneFoot || twoFoot) && CatchAirIsTrick()) {
+                // Latch the flicked foot on the FIRST narrowable orient of this catch, then hold it.
+                if (g_flickLatch == 0 && g_flickFresh > 0 && g_flickPhys != 0) {
+                    int want = (g_flickPhys == 1) ? 1 : 2;
+                    if (CatchStanceInverts()) want = 3 - want;   // goofy-and-not-switch; see the table
+                    if (g_flickInvert)        want = 3 - want;   // manual override, if parity reads backwards
+                    g_flickLatch = want;
+                }
+                if (g_flickLatch != 0 && (uint8_t)g_flickLatch != state) {
+                    use = (uint8_t)g_flickLatch; InterlockedIncrement(&g_uiFlickFixes);
+                }
+            }
+            // Behind CatchDiag now that the foot selection is settled. It stays available because a
+            // silent log distinguishes "never routed through this setter" from "ran and declined",
+            // which is not inferable from the game's behaviour and cost a round to learn.
+            if (g_catchDiag)
+                TwkLog("[catch] SetCatchOrient(state=%d)%s flick=%s latch=%d %s trick=%d%s",
+                       (int)state, isMine ? "" : " [not mine]",
+                       (g_flickPhys == 1) ? "LEFT" : (g_flickPhys == 2) ? "RIGHT" : "none",
+                       g_flickLatch,
+                       CatchIsGoofy() ? (CatchIsSwitch() ? "goofy-switch" : "goofy")
+                                      : (CatchIsSwitch() ? "reg-switch"   : "regular"),
+                       CatchAirIsTrick() ? 1 : 0,
+                       (use != state) ? ((use == 1) ? "  -> FORCED left(1)" : "  -> FORCED right(2)") : "");
+        } __except (EXCEPTION_EXECUTE_HANDLER) { g_flickFoot = 0; }
+    }
+    __try { ((SetCatchOrientFn)g_origSetOrient)(self, use, pitchRatio, yawRatio); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        if (InterlockedIncrement(&g_faults) == 1)
+            TwkLog("[catch] caught fatal in SetCatchOrient -> recovered");
+    }
+}
+
 // ------------------------------------------------------------------ install + menu
 void CatchTweaks_Install() {
     g_startCanCatch = TwkScanExe(SIG_CAN_CATCH);
@@ -760,7 +1158,7 @@ void CatchTweaks_Install() {
 
     // The dark-slide mask and the decide log both live on the _Default hook, so when neither is
     // wanted the hook is not installed at all rather than relying on a pass-through being harmless.
-    if (!g_catchBeatsDS && !g_catchDiag) { TwkLog("[catch] CatchBeatsDarkslide=0 + CatchDiag=0 -- CheckForCatchOrient_Default NOT hooked"); return; }
+    if (!g_catchBeatsDS && !g_catchDiag && !g_catchTwoStick) { TwkLog("[catch] CatchBeatsDarkslide=0 + CatchDiag=0 + CatchWithStickHeld=0 -- CheckForCatchOrient_Default NOT hooked"); return; }
     g_startCatchDef = TwkScanExe(SIG_CATCH_DEFAULT);
     if (!g_startCatchDef) { TwkLog("[catch] CheckForCatchOrient_Default sig NOT FOUND -- dark-slide fix off (game updated?)"); g_catchBeatsDS = 0; }
     else if (MH_CreateHook(g_startCatchDef, (void*)&hkCatchDefault, &g_origCatchDef) != MH_OK ||
@@ -768,6 +1166,21 @@ void CatchTweaks_Install() {
         TwkLog("[catch] CheckForCatchOrient_Default hook failed -- dark-slide fix off");
         g_startCatchDef = nullptr; g_catchBeatsDS = 0;
     } else TwkLog("[catch] hooked CheckForCatchOrient_Default @ %p -- catch input beats dark slides", g_startCatchDef);
+
+    // The flicked-foot fix needs the decide hook above for the flick record, so it is only useful
+    // once that one is live.
+    if (g_flickFoot && g_startCatchDef) {
+        g_startSetOrient = TwkScanExe(SIG_SET_CATCH_ORIENT);
+        if (!g_startSetOrient) { TwkLog("[catch] SetCatchOrient sig NOT FOUND -- flicked-foot fix off (game updated?)"); g_flickFoot = 0; }
+        else if (MH_CreateHook(g_startSetOrient, (void*)&hkSetCatchOrient, &g_origSetOrient) != MH_OK ||
+                 MH_EnableHook(g_startSetOrient) != MH_OK) {
+            TwkLog("[catch] SetCatchOrient hook failed -- flicked-foot fix off");
+            g_startSetOrient = nullptr; g_flickFoot = 0;
+        } else TwkLog("[catch] hooked ASkaterCharacterBase::SetCatchOrient @ %p -- catch uses the flicked foot", g_startSetOrient);
+    } else if (g_flickFoot) {
+        TwkLog("[catch] flicked-foot fix needs CheckForCatchOrient_Default -- not installed");
+        g_flickFoot = 0;
+    }
 }
 
 bool CatchTweaks_Enabled() { return g_catchFix != 0; }
@@ -781,8 +1194,19 @@ void CatchTweaks_ResetDefaults() {
     g_stopFlip = 1; g_stopFlipDeg = 168; g_snapMs = 90;
     g_snapMaxDeg = 200; g_snapMaxBoost = 3; g_flipAxis = 0;
     g_boneScale = 100; g_boneAdd[0] = g_boneAdd[1] = g_boneAdd[2] = 0;
+    g_secondFootHold = 0; g_catchTwoStick = 1; g_heldMaskFrames = 2;
+    // `g_flickFoot` is NOT reset to 1 here if its hook never installed -- Install() clears it on a
+    // failed scan and turning it back on would advertise a fix that cannot run.
+    g_flickFoot = g_startSetOrient ? 1 : 0; g_flickInvert = 0;
     TwkMarkDirty();
 }
+bool  CatchTweaks_SecondFootHold() { return g_secondFootHold != 0; }
+void  CatchTweaks_SetSecondFootHold(bool on) { g_secondFootHold = on ? 1 : 0; TwkMarkDirty(); }
+bool  CatchTweaks_FlickFoot() { return g_flickFoot != 0; }
+void  CatchTweaks_SetFlickFoot(bool on) { g_flickFoot = (on && g_startSetOrient) ? 1 : 0; TwkMarkDirty(); }
+bool  CatchTweaks_FlickInvert() { return g_flickInvert != 0; }
+void  CatchTweaks_SetFlickInvert(bool on) { g_flickInvert = on ? 1 : 0; TwkMarkDirty(); }
+void* CatchTweaks_SetCatchOrientAddr() { return g_startSetOrient; }
 float CatchTweaks_BoneScalePct() { return (float)g_boneScale; }
 void  CatchTweaks_SetBoneScalePct(float v) {
     int s = (int)v; if (s < 0) s = 0; else if (s > 300) s = 300;
@@ -822,6 +1246,26 @@ void CatchTweaks_DrawMenu(const OmpMenuApi* api) {
     }
     if (g_startCatchDef) {
     float bs = (float)g_boneScale;
+    bool cts = g_catchTwoStick != 0;
+    if (api->Checkbox("Catch while the other stick is held", &cts)) { g_catchTwoStick = cts ? 1 : 0; TwkMarkDirty(); }
+    api->SameLine(); api->TextDisabled("(catch mid-scoop; the game refuses a two-stick catch)");
+    if (g_startSetOrient) {
+        bool cff = g_flickFoot != 0;
+        if (api->Checkbox("Catch with the foot you flicked", &cff)) { g_flickFoot = cff ? 1 : 0; TwkMarkDirty(); }
+        api->SameLine(); api->TextDisabled("(the game otherwise picks the foot itself)");
+        if (cff) {
+            api->Indent();
+            bool inv = g_flickInvert != 0;
+            if (api->Checkbox("Swap left/right", &inv)) { g_flickInvert = inv ? 1 : 0; TwkMarkDirty(); }
+            api->SameLine(); api->TextDisabled("(tick this if it picks the opposite foot)");
+            snprintf(b, sizeof(b), "orients corrected: %d", (int)g_uiFlickFixes);
+            api->TextDisabled(b);
+            api->Unindent();
+        }
+    }
+    bool sfh = g_secondFootHold != 0;
+    if (api->Checkbox("Hold the second foot until landing", &sfh)) { g_secondFootHold = sfh ? 1 : 0; TwkMarkDirty(); }
+    api->SameLine(); api->TextDisabled("(the foot you did NOT catch with stays off the board)");
     if (api->SliderFloat("Boned ollie (%)", &bs, 0.0f, 300.0f, "%.0f")) CatchTweaks_SetBoneScalePct(bs);
     api->SameLine(); api->TextDisabled("(100 = stock, 0 = no bone at all)");
     {
@@ -906,21 +1350,39 @@ static void TraceFeetCatch(void* skater, void* comp, float ang) {
     static float angAt = 0.0f, curAt = 0.0f, tgtAt = 0.0f;
     static int   frames = 0, quiet = 0;
 
+    // The forced-catch timers, captured fresh at the START of each catch. Fresh per catch because
+    // the game may set them per trick -- scaling from a baseline taken this catch is correct either
+    // way, and re-deriving from it every frame can never compound.
+    static float baseTotal = 0.0f, baseForce = 0.0f, baseDelay = 0.0f;
+    static int   typeLat = 0, typeRat = 0;
+    // heldRejected is the honest test: if the write does not stick, this lever is the wrong one too.
+    static int   heldFrames = 0, heldRejected = 0, heldAlready = 0;
+
     if (state != 0 && !inCatch) {
         inCatch = true; sawL = sawR = false; peakL = peakR = 0.0f; frames = 0; quiet = 0;
         angAt = ang;
         curAt = twkF(comp, MC_BOARD_FLIP_CUR);
         tgtAt = twkF(comp, MC_BOARD_FLIP_TARGET);
+        baseTotal = twkF(comp, MC_CATCH_TOTAL_TIME);
+        baseForce = twkF(comp, MC_CATCH_FORCE_TIME);
+        baseDelay = twkF(comp, MC_CATCH_TO_BOARD_DELAY);
+        typeLat = twkB(comp, MC_LFOOT_CATCH); typeRat = twkB(comp, MC_RFOOT_CATCH);
+        heldFrames = heldRejected = heldAlready = 0;
     }
     if (!inCatch) return;
 
     ++frames;
-    const float rl = twkF(comp, MC_LFOOT_CATCH + FCFI_RATIO);
-    const float rr = twkF(comp, MC_RFOOT_CATCH + FCFI_RATIO);
-    if (rl > peakL) peakL = rl;
-    if (rr > peakR) peakR = rr;
-    if (twkB(anim, AN_HAS_LFOOT_CATCH) == 1) sawL = true;
-    if (twkB(anim, AN_HAS_RFOOT_CATCH) == 1) sawR = true;
+    // ---- HOLD THE SECOND FOOT. The foot WITHOUT the catch orient is the one you did not catch
+    // with; clearing its catch TYPE to CF_None leaves it nothing to do until the board lands.
+    // Written every frame because the movement tick recomputes it (UpdateFeetCatchInfo runs in the
+    // physics pass, ahead of this animation-phase hook), so this follows rather than fights it.
+    // Released the moment IsLanding goes true.
+    // ⛔ REMOVED: forcing the per-foot CatchRatio (lead=1, other=0) to pick the catching foot.
+    // It did NOT change which foot catches AND it destroyed the catch outright -- measured
+    // `L orient=no peak ratio 0.00 | R orient=no peak ratio 0.00  <-- NO FOOT CAUGHT` on every
+    // attempt, and the un-caught foot then passed through the deck on landing. The ratio is an
+    // output of the ramp, not the selector; writing it only removes a catch that was working.
+    // The foot is chosen by the catch ORIENT, upstream of this component entirely.
 
     // The catch state drops back to 0 the moment it ends; a few frames of grace keep a one-frame
     // flicker from splitting one catch into two log lines.
@@ -928,14 +1390,38 @@ static void TraceFeetCatch(void* skater, void* comp, float ang) {
     if (quiet < 4 && frames < 600) return;
 
     inCatch = false;
+    // A catch state that simply sits on while rolling is not a catch worth a line -- without this
+    // the log filled with 600-frame summaries every 5 seconds, flip angle 0 throughout.
+    if (fabsf(twkF(comp, MC_BOARD_FLIP_CUR) - curAt) < 1.0f && peakL <= 0.0f && peakR <= 0.0f) return;
+    // The timers are printed as CAPTURED (start of catch) and as they read NOW. If they are live
+    // state the pair differs; if they never move and scaling them changes nothing on screen, the
+    // fields are not consulted and holding the second foot needs a different lever entirely.
     TwkLog("[feet] catch over %d frames: L orient=%s peak ratio %.2f | R orient=%s peak ratio %.2f "
-           "| deck %.0f -> %.0f deg | flip angle %.0f -> %.0f (target %.0f)%s",
+           "| deck %.0f -> %.0f deg | flip angle %.0f -> %.0f (target %.0f)%s"
+           " | footType L=%d R=%d -> %d/%d | timers total %.3f force %.3f delay %.3f"
+           " -> %.3f/%.3f/%.3f%s",
            frames, sawL ? "YES" : "no ", peakL, sawR ? "YES" : "no ", peakR,
            angAt, ang, curAt, twkF(comp, MC_BOARD_FLIP_CUR), tgtAt,
-           (!sawL && !sawR) ? "   <-- NO FOOT CAUGHT" : "");
+           (!sawL && !sawR) ? "   <-- NO FOOT CAUGHT" : "",
+           typeLat, typeRat, twkB(comp, MC_LFOOT_CATCH), twkB(comp, MC_RFOOT_CATCH),
+           baseTotal, baseForce, baseDelay,
+           twkF(comp, MC_CATCH_TOTAL_TIME), twkF(comp, MC_CATCH_FORCE_TIME),
+           twkF(comp, MC_CATCH_TO_BOARD_DELAY),
+           (g_secondFootHold && heldFrames)
+               ? (heldRejected ? "   [2nd foot: WRITE REJECTED]" : "   [2nd foot held]")
+               : (g_secondFootHold ? "   [2nd foot: nothing to hold]" : ""));
+    if (g_secondFootHold)
+        TwkLog("[feet]   second-foot hold: cleared on %d frames, rejected %d, already clear %d",
+               heldFrames, heldRejected, heldAlready);
 }
 
 void CatchTweaks_PumpFrame() {
+    // The flicked-foot record ages out HERE, above every early-out -- it must decay on ordinary
+    // frames or a stale flick would still be naming a foot minutes later.
+    if (g_flickFresh > 0 && --g_flickFresh == 0) g_flickPhys = 0;
+    // Belt-and-braces latch release: the state==0 call is the normal end of a catch, but if the
+    // setter simply STOPS being called instead, the latch would otherwise persist into the next one.
+    if (g_flickLatch != 0 && ++g_latchIdle > 10) { g_flickLatch = 0; g_latchIdle = 0; }
     // ⚠️ The FIX (g_stopFlip) lives in here alongside the diagnostic trace, so this must not early-out
     // on the trace flag -- doing so silently disabled the fix the moment logging was turned off for
     // release. Each part checks its own switch below.
@@ -1006,21 +1492,34 @@ void CatchTweaks_PumpFrame() {
                 }
             }
             // ---- a caught board finishes its flip flat under the foot -----------------------
+            // ⚠️ _boardFlipTargetAngle is a MAGNITUDE and does NOT share the sign of
+            // _boardFlipCurrentAngle -- the logs show target +357 against current -356, and the
+            // game's own ratio takes |target| and |current|. Comparing the two raw (to work out
+            // which way the flip was going) is therefore meaningless, and doing it wrote garbage
+            // targets: +356 became -332, and with no flip running at all a target of 0 became 27.
+            // The aim is computed on magnitudes and put back on the TARGET's sign.
             static bool endedThisCatch = false;
             if (catchState == 0) endedThisCatch = false;
             if (g_anyRev && comp && catchState != 0 && !endedThisCatch &&
                 ang >= (180.0f - (float)g_anyRevDeg)) {
-                const float tgt = twkF(comp, MC_BOARD_FLIP_TARGET);
-                const float cur = twkF(comp, MC_BOARD_FLIP_CUR);
-                const float toFlat = 180.0f - ang;          // deck degrees still to roll to grip-up
-                const float dir = (tgt < cur) ? -1.0f : 1.0f;   // the way the flip is already going
-                const float aim = cur + dir * toFlat;
-                if (fabsf(aim - tgt) > 1.0f) {
-                    *(float*)((uint8_t*)comp + MC_BOARD_FLIP_TARGET) = aim;
-                    endedThisCatch = true;
-                    TwkLog("[catch] caught at %.0f deg -- aiming the flip at flat, %.0f deg away "
-                           "(target %.0f -> %.0f, game wanted %.0f more)",
-                           ang, toFlat, tgt, aim, fabsf(tgt) - fabsf(cur));
+                const float tgt  = twkF(comp, MC_BOARD_FLIP_TARGET);
+                const float cur  = twkF(comp, MC_BOARD_FLIP_CUR);
+                const float rate = twkF(comp, MC_BOARD_FLIP_RATE);
+                const float owed = fabsf(tgt) - fabsf(cur);
+                // Only ever touch a flip that is genuinely still running and still owes rotation.
+                // Without this the write fired while simply rolling along -- the catch state sits
+                // non-zero for long stretches -- and invented a flip target out of nothing.
+                if (owed > 1.0f && fabsf(rate) > 1.0f) {
+                    const float toFlat = 180.0f - ang;      // deck degrees still to roll to grip-up
+                    const float aimMag = fabsf(cur) + toFlat;
+                    const float aim = (tgt < 0.0f) ? -aimMag : aimMag;
+                    if (fabsf(aim - tgt) > 1.0f) {
+                        *(float*)((uint8_t*)comp + MC_BOARD_FLIP_TARGET) = aim;
+                        endedThisCatch = true;
+                        TwkLog("[catch] caught at %.0f deg -- aiming the flip at flat, %.0f deg away "
+                               "(target %.0f -> %.0f, game wanted %.0f more)",
+                               ang, toFlat, tgt, aim, owed);
+                    }
                 }
             }
             if (catchState == 0 && ang > 170.0f) armed = false;

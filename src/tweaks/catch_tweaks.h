@@ -55,5 +55,21 @@ bool CatchTweaks_AnyRevolution();  void CatchTweaks_SetAnyRevolution(bool on);
 // already owns the InAirHandler hook and the save/write/restore pattern.
 // Scale it (0 = no bone at all, 100 = stock) and optionally add cm on top. Axis 0/1/2 = the offset
 // vector's raw components; which one reads as "up" is for the headset to say.
+// Hold the foot you did NOT catch with off the board until the board lands. The catch ORIENT is
+// already one-footed, but both feet are handed a catch TYPE immediately -- this clears the
+// un-oriented foot's type until IsLanding. UNPROVEN that the write sticks; the [feet] line reports
+// cleared/rejected counts so one round settles it.
+bool  CatchTweaks_SecondFootHold(); void CatchTweaks_SetSecondFootHold(bool on);
+// Catch with the foot whose stick was flicked. The catching foot is the skater's ECatchOrientState
+// byte (+0x63e) and nothing else -- USkaterAnimInstance::SetCatchOrient derives both foot flags
+// from it (left = state in {1,5,10,11}, right = {2,5,10,11}) -- so this corrects that byte at its
+// setter. Invert swaps the left/right parity if it reads backwards.
+bool  CatchTweaks_FlickFoot();   void CatchTweaks_SetFlickFoot(bool on);
+bool  CatchTweaks_FlickInvert(); void CatchTweaks_SetFlickInvert(bool on);
+// ⚠️ ASkaterCharacterBase::SetCatchOrient's start, or null. This module HOOKS that function, which
+// overwrites its first bytes -- so any later `TwkScanExe(SIG_SET_CATCH_ORIENT)` finds nothing (one
+// detour per address; a hook destroys its own signature). run_out uses the address as a
+// return-range anchor, so it must take it from here rather than scan for it again.
+void* CatchTweaks_SetCatchOrientAddr();
 float CatchTweaks_BoneScalePct();  void CatchTweaks_SetBoneScalePct(float v);
 float CatchTweaks_BoneAdd(int axis); void CatchTweaks_SetBoneAdd(int axis, float v);

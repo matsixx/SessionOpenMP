@@ -59,6 +59,8 @@
 #include "scoop_speed.h"
 #include "ui/menu_ext.h"
 #include "tweaks_mod.h"
+#include "grind_pop.h"   // GrindPop_NameOfFName -- it owns the FName::ToString address
+#include <cstring>
 #include <cmath>
 
 // ------------------------------------------------------------------ measured offsets
@@ -98,6 +100,8 @@ enum {
     // kept only as frame 1, for comparison.
     BOARD_FLIPPER    = 0x4e8,
     ACTOR_ROOT       = 0x130,   // AActor::RootComponent -- its ComponentToWorld carries no flip
+    SK_CUR_TRICK     = 0x590,   // _currentFlipTrickDef -- what the pop actually selected
+    TRICKDEF_NAME    = 0x30,    // UFlipTrickDefinition::Name (FName) -- "Ollie", "Kickflip", ...
 };
 
 // ------------------------------------------------------------------ knobs (ALL above the reader)
@@ -114,10 +118,10 @@ static int   g_probeCm    = 0;      // FootSteerProbeCm -- non-zero pushes BOTH 
 // past the leg's reach the two-bone IK saturates and the foot chatters at the limit rather than
 // travelling further. Where that sits was never measured, so the range here is deliberately generous
 // and the judgement is left to the eye. The hard clamp only exists to keep a typo out of orbit.
-static float g_reachCm    = 30.0f;
-static float g_responseMs = 300.0f; // FootSteerResponseMs -- stick to full steer; the discriminator
+static float g_reachCm    = 40.0f;
+static float g_responseMs = 250.0f; // FootSteerResponseMs -- stick to full steer; the discriminator
 static float g_returnMs   = 150.0f; // FootSteerReturnMs -- back to neutral, deliberately quicker
-static float g_deadzone   = 0.05f;  // FootSteerDeadzone (pct) -- radial, rescaled so 1.0 still reaches
+static float g_deadzone   = 0.0f;  // FootSteerDeadzone (pct) -- radial, rescaled so 1.0 still reaches
 static float g_flickVeto  = 10.0f;  // FootSteerFlickVeto (tenths) -- stick units/s that count as a
                                     // flick. flip_speed maps real flicks over 15..50 on this measure;
                                     // a deliberate steer push runs 1-5. Set from probe data.
@@ -133,7 +137,9 @@ static int   g_catchVeto  = 1;      // FootSteerCatchVeto -- a registered catch 
 //   1 = the flipping deck (this is the circle; kept for comparison)
 //   2 = the board's ROOT -- deck heading with the flip stripped, if the flip lives in the flipper
 //   3 = the skater's ROOT (the capsule) -- follows only where you face, never flips or shoves
-static int   g_frame      = 3;
+// FIXED AT 0 (the leg rig). The other frames were A/B knobs during development; 0 is the one
+// that ships, so the slider is gone. The ini key still reads, for a fallback.
+static int   g_frame      = 0;
 // Which basis axis each stick component drives: 0..2 = +X/+Y/+Z, 3..5 = -X/-Y/-Z. Defaults follow
 // UE's convention for a character root (X forward, Y right), so stick-up pushes the foot forward and
 // stick-right pushes it right. Live, because whether that convention holds here is a thing to look
@@ -158,6 +164,14 @@ static int   g_twistAxis  = 4;      // FootSteerTwistAxis -- -Y of the chosen fr
 // sign that flips on a frame boundary would snap the foot -- the same lesson foot placement learned
 // for its own switch values.
 static int   g_switchInv  = 3;      // FootSteerSwitchInvert
+// "Has this air flipped or rotated" -- latched, cleared on the ground. An ollie of ANY kind
+// (regular/switch/fakie/nollie, from any pocket) never sets it, and surrenders both feet.
+static int   g_airTrick   = 0;
+// The trick definition last seen, and what its NAME said. Cached per definition pointer so
+// the FName is resolved once per trick, not per frame.
+static void* g_lastTrickDef = nullptr;
+static int   g_defIsOllie   = 0;
+static int   g_defNamed     = 0;
 static float g_swBlend    = 0.0f;   // 0 = regular, 1 = switch
 static int   g_followIK   = 1;      // FootSteerFollowIK
 static const float kAlphaMin = 0.02f;   // below this the socket is meaningless -- do not write at all
@@ -176,14 +190,14 @@ void FootSteer_ReadConfig(const char* buf) {
     g_probe      = TwkIniInt(buf, "FootSteerProbe", 1);
     g_probeAxis  = TwkIniInt(buf, "FootSteerProbeAxis", 0);
     g_probeCm    = TwkIniInt(buf, "FootSteerProbeCm", 0);
-    g_reachCm    = (float)TwkIniInt(buf, "FootSteerReachCm", 30);
-    g_responseMs = (float)TwkIniInt(buf, "FootSteerResponseMs", 300);
+    g_reachCm    = (float)TwkIniInt(buf, "FootSteerReachCm", 40);
+    g_responseMs = (float)TwkIniInt(buf, "FootSteerResponseMs", 250);
     g_returnMs   = (float)TwkIniInt(buf, "FootSteerReturnMs", 150);
-    g_deadzone   = (float)TwkIniInt(buf, "FootSteerDeadzone", 5) / 100.0f;
+    g_deadzone   = (float)TwkIniInt(buf, "FootSteerDeadzone", 0) / 100.0f;
     g_flickVeto  = (float)TwkIniInt(buf, "FootSteerFlickVeto", 100) / 10.0f;
     g_blankMs    = TwkIniInt(buf, "FootSteerBlankMs", 250);
     g_catchVeto  = TwkIniInt(buf, "FootSteerCatchVeto", 1);
-    g_frame      = TwkIniInt(buf, "FootSteerFrame", 3);
+    g_frame      = TwkIniInt(buf, "FootSteerFrame", 0);
     g_axisX      = TwkIniInt(buf, "FootSteerAxisX", 1);
     g_axisY      = TwkIniInt(buf, "FootSteerAxisY", 0);
     g_twistDeg   = (float)TwkIniInt(buf, "FootSteerTwistDeg", 5);
@@ -284,6 +298,9 @@ struct Sample {
     // back; these two can, because they move independently of each other.
     float deckX;        // the flipping deck component along the capsule's forward axis
     float meshX;        // the character mesh along the same axis
+    // What the OLLIE GATE sees. A pocket ollie still steers, so one of these must be reading like a
+    // trick -- printed rather than reasoned about.
+    unsigned char fl, ro, at, hasDef;
 };
 static const int kSamples = 256;
 static Sample g_buf[kSamples];
@@ -353,6 +370,8 @@ static void dumpSamples() {
                s.sL[0], s.sL[1], s.sL[2], s.sR[0], s.sR[1], s.sR[2],
                s.lx, s.ly, s.rx, s.ry, fl, fr, s.autoL, s.autoR, s.gapL, s.gapR,
                s.cS, s.cL, s.cR, s.deckX, s.meshX);
+        TwkLog("[steer]      gate: flip=%d rot=%d airTrick=%d trickDef=%s",
+               s.fl, s.ro, s.at, s.hasDef ? "YES" : "null");
     }
     g_nBuf = 0; g_bufFull = false;
 }
@@ -510,6 +529,7 @@ bool FootSteer_AddOffset(void* a, float dt, float outL[3], float outR[3]) {
         const int cranking = crankBs ? twkB(a, AN_IS_CRANKING) : 0;
         const int pending  = twkB(a, AN_TRICK_PENDING);
         const int falling  = twkB(a, AN_FALLING);
+        const int grounded = twkB(a, AN_GROUNDED);
         const int flipping = twkB(a, AN_FLIPPING);
         const int rotating = twkB(a, AN_ROTATING);
         const int catchSt  = twkB(a, AN_CATCH_ST);
@@ -539,9 +559,50 @@ bool FootSteer_AddOffset(void* a, float dt, float outL[3], float outR[3]) {
         // under the thumb. So: an ollie (no flip, no rotation) with ANY catch indication surrenders
         // BOTH feet. A flip trick keeps the per-foot split, so catching with one foot still leaves
         // the other one yours -- which is the whole point of that split.
-        const bool ollieLike = !(flipping > 0) && !(rotating > 0);
-        const bool anyCatch  = (catchSt > 0) || (catchL > 0) || (catchR > 0);
-        const bool bothFeet  = ollieLike && anyCatch;
+        // ⚠️ "HAS THIS AIR FLIPPED OR ROTATED", LATCHED -- not "is an orient showing right now".
+        // The previous test was `ollieLike && anyCatch`, i.e. it only surrendered the feet when an
+        // ollie ALSO raised a catch indication. POCKET POPS do not: setting the stick diagonally and
+        // popping with the other one produces no catch orient, so `anyCatch` stayed false and both
+        // feet remained steerable through the ollie (reported). There is no reason to ask the catch
+        // system at all -- an ollie is simply an air that never flips or rotates, in every stance and
+        // from every pocket.
+        // Latched rather than instantaneous because a flip trick has not started flipping yet at the
+        // moment of the pop: sampling live would call the first frames of a kickflip an ollie. The
+        // latch starts false on takeoff and never becomes true for any ollie, so an ollie surrenders
+        // both feet for the WHOLE air.
+        // ⚠️ ASK THE TRICK WHAT IT IS. The board's motion flags cannot answer this:
+        //     pocket ollie : flip=0 rot=1     shove-it : flip=0 rot=1
+        // A pop out of a diagonal pocket imparts yaw, so the game flags an ollie as ROTATING and it
+        // reads identically to a shuv. Gating on `flipping || rotating` let pocket ollies steer;
+        // gating on flipping alone stopped shuvs steering. Neither is the question being asked.
+        // The question is "which trick did I just do", and UFlipTrickDefinition::Name (+0x30) answers
+        // it directly -- Ollie / Nollie / Fakie Ollie / Switch Ollie all carry "ollie", and no flip
+        // or shove trick does. Resolved once per definition (the resolver caches by FName value).
+        // Latched over the air because the definition is chosen at the pop and cleared on landing.
+        {
+            void* sk  = twkP(a, AN_SKATER);
+            void* def = sk ? twkP(sk, SK_CUR_TRICK) : nullptr;
+            if (def && def != g_lastTrickDef) {           // only on a NEW definition
+                g_lastTrickDef = def;
+                char nm[96];
+                if (GrindPop_NameOfFName((const uint8_t*)def + TRICKDEF_NAME, nm, sizeof(nm))) {
+                    for (char* c = nm; *c; c++) if (*c >= 'A' && *c <= 'Z') *c = (char)(*c + 32);
+                    g_defIsOllie = (strstr(nm, "ollie") != nullptr) ? 1 : 0;
+                    g_defNamed   = 1;
+                    if (g_probe) TwkLog("[steer] trick def '%s' -> %s", nm,
+                                        g_defIsOllie ? "OLLIE (feet surrendered)" : "trick (feet yours)");
+                } else {
+                    g_defNamed = 0;                      // resolver unavailable: fall back below
+                }
+            }
+        }
+        // FALLBACK when the name could not be resolved (FName::ToString sig missing): flipping only.
+        // It costs shuvs their steering, which is the safer of the two failures -- the alternative
+        // lets every pocket ollie steer.
+        if (g_defNamed) g_airTrick = g_defIsOllie ? 0 : 1;
+        else if (flipping > 0) g_airTrick = 1;
+        else if (grounded > 0) g_airTrick = 0;   // back on the board: re-arm for the next
+        const bool bothFeet = (g_airTrick == 0);
         const bool catchNowL = (g_catchVeto != 0) && ((catchL > 0) || bothFeet);
         const bool catchNowR = (g_catchVeto != 0) && ((catchR > 0) || bothFeet);
         // ⚠️ THE STATE GATE AND THE APPLY GATE ARE SEPARATE. Folding the feature toggle into the
@@ -641,6 +702,10 @@ bool FootSteer_AddOffset(void* a, float dt, float outL[3], float outR[3]) {
                            ((cranking > 0) ? 4 : 0) |
                            ((swNow > 0) ? 8 : 0);
                     s.cS = catchSt; s.cL = catchL; s.cR = catchR;
+                    s.fl = (unsigned char)flipping; s.ro = (unsigned char)rotating;
+                    s.at = (unsigned char)g_airTrick;
+                    { void* sk = twkP(a, AN_SKATER);
+                      s.hasDef = (unsigned char)((sk && twkP(sk, SK_CUR_TRICK)) ? 1 : 0); }
                     s.aL = twkF(a, AN_L_ALPHA);   s.aR = twkF(a, AN_R_ALPHA);
                     for (int i = 0; i < 3; i++) {
                         s.sL[i] = twkF(a, AN_L_SOCK_LOC + i * 4);
@@ -818,16 +883,13 @@ void FootSteer_DrawMenu(const OmpMenuApi* api) {
     api->SameLine(); api->TextDisabled("(in the air; flicks stay the catch)");
     if (on) {
         api->Indent();
-        float reach = g_reachCm, resp = g_responseMs, dz = g_deadzone * 100.0f;
+        float reach = g_reachCm, resp = g_responseMs;
         if (api->SliderFloat("Reach (cm)", &reach, 2.0f, 80.0f, "%.0f")) FootSteer_SetReachCm(reach);
         api->SameLine(); api->TextDisabled("(past the leg's reach the foot stops travelling and buzzes)");
         if (api->SliderFloat("Response (ms)", &resp, 100.0f, 800.0f, "%.0f")) {
             g_responseMs = resp; TwkMarkDirty();
         }
         api->SameLine(); api->TextDisabled("(lower = quicker, and closer to a flick)");
-        if (api->SliderFloat("Deadzone (%)", &dz, 0.0f, 60.0f, "%.0f")) {
-            g_deadzone = dz / 100.0f; TwkMarkDirty();
-        }
         float veto = g_flickVeto;
         if (api->SliderFloat("Flick veto (units/s)", &veto, 2.0f, 40.0f, "%.1f")) {
             g_flickVeto = veto; TwkMarkDirty();
@@ -837,20 +899,14 @@ void FootSteer_DrawMenu(const OmpMenuApi* api) {
         if (api->Checkbox("Yield to the catch", &cv)) { g_catchVeto = cv ? 1 : 0; TwkMarkDirty(); }
         // ⚠️ The basis must not carry the board's flip. Frame 1 does, and a held stick then traces a
         // circle through a kickflip -- the direction it means rolls with the deck.
-        float fr = (float)g_frame, axx = (float)g_axisX, axy = (float)g_axisY;
-        if (api->SliderFloat("Directions relative to", &fr, 0.0f, 3.0f, "%.0f"))
-            FootSteer_SetFrame(fr);
-        api->SameLine(); api->TextDisabled(FootSteer_FrameName());
+        float axx = (float)g_axisX, axy = (float)g_axisY;
         if (api->SliderFloat("Stick X drives axis", &axx, 0.0f, 5.0f, "%.0f")) FootSteer_SetAxisX(axx);
         if (api->SliderFloat("Stick Y drives axis", &axy, 0.0f, 5.0f, "%.0f")) FootSteer_SetAxisY(axy);
         api->TextDisabled("axis 0/1/2 = +X/+Y/+Z, 3/4/5 = the same negated");
         float tw = g_twistDeg, ta = (float)g_twistAxis;
-        if (api->SliderFloat("Foot twist (deg)", &tw, 0.0f, 90.0f, "%.0f")) FootSteer_SetTwistDeg(tw);
+        if (api->SliderFloat("Foot twist (deg)", &tw, 0.0f, 20.0f, "%.0f")) FootSteer_SetTwistDeg(tw);
         api->SameLine(); api->TextDisabled("(push up = toe forward, pull back = toe back)");
         if (api->SliderFloat("Twist about axis", &ta, 0.0f, 5.0f, "%.0f")) FootSteer_SetTwistAxis(ta);
-        float si = (float)g_switchInv;
-        if (api->SliderFloat("Invert when switch", &si, 0.0f, 3.0f, "%.0f")) FootSteer_SetSwitchInvert(si);
-        api->SameLine(); api->TextDisabled("(0 none, 1 sideways, 2 forward/back, 3 both)");
         bool fik = g_followIK != 0;
         if (api->Checkbox("Fade with the game's foot IK", &fik)) { g_followIK = fik ? 1 : 0; TwkMarkDirty(); }
         api->SameLine(); api->TextDisabled("(off = fight it, for A/B)");

@@ -66,6 +66,21 @@ enum {
     AN_CATCH_ST    = 0x312,   // CatchOrientState -- non-zero while a catch owns the feet
     AN_AUTOADJUST  = 0x3e8,   // FootIKAutoAdjust  <-- the fix
     AN_GROUNDED    = 0x5fa,
+    // ⛔ MEASURED FACTS from a REMOVED feature (second-foot smoothing, 2026-08-11). Kept because
+    // each one cost a test round and any future foot work will hit them again:
+    //   * HasLeftFootCatchOrient (+0x313) / HasRightFootCatchOrient (+0x314) read ZERO through real
+    //     catches. "Which foot caught" is the SKATER's ECatchOrientState +0x63e (1 = left,
+    //     2 = right, 5/10/11 = both, 7/8/9 = dark slide). The anim booleans look authoritative and
+    //     are not -- do not gate on them.
+    //   * IsLanding (+0x5fd) reads 1 through the whole DESCENT, not at touchdown. It is useless as
+    //     an "airborne work is over" test; AN_GROUNDED is the real one.
+    //   * IsBoardFlipping (+0x495) / IsBoardRotating (+0x496) are both FALSE by the time a catch
+    //     registers (the flip has been stopped at grip-up), so "is this a trick" must be LATCHED
+    //     over the air, not sampled at the catch.
+    // The feature itself was removed: easing the non-catching foot back left the feet wrong after a
+    // trick, and pinning it (tried twice before that) fought the authored whole-body catch pose.
+    // The foot motion on a catch is ANIMATION -- no C++ foot function on USkaterAnimInstance reads a
+    // catch field at all -- so anything here is fighting the anim graph. Look elsewhere.
     // The foot sockets the graph consumes. foot_steer writes through these; nothing else here does.
     AN_L_SOCK_LOC  = 0x404,   AN_R_SOCK_LOC = 0x41c,
     // The trick-setup crouch, exported for catch_level. Both are ASSET-GATED: they only mean
@@ -78,12 +93,11 @@ enum {
 // The ini key remains as a kill switch in case a future game patch makes the suppression wrong.
 static int g_on = 1;             // FootFixShoeHeight
 static int g_ok = 1;             // runtime health, NEVER persisted (the catch_level lesson)
-
 void FootPlace_ReadConfig(const char* buf) {
     g_on = TwkIniInt(buf, "FootFixShoeHeight", 1) ? 1 : 0;
 }
 void FootPlace_SaveConfig(char* buf, size_t cap) {
-    TwkIniSetInt(buf, cap, "FootFixShoeHeight", g_on);
+    TwkIniSetInt(buf, cap, "FootFixShoeHeight",      g_on);
 }
 void FootPlace_ResetDefaults()     { g_on = 1; g_ok = 1; }
 bool FootPlace_Enabled()           { return g_on != 0; }
@@ -248,4 +262,6 @@ void FootPlace_DrawMenu(const OmpMenuApi* api) {
     api->TextDisabled("The game sweeps each foot down onto the surface below and lifts the shoe by");
     api->TextDisabled("what it hits -- but that query reaches the road, not the deck. Nothing to tune.");
     api->Unindent();
+
+
 }

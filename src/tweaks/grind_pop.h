@@ -28,3 +28,7 @@ bool  GrindPop_PitchEnabled();     void GrindPop_SetPitchEnabled(bool on);
 float GrindPop_PitchScale();       void GrindPop_SetPitchScale(float pct);
 bool  GrindPop_SwingEnabled();     void GrindPop_SetSwingEnabled(bool on);
 float GrindPop_SwingBlend();       void GrindPop_SetSwingBlend(float pct);
+// Resolve an FName to text, cached by FName value (this module owns the FName::ToString address, and
+// only one module may resolve it). `fnamePtr` points AT the FName field, not at the owning object.
+// False if the resolver is unavailable or the read failed -- callers must have a fallback.
+bool GrindPop_NameOfFName(const void* fnamePtr, char* out, int cap);

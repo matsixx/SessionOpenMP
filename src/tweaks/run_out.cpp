@@ -427,8 +427,14 @@ void RunOut_Install() {
     if (!g_enableRagdoll) TwkLog("[runout] EnableRagDoll sig NOT FOUND -- run-out board may go to the hand");
     g_setLocRot = (SetLocRotFn)TwkScanExe(SIG_SET_ACTOR_LOCROT);
     if (!g_setLocRot) TwkLog("[runout] SetActorLocationAndRotation sig NOT FOUND -- run-out keeps the old facing");
-    if (uint8_t* co = TwkScanExe(SIG_SET_CATCH_ORIENT))
-        g_catchOrientRva = (uint64_t)(co - (uint8_t*)GetModuleHandleA(nullptr));
+    // ⚠️ catch_tweaks HOOKS SetCatchOrient (the flicked-foot fix) and installs BEFORE this, so its
+    // first bytes are a detour by now and SIG_SET_CATCH_ORIENT no longer matches -- one detour per
+    // address, a hook destroys its own signature. Take the address it already resolved, and only
+    // fall back to scanning when that module did not hook it.
+    if (void* co = CatchTweaks_SetCatchOrientAddr())
+        g_catchOrientRva = (uint64_t)((uint8_t*)co - (uint8_t*)GetModuleHandleA(nullptr));
+    else if (uint8_t* co2 = TwkScanExe(SIG_SET_CATCH_ORIENT))
+        g_catchOrientRva = (uint64_t)(co2 - (uint8_t*)GetModuleHandleA(nullptr));
     else TwkLog("[runout] SetCatchOrient sig NOT FOUND -- bad-catch bails will NOT convert");
     if (!hookOne(SIG_BAIL_ANGLE,   (void*)&hkBailAngle,   &g_origBailAngle, &g_startBailAngle, "CheckForBailBoardAngle") ||
         !hookOne(SIG_BAIL_FALLING, (void*)&hkBailFalling, &g_origBailFall,  &g_startBailFall,  "CheckForBailFalling")   ||

@@ -712,3 +712,9 @@ void GrindPop_DrawMenu(const OmpMenuApi* api) {
     snprintf(b, sizeof(b), "   momentum pop %.4f  ..  real pop %.4f", (float)g_uiMom, (float)g_uiPop);
     api->Text(b);
 }
+
+// Public wrapper: foot_steer needs a trick definition's Name, and this module owns the
+// FName::ToString address (one resolve site, one cache).
+bool GrindPop_NameOfFName(const void* fnamePtr, char* out, int cap) {
+    return NameOfFName(fnamePtr, out, cap);
+}
