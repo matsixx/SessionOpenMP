@@ -47,7 +47,7 @@ static volatile LONG g_pending = OVA_NONE;  // same single-slot handoff shape as
 // different row array and re-run it. So the reset signal cannot be the page definition; it is
 // "CreatePageItems ran on the root page and WE did not ask for it" (see g_selfRefresh).
 enum Page { PG_ROOT = 0, PG_MP = 1, PG_BROWSE = 2, PG_PLAYERS = 3, PG_PLAYER = 4, PG_NAMES = 5,
-            PG_GUEST0 = 6 };
+            PG_OTHER = 6, PG_GUEST0 = 7 };
 static int  g_page        = PG_ROOT;
 // True for pages whose row list is ENTIRELY ours (as opposed to the pause root, where we append to
 // the game's own rows). Only these can safely be left to the engine's own scroll window.
@@ -345,7 +345,9 @@ static const int kMpPrivacyAfter = 2;    // after "Join private game", before "L
 // preferences and the multiplayer page is a list of things to DO -- mixing the two makes both harder
 // to read. Its rows are the game's own native controls (one MultiOption, two ProgressBars), first-party
 // like the privacy toggle rather than routed through the guest seam.
-static uint8_t   g_namesOpenRow[0x90];                  // "Player names" on the MP page
+static uint8_t   g_otherOpenRow[0x90];                  // "Other options" on the MP page
+static uint64_t  g_otherOpenKey = 0;
+static uint8_t   g_namesOpenRow[0x90];                  // "Player names", now on PG_OTHER
 static uint64_t  g_namesOpenKey = 0;
 static uint8_t   g_nameModeRow[0x90];
 static FTextBlob g_nameModeOpts[3];
@@ -605,6 +607,12 @@ static void buildRows() {
         if (!buildRow(g_namesOpenRow, "OmpNames", "Player names",
                       "Names and chat bubbles above the other players", &g_namesOpenKey))
             g_namesOpenKey = 0;
+        // The multiplayer page is a list of things to DO; everything that is a PREFERENCE moves
+        // behind this one row. That keeps the four ways of connecting adjacent at the top instead of
+        // separated by settings, and takes the page from thirteen rows to nine.
+        if (!buildRow(g_otherOpenRow, "OmpOther", "Other options",
+                      "Your name, player names, and what the session shares", &g_otherOpenKey))
+            g_otherOpenKey = 0;
         // Dropped objects. Built alongside the names page's rows and failing just as independently:
         // this row is a preference, and the buttons that connect you to a session must never depend
         // on one having built.
@@ -1018,42 +1026,16 @@ static const TArrayHdr* chooseArray(void* page, const TArrayHdr* items, TArrayHd
             uint8_t* row = g_mpRows + (size_t)i * off::kItemSize;
             setRowRoster(row);
             add(row, true);
-            if (i == kMpNameAfter) {
-                // Value column = the live name, so the row answers "who am I?" without being opened.
-                if (buildInfoRow(g_nameRow, "OmpName", "Your name",
-                                 "Everyone in the session sees this", MpName_Get(),
-                                 &g_nameKey, &g_nameOpt)) {
-                    setRowRoster(g_nameRow);
-                    add(g_nameRow, true);
-                }
-            }
-            if (i == kMpNamesAfter && g_namesOpenKey) {
-                setRowRoster(g_namesOpenRow);
-                add(g_namesOpenRow, true);
-            }
-            if (i == kMpDropAfter && g_worldKey) {
-                setRowRoster(g_worldRow);
-                *(int32_t*)(g_worldRow + off::kItemMultiStart) = MpPrefs_WorldMode();
-                g_worldAt = n;
-                add(g_worldRow, true);
-            }
-            if (i == kMpDropAfter && g_dropKey) {
-                setRowRoster(g_dropRow);
-                // The value goes on the DEFINITION here (so the row reads right even if the stamp is
-                // skipped) and onto the widget in stampValues, which is the only point at which it
-                // survives the rebuild.
-                *(int32_t*)(g_dropRow + off::kItemMultiStart) = MpPrefs_DropMode();
-                g_dropAt = n;
-                add(g_dropRow, true);
-            }
+            // ORDER, deliberately: the four ways of CONNECTING run together at the top, then the
+            // session tools, then everything that is a preference behind "Other options".
+            //   Host online / Join online / Create private / Join private / Players / Connection /
+            //   Other options / Leave session / Back
             if (i == kMpBrowseAfter) { setRowRoster(g_browseOpenRow); add(g_browseOpenRow, true); }
             // "Players" sits with the session actions, and only means anything while hosting.
             if (i == kMpPlayersAfter) { setRowRoster(g_playersOpenRow); add(g_playersOpenRow, true); }
-            if (i == kMpPrivacyAfter && g_privacyKey) {
-                setRowRoster(g_privacyRow);
-                g_privacyAt = n;                 // `n` is the index this row is about to take
-                add(g_privacyRow, true);
-                // ...and the posture, right under the switch that changes half of it.
+            if (i == kMpPlayersAfter) {
+                // The posture, stated on the page itself: it is what you are connected THROUGH,
+                // which is worth seeing without opening anything.
                 char posture[192], value[32];
                 omp::Posture(posture, sizeof(posture));
                 const omp::Backend bk = omp::Current();
@@ -1063,10 +1045,41 @@ static const TArrayHdr* chooseArray(void* page, const TArrayHdr* items, TArrayHd
                        : "Not connected");
                 if (buildInfoRow(g_postureRow, "OmpPosture", "Connection", posture, value,
                                  &g_postureKey, &g_postureOpt)) {
+                    setRowRoster(g_postureRow);
                     add(g_postureRow, true);
                 }
+                // Your name stays on the MAIN page: it is who you ARE in the session, not a
+                // preference to go hunting for. Value column = the live name, so the row answers
+                // "who am I?" without being opened.
+                if (buildInfoRow(g_nameRow, "OmpName", "Your name",
+                                 "Everyone in the session sees this", MpName_Get(),
+                                 &g_nameKey, &g_nameOpt)) {
+                    setRowRoster(g_nameRow);
+                    add(g_nameRow, true);
+                }
+                if (g_otherOpenKey) { setRowRoster(g_otherOpenRow); add(g_otherOpenRow, true); }
             }
         }
+    } else if (g_page == PG_OTHER) {
+        // Everything that was cluttering the multiplayer page. Same rows, same storage, same
+        // independent-failure rule -- a key left at 0 is simply never added, so one broken control
+        // still leaves the others usable.
+        buildRosterText();
+        g_privacyAt = -1; g_dropAt = -1; g_worldAt = -1;
+        if (g_namesOpenKey) add(g_namesOpenRow, true);
+        if (g_worldKey) {
+            *(int32_t*)(g_worldRow + off::kItemMultiStart) = MpPrefs_WorldMode();
+            g_worldAt = n; add(g_worldRow, true);
+        }
+        if (g_dropKey) {
+            // The value goes on the DEFINITION here (so the row reads right even if the stamp is
+            // skipped) and onto the widget in stampValues, which is the only point at which it
+            // survives the rebuild.
+            *(int32_t*)(g_dropRow + off::kItemMultiStart) = MpPrefs_DropMode();
+            g_dropAt = n; add(g_dropRow, true);
+        }
+        if (g_privacyKey) { g_privacyAt = n; add(g_privacyRow, true); }
+        add(g_mpRows + (size_t)(kMpRowCount - 1) * off::kItemSize, true);       // the shared Back row
     } else if (g_page == PG_NAMES) {
         // Three settings and a way out. The rows carry their CURRENT values twice over: the option
         // index goes on the definition here (so the row is right even if the stamp is skipped), and
@@ -1605,7 +1618,9 @@ static bool handleConfirm(void* page, void* params) {
             }
         }
         if (g_page == PG_PLAYER)  { g_page = PG_PLAYERS; queueSwap(page, "Players", false, true); return true; }
-        const bool toMp = (g_page == PG_BROWSE || g_page == PG_PLAYERS || g_page == PG_NAMES);
+        // PG_NAMES now sits under PG_OTHER, so Back from it returns THERE, not to the MP page.
+        if (g_page == PG_NAMES) { g_page = PG_OTHER; queueSwap(page, "Other options", false, true); return true; }
+        const bool toMp = (g_page == PG_BROWSE || g_page == PG_PLAYERS || g_page == PG_OTHER);
         g_page = toMp ? PG_MP : PG_ROOT;
         if (toMp) g_lastSig = sessionSig();
         queueSwap(page, toMp ? mpTitle() : nullptr, !toMp, true);
@@ -1620,12 +1635,18 @@ static bool handleConfirm(void* page, void* params) {
         log("[menu] pause: opened the lobby browser");
         return true;
     }
+    if (g_page == PG_MP && g_otherOpenKey && itemKey == g_otherOpenKey) {
+        g_page = PG_OTHER;
+        queueSwap(page, "Other options", false, true);
+        log("[menu] pause: opened the other options");
+        return true;
+    }
     if (g_page == PG_MP && g_nameKey && itemKey == g_nameKey) {
         post(OVA_SET_NAME);              // the loader opens the box; the box saves and closes itself
         log("[menu] pause: opening the name box");
         return true;
     }
-    if (g_page == PG_MP && g_namesOpenKey && itemKey == g_namesOpenKey) {
+    if (g_page == PG_OTHER && g_namesOpenKey && itemKey == g_namesOpenKey) {
         g_page = PG_NAMES;
         queueSwap(page, "Player names", false, true);
         log("[menu] pause: opened the player-names settings");
@@ -1633,7 +1654,7 @@ static bool handleConfirm(void* page, void* params) {
     }
     // Every other row on this page is a toggle or a slider: the confirm is the engine acknowledging
     // the row, not a command. Swallow it rather than letting it fall through to the stock chain.
-    if (g_page == PG_NAMES) return true;
+    if (g_page == PG_NAMES || g_page == PG_OTHER) return true;
     if (g_page == PG_MP && itemKey == g_playersOpenKey) {
         g_page = PG_PLAYERS;
         queueSwap(page, "Players", false, true);

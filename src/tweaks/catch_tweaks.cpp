@@ -94,6 +94,13 @@ enum {
     // goofy AND goofy-switch, and the right one in both regular variants -- so goofy flips it and
     // switch does NOT. (Switch reverses which END of the board leads; it does not swap your feet.)
     AN_IS_GOOFY             = 0x304,
+    AN_SKATER               = 0x608,   // USkaterAnimInstance::_skater -- to reach the stance options
+    // bit 0 = _isLeftRightFootSkater, the CONTROL-SCHEME option "sticks bind to left/right foot"
+    // rather than front/back. CheckForCatchOrient swaps its two stick vectors on
+    //     swap = (IsSkatingGoofy != IsSkatingSwitch) && (skater[0x651] & 1)
+    // so the front/back args handed to _Default are ALREADY stance- AND setting-resolved. Any
+    // hand-rolled stance rule that ignores this bit is only correct for one value of a user setting.
+    SK_STANCE_OPTS          = 0x651,
     SK_CATCH_MODE           = 0x63d,   // ECatchMode -- THIS is the menu's Catch Mode
     SK_CATCH_ORIENT_STATE   = 0x63e,   // ECatchOrientState -- nonzero = a catch actually ENGAGED
     SK_BOARD                = 0x568,   // ASkaterCharacterBase -> _skateboard (ASkateboardEx*)
@@ -837,6 +844,21 @@ static void* hkCatchDefault(void* self, double dt, void* frontStick, void* backS
                     // 60 frames only has to span flick -> catch-engage (measured ~15); the latch
                     // covers the catch itself, so this window no longer bounds the correction.
                     g_flickPhys = edgeL ? 1 : 2; g_flickFresh = 60; g_flickLatch = 0;
+                    // ---- MAPPING PROBE (no behaviour change). Closes the model that the hand-rolled
+                    // stance table stands in for: which ARG the flicked stick landed on, plus every
+                    // term of the game's own swap predicate. Four catches, one per stance, and the
+                    // correct rule is readable straight off these lines.
+                    if (g_catchDiag) {
+                        const float fx2 = twkF(frontStick, 0), fy2 = twkF(frontStick, 4);
+                        const bool fIsL = (fabsf(fx2 - lx) < 0.01f && fabsf(fy2 - ly) < 0.01f);
+                        const bool fIsR = (fabsf(fx2 - rx) < 0.01f && fabsf(fy2 - ry) < 0.01f);
+                        void* sk2 = twkP(self, IAH_SKATER);
+                        TwkLog("[catch] MAP: flicked=%s frontArg=%s goofy=%d switch=%d lrFoot=%d",
+                               edgeL ? "LEFT" : "RIGHT",
+                               fIsL ? "rawLEFT" : fIsR ? "rawRIGHT" : "NEITHER",
+                               CatchIsGoofy() ? 1 : 0, CatchIsSwitch() ? 1 : 0,
+                               sk2 ? (twkB(sk2, SK_STANCE_OPTS) & 1) : -1);
+                    }
                     if (g_catchDiag)
                         TwkLog("[catch] flick: %s stick (L %.2f,%.2f  R %.2f,%.2f)",
                                edgeL ? "LEFT" : "RIGHT", lx, ly, rx, ry);
@@ -1074,15 +1096,38 @@ static bool CatchIsSwitch() {
         return a && twkB(a, AN_IS_SWITCH) > 0;
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
-// The stance correction, as a COMPLETE MEASURED TRUTH TABLE -- all four combinations were tested in
-// the headset once the both-feet bug (which masked this) was fixed:
-//     regular + regular  -> correct      regular + switch -> correct
-//     GOOFY   + regular  -> WRONG        goofy   + switch -> correct
-// So the mapping inverts for goofy ONLY while not switch. Deliberately written as the table rather
-// than as a theory: "which foot leads" would predict regular-switch to be wrong too, and it is not,
-// so the underlying reason is NOT understood -- only the behaviour is. Do not "simplify" this to
-// goofy alone or to goofy XOR switch; both contradict a measured case.
-static bool CatchStanceInverts() { return CatchIsGoofy() && !CatchIsSwitch(); }
+// The stance correction, expressed through THE GAME'S OWN RULE rather than as a bare stance pair.
+//
+// CheckForCatchOrient (0x1045d80) fetches the two sticks and then swaps which one it hands to
+// _Default as `front` / `back`:
+//     swap = (IsSkatingGoofy != IsSkatingSwitch) && (skater[0x651] & 1)      <- disassembled
+// and that predicate was then confirmed live, all four stances, by the MAP probe:
+//     goofy=0 switch=0 -> front = raw LEFT      goofy=0 switch=1 -> front = raw RIGHT
+//     goofy=1 switch=0 -> front = raw RIGHT     goofy=1 switch=1 -> front = raw LEFT
+//
+// We key on the PHYSICAL stick, so we have to undo that swap ourselves -- but only on its goofy
+// half, which is what the headset testing found (wrong in goofy-regular alone):
+//     invert = swap && goofy = goofy && !switch && _isLeftRightFootSkater
+//
+// THE SETTING TERM MATTERS. `_isLeftRightFootSkater` is the control-scheme option binding the
+// sticks to LEFT/RIGHT feet instead of FRONT/BACK. With it OFF the game never swaps, so inverting
+// would be wrong -- the earlier `goofy && !switch` rule was correct only for the one value of a
+// setting the player can change in the options menu.
+//
+// What is still NOT understood is why only the goofy half needs undoing: role alone does not
+// determine the foot (a LEFT flick lands on the BACK role in both goofy-regular and regular-switch,
+// yet only goofy-regular inverts). Until that is measured, this stays as the game's predicate plus
+// the measured half -- do not "simplify" it to goofy alone or to goofy XOR switch.
+static bool CatchStanceInverts() {
+    if (!CatchIsGoofy() || CatchIsSwitch()) return false;
+    __try {
+        void* a  = FootPlace_AnimInstance();
+        void* sk = a ? twkP(a, AN_SKATER) : nullptr;
+        // Unreadable setting: fall back to the measured-true behaviour rather than to "no invert",
+        // so a bad read keeps goofy working instead of silently regressing it.
+        return !sk || (twkB(sk, SK_STANCE_OPTS) & 1) != 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return true; }
+}
 
 // READ-ONLY. The latch is maintained in CatchTweaks_PumpFrame, every frame. It used to be updated
 // HERE, but this runs only from the hook -- i.e. only on a non-zero orient state -- so after a flip

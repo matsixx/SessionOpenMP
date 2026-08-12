@@ -50,6 +50,17 @@ enum {
 // ------------------------------------------------------------------ knobs (ALL above the reader)
 static int   g_scoopFix    = 1;       // AngularVelocity: 0 = measure only, stock value returned
 static int   g_scoopLog    = 1;       // one log line (+input array) per scoop
+static int   g_neutralUnmeasured = 1;   // ScoopNeutralWhenUnmeasured
+// ScoopSustainFracPct -- scale the sustained window to a fraction of the gesture instead of the
+// absolute 50-120 ms.
+// DEFAULT 0 (OFF). TESTED AND REJECTED at 35: real scoops ACCELERATE rather than holding one speed,
+// so requiring the peak to hold for 130-260 ms averages the fast part together with the wind-up and
+// drags every genuine scoop down. Measured, same gesture shape before and after:
+//     before: sweep=184 raw=2328 -> OURS=1.399     after: sweep=183 raw=1295 -> OURS=0.860
+//     a FAST 125 ms 180deg scoop (arcVel=720) came out at 0.674, near the floor
+// It did not merely fail to isolate the yank -- it penalised exactly what the feature rewards.
+// Kept as a knob because the mechanism is sound for a LONG gesture; it just cannot be the default.
+static float g_sustainFrac = 0.0f;      // ScoopSustainFracPct
 static int   g_useTracker  = 1;       // 0 = fall back to the game's arc input
 static int   g_normArc     = 1;       // normalise by gesture size (360 vs 180 shove)
 static float g_velMin      = 350.0f;  // sustained deg/s mapping to the slowest scoop
@@ -68,6 +79,9 @@ void ScoopSpeed_ReadConfig(const char* buf) {
     g_scoopFix    = TwkIniInt(buf, "AngularVelocity", 1);
     g_scoopLog    = TwkIniInt(buf, "ScoopLog", 1);
     g_useTracker  = TwkIniInt(buf, "UseStickTracker", 1);
+    g_neutralUnmeasured = TwkIniInt(buf, "ScoopNeutralWhenUnmeasured", 1);
+    g_sustainFrac = (float)TwkIniInt(buf, "ScoopSustainFracPct", 0) / 100.0f;
+    if (g_sustainFrac < 0.0f) g_sustainFrac = 0.0f; else if (g_sustainFrac > 0.9f) g_sustainFrac = 0.9f;
     g_normArc     = TwkIniInt(buf, "NormalizeArc", 1);
     g_velMin      = (float)TwkIniInt(buf, "VelMin", 350);
     g_velMax      = (float)TwkIniInt(buf, "VelMax", 1600);
@@ -86,6 +100,8 @@ void ScoopSpeed_ReadConfig(const char* buf) {
 void ScoopSpeed_SaveConfig(char* buf, size_t cap) {
     TwkIniSetInt(buf, cap, "AngularVelocity", g_scoopFix);
     TwkIniSetInt(buf, cap, "UseStickTracker", g_useTracker);
+    TwkIniSetInt(buf, cap, "ScoopNeutralWhenUnmeasured", g_neutralUnmeasured);
+    TwkIniSetInt(buf, cap, "ScoopSustainFracPct", (int)(g_sustainFrac * 100.0f + 0.5f));
     TwkIniSetInt(buf, cap, "NormalizeArc",    g_normArc);
     TwkIniSetInt(buf, cap, "VelMin",          (int)g_velMin);
     TwkIniSetInt(buf, cap, "VelMax",          (int)g_velMax);
@@ -291,9 +307,31 @@ bool ScoopSpeed_StickRaw(bool rightStick, float* x, float* y) {
 static bool gestureFresh(const StickTracker& T) {
     return T.nSamples > 1 && (nowSeconds() - T.velT[T.nSamples - 1]) <= g_trackWindow;
 }
+// THE BASELINE SCALES WITH THE GESTURE. It used to be an absolute 50-120 ms window, which asks
+// "was the stick ever fast for 120 ms" -- and a brief YANK inside a long slow gesture answers yes.
+// Measured on a spread-eagle tre, where the back stick is pulled down straight after the flick:
+//     angle=133.8 totalTime=0.4582 arcVel=292   (the game: a slow 458 ms scoop, rated 0.600)
+//     raw=1357 sustained                        (us: 4.6x the gesture's own average) -> OURS=1.601
+// The gesture is scoped stick-leaves-centre -> stick-returns-centre, so the scoop AND the pull-down
+// after it are one gesture and the fastest slice wins. Requiring the speed to hold for a FRACTION of
+// the gesture makes "sustained" mean sustained relative to the movement being rated: a 458 ms gesture
+// now demands ~160 ms of held speed, which a yank cannot supply, while a brisk 200 ms scoop only has
+// to hold ~70 ms and is unaffected.
+// A ratio test (reject sustained >> average) was considered and REJECTED against real data: a
+// legitimate scoop measured arcVel=204 -> norm=852, a ratio of 4.2, indistinguishable from the
+// artifact's 4.6. Duration separates them; magnitude does not.
 static float sustainedStickVel(const StickTracker& T) {
     if (!gestureFresh(T)) return 0.0f;
-    const double loBase = 0.05, hiBase = 0.12;
+    double loBase = 0.05, hiBase = 0.12;
+    if (g_sustainFrac > 0.0f && T.nSamples > 1) {
+        const double dur = T.velT[T.nSamples - 1] - T.velT[0];
+        if (dur > 0.0) {
+            loBase = dur * (double)g_sustainFrac;
+            if (loBase < 0.05) loBase = 0.05; else if (loBase > 0.20) loBase = 0.20;
+            hiBase = loBase * 2.0;
+            if (hiBase > 0.35) hiBase = 0.35;
+        }
+    }
     float best = 0.0f;
     for (int j = 1; j < T.nSamples; j++)
         for (int i = 0; i < j; i++) {
@@ -428,12 +466,25 @@ static float hkScoopSpeed(void* handler, uint64_t bArg, void* inputs, void* d) {
             trackVel = rawTrack * 90.0f / expected;
         }
         const char* src = "arc";
+        bool unmeasured = false;
         if (g_useTracker && trackVel > 0.0f) { vel = trackVel; src = "tracker"; }
 
         if (g_scoopFix && mode == 2 && vel > 0.0f) {
             float r = (vel - g_velMin) / (g_velMax - g_velMin);
             if (r < 0.0f) r = 0.0f; else if (r > 1.0f) r = 1.0f;
             out = minM + r * (maxM - minM);
+        } else if (g_scoopFix && mode == 2 && g_neutralUnmeasured && stock > 1.0f) {
+            // NO SUSTAINED SWEEP WAS MEASURED, so do NOT inherit the game's value here.
+            // With no timing the game derives its multiplier from the RAW ARC alone, and a fast yank
+            // traces a huge arc in almost no time -- measured on a tre flip where the back stick was
+            // pulled down straight after the flick:
+            //     angle=-177.2 totalTime=0.0000 arcVel=0 sweep=0  ->  STOCK=1.750 (the maximum)
+            // against a real scoop, which always carries timing (angle=-128.5 totalTime=0.2166
+            // arcVel=593 -> STOCK=1.029). Inheriting the first case is the mod claiming ownership of
+            // scoop speed and then passing through the exact artifact it exists to replace.
+            // Neutral (1.0), not minM: this says "no scoop gesture", not "the slowest possible scoop".
+            out = 1.0f;
+            unmeasured = true;
         }
         g_uiSweep = sweep; g_uiRaw = rawTrack; g_uiNorm = trackVel;
         g_uiStock = stock; g_uiOurs = out;
@@ -444,10 +495,11 @@ static float hkScoopSpeed(void* handler, uint64_t bArg, void* inputs, void* d) {
         if (g_scoopLog) {
             TwkLog("[scoop] SCOOP mode=%d n=%d pick=%d stick=%s | angle=%.1f totalTime=%.4f | arcVel=%.0f "
                    "sweep=%.0f raw=%.0f norm=%.0f (peak=%.0f) used=%s(%.0f) | min=%.3f max=%.3f "
-                   "| STOCK=%.3f -> OURS=%.3f%s",
+                   "| STOCK=%.3f -> OURS=%.3f%s%s",
                    mode, num, pick, scoopStick == 0 ? "L" : scoopStick == 1 ? "R" : "-",
                    pAngle, pTotal, arcVel, sweep, rawTrack, trackVel, peakVel,
-                   src, vel, minM, maxM, stock, out, g_scoopFix ? "" : "  (measure only -- stock returned)");
+                   src, vel, minM, maxM, stock, out, g_scoopFix ? "" : "  (measure only -- stock returned)",
+                   unmeasured ? "  <-- NO SWEEP MEASURED, neutralised (was a raw-arc max)" : "");
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         if (InterlockedIncrement(&g_faults) == 1) TwkLog("[scoop] caught fatal reading scoop input -> returning stock");

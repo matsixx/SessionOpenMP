@@ -69,6 +69,7 @@ enum {
     AN_ON_BOARD      = 0x300,   // IsOnBoard -- hard gate, never steer while walking
     AN_IS_SWITCH     = 0x303,   // IsSkatingSwitch (plain bool, no asset gate)
     AN_IS_GOOFY      = 0x304,   // IsSkatingGoofy -- see the per-foot veto for why it matters
+    SK_STANCE_OPTS   = 0x651,   // bit 0 = _isLeftRightFootSkater (the stick-binding option)
     // The game's built-in boned ollie is NOT the stance system (EFootPositionType +0x305 reads a
     // constant through one) and NOT HipOffset (+0x3dc reads (0,0,0) throughout). Both were measured
     // and both are dead ends; the probes for them are gone. What a bone actually does is push the
@@ -145,6 +146,10 @@ static int   g_frame      = 0;
 // UE's convention for a character root (X forward, Y right), so stick-up pushes the foot forward and
 // stick-right pushes it right. Live, because whether that convention holds here is a thing to look
 // at rather than to argue about.
+// The return arc: how far the foot lifts at the midpoint of its way back, and along which axis.
+// 0 disables it and restores the straight-line return.
+static float g_liftCm     = 6.0f;   // FootSteerReturnLiftCm
+static int   g_liftAxis   = 2;      // FootSteerReturnLiftAxis -- 2 = +Z (up in the foot's frame)
 static int   g_axisX      = 1;      // FootSteerAxisX -- stick X drives +Y (right)
 static int   g_axisY      = 0;      // FootSteerAxisY -- stick Y drives +X (forward)
 // The TWIST: push the stick up and the toe swings forward, pull down and it swings back. Driven by
@@ -199,6 +204,10 @@ void FootSteer_ReadConfig(const char* buf) {
     g_blankMs    = TwkIniInt(buf, "FootSteerBlankMs", 250);
     g_catchVeto  = TwkIniInt(buf, "FootSteerCatchVeto", 1);
     g_frame      = TwkIniInt(buf, "FootSteerFrame", 0);
+    g_liftCm     = (float)TwkIniInt(buf, "FootSteerReturnLiftCm", 6);
+    g_liftAxis   = TwkIniInt(buf, "FootSteerReturnLiftAxis", 2);
+    if (g_liftCm < 0.0f) g_liftCm = 0.0f; else if (g_liftCm > 40.0f) g_liftCm = 40.0f;
+    if (g_liftAxis < 0 || g_liftAxis > 5) g_liftAxis = 2;
     g_axisX      = TwkIniInt(buf, "FootSteerAxisX", 1);
     g_axisY      = TwkIniInt(buf, "FootSteerAxisY", 0);
     g_twistDeg   = (float)TwkIniInt(buf, "FootSteerTwistDeg", 5);
@@ -241,6 +250,8 @@ void FootSteer_SaveConfig(char* buf, size_t cap) {
     TwkIniSetInt(buf, cap, "FootSteerBlankMs",     g_blankMs);
     TwkIniSetInt(buf, cap, "FootSteerCatchVeto",   g_catchVeto);
     TwkIniSetInt(buf, cap, "FootSteerFrame",       g_frame);
+    TwkIniSetInt(buf, cap, "FootSteerReturnLiftCm",   (int)g_liftCm);
+    TwkIniSetInt(buf, cap, "FootSteerReturnLiftAxis", g_liftAxis);
     TwkIniSetInt(buf, cap, "FootSteerAxisX",       g_axisX);
     TwkIniSetInt(buf, cap, "FootSteerAxisY",       g_axisY);
     TwkIniSetInt(buf, cap, "FootSteerTwistDeg",    (int)g_twistDeg);
@@ -267,6 +278,13 @@ static void unitAxis(int code, float v[3]) {
 struct Foot {
     float  s[2];        // the filtered steer, -1..1
     double blankUntil;  // flick/catch refractory
+    // The RETURN arc. The steer is chased to zero in a straight line, and that line runs through
+    // whatever sits between the held position and the foot's place on the deck -- so a foot held out
+    // past the nose or tail clipped THROUGH the board on its way back. `retFrom` is the magnitude the
+    // return started at, which turns the chase into a measurable 0..1 progress; `lift` is the bump
+    // taken from it. Cleared whenever the steer grows again, so only an actual return arcs.
+    float  retFrom;
+    float  lift;
 };
 static Foot   g_footL = {}, g_footR = {};
 static float  g_ease = 0.0f;        // armed ramp; also what eases the offset out on a landing
@@ -410,6 +428,16 @@ static bool updateFoot(Foot& F, bool rightStick, bool armed, bool catchNow, floa
     if (d > 1e-5f) {
         const float curMag = sqrtf(F.s[0] * F.s[0] + F.s[1] * F.s[1]);
         const float tgtMag = sqrtf(tx * tx + ty * ty);
+        // Arc the RETURN so the foot goes over the deck rather than through it. Progress is measured
+        // against the magnitude the return began at, and the bump is a half-sine: zero at both ends
+        // (no discontinuity when it starts, none when it lands) and widest halfway, which is exactly
+        // where the straight line would be deepest inside the board.
+        if (tgtMag >= curMag) { F.retFrom = 0.0f; F.lift = 0.0f; }
+        else {
+            if (F.retFrom <= 0.0f) F.retFrom = curMag;
+            const float prog = (F.retFrom > 1e-4f) ? (1.0f - curMag / F.retFrom) : 1.0f;
+            F.lift = sinf(3.14159265f * ((prog < 0.0f) ? 0.0f : (prog > 1.0f) ? 1.0f : prog));
+        }
         const float rate = (tgtMag >= curMag) ? (1000.0f / g_responseMs) : (1000.0f / g_returnMs);
         const float step = rate * dt;
         if (d <= step) { F.s[0] = tx; F.s[1] = ty; }
@@ -613,7 +641,14 @@ bool FootSteer_AddOffset(void* a, float dt, float outL[3], float outR[3]) {
         // the catching foot is already planted by the animation.
         // Same predicate as CatchStanceInverts() in catch_tweaks -- if one changes, change both.
         // Read directly rather than via swNow -- that is declared further down, with the stance blend.
-        const bool stanceInv = (twkB(a, AN_IS_GOOFY) > 0) && (twkB(a, AN_IS_SWITCH) == 0);
+        // Same predicate as CatchStanceInverts() in catch_tweaks, INCLUDING the setting term --
+        // the game only swaps its stick roles while _isLeftRightFootSkater is set, so without
+        // that term this would swap the flags in a stance where nothing was swapped.
+        bool stanceInv = (twkB(a, AN_IS_GOOFY) > 0) && (twkB(a, AN_IS_SWITCH) == 0);
+        if (stanceInv) {
+            void* sk2 = twkP(a, AN_SKATER);
+            if (sk2 && (twkB(sk2, SK_STANCE_OPTS) & 1) == 0) stanceInv = false;
+        }
         const int  useCatchL = stanceInv ? catchR : catchL;
         const int  useCatchR = stanceInv ? catchL : catchR;
         const bool catchNowL = (g_catchVeto != 0) && ((useCatchL > 0) || bothFeet);
@@ -682,6 +717,19 @@ bool FootSteer_AddOffset(void* a, float dt, float outL[3], float outR[3]) {
         } else if (g_ease > 0.0f) {
             if (wL > 0.0f) buildDelta(a, g_axisX, g_axisY, lX, lY, g_reachCm * g_ease * wL, dL);
             if (wR > 0.0f) buildDelta(a, g_axisX, g_axisY, rX, rY, g_reachCm * g_ease * wR, dR);
+            // ... plus the return arc, in the SAME frame as the steer (buildDelta handles the basis),
+            // so it lifts along the foot's own up rather than along world up on a tilted board.
+            if (g_liftCm > 0.0f) {
+                float lift[3];
+                if (wL > 0.0f && g_footL.lift > 0.0f) {
+                    buildDelta(a, g_liftAxis, -1, 1.0f, 0.0f, g_liftCm * g_footL.lift * g_ease * wL, lift);
+                    dL[0] += lift[0]; dL[1] += lift[1]; dL[2] += lift[2];
+                }
+                if (wR > 0.0f && g_footR.lift > 0.0f) {
+                    buildDelta(a, g_liftAxis, -1, 1.0f, 0.0f, g_liftCm * g_footR.lift * g_ease * wR, lift);
+                    dR[0] += lift[0]; dR[1] += lift[1]; dR[2] += lift[2];
+                }
+            }
         }
         if (dL[0] != 0.0f || dL[1] != 0.0f || dL[2] != 0.0f ||
             dR[0] != 0.0f || dR[1] != 0.0f || dR[2] != 0.0f) {
@@ -884,7 +932,7 @@ void FootSteer_ResetDefaults() {
     // "Reset to defaults" would have quietly restored the pre-tuning feel.
     g_reachCm = 30.0f; g_responseMs = 300.0f; g_returnMs = 150.0f;
     g_deadzone = 0.05f; g_flickVeto = 10.0f; g_blankMs = 250; g_catchVeto = 1;
-    g_frame = 3; g_axisX = 1; g_axisY = 0;
+    g_frame = 0; g_axisX = 1; g_axisY = 0; g_liftCm = 6.0f; g_liftAxis = 2;
     g_twistDeg = 5.0f; g_twistAxis = 4; g_switchInv = 3; g_followIK = 1;
     TwkMarkDirty();
 }

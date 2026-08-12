@@ -456,7 +456,7 @@ public:
     SessionTweaks() {
         ModName = STR("SessionTweaks");
         // Version history is kept with the releases, not in the source.
-        ModVersion = STR("2.53.2");
+        ModVersion = STR("2.57.1");
         ModDescription = STR("Gameplay fixes: real-stick-sweep scoop speed, wider manual catch window, darkslide-aware catch fix, run out on missed tricks");
         ModAuthors = STR("matsix");
         char dir[MAX_PATH]{};
@@ -465,7 +465,7 @@ public:
         char path[MAX_PATH];
         snprintf(path, sizeof(path), "%sSessionTweaks.log", dir);
         g_log = fopen(path, "w");
-        TwkLog("=== SessionTweaks 2.53.2 loading (UE4SS C++ mod) ===");
+        TwkLog("=== SessionTweaks 2.57.1 loading (UE4SS C++ mod) ===");
         readConfig(dir);
     }
     ~SessionTweaks() override {

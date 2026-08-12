@@ -24,7 +24,7 @@
 
 // The one place the mod's version number is written. It reaches the intro screen, the pause menu and
 // UE4SS's mod list from here -- there is no second copy to keep in step.
-#define OMP_VERSION_STRING "0.9.2b"
+#define OMP_VERSION_STRING "0.9.3b"
 // ...and the same thing wide, for the engine's TCHAR strings. Two levels because a single-level
 // `L##x` macro pastes the macro NAME instead of expanding it (UE4SS's own STR() has exactly that
 // shape, which is why it cannot be handed OMP_VERSION_STRING directly).
