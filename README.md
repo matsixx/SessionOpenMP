@@ -2,7 +2,7 @@
 
 **NOTE FROM DEV: This is a vibecoded project through and through. I won't sugarcoat it. This would be an
 incredibly massive undertaking for a solo developer. So, I used AI with the experience I have using it
-for many other very complex projects. This is 1-2 weeks of work day and night.**
+for many other very complex projects. This took 1-2 weeks of work day and night to get it into a working state.**
 
 **License notice: This project is licensed under GPL-3.0. You are free to fork, modify, and redistribute it, 
 provided your version remains licensed under GPL-3.0 and its complete corresponding source is made available. 
