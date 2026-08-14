@@ -4,6 +4,9 @@
 incredibly massive undertaking for a solo developer. So, I used AI with the experience I have using it
 for many other very complex projects. This took 1-2 weeks of work day and night to get it into a working state.**
 
+**I can guarantee though, I will always do my best to deliver on a high quality experience. I am working on this
+as someone with 2,000+ hours on this game. I care about this game a lot.**
+
 **License notice: This project is licensed under GPL-3.0. You are free to fork, modify, and redistribute it, 
 provided your version remains licensed under GPL-3.0 and its complete corresponding source is made available. 
 Incorporating this code into a closed-source or proprietary distributed product is a license violation. 
