@@ -26,6 +26,12 @@ const void* CatchLevel_ExtraPitchFn();
 // The real movement component (null until one trick has executed). See the .cpp for why
 // skater+0x550 is not it.
 void* CatchLevel_MovementComponent();
+// POST-PHYSICS re-assert of the level setpoint, called from foot_place's UpdateFootAnchors detour
+// (inside the animation update = after the physics pass). While a held-over stick keeps re-arming
+// the trick's pitch trajectory past the catch, the physics write lands AFTER the pump's setpoint
+// each frame and wins the race -- this runs later still, so the leveller wins instead. Gated on
+// CatchTweaks_HeldOverStale(): a fresh post-catch orient press stands down.
+void CatchLevel_PostPhysAssert();
 void  CatchLevel_PumpFrame();                     // game thread, once per input tick
 void  CatchLevel_DrawMenu(const OmpMenuApi* api); // RENDER THREAD (menu_ext contract)
 // pause-menu accessors (GAME THREAD), same shape as the other modules

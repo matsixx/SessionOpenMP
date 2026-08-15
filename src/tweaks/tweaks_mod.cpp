@@ -47,6 +47,7 @@
 #include "foot_place.h"
 #include "foot_steer.h"
 #include "grind_pop.h"
+#include "camera_height.h"
 #include "MinHook.h"
 #include "ue4ss_abi.h"
 #include "ui/menu_ext.h"
@@ -86,6 +87,7 @@ static void saveSettings() {
     FootPlace_SaveConfig(buf, sizeof(buf));
     FootSteer_SaveConfig(buf, sizeof(buf));
     GrindPop_SaveConfig(buf, sizeof(buf));
+    CameraHeight_SaveConfig(buf, sizeof(buf));
     f = fopen(g_iniPath, "w");
     if (!f) { TwkLog("[tweaks] settings save FAILED (cannot write %s)", g_iniPath); return; }
     fwrite(buf, 1, strlen(buf), f);
@@ -119,6 +121,7 @@ static void readConfig(const char* dir) {
     FootPlace_ReadConfig(buf);
     FootSteer_ReadConfig(buf);
     GrindPop_ReadConfig(buf);
+    CameraHeight_ReadConfig(buf);
     // No ini yet: write one holding the defaults just loaded. Without the multiplayer mod there is
     // no menu to change a setting through, so the file IS the interface -- and a file that lists
     // every key at its current value is the only way to discover what can be configured. Writing it
@@ -144,6 +147,7 @@ static void resetAllDefaults() {
     FootPlace_ResetDefaults();
     FootSteer_ResetDefaults();
     GrindPop_ResetDefaults();
+    CameraHeight_ResetDefaults();
     TwkLog("[tweaks] settings reset to defaults");
 }
 
@@ -167,6 +171,8 @@ static void drawSection(const OmpMenuApi* api, void*) {
     FootSteer_DrawMenu(api);
     api->Separator();
     GrindPop_DrawMenu(api);
+    api->Separator();
+    CameraHeight_DrawMenu(api);
     // The same reset the pause menu offers, so neither surface is the only way to get back.
     if (api->version >= 2 && api->Button) {
         api->Separator();
@@ -198,6 +204,10 @@ static const char* const kTwkPitch    = "TwkPitchRange";
 static const char* const kTwkPitchAmt = "TwkPitchSpread";
 static const char* const kTwkStopFlip = "TwkCatchStopsFlip";
 static const char* const kTwkAnyRev   = "TwkCatchAnyRevolution";
+static const char* const kTwkCamFollow    = "TwkCamFollow";
+static const char* const kTwkCamPitchDrop = "TwkCamPitchDrop";
+static const char* const kTwkCamPitch  = "TwkCamPitch";
+static const char* const kTwkFootLvl  = "TwkCatchFootLevelsBoard";
 static const char* const kTwkFlip     = "TwkFlipSpeed";
 static const char* const kTwkFlipMin  = "TwkFlipVelMin";
 static const char* const kTwkFlipMax  = "TwkFlipVelMax";
@@ -236,6 +246,7 @@ static void pageValue(const char* key, int iv, float fv, void*) {
     else if (!strcmp(key, kTwkLevel))    CatchLevel_SetEnabled(iv != 0);
     else if (!strcmp(key, kTwkStopFlip)) CatchTweaks_SetStopsFlip(iv != 0);
     else if (!strcmp(key, kTwkAnyRev))   CatchTweaks_SetAnyRevolution(iv != 0);
+    else if (!strcmp(key, kTwkFootLvl))  CatchTweaks_SetFootLevelsBoard(iv != 0);
     else if (!strcmp(key, kTwkGPitch))    GrindPop_SetPitchEnabled(iv != 0);
     else if (!strcmp(key, kTwkGPitchAmt)) GrindPop_SetPitchScale(fv);
     else if (!strcmp(key, kTwkGSwing))    GrindPop_SetSwingEnabled(iv != 0);
@@ -256,6 +267,9 @@ static void pageValue(const char* key, int iv, float fv, void*) {
     else if (!strcmp(key, kTwkBoneX))     CatchTweaks_SetBoneAdd(0, fv);
     else if (!strcmp(key, kTwkBoneY))     CatchTweaks_SetBoneAdd(1, fv);
     else if (!strcmp(key, kTwkBoneZ))     CatchTweaks_SetBoneAdd(2, fv);
+    else if (!strcmp(key, kTwkCamFollow))    CameraHeight_SetFollowEnabled(iv != 0);
+    else if (!strcmp(key, kTwkCamPitchDrop)) CameraHeight_SetPitchOnDropEnabled(iv != 0);
+    else if (!strcmp(key, kTwkCamPitch))  CameraHeight_SetPitchDeg(fv);
 }
 // ...and what it is set to RIGHT NOW, so a row opens showing the truth instead of a default.
 static int pageGet(const char* key, int* oi, float* of, void*) {
@@ -273,6 +287,7 @@ static int pageGet(const char* key, int* oi, float* of, void*) {
     else if (!strcmp(key, kTwkLevel))    { *oi = CatchLevel_Enabled() ? 1 : 0; return 1; }
     else if (!strcmp(key, kTwkStopFlip)) { *oi = CatchTweaks_StopsFlip() ? 1 : 0; return 1; }
     else if (!strcmp(key, kTwkAnyRev))   { *oi = CatchTweaks_AnyRevolution() ? 1 : 0; return 1; }
+    else if (!strcmp(key, kTwkFootLvl))  { *oi = CatchTweaks_FootLevelsBoard() ? 1 : 0; return 1; }
     else if (!strcmp(key, kTwkGPitch))    { *oi = GrindPop_PitchEnabled() ? 1 : 0; return 1; }
     else if (!strcmp(key, kTwkGPitchAmt)) { *of = GrindPop_PitchScale();           return 1; }
     else if (!strcmp(key, kTwkGSwing))    { *oi = GrindPop_SwingEnabled() ? 1 : 0; return 1; }
@@ -289,6 +304,9 @@ static int pageGet(const char* key, int* oi, float* of, void*) {
     else if (!strcmp(key, kTwkSteerAxY))  { *of = FootSteer_AxisY();              return 1; }
     else if (!strcmp(key, kTwkSteerTw))   { *of = FootSteer_TwistDeg();           return 1; }
     else if (!strcmp(key, kTwkSteerTwA))  { *of = FootSteer_TwistAxis();          return 1; }
+    else if (!strcmp(key, kTwkCamFollow))    { *oi = CameraHeight_FollowEnabled()      ? 1 : 0; return 1; }
+    else if (!strcmp(key, kTwkCamPitchDrop)) { *oi = CameraHeight_PitchOnDropEnabled() ? 1 : 0; return 1; }
+    else if (!strcmp(key, kTwkCamPitch))  { *of = CameraHeight_PitchDeg();            return 1; }
     else if (!strcmp(key, kTwkBone))      { *of = CatchTweaks_BoneScalePct();          return 1; }
     else if (!strcmp(key, kTwkBoneX))     { *of = CatchTweaks_BoneAdd(0);              return 1; }
     else if (!strcmp(key, kTwkBoneY))     { *of = CatchTweaks_BoneAdd(1);              return 1; }
@@ -306,6 +324,7 @@ static const OmpPageItem2 kTwkRootItems[] = {
     { OMP_ITEM_PAGE, "Catch & bail",   "Catch & bail",    "Catch window, catch sound, running out of a bail" },
     { OMP_ITEM_PAGE, "Grinds",         "Grinds",          "Pitch control and pop swing coming out of a grind" },
     { OMP_ITEM_PAGE, "Feet",           "Feet",            "Move your feet with the sticks while you are in the air" },
+    { OMP_ITEM_PAGE, "Camera",         "Camera",          "Make the camera's height follow your skater everywhere" },
     // Kept on the front page deliberately: it resets EVERY Session Tweaks setting, not one category.
     { OMP_ITEM_ACTION, kTwkReset,  "Reset to defaults",   "Restore every Session Tweaks setting to its shipped value" },
 };
@@ -336,6 +355,7 @@ static const OmpPageItem2 kTwkCatchItems[] = {
       nullptr, nullptr, 10.0f, 170.0f, 10.0f },
     { OMP_ITEM_TOGGLE, kTwkStopFlip, "Catch ends the flip",   "A caught board stops at griptape-up instead of spinning another full flip" },
     { OMP_ITEM_TOGGLE, kTwkAnyRev,  "Foot always attaches",    "A caught board ends its flip flat under your foot, whatever revolution it was on" },
+    { OMP_ITEM_TOGGLE, kTwkFootLvl, "  Foot levels the board", "The deck rolls flat in step with the foot coming down on it" },
     { OMP_ITEM_TOGGLE, kTwkLevel,   "Level board on catch",   "Eases the board flat when it hits your foot" },
     { OMP_ITEM_TOGGLE, kTwkCatchSnd, "Catch sound fix",       "A catch sound on every catch, and never too quiet" },
     { OMP_ITEM_SLIDER, kTwkSndVol,  "  Catch sound (%)",      "100 = the game's own volume",
@@ -373,13 +393,25 @@ static const OmpPageItem2 kTwkFeetItems[] = {
     { OMP_ITEM_SLIDER, kTwkBoneZ,    "  Bone add Z (cm)",    "Added on top of the scaled bone -- raise whichever axis lifts the deck",
       nullptr, nullptr, -100.0f, 100.0f, 2.0f },
 };
+static const OmpPageItem2 kTwkCameraItems[] = {
+    { OMP_ITEM_TOGGLE, kTwkCamFollow, "Camera always follows height",
+      "The camera tracks your height on every air, not just onto obstacles higher than you" },
+    // Named for what the GAME does, so ON is stock -- the module disables drop detection when this
+    // is off. Do not "correct" the apparent inversion in camera_height.cpp; the label is the contract.
+    { OMP_ITEM_TOGGLE, kTwkCamPitchDrop, "Pitch camera before drop",
+      "Stock behaviour: the camera tilts down at the edge of a drop instead of descending with you" },
+    { OMP_ITEM_SLIDER, kTwkCamPitch, "Pitch (deg)",
+      "Tilts the camera: positive looks up, negative looks down. 0 is the stock camera",
+      nullptr, nullptr, -30.0f, 30.0f, 1.0f },
+};
 // Every page must stay inside the host's cap AND inside the engine's visible window -- the host
 // truncates the TAIL, so an over-long page loses its Back row, not the row just added.
 static_assert(sizeof(kTwkRootItems)  / sizeof(kTwkRootItems[0])  <= 13 &&
               sizeof(kTwkBoardItems) / sizeof(kTwkBoardItems[0]) <= 13 &&
               sizeof(kTwkCatchItems) / sizeof(kTwkCatchItems[0]) <= 13 &&
               sizeof(kTwkGrindItems) / sizeof(kTwkGrindItems[0]) <= 13 &&
-              sizeof(kTwkFeetItems)  / sizeof(kTwkFeetItems[0])  <= 13,
+              sizeof(kTwkFeetItems)  / sizeof(kTwkFeetItems[0])  <= 13 &&
+              sizeof(kTwkCameraItems) / sizeof(kTwkCameraItems[0]) <= 13,
               "A Session Tweaks page exceeds the engine's visible-row window (14 incl. the Back row "
               "the host appends). Split it into another category page rather than raising this.");
 
@@ -418,12 +450,13 @@ static bool tryRegisterMenu() {
                 TWK_SUBPAGE("Catch & bail",   kTwkCatchItems);
                 TWK_SUBPAGE("Grinds",         kTwkGrindItems);
                 TWK_SUBPAGE("Feet",           kTwkFeetItems);
+                TWK_SUBPAGE("Camera",         kTwkCameraItems);
                 #undef TWK_SUBPAGE
                 if (regp("Session Tweaks", kTwkRootItems,
                          (int)(sizeof(kTwkRootItems) / sizeof(kTwkRootItems[0])),
                          &pageSelect, &pageValue, &pageGet, nullptr, nullptr)) {
                     g_pageRegistered = true;
-                    TwkLog("[tweaks] registered the pause-menu page (3 category pages + the front page)");
+                    TwkLog("[tweaks] registered the pause-menu page (5 category pages + the front page)");
                 }
             }
         }
@@ -456,7 +489,7 @@ public:
     SessionTweaks() {
         ModName = STR("SessionTweaks");
         // Version history is kept with the releases, not in the source.
-        ModVersion = STR("2.58.0");
+        ModVersion = STR("2.67.1");
         ModDescription = STR("Gameplay fixes: real-stick-sweep scoop speed, wider manual catch window, darkslide-aware catch fix, run out on missed tricks");
         ModAuthors = STR("matsix");
         char dir[MAX_PATH]{};
@@ -465,7 +498,7 @@ public:
         char path[MAX_PATH];
         snprintf(path, sizeof(path), "%sSessionTweaks.log", dir);
         g_log = fopen(path, "w");
-        TwkLog("=== SessionTweaks 2.58.0 loading (UE4SS C++ mod) ===");
+        TwkLog("=== SessionTweaks 2.67.1 loading (UE4SS C++ mod) ===");
         readConfig(dir);
     }
     ~SessionTweaks() override {
@@ -487,6 +520,7 @@ public:
         FootPlace_Install();
         FootSteer_Install();
         GrindPop_Install();
+        CameraHeight_Install();
         RunOut_Install();
         // Registration is attempted once now (host usually loaded already; mods.txt order) and
         // re-offered from the frame pump until the host appears, or forever if it never does:

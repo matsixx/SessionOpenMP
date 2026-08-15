@@ -18,6 +18,7 @@
 //     structs are newer than the runtime understands and every call returns IncompatibleVersion.
 //   * the send-after-close cooldown below is kept regardless of SDK version: it is correct behaviour,
 //     not a workaround for one release.
+#include <time.h>
 #include "transport.h"
 #include "eos_creds.h"
 // Macro-only, no dependencies: the mod version is written in exactly one place and the lobby ad
@@ -113,14 +114,58 @@ static Peer* peerByPuid(EOS_ProductUserId p) {
 // ESTABLISHED can arrive BEFORE any Peer entry exists (their connect lands first), and dropping the
 // event leaves the state stuck on "connecting" while packets flow. So learn on the event.
 static int addPeerEx(const char* puidStr, bool fromRoster);
+
+// IS THIS USER IN OUR LOBBY, RIGHT NOW? The SDK's local lobby cache, so it is cheap and answers at
+// packet time -- which is the whole point: the lobby is the ONLY authority on who belongs in the
+// session, and every path that used to adopt a peer from mere traffic asks this instead. A stale
+// client from a dead session still knows our id and still connects the moment we are back online
+// (field-logged: two of them walked straight into a fresh PRIVATE lobby); membership is what they
+// cannot fake. ProductUserIds are interned by the SDK, so handle equality is identity.
+static bool lobbyHasMember(EOS_ProductUserId user) {
+    if (!g_lobbyH || !g_me || !g_lobbyId[0] || !user) return false;
+    EOS_Lobby_CopyLobbyDetailsHandleOptions o{};
+    o.ApiVersion = EOS_LOBBY_COPYLOBBYDETAILSHANDLE_API_LATEST;
+    o.LobbyId = g_lobbyId; o.LocalUserId = g_me;
+    EOS_HLobbyDetails det = nullptr;
+    if (EOS_Lobby_CopyLobbyDetailsHandle(g_lobbyH, &o, &det) != EOS_EResult::EOS_Success || !det)
+        return false;
+    EOS_LobbyDetails_GetMemberCountOptions mc{};
+    mc.ApiVersion = EOS_LOBBYDETAILS_GETMEMBERCOUNT_API_LATEST;
+    const uint32_t n = EOS_LobbyDetails_GetMemberCount(det, &mc);
+    bool found = false;
+    for (uint32_t i = 0; i < n && !found; i++) {
+        EOS_LobbyDetails_GetMemberByIndexOptions mo{};
+        mo.ApiVersion = EOS_LOBBYDETAILS_GETMEMBERBYINDEX_API_LATEST; mo.MemberIndex = i;
+        found = (EOS_LobbyDetails_GetMemberByIndex(det, &mo) == user);
+    }
+    EOS_LobbyDetails_Release(det);
+    return found;
+}
+
+// Hang up on a sender who is not in our lobby, so their client stops streaming at us. Throttled per
+// sender: the close is advisory to THEIR stack, and a ghost that keeps knocking needs one hangup a
+// beat, not one per packet.
+static void closeStrangerConnection(EOS_ProductUserId who) {
+    static struct { EOS_ProductUserId who; uint64_t untilMs; } recent[8];
+    const uint64_t now = GetTickCount64();
+    for (auto& r : recent) if (r.who == who && now < r.untilMs) return;
+    for (auto& r : recent) if (now >= r.untilMs) { r.who = who; r.untilMs = now + 5000; break; }
+    EOS_P2P_CloseConnectionOptions c{};
+    c.ApiVersion = EOS_P2P_CLOSECONNECTION_API_LATEST;
+    c.LocalUserId = g_me; c.RemoteUserId = who; c.SocketId = &g_sock;
+    EOS_P2P_CloseConnection(g_p2p, &c);
+}
+
 static Peer* peerByPuidOrLearn(EOS_ProductUserId p) {
     Peer* pe = peerByPuid(p);
     if (pe) return pe;
     char id[64] = {0}; int32_t n = sizeof(id);
     if (EOS_ProductUserId_ToString(p, id, &n) != EOS_EResult::EOS_Success) return nullptr;
-    // A connection-state notification is NOT a roster event: EOS is telling us a link changed, not
-    // that this human belongs in our session. Unvouched until the roster says otherwise.
-    const int i = addPeerEx(id, false);
+    // A connection-state notification is NOT a roster event -- and a user who is not even in our
+    // lobby does not become a peer because a link to them changed state. (The ping tool's
+    // paste-an-id rig keeps the old adopt-anyone behaviour.)
+    if (!g_learnWithoutSession && !lobbyHasMember(p)) return nullptr;
+    const int i = addPeerEx(id, g_learnWithoutSession ? false : true);
     return (i >= 0) ? &g_peers[i] : nullptr;
 }
 
@@ -148,10 +193,19 @@ static void EOS_CALL onConnRequest(const EOS_P2P_OnIncomingConnectionRequestInfo
     char id[64] = {0}; int32_t n = sizeof(id);
     EOS_ProductUserId_ToString(i->RemoteUserId, id, &n);
     // Gate on being deliberately in a session, or an instance that never hosted or joined opens a
-    // channel to anyone who asks. NOT on the roster -- a connection request legitimately PRECEDES the
-    // roster during a join, so a membership test here would refuse the very peer we are joining.
+    // channel to anyone who asks.
     if (!SessionOpenLocal() && !g_learnWithoutSession) {
         Log("[p2p] incoming connection from %s -- IGNORED (not in a session)", id);
+        return;
+    }
+    // ...and on THE LOBBY: a request from someone who is not a member is a stale client from a dead
+    // session (they keep our id and reconnect on sight -- field-logged walking into a fresh PRIVATE
+    // game). The join race resolves itself: the SDK's membership cache typically lists a joiner
+    // before their first packet, and a request refused a beat early is simply re-raised by their
+    // next send and accepted once the membership lands.
+    if (!g_learnWithoutSession && !lobbyHasMember(i->RemoteUserId)) {
+        static int said = 0;
+        if (said < 12) { said++; Log("[p2p] incoming connection from %s -- REFUSED (not in our lobby)", id); }
         return;
     }
     EOS_P2P_AcceptConnectionOptions a{};
@@ -165,7 +219,7 @@ static void EOS_CALL onConnRequest(const EOS_P2P_OnIncomingConnectionRequestInfo
 // LOBBY -- the roster is the peer list. All callbacks fire from whichever thread ticks the platform,
 // which after bring-up is the game thread only.
 // =====================================================================================================
-static void publishAd();     // defined with the browser below; called the moment a lobby exists
+static void publishAd(bool say = true);     // defined with the browser below; called the moment a lobby exists
 // HOST MIGRATION. Ownership is a property of the lobby, not a memory of who created it: we call
 // LeaveLobby (never DestroyLobby), so when the host walks away EOS hands the lobby to somebody else
 // and everyone stays in it. Nothing here may infer "am I the host" from having hosted, or the promoted
@@ -195,7 +249,36 @@ static void rosterAddAll(const char* lobbyId) {
     EOS_LobbyDetails_Release(det);
 }
 
+// Evictions from LINGERING lobbies (below) get their own callback: the normal one clears the
+// private-game code, which is OURS for the lobby we are actually in, not the one being left.
+static void EOS_CALL onLeaveLingering(const EOS_Lobby_LeaveLobbyCallbackInfo* d) {
+    Log("[lobby] lingering membership closed: %s", EOS_EResult_ToString(d->ResultCode));
+}
+
 static void EOS_CALL onMemberStatus(const EOS_Lobby_LobbyMemberStatusReceivedCallbackInfo* d) {
+    // WHICH LOBBY IS THIS ABOUT? EOS delivers member events for EVERY lobby this user is a member
+    // of -- including a LINGERING membership left by a process that died before its goodbye reached
+    // Epic (the backend keeps counting us in it once the same identity is back online). Acting on
+    // those events vouched the DEAD lobby's members into the current session's roster: field-logged
+    // as "hosted a private game and the previous lobby's players appeared in it", and as roster
+    // names with nobody in the world behind them. An event for a lobby that is not ours is ignored
+    // -- and answered with the one thing that helps: LEAVING that lobby, because the event itself
+    // is proof we are still in it. Never while an operation is deciding (status 1): the callback
+    // that will set g_lobbyId may not have run yet, and evicting ourselves from the lobby we are
+    // entering would be worse than any stale event. There is always another event.
+    if (!d->LobbyId || !d->LobbyId[0] || _stricmp(d->LobbyId, g_lobbyId) != 0) {
+        if (g_lobbyStatus != 1 && d->LobbyId && d->LobbyId[0]) {
+            static int said = 0;
+            if (said < 8) { said++;
+                Log("[lobby] leaving a LINGERING membership in %s (we are in %s)",
+                    d->LobbyId, g_lobbyId[0] ? g_lobbyId : "no lobby"); }
+            EOS_Lobby_LeaveLobbyOptions o{};
+            o.ApiVersion = EOS_LOBBY_LEAVELOBBY_API_LATEST;
+            o.LobbyId = d->LobbyId; o.LocalUserId = g_me;
+            EOS_Lobby_LeaveLobby(g_lobbyH, &o, nullptr, onLeaveLingering);
+        }
+        return;
+    }
     char who[64] = {0}; int32_t n = sizeof(who);
     EOS_ProductUserId_ToString(d->TargetUserId, who, &n);
     const bool isMe = !_stricmp(who, g_myId);
@@ -212,7 +295,15 @@ static void EOS_CALL onMemberStatus(const EOS_Lobby_LobbyMemberStatusReceivedCal
     case EOS_ELobbyMemberStatus::EOS_LMS_KICKED:
         if (isMe) { InterlockedExchange(&g_lobbyStatus, 0); g_lobbyId[0] = 0; Log("[lobby] we are OUT (status %d)", (int)d->CurrentStatus); }
         else for (int i = 0; i < g_nPeers; i++)
-            if (!_stricmp(g_peers[i].idStr, who)) { g_peers[i].st.state = 5; Log("[lobby] member DEPARTED: %s", who); }
+            if (!_stricmp(g_peers[i].idStr, who)) {
+                g_peers[i].st.state = 5; Log("[lobby] member DEPARTED: %s", who);
+                // ...and the channel goes with them. Their client may keep our id and keep sending
+                // (a stale session does exactly that); membership ended, so the link ends.
+                EOS_P2P_CloseConnectionOptions c{};
+                c.ApiVersion = EOS_P2P_CLOSECONNECTION_API_LATEST;
+                c.LocalUserId = g_me; c.RemoteUserId = g_peers[i].puid; c.SocketId = &g_sock;
+                EOS_P2P_CloseConnection(g_p2p, &c);
+            }
         break;
     case EOS_ELobbyMemberStatus::EOS_LMS_CLOSED:
         Log("[lobby] lobby CLOSED");
@@ -298,6 +389,14 @@ static const char* kAttrCode = "OMPCODE";   // present = a PRIVATE game; the bro
 // snapshots fail to parse, so the symptom is a peer who is simply never there. A build too old to
 // advertise this reports blank, which the browser shows as "unknown" rather than as a mismatch.
 static const char* kAttrVer  = "OMPVER";
+// The liveness beat: unix seconds, re-stamped by the OWNER on a slow cadence. A lobby whose beat has
+// gone stale is a GHOST -- its host crashed or was killed, the backend kept the lobby, and the
+// advertised host name now names somebody who is not in it (field-logged: a browse row said a player
+// was hosting while their process was long dead, and people joined it). A lobby with NO beat at all
+// is from a build too old to stamp one, whose wire we cannot talk to anyway; both are hidden.
+static const char* kAttrBeat = "OMPBEAT";
+static const uint64_t kBeatPeriodMs  = 90 * 1000;    // owner re-stamp cadence
+static const int      kBeatStaleSec  = 240;          // ~2.5 missed beats + clock slop between PCs
 
 static char  g_adHost[40] = {0};
 static char  g_adMap [40] = {0};
@@ -449,7 +548,7 @@ static void EOS_CALL onUpdateLobby(const EOS_Lobby_UpdateLobbyCallbackInfo* d) {
     }
     NoteAuthResult(d->ResultCode, "attribute update");
 }
-static void publishAd() {
+static void publishAd(bool say) {
     if (!g_lobbyH || !g_me || !g_lobbyId[0]) return;
     EOS_Lobby_UpdateLobbyModificationOptions mo{};
     mo.ApiVersion = EOS_LOBBY_UPDATELOBBYMODIFICATION_API_LATEST;
@@ -474,12 +573,27 @@ static void publishAd() {
     add(kAttrMap,  g_adMap);
     add(kAttrCode, g_adCode);          // absent for a public game -- `add` skips empty values
     add(kAttrVer,  OMP_VERSION_STRING);
+    char beat[24];
+    snprintf(beat, sizeof(beat), "%llu", (unsigned long long)_time64(nullptr));
+    add(kAttrBeat, beat);
     EOS_Lobby_UpdateLobbyOptions uo{};
     uo.ApiVersion = EOS_LOBBY_UPDATELOBBY_API_LATEST;
     uo.LobbyModificationHandle = mod;
     EOS_Lobby_UpdateLobby(g_lobbyH, &uo, nullptr, onUpdateLobby);
     EOS_LobbyModification_Release(mod);
-    Log("[lobby] advertising host='%s' map='%s'", g_adHost, g_adMap);
+    if (say) Log("[lobby] advertising host='%s' map='%s'", g_adHost, g_adMap);
+}
+
+// Seconds since a details handle's beat, or -1 for no beat at all. Negative skew (their clock a touch
+// ahead of ours) reads as FRESH -- the harmless direction.
+static long long beatAgeSec(EOS_HLobbyDetails det) {
+    char b[24];
+    readAttr(det, kAttrBeat, b, sizeof(b));
+    if (!b[0]) return -1;
+    const long long then = _atoi64(b);
+    if (then <= 0) return -1;
+    long long age = (long long)_time64(nullptr) - then;
+    return age < 0 ? 0 : age;
 }
 
 static void EOS_CALL onFind(const EOS_LobbySearch_FindCallbackInfo* d) {
@@ -521,6 +635,19 @@ static void EOS_CALL onFind(const EOS_LobbySearch_FindCallbackInfo* d) {
             InterlockedExchange(&g_lobbyStatus, -1);
             return;
         }
+        // A code can name a ghost too: the friend's game crashed, the lobby lingered, and joining
+        // it puts the player alone in a dead session with no error. Refuse it the same way the
+        // browser hides one.
+        {
+            const long long age = beatAgeSec(det);
+            if (age < 0 || age > kBeatStaleSec) {
+                EOS_LobbyDetails_Release(det);
+                InterlockedExchange(&g_lobbyStatus, -1);
+                Log("[lobby] code %s: that game looks ABANDONED (%s) -- ask them to host again", want,
+                    age < 0 ? "no liveness beat" : "beat stale");
+                return;
+            }
+        }
         strncpy_s(g_myCode, want, _TRUNCATE);      // we are joining a private game; remember its code
         Log("[lobby] code %s matched -- joining", want);
         EOS_Lobby_JoinLobbyOptions jo{};
@@ -550,6 +677,7 @@ static void EOS_CALL onFind(const EOS_LobbySearch_FindCallbackInfo* d) {
                 continue;
             LobbyInfo& L = g_browse[g_nBrowse];
             L = LobbyInfo{};
+            L.searchIdx = (int)i;                    // the row must remember where it came from
             EOS_LobbyDetails_GetMemberCountOptions mc{};
             mc.ApiVersion = EOS_LOBBYDETAILS_GETMEMBERCOUNT_API_LATEST;
             L.players = (int)EOS_LobbyDetails_GetMemberCount(det, &mc);
@@ -566,7 +694,33 @@ static void EOS_CALL onFind(const EOS_LobbySearch_FindCallbackInfo* d) {
             readAttr(det, kAttrVer,  L.version, sizeof(L.version));
             char code[16] = {0};
             readAttr(det, kAttrCode, code, sizeof(code));
+            const long long beatAge = beatAgeSec(det);
+            // OUR OWN ORPHAN: the backend's CURRENT owner (not the stale advertised name) is us,
+            // for a lobby we are not in -- a leftover from a crash of ours. Never a joinable game.
+            bool ownOrphan = false;
+            {
+                EOS_LobbyDetails_GetLobbyOwnerOptions oo{};
+                oo.ApiVersion = EOS_LOBBYDETAILS_GETLOBBYOWNER_API_LATEST;
+                EOS_ProductUserId owner = EOS_LobbyDetails_GetLobbyOwner(det, &oo);
+                char ownerStr[64] = {0}; int32_t on = sizeof(ownerStr);
+                if (owner && EOS_ProductUserId_ToString(owner, ownerStr, &on) == EOS_EResult::EOS_Success)
+                    ownOrphan = !_stricmp(ownerStr, g_myId) && _stricmp(L.id, g_lobbyId) != 0;
+            }
             EOS_LobbyDetails_Release(det);
+            // GHOSTS AND ORPHANS are hidden, not shown-but-warned: a row in this list is an
+            // invitation to join, and every one of these joins a dead session. Said in the log so
+            // "my friend's game is not in my list" is answerable.
+            if (ownOrphan || beatAge < 0 || beatAge > kBeatStaleSec) {
+                static int said = 0;
+                if (said < 12) { said++;
+                    Log("[lobby] hiding '%s' on '%s': %s", L.host[0] ? L.host : "?",
+                        L.map[0] ? L.map : "?",
+                        ownOrphan ? "it is OUR OWN crash leftover"
+                        : beatAge < 0 ? "no liveness beat (abandoned, or a build older than 0.9.5)"
+                                      : "its host stopped answering (abandoned)");
+                }
+                continue;
+            }
             // A lobby with a code is PRIVATE: it must not appear in the public list, or the code
             // would protect nothing. (It is still publicly advertised -- that is what lets a search
             // by code find it at all -- so the filter has to be here, on the browsing side.)
@@ -708,12 +862,18 @@ bool LobbyJoinAt(int i) {
     if (i < 0 || i >= g_nBrowse) return false;
     if (!leaveCurrentBeforeJoining("join the session you picked")) return false;
     EOS_LobbySearch_CopySearchResultByIndexOptions ro{};
-    ro.ApiVersion = EOS_LOBBYSEARCH_COPYSEARCHRESULTBYINDEX_API_LATEST; ro.LobbyIndex = (uint32_t)i;
+    // THE ROW'S OWN search index, never the row number: the list is filtered (private lobbies,
+    // ghosts, orphans), so the two diverge -- and joining by row number picked whatever lobby
+    // happened to sit at that position in the UNFILTERED results. Field symptom: players landing in
+    // sessions they never clicked.
+    ro.ApiVersion = EOS_LOBBYSEARCH_COPYSEARCHRESULTBYINDEX_API_LATEST;
+    ro.LobbyIndex = (uint32_t)g_browse[i].searchIdx;
     EOS_HLobbyDetails det = nullptr;
     if (EOS_LobbySearch_CopySearchResultByIndex(g_search, &ro, &det) != EOS_EResult::EOS_Success || !det)
         return false;
     InterlockedExchange(&g_lobbyStatus, 1);
-    Log("[lobby] joining browse[%d] '%s' on '%s'", i, g_browse[i].host, g_browse[i].map);
+    Log("[lobby] joining browse[%d] (search index %d) '%s' on '%s'", i, g_browse[i].searchIdx,
+        g_browse[i].host, g_browse[i].map);
     EOS_Lobby_JoinLobbyOptions jo{};
     jo.ApiVersion = EOS_LOBBY_JOINLOBBY_API_LATEST;
     jo.LobbyDetailsHandle = det; jo.LocalUserId = g_me;
@@ -735,6 +895,14 @@ void LobbyLeave() {
     EOS_Lobby_LeaveLobby(g_lobbyH, &o, nullptr, onLeaveLobby);
     InterlockedExchange(&g_lobbyStatus, 0); g_lobbyId[0] = 0; g_lobbyOwner[0] = 0;
     for (int i = 0; i < g_nPeers; i++) g_peers[i].st.state = 5;   // we left; nobody to send to
+    // Every channel closes with the membership: the session is the lobby, and a link that outlives
+    // it is exactly how a dead session's players walk into the next one.
+    if (g_p2p && g_me) {
+        EOS_P2P_CloseConnectionsOptions c{};
+        c.ApiVersion = EOS_P2P_CLOSECONNECTIONS_API_LATEST;
+        c.LocalUserId = g_me; c.SocketId = &g_sock;
+        EOS_P2P_CloseConnections(g_p2p, &c);
+    }
 }
 int LobbyStatus() { return (int)g_lobbyStatus; }
 
@@ -1166,6 +1334,16 @@ void Tick(RecvFn onRecv, void* user) {
         Log("[lobby] browse timed out after %llums -- no answer from the service",
             (unsigned long long)kBrowseTimeoutMs);
     }
+    // THE LIVENESS BEAT. Only the owner stamps it (a guest's update would be refused anyway), and
+    // quietly -- the once-per-map "advertising" line stays meaningful. A ghost lobby is one whose
+    // owner stopped doing exactly this.
+    {
+        static uint64_t lastBeatMs = 0;
+        if (g_lobbyId[0] && g_lobbyStatus == 2 && nowMs() - lastBeatMs >= kBeatPeriodMs) {
+            lastBeatMs = nowMs();
+            publishAd(false);
+        }
+    }
     // The bounded ownership re-check armed by a refused publish (see onUpdateLobby). Costs one lobby
     // details copy per attempt, only after a refusal, and stops on its own either way.
     if (g_ownerRechecksLeft > 0 && g_ownerRecheckAtMs && nowMs() >= g_ownerRecheckAtMs) {
@@ -1186,17 +1364,22 @@ void Tick(RecvFn onRecv, void* user) {
         EOS_ProductUserId from = nullptr; EOS_P2P_SocketId sk{}; uint8_t ch = 0; uint32_t got = 0;
         if (EOS_P2P_ReceivePacket(g_p2p, &ro, &from, &sk, &ch, buf, &got) != EOS_EResult::EOS_Success) break;
         Peer* p = peerByPuid(from);
-        if (!p) {                                            // first contact: learn the peer
+        if (!p) {                                            // first contact
             char id[64] = {0}; int32_t n = sizeof(id);
             EOS_ProductUserId_ToString(from, id, &n);
-            // Only LEARN a sender while we are deliberately in a session. An idle instance that never
-            // hosted or joined has no business adopting whoever sends it bytes -- the same reason shm
-            // gates on its own in-session flag. Peers we ALREADY know keep working regardless, so this
-            // can never interrupt a session in progress.
-            if (SessionOpenLocal() || g_learnWithoutSession) {
-                const int i = addPeerEx(id, false);          // traffic is not a vouching event
+            // TRAFFIC IS NOT A VOUCHING EVENT -- and on this wire it is not a LEARNING event either.
+            // The sender becomes a peer only if the LOBBY says they are in it right now, checked at
+            // packet time (which covers the join race: a member whose JOINED notification has not
+            // landed yet passes this check, and arrives properly vouched). Anyone else is a stale
+            // client from a dead session; their packet is dropped and their connection hung up on.
+            if (SessionOpenLocal() && !g_learnWithoutSession && lobbyHasMember(from)) {
+                const int i = addPeerEx(id, true);           // checked against the lobby: vouched
+                p = (i >= 0) ? &g_peers[i] : nullptr;
+            } else if (g_learnWithoutSession) {
+                const int i = addPeerEx(id, false);          // the ping tool's paste-an-id rig
                 p = (i >= 0) ? &g_peers[i] : nullptr;
             } else {
+                if (SessionOpenLocal()) closeStrangerConnection(from);
                 static uint64_t lastIdleLogMs = 0;
                 const uint64_t now = GetTickCount64();
                 if (now - lastIdleLogMs > 5000) {

@@ -139,6 +139,11 @@ struct LobbyInfo {
     // session where the other player never appears rather than an error -- so it is worth saying
     // before the join, not after.
     char version[16];
+    // Which SEARCH RESULT this row came from. The list is FILTERED (private lobbies, stale ghosts,
+    // our own orphans never become rows), so a row's position in the list and its position in the
+    // search results diverge -- and joining by the LIST index picked the wrong lobby whenever they
+    // did. Joins must use this, never the row number.
+    int  searchIdx;
 };
 // What WE advertise while hosting. Call before LobbyHost(); the attributes are attached to the lobby
 // immediately after it is created (EOS_Lobby_CreateLobby takes no attributes of its own). Safe to call
@@ -183,6 +188,11 @@ bool        LobbyIsHost();                   // we own the lobby -> kick is avai
 // WHO owns it, as a peer identity, or "" if unknown. Ownership migrates, so this is re-read from the
 // service on every membership change rather than remembered from who created the lobby.
 const char* LobbyOwnerId();
+// Can this wire EVER name a lobby owner? True on EOS (the answer may still be in flight); false on
+// shared memory and UDP, which are symmetric by construction. The difference matters: a fallback
+// that decides authority some other way is correct on a wire that will never know, and a data race
+// on one that merely does not know YET.
+bool LobbyOwnershipKnowable();
 bool        LobbyKick(const char* peerId);   // async; false = not hosting / no such member
 bool        LobbyBrowse();                   // start an async search that KEEPS its results
 int         BrowseStatus();                  // 0 idle, 1 searching, 2 results ready, -1 failed

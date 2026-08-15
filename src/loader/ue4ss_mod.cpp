@@ -1098,6 +1098,9 @@ static bool hkActorSetLocation(void* actor, const void* newLoc, bool sweep, void
     return o_ActorSetLocation(actor, newLoc, sweep, hit, teleport);
 }
 static void InstallMapDefaultSeam() {
+    static bool done = false;                 // called from the ctor AND the unreal-init chain
+    if (done) return;
+    done = true;
     const game::Syms& S = game::Get();
     // Both or neither: the flag without the capture records nothing, and the capture without the flag
     // would fire for every SetActorLocation in the game. Say which one is missing -- "it silently did
@@ -1135,9 +1138,19 @@ static void hkDropperSave(void* handler, unsigned char flag) {
                  " writing -- your profile keeps only your own", removed);
         logLine(m);
     }
+    // THE WORLD BRACKET. During a session the level's own props stand on the HOST'S arrangement --
+    // and this save is what writes their poses into the local profile. Standing each touched prop on
+    // its remembered original for exactly the duration of the write means a mid-session save always
+    // records the player's OWN arrangement; the session poses come straight back after. Without this,
+    // leaving the dropper mid-session would quietly overwrite the player's park with the host's.
+    game::dropper::WorldSaveRestoreBegin();
     o_DropperSave(handler, flag);
+    game::dropper::WorldSaveRestoreEnd();
 }
 static void InstallSaveGuard() {
+    static bool done = false;                 // called from the ctor AND the unreal-init chain
+    if (done) return;
+    done = true;
     const game::Syms& S = game::Get();
     if (!S.DropperSave) {
         logLine("[drop/save] *** DropperSave unresolved -- session props stay UNPICKABLE for safety");
@@ -1272,6 +1285,23 @@ public:
         // (a ProductUserId already identifies you); the direct-UDP wire has nothing else to go on.
         omp::SetLocalIdentity(MpPrefs_PeerId());
         logLine("[mp] keys: F8 = HOST session, F9 = JOIN session, F6 = leave");
+        // THE BOOT RACE. Session applies the world-prop save during its INITIAL level load, ~7 s
+        // after process start -- and the unreal-init chain used to hook the Load seam at ~8 s.
+        // Whoever won that coin flip got map defaults; whoever lost reported an empty arrangement
+        // for the rest of the run (field-measured: three friend boots won it, two boots the same
+        // day lost it). The exe is fully mapped from the moment this DLL exists, so the sig scan
+        // and these two hooks run HERE, before the game's own boot can reach a level load. The
+        // handlers are early-safe by construction: pure statics until their functions first fire.
+        {
+            const MH_STATUS ms = MH_Initialize();
+            if (ms == MH_OK || ms == MH_ERROR_ALREADY_INITIALIZED) {
+                game::Resolve(logLine);
+                InstallMapDefaultSeam();
+                InstallSaveGuard();
+            } else {
+                logLine("[mod] *** MinHook unavailable at construction -- dropper seams wait for unreal-init");
+            }
+        }
     }
     ~SessionOpenMP() override {
         session::Shutdown();

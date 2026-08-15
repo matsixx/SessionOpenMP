@@ -29,6 +29,9 @@ const Stats& St() { return g_st; }
 // world change rather than pruned.
 static void* g_remote[kMaxObjects];  static int g_remoteN = 0;
 static void* g_hidden[kMaxObjects];  static int g_hiddenN = 0;
+// The pre-session baseline (see the header). Pointers only -- these are the player's own live
+// actors, and the list dies with the world like every other actor pointer here.
+static void* g_pre[kMaxObjects];     static int g_preN = 0;
 
 #ifdef _WIN32
 
@@ -257,23 +260,43 @@ int EnumerateOwn(ObjRec* out, void** actorsOut, int cap) {
 #endif
 }
 
+// ---- the pre-session baseline -----------------------------------------------------------------
+void SnapshotPreSession() {
+#ifdef _WIN32
+    if (g_preN) return;                              // taken ONCE per session
+    void* m = Manager();
+    TArrayHdr a;
+    if (!m || !readArray(m, off::kDropMgrAllObjects, &a)) return;
+    for (int i = 0; i < a.num && g_preN < kMaxObjects; i++) {
+        void* actor = nullptr;
+        if (!rd(&a.data[i], &actor, sizeof(actor)) || !actor || IsRemote(actor)) continue;
+        // Inventory objects only. The level's own furniture belongs to the map, travels on the world
+        // lane, and must never be hidden -- hiding one deleted a piece of the level off a screen.
+        if (!isStorable(actor)) continue;
+        g_pre[g_preN++] = actor;
+    }
+#endif
+}
+bool IsPreSession(void* actor) {
+    for (int i = 0; i < g_preN; i++) if (g_pre[i] == actor) return true;
+    return false;
+}
+void ClearPreSession() { g_preN = 0; }
+int  PreSessionCount() { return g_preN; }
+
 // ---- adoption ---------------------------------------------------------------------------------
 void HideOwnSet(void (*logf)(const char*)) {
 #ifdef _WIN32
-    if (g_hiddenN) return;                           // already adopted; snapshot is taken ONCE
+    if (g_hiddenN) return;                           // already adopted
     const Syms& S = Get();
-    void* m = Manager();
-    if (!m || !S.SetActorHidden) return;
-    TArrayHdr a;
-    if (!readArray(m, off::kDropMgrAllObjects, &a)) return;
-    int noCollide = 0, keptWorld = 0;
-    for (int i = 0; i < a.num && g_hiddenN < kMaxObjects; i++) {
-        void* actor = nullptr;
-        if (!rd(&a.data[i], &actor, sizeof(actor)) || !actor || IsRemote(actor)) continue;
-        // NEVER HIDE THE LEVEL'S OWN FURNITURE. Adoption is about whose INVENTORY props the world
-        // shows -- a bench belongs to the map, and every player already has the same one. Hiding it
-        // deleted a piece of the level off the joiner's screen.
-        if (!isStorable(actor)) { keptWorld++; continue; }
+    if (!S.SetActorHidden) return;
+    // THE BASELINE IS THE LIST, not a fresh snapshot: by adoption time the player may already have
+    // placed post-join objects, and hiding those would also silently unpublish them (hidden objects
+    // are excluded from enumeration). Taken here only if the session flow somehow never took it.
+    SnapshotPreSession();
+    int noCollide = 0;
+    for (int i = 0; i < g_preN && g_hiddenN < kMaxObjects; i++) {
+        void* actor = g_pre[i];
         __try {
             S.SetActorHidden(actor, true);
             // Hiding is PURELY VISUAL -- the components keep colliding, and an invisible rail you can
@@ -284,13 +307,30 @@ void HideOwnSet(void (*logf)(const char*)) {
         } __except (EXCEPTION_EXECUTE_HANDLER) { g_st.faults++; }
     }
     if (logf) { char msg[240]; snprintf(msg, sizeof(msg),
-        "[drop] adopted the shared set: %d of my own objects hidden (%d decollided), %d of the"
-        " level's own left alone%s",
-        g_hiddenN, noCollide, keptWorld,
+        "[drop] adopted the shared set: %d of my own objects hidden (%d decollided)%s",
+        g_hiddenN, noCollide,
         S.SetActorCollision ? "" : " -- NO SetActorCollision: they still block!");
         logf(msg); }
 #else
     (void)logf;
+#endif
+}
+
+// Put the adoption hide BACK. The hidden actors are the player's own real actors, and the replay
+// editor's exit pass restores the visibility of everything it registered -- which un-hides the whole
+// adopted-away set and leaves the player looking at their own park standing inside the host's
+// (field-logged, and the same enemy the withdrawn world model fought). Cheap to re-assert on a slow
+// beat; collision comes along so an invisible rail can never be grindable.
+void ReassertOwnSetHidden() {
+#ifdef _WIN32
+    const Syms& S = Get();
+    if (!g_hiddenN || !S.SetActorHidden) return;
+    for (int i = 0; i < g_hiddenN; i++) {
+        __try {
+            S.SetActorHidden(g_hidden[i], true);
+            if (S.SetActorCollision) S.SetActorCollision(g_hidden[i], false);
+        } __except (EXCEPTION_EXECUTE_HANDLER) { g_st.faults++; }
+    }
 #endif
 }
 
@@ -427,12 +467,14 @@ static bool sayUnknownOnce(const char* s) {
 // Name -> UClass, cached per distinct name. The cache matters: the catalogue walk allocates an FString
 // per entry it inspects, and a set arrives every few seconds, so an un-cached miss would leak on a
 // heartbeat. One decision per name, kept.
-struct ResolveEntry { char name[64]; void* cls; };
-static ResolveEntry g_resolved[96];
-static int g_resolvedN = 0;
-
+// NO CLASS CACHE, deliberately (one was here and got a field round spent on it): a UClass returned
+// by TryLoad stays alive only while something references it, and OUR references are the spawned
+// actors themselves -- the moment a session reset destroys the last one, the soft-loaded class is
+// garbage-collectable IN THE SAME WORLD, and a cached pointer starts dangling. Field-logged as the
+// same three classes spawning at 23:26 and returning null / FAULTING from 23:33, with zero level
+// changes between. TryLoad on a live class is a cheap resolve, spawns are rare, and a fresh answer
+// is valid by construction at the moment it is used.
 static void* resolveClass(void* db, const char* name, void (*logf)(const char*)) {
-    for (int i = 0; i < g_resolvedN; i++) if (_stricmp(g_resolved[i].name, name) == 0) return g_resolved[i].cls;
     const Syms& S = Get();
     void* cls = nullptr;
     char sample[200] = {0};
@@ -468,11 +510,6 @@ static void* resolveClass(void* db, const char* name, void (*logf)(const char*))
         if (logf && sayUnknownOnce(name)) { char msg[320]; snprintf(msg, sizeof(msg),
             "[drop] object '%s' is not in this install's dropper catalogue -- skipping it%s%s",
             name, sample[0] ? ". Mine are named like: " : "", sample); logf(msg); }
-    }
-    if (g_resolvedN < (int)(sizeof(g_resolved) / sizeof(g_resolved[0]))) {
-        strncpy_s(g_resolved[g_resolvedN].name, sizeof(g_resolved[0].name), name, _TRUNCATE);
-        g_resolved[g_resolvedN].cls = cls;
-        g_resolvedN++;
     }
     return cls;
 }
@@ -645,24 +682,25 @@ bool IsSelectedLocally(void* actor) {
 #endif
 }
 
-// ---- THE SESSION'S OWN COPIES (see the header) -------------------------------------------------
-struct SessionWorld {
+// ---- THE LEVEL'S OWN PROPS, moved for the session (see the header) -----------------------------
+struct WorldTouched {
     char  name[64];
-    void* original;      // the level's own actor, hidden for the session
-    void* copy;          // ours, spawned at the map default
+    void* actor;                       // the level's own actor, standing on a session pose
+    float origLoc[3], origQuat[4];     // where THIS player's world had it before the session
+    float stashLoc[3], stashQuat[4];   // the session pose, parked here across a bracketed save
+    bool  stashed;
 };
-static SessionWorld g_sw[128];
-static int          g_swN = 0;
-int SessionWorldCount() { return g_swN; }
+static WorldTouched g_wt[128];
+static int          g_wtN = 0;
+int WorldTouchedCount() { return g_wtN; }
 static bool g_saveGuard = false;
 void SetSaveGuardArmed(bool armed) { g_saveGuard = armed; }
 bool SaveGuardArmed() { return g_saveGuard; }
 
-static SessionWorld* swFind(const char* name) {
-    for (int i = 0; i < g_swN; i++) if (_stricmp(g_sw[i].name, name) == 0) return &g_sw[i];
+static WorldTouched* wtFind(const char* name) {
+    for (int i = 0; i < g_wtN; i++) if (_stricmp(g_wt[i].name, name) == 0) return &g_wt[i];
     return nullptr;
 }
-void* SessionWorldCopy(const char* name) { SessionWorld* w = swFind(name); return w ? w->copy : nullptr; }
 
 #ifdef _WIN32
 // The level's own actor with this name, proven to be a dropper prop and not one of ours. The name
@@ -687,104 +725,89 @@ static void* levelActorByName(const char* name) {
 }
 #endif
 
-bool SessionWorldBegin(void* ownPawn, const char* actorName, void (*logf)(const char*)) {
+void* WorldTouch(const char* actorName) {
 #ifdef _WIN32
-    const Syms& S = Get();
-    if (!ownPawn || !actorName || !actorName[0]) return false;
-    if (swFind(actorName)) return true;                       // already standing
-    if (g_swN >= (int)(sizeof(g_sw) / sizeof(g_sw[0]))) return false;
-    void* orig = levelActorByName(actorName);
-    if (!orig) { g_st.worldMissing++; return false; }
-
-    // WHERE THE MAP PUT IT. Captured at the Load seam if this player's save moved it; otherwise the
-    // actor is standing on its default right now, so reading it IS the answer. Every client resolves
-    // the same world position from its own data, which is why no pose has to travel for the layout.
+    if (!actorName || !actorName[0]) return nullptr;
+    if (WorldTouched* w = wtFind(actorName)) return w->actor;
+    if (g_wtN >= (int)(sizeof(g_wt) / sizeof(g_wt[0]))) return nullptr;
+    void* actor = levelActorByName(actorName);
+    if (!actor) { g_st.worldMissing++; return nullptr; }
+    // The pose it stands on RIGHT NOW is this player's own arrangement -- their save applied it at
+    // level load. Remembered before anything writes, because it is what every restore returns to.
     float loc[3], quat[4];
-    if (!MapDefaultOf(orig, loc, quat) && !ActorPoseOf(orig, loc, quat)) return false;
-
-    void* cls = rdPtr(orig, off::kObjClassPrivate);
-    void* world = S.GetWorld(ownPawn);
-    if (!cls || !world || !S.SpawnActor) return false;
-
-    float rot0[3] = { 0, 0, 0 };
-    uint8_t params[0x80]; memset(params, 0, sizeof(params));
-    void* p = nullptr;
-    unsigned long xcode = 0;
-    __try { p = S.SpawnActor(world, cls, loc, rot0, params); }
-    __except (xcode = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) { p = nullptr; }
-    if (!p) {
-        g_st.spawnFails++;
-        if (logf) { char m[200]; snprintf(m, sizeof(m), "[drop/world] could not spawn a session copy of"
-            " '%s'%s", actorName, xcode ? " (FAULTED)" : ""); logf(m); }
-        return false;
-    }
-
-    // Registered as one of ours FIRST: every "is this actor mine?" answer -- the save purge included
-    // -- has to be right from the actor's first frame.
-    if (g_remoteN < kMaxObjects) g_remote[g_remoteN++] = p;
-    __try { if (S.SetReplicates) S.SetReplicates(p, false); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { g_st.faults++; }
-    // Left PICKABLE so anybody can rearrange it -- but only when the save guard is actually hooked.
-    // Without it a session prop could be called back into this player's inventory and written to
-    // their profile, so the feature gives up its capability instead of their save.
-    if (!g_saveGuard) clearPickable(p);
-    purgeFromAllObjects(p);
-    makeMovable(p);
-    __try { S.SetActorLocRot(p, loc, quat, false, nullptr, 0); }
-    __except (EXCEPTION_EXECUTE_HANDLER) { g_st.faults++; }
-
-    // ...and the player's own copy steps aside. Visual AND collision, or it stays a solid obstacle
-    // exactly where the session copy now stands.
-    __try {
-        if (S.SetActorCollision) S.SetActorCollision(orig, false);
-        if (S.SetActorHidden)    S.SetActorHidden(orig, true);
-    } __except (EXCEPTION_EXECUTE_HANDLER) { g_st.faults++; }
-
-    SessionWorld& w = g_sw[g_swN++];
-    g_st.sessionWorld = g_swN;
+    if (!ActorPoseOf(actor, loc, quat)) return nullptr;
+    makeMovable(actor);
+    WorldTouched& w = g_wt[g_wtN++];
+    g_st.worldTouched = g_wtN;
     strncpy_s(w.name, sizeof(w.name), actorName, _TRUNCATE);
-    w.original = orig; w.copy = p;
-    g_st.spawned++;
-    return true;
+    w.actor = actor;
+    memcpy(w.origLoc, loc, sizeof(w.origLoc)); memcpy(w.origQuat, quat, sizeof(w.origQuat));
+    w.stashed = false;
+    return actor;
 #else
-    (void)ownPawn; (void)actorName; (void)logf; return false;
+    (void)actorName; return nullptr;
 #endif
 }
 
-void ReassertSessionWorldHidden() {
-#ifdef _WIN32
-    const Syms& S = Get();
-    for (int i = 0; i < g_swN; i++) {
-        __try {
-            if (S.SetActorHidden)    S.SetActorHidden(g_sw[i].original, true);
-            if (S.SetActorCollision) S.SetActorCollision(g_sw[i].original, false);
-        } __except (EXCEPTION_EXECUTE_HANDLER) { g_st.faults++; }
-    }
-#endif
+bool WorldOriginalOf(const char* actorName, float loc[3], float quat[4]) {
+    WorldTouched* w = wtFind(actorName);
+    if (!w) return false;
+    memcpy(loc, w->origLoc, 12); memcpy(quat, w->origQuat, 16);
+    return true;
 }
 
-bool SessionWorldPose(const char* name, float loc[3], float quat[4]) {
-    SessionWorld* w = swFind(name);
-    return w && w->copy && ActorPoseOf(w->copy, loc, quat);
-}
-
-void SessionWorldEnd(void (*logf)(const char*)) {
+void RestoreWorldAll(void (*logf)(const char*)) {
 #ifdef _WIN32
-    if (!g_swN) return;
+    if (!g_wtN) return;
     const Syms& S = Get();
-    const int n = g_swN;
-    for (int i = 0; i < g_swN; i++) {
-        if (g_sw[i].copy) DestroyRemote(g_sw[i].copy, logf);
-        __try {
-            if (S.SetActorHidden)    S.SetActorHidden(g_sw[i].original, false);
-            if (S.SetActorCollision) S.SetActorCollision(g_sw[i].original, true);
-        } __except (EXCEPTION_EXECUTE_HANDLER) { g_st.faults++; }
+    const int n = g_wtN;
+    for (int i = 0; i < g_wtN; i++) {
+        makeMovable(g_wt[i].actor);                 // the game restores remembered mobility on dropper close
+        __try { S.SetActorLocRot(g_wt[i].actor, g_wt[i].origLoc, g_wt[i].origQuat, false, nullptr, 0); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { g_st.faults++; }
     }
-    g_swN = 0; g_st.sessionWorld = 0;
+    g_wtN = 0; g_st.worldTouched = 0;
     if (logf) { char m[160]; snprintf(m, sizeof(m),
         "[drop/world] session over -- %d level prop(s) back to your own arrangement", n); logf(m); }
 #else
     (void)logf;
+#endif
+}
+
+// The save bracket (see the header). Begin parks each prop's SESSION pose and stands it on its
+// original; End puts the session pose back. Between the two the game reads the world and writes the
+// profile, so what it records is always the player's own arrangement. Both are no-ops for a prop
+// whose pose was never changed (origin == current), which keeps the bracket harmless when idle.
+void WorldSaveRestoreBegin() {
+#ifdef _WIN32
+    const Syms& S = Get();
+    for (int i = 0; i < g_wtN; i++) {
+        WorldTouched& w = g_wt[i];
+        w.stashed = false;
+        float loc[3], quat[4];
+        if (!ActorPoseOf(w.actor, loc, quat)) continue;
+        const float dx = loc[0]-w.origLoc[0], dy = loc[1]-w.origLoc[1], dz = loc[2]-w.origLoc[2];
+        if (dx*dx + dy*dy + dz*dz < 0.25f) {
+            float qd = 0; for (int k = 0; k < 4; k++) { const float d = quat[k]-w.origQuat[k]; qd += d*d; }
+            if (qd < 1e-6f) continue;                // standing on its original: nothing to bracket
+        }
+        memcpy(w.stashLoc, loc, sizeof(w.stashLoc)); memcpy(w.stashQuat, quat, sizeof(w.stashQuat));
+        w.stashed = true;
+        __try { S.SetActorLocRot(w.actor, w.origLoc, w.origQuat, false, nullptr, 0); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { g_st.faults++; }
+    }
+#endif
+}
+void WorldSaveRestoreEnd() {
+#ifdef _WIN32
+    const Syms& S = Get();
+    for (int i = 0; i < g_wtN; i++) {
+        WorldTouched& w = g_wt[i];
+        if (!w.stashed) continue;
+        w.stashed = false;
+        __try { S.SetActorLocRot(w.actor, w.stashLoc, w.stashQuat, false, nullptr, 0); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { g_st.faults++; }
+    }
 #endif
 }
 
@@ -807,21 +830,28 @@ int PurgeOursFromSaveList() {
 #endif
 }
 
+struct MapDefault { void* actor; float loc[3]; float quat[4]; };
+static MapDefault g_mapDef[512];
+static int        g_mapDefN = 0;
+static bool       g_inLoad = false;
+
 int MovedWorldNames(char out[][64], int cap) {
 #ifdef _WIN32
-    void* m = Manager();
-    TArrayHdr a;
-    if (!m || cap <= 0 || !readArray(m, off::kDropMgrAllObjects, &a)) return 0;
+    // MOVED means "not where the map put it": the map-default table (fed by the Load seam, topped up
+    // by first-sight capture during enumeration) holds where each prop started, so the answer is a
+    // pose diff against it -- NOT a walk of `_allObjects`, whose membership is the manager's business
+    // and includes props nobody ever touched. A prop dragged back onto its own default correctly
+    // stops counting as moved.
+    if (cap <= 0) return 0;
     int n = 0;
-    for (int i = 0; i < a.num && n < cap; i++) {
-        void* actor = nullptr;
-        if (!rd(&a.data[i], &actor, sizeof(actor)) || !actor) continue;
-        if (IsRemote(actor) || isStorable(actor)) continue;    // ours, or an inventory prop
-        // FIRST SIGHT IS THE DEFAULT. The Load seam only sees props the SAVE moves; one the player
-        // rearranges during play was never in that file, so without this its "default" would be
-        // wherever they had just dragged it -- and a session rejoin would stand its copy there.
-        // First-write-wins, so a prop Load already recorded keeps the better answer.
-        NoteMapDefault(actor);
+    for (int i = 0; i < g_mapDefN && n < cap; i++) {
+        void* actor = g_mapDef[i].actor;
+        if (!actor || IsRemote(actor)) continue;
+        float loc[3], quat[4];
+        if (!ActorPose(actor, loc, quat)) continue;
+        const float dx = loc[0]-g_mapDef[i].loc[0], dy = loc[1]-g_mapDef[i].loc[1], dz = loc[2]-g_mapDef[i].loc[2];
+        float qd = 0; for (int k = 0; k < 4; k++) { const float d = quat[k]-g_mapDef[i].quat[k]; qd += d*d; }
+        if (dx*dx + dy*dy + dz*dz < 1.0f && qd < 1e-5f) continue;    // standing on its default
         if (!ObjectName(actor, out[n], 64) || !out[n][0]) continue;
         n++;
     }
@@ -835,10 +865,6 @@ int MovedWorldNames(char out[][64], int cap) {
 // Actor-keyed, so it dies with the world like every other actor pointer we hold. Sized for the whole
 // level rather than for a session's worth of props: this records what the MAP has, which is a
 // property of the level and not of who is playing.
-struct MapDefault { void* actor; float loc[3]; float quat[4]; };
-static MapDefault g_mapDef[512];
-static int        g_mapDefN = 0;
-static bool       g_inLoad = false;
 
 void SetInPersistentLoad(bool inside) { g_inLoad = inside; }
 bool InPersistentLoad() { return g_inLoad; }
@@ -847,6 +873,10 @@ int  MapDefaultCount() { return g_mapDefN; }
 void NoteMapDefault(void* actor) {
 #ifdef _WIN32
     if (!actor || g_mapDefN >= (int)(sizeof(g_mapDef) / sizeof(g_mapDef[0]))) return;
+    // Never capture a prop that is standing on a SESSION pose -- reading it now would record the
+    // host's arrangement as this map's default. (First sight during a session happens: the world
+    // table can touch a prop before the enumeration ever saw it.)
+    for (int i = 0; i < g_wtN; i++) if (g_wt[i].actor == actor) return;
     // FIRST WRITE WINS. Load may move a prop more than once, and only the pose before the FIRST move
     // is the map's -- every later one is already the save talking.
     for (int i = 0; i < g_mapDefN; i++) if (g_mapDef[i].actor == actor) return;
@@ -874,21 +904,18 @@ bool MapDefaultOf(void* actor, float loc[3], float quat[4]) {
 
 void Forget() {
     g_mapDefN = 0; g_st.mapDefaults = 0;   // actor-keyed: they died with the level
-    g_swN = 0;                             // ...and so did the session's copies and originals
-    g_remoteN = 0; g_hiddenN = 0; g_clsCacheN = 0;
-    // The resolve cache holds UClass pointers from TryLoad. A class stays valid while something
-    // references it, and after a world change nothing of ours does -- so it is dropped rather than
-    // trusted. The cost is one catalogue walk per name in the new world; the alternative is handing
-    // SpawnActor a collected pointer.
-    g_resolvedN = 0;
+    g_wtN = 0; g_st.worldTouched = 0;      // ...and so did the touched props and their originals
+    g_remoteN = 0; g_hiddenN = 0; g_preN = 0; g_clsCacheN = 0;
     g_st.remote = 0; g_st.own = 0;
 }
 
 void ResetAll(void (*logf)(const char*)) {
-    SessionWorldEnd(logf);          // copies destroyed, the player's own props unhidden
+    RestoreWorldAll(logf);          // every level prop back on this player's own arrangement
     while (g_remoteN > 0) DestroyRemote(g_remote[g_remoteN - 1], logf);
     RestoreOwnSet(logf);
-    Forget();
+    // NOT Forget(): the world is still standing, and so is everything the map-default table knows
+    // about it. Only a level change may clear that table -- see the header note.
+    g_preN = 0;
 }
 
 }}} // namespace omp::game::dropper

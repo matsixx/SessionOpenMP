@@ -63,9 +63,9 @@ void MpPrefs_SetDropMode(int mode);
 // shove around). A SEPARATE setting from the one above, and OFF by default, deliberately: sharing
 // them is the unfinished half of this feature and it must not be able to destabilise the inventory
 // sharing, which works. Off = the level's furniture is left entirely alone.
-enum { MPWORLD_OFF = 0, MPWORLD_SHARED = 1 };
-int  MpPrefs_WorldMode();                // MPWORLD_* -- default MPWORLD_OFF
-void MpPrefs_SetWorldMode(int mode);
+// The old separate world-props mode (MPWORLD_*) is retired: the level's own props are part of
+// "Share one set" now -- the host's arrangement IS the session layout. The WorldMode ini key is
+// ignored on read and no longer written.
 
 // Bumped by the setters whose value the TRANSPORT has to be told about. The game thread applies
 // those when this changes, so a menu can write from any thread without ever calling into the SDK

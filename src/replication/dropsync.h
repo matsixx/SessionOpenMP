@@ -10,7 +10,7 @@
 // work combined with the Epic Online Services SDK and the proprietary game runtime it
 // loads into. See LICENSE-EXCEPTION.txt.
 //
-// SessionOpenMP -- the DROPPED-OBJECT lane (magic "OMPL"). The codec and the part assembly only; it
+// SessionOpenMP -- the DROPPED-OBJECT lane (magic "OMPO"). The codec and the part assembly only; it
 // never touches the game (game/dropper.cpp) and never touches the transport (the session injects a
 // send function, exactly as replaysync does), so the whole protocol runs in the offline loop test.
 //
@@ -80,17 +80,30 @@ int SendMove(int peerIdx, uint8_t gen, const Rec* recs, int n);
 int SendRemove(int peerIdx, uint8_t gen, const uint16_t* ids, int n);
 
 // ---- THE LEVEL'S OWN PROPS ---------------------------------------------------------------------
-// A separate, tiny lane, deliberately NOT part of the object set above. A session prop is not owned
-// by anybody: every client spawns its own copy at the map default, so the STARTING layout needs no
-// transfer at all -- only membership does, and then whoever picks one up says where it went.
-//   kWorldSet   the actor NAMES this player's save has moved. Unioned by everyone; each name becomes
-//               one session copy on every machine. Names, not poses: the pose is the map default,
-//               which every client computes from its own copy of the level.
-//   kWorldMove  one prop's pose, sent by whoever is holding it. `claim` is true while they still have
-//               it. Only the holder ever sends, so there is exactly one writer per prop at all times
-//               and nothing has to be arbitrated afterwards.
-static const int kWorldNameBatch = 10;
-int SendWorldSet(int peerIdx, uint8_t gen, const char* const* names, int n);
+// A separate lane, deliberately NOT part of the object set above: these actors already exist on
+// every machine (they are baked into the map), so nothing is ever spawned for them -- each client
+// MOVES ITS OWN copy of the actor named.
+//   kWorldSet   the HOST'S ARRANGEMENT: name + pose for every level prop the session layout has an
+//               opinion about. Sent by the canonical player only, assembled from parts exactly like
+//               kSet (a half-received layout would revert the missing props to their defaults), and
+//               a COMPLETE EMPTY set is meaningful -- it says "the host moved nothing", which still
+//               tells a joiner to stand its own moved props back on their map defaults.
+//   kWorldMove  one prop's pose, sent by whoever is holding it. `claim` is true while they still
+//               have it. Only the holder ever sends, so there is exactly one writer per prop at all
+//               times; the host folds the release pose into its layout so later resyncs carry it.
+static const int kMaxWorldRecords   = 128;   // must match the session's world table
+static const int kWorldRecsPerPacket = 10;   // 92 B worst-case record; 10 stays under the 1 KB cap
+
+struct WorldRec {
+    char  name[64];        // the level actor's own name -- identical on every install
+    float loc[3];
+    float quat[4];
+};
+// All-or-nothing like SendSet: returns parts sent, or 0 having sent nothing if the whole layout
+// cannot go. n = 0 is a legal, meaningful send (one empty part). `map` is the level the layout
+// describes: a layout is meaningless anywhere else, and an EMPTY one actively harmful (it reads as
+// "revert your furniture to its defaults") -- so the receiver refuses a map that is not its own.
+int SendWorldSet(int peerIdx, uint8_t gen, const char* map, const WorldRec* recs, int n, int budget);
 int SendWorldMove(int peerIdx, uint8_t gen, const char* name, const float loc[3], const float quat[4],
                   bool claim);
 
@@ -106,9 +119,9 @@ struct Update {
     int     nPlace     = 0;   const Rec*      place  = nullptr;
     int     nMove      = 0;   const Rec*      move   = nullptr;
     int     nRemove    = 0;   const uint16_t* remove = nullptr;
-    // The level's own props. `worldSet` is a membership list; a world MOVE is one prop's pose from
-    // whoever is holding it.
-    int         nWorldSet = 0; const char* const* worldSet = nullptr;
+    // The level's own props. `worldSetReady` means a COMPLETE layout is available from
+    // WorldSetRecords(peerIdx); a world MOVE is one prop's pose from whoever is holding it.
+    bool        worldSetReady = false;
     bool        haveWorldMove = false;
     const char* worldMoveName = nullptr;
     float       worldMoveLoc[3] = {0,0,0};
@@ -119,6 +132,10 @@ struct Update {
 // applies: `out` is only filled from a packet that parsed completely.
 bool OnPacket(int peerIdx, const uint8_t* d, int len, Update& out);
 const Rec* SetRecords(int peerIdx, int* nOut);   // the last COMPLETE set for this peer
+// The last COMPLETE world layout from this peer, or null if none has ever assembled. A non-null
+// return with *nOut == 0 is the empty layout -- a real answer, not an absence. `mapOut` (optional)
+// receives the map the layout is FOR.
+const WorldRec* WorldSetRecords(int peerIdx, int* nOut, const char** mapOut = nullptr);
 void ForgetPeer(int peerIdx);
 void ResetAll();
 

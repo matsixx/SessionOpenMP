@@ -39,7 +39,6 @@ static int      g_bubbleDistM = 35;
 static int      g_dropMode    = MPDROP_SHARED;
 // OFF by default: sharing the level's own furniture is unfinished, and the setting exists so it
 // cannot take the working half down with it.
-static int      g_worldMode   = MPWORLD_OFF;
 
 static void say(const char* s) { if (g_log) g_log(s); }
 
@@ -61,7 +60,6 @@ static void saveAll() {
     fprintf(f, "# Dropped objects: 0 off, 1 only what is placed during the session, 2 share one set.\n");
     fprintf(f, "DropMode=%d\n", g_dropMode);
     fprintf(f, "# The level's own props (benches, barriers): 0 leave them alone, 1 share them.\n");
-    fprintf(f, "WorldMode=%d\n", g_worldMode);
     // PeerId is an IDENTITY, not a preference: deleting the line makes this install a different
     // person to everyone who has played with it. Written last, with a warning above it.
     fprintf(f, "# PeerId identifies this install to peers on non-EOS transports. Deleting it is\n"
@@ -104,17 +102,6 @@ void MpPrefs_SetHideAddress(bool on) {
 // or corrupt file can never produce a slider position the menu could not have produced.
 int  MpPrefs_NameMode()    { return g_nameMode; }
 int  MpPrefs_DropMode()    { return g_dropMode; }
-int  MpPrefs_WorldMode()   { return g_worldMode; }
-void MpPrefs_SetWorldMode(int mode) {
-    mode = clampI(mode, MPWORLD_OFF, MPWORLD_SHARED);
-    if (mode == g_worldMode) return;
-    g_worldMode = mode;
-    saveAll();
-    char m[140];
-    snprintf(m, sizeof(m), "[prefs] the level's own props: %s",
-             (mode == MPWORLD_OFF) ? "left alone" : "shared in a session");
-    say(m);
-}
 void MpPrefs_SetDropMode(int mode) {
     mode = clampI(mode, MPDROP_OFF, MPDROP_SHARED);
     if (mode == g_dropMode) return;
@@ -179,7 +166,6 @@ void MpPrefs_Init(const char* dir, void (*logf)(const char*)) {
             else if (!_stricmp(key, "NameDistM"))   g_nameDistM   = clampI(atoi(val), MPNAME_DIST_MIN, MPNAME_DIST_MAX);
             else if (!_stricmp(key, "BubbleDistM")) g_bubbleDistM = clampI(atoi(val), MPBUBBLE_DIST_MIN, MPBUBBLE_DIST_MAX);
             else if (!_stricmp(key, "DropMode"))    g_dropMode    = clampI(atoi(val), MPDROP_OFF, MPDROP_SHARED);
-            else if (!_stricmp(key, "WorldMode"))   g_worldMode   = clampI(atoi(val), MPWORLD_OFF, MPWORLD_SHARED);
             else if (!_stricmp(key, "PeerId")) {
                 // Only accept a well-formed one. A truncated or hand-edited id would still "work"
                 // right up until it collided with somebody, which is the worst time to find out.

@@ -38,6 +38,7 @@ const char* MyId() { return "test:self"; }
 // No lobby, so no host: the dropped-object authority falls back to its lowest-key rule, which is
 // exactly the path a host-less wire (shared memory) takes for real.
 const char* LobbyOwnerId() { return ""; }
+bool LobbyOwnershipKnowable() { return false; }   // the test rig is the symmetric-wire case
 const char* PeerIdStr(int) { return ""; }
 bool LobbyIsHost() { return false; }
 TrustLevel BackendTrust() { return TRUST_NONE; }  // no wire can vouch: the spawn gate stays open here

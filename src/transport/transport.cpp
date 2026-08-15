@@ -242,6 +242,7 @@ bool LobbyIsHost(){ return (g_cur == BK_EOS) && eosb::LobbyIsHost(); }
 // Only EOS has a lobby with an owner; the other backends have no such concept, so "" is the honest
 // answer rather than pretending somebody is in charge.
 const char* LobbyOwnerId(){ return (g_cur == BK_EOS) ? eosb::LobbyOwnerId() : ""; }
+bool LobbyOwnershipKnowable(){ return g_cur == BK_EOS; }
 // Shared memory and UDP come up in microseconds and have nothing to sign in to, so a successful Init
 // IS readiness for them. Only EOS has a state to poll.
 int InitState(){ return (g_cur == BK_EOS) ? eosb::InitState() : (g_cur == BK_NONE ? 0 : 2); }

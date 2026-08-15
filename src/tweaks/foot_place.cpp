@@ -55,6 +55,7 @@
 #include "foot_place.h"
 #include "foot_steer.h"       // shares this hook: only one detour may exist on UpdateFootAnchors
 #include "catch_tweaks.h"     // CatchTweaks_Skater() -- the live skater, without a hook of our own
+#include "catch_level.h"      // CatchLevel_PostPhysAssert() -- the post-physics level re-assert
 #include <cmath>
 #include "MinHook.h"
 
@@ -139,6 +140,10 @@ static void hkUpdateFootAnchors(void* self, double dt, void* a, void* b) {
         void* t = twkP(self, AN_SKATER);
         if (m && t && m != t) mine = false;
     }
+    // The post-physics level re-assert rides this detour because it runs INSIDE the animation
+    // update, after the physics pass -- the one phase where a pitch write beats the game's per-frame
+    // trajectory re-arm to the renderer. Our skater only; the function gates itself further.
+    if (mine) CatchLevel_PostPhysAssert();
     unsigned char savedAA = 0;
     bool suppressed = false;
     if (mine && g_ok && g_on && self && SuppressWanted(self)) {

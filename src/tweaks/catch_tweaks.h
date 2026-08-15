@@ -49,6 +49,7 @@ void CatchTweaks_PumpFrame();
 // A registered catch ends the flip at griptape-up instead of letting it spin another revolution.
 bool CatchTweaks_StopsFlip();  void CatchTweaks_SetStopsFlip(bool on);
 bool CatchTweaks_AnyRevolution();  void CatchTweaks_SetAnyRevolution(bool on);
+bool CatchTweaks_FootLevelsBoard(); void CatchTweaks_SetFootLevelsBoard(bool on);
 // Tune the game's own boned ollie. It is authored catch-orient data -- FCatchOrientSettings carries
 // four BoardRelativeOffset vectors that shove the board forward of the skater while both sticks are
 // held, the legs following because the feet are IK'd to the deck. Lives here because this module
@@ -71,5 +72,9 @@ bool  CatchTweaks_FlickInvert(); void CatchTweaks_SetFlickInvert(bool on);
 // detour per address; a hook destroys its own signature). run_out uses the address as a
 // return-range anchor, so it must take it from here rather than scan for it again.
 void* CatchTweaks_SetCatchOrientAddr();
+// True while a flip trick is running and every CURRENTLY-DEFLECTED stick's deflection began
+// before the pop -- the held-over test behind CatchNeedsFreshFlick, shared so catch_level can
+// gate its post-physics level assert on it.
+bool  CatchTweaks_HeldOverStale();
 float CatchTweaks_BoneScalePct();  void CatchTweaks_SetBoneScalePct(float v);
 float CatchTweaks_BoneAdd(int axis); void CatchTweaks_SetBoneAdd(int axis, float v);

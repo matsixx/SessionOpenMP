@@ -88,12 +88,27 @@ bool  LocalActive();            // the local player is IN the dropper right now 
 // Returns the count written; `actorsOut` (optional) receives the matching actor pointers.
 int   EnumerateOwn(ObjRec* out, void** actorsOut, int cap);
 
+// ---- the pre-session baseline -----------------------------------------------------------------
+// The inventory objects this player already had when the session began. Snapshotted ONCE, at the
+// moment the first peer appears, and it is the single list three policies consult:
+//   * publish: a baseline object goes on the wire only while WE are the canonical (host) set --
+//     Live-only never shares it, and a joiner's park never flashes at peers while authority settles.
+//   * adoption: HideOwnSet hides exactly this list (not a fresh snapshot -- by adoption time the
+//     player may already have placed post-join objects, and those must stay visible and published).
+//   * teardown: cleared when the session ends, so solo play is untouched.
+void  SnapshotPreSession();
+bool  IsPreSession(void* actor);
+void  ClearPreSession();
+int   PreSessionCount();
+
 // ---- adoption ---------------------------------------------------------------------------------
-// Snapshot the current `_allObjects` as "mine, from my save" and hide + decollide all of it, so the
-// world shows exactly one canonical set. Reversible and save-neutral. Objects placed AFTER this are
-// not in the snapshot, so they stay visible and get published as ours.
+// Hide + decollide the pre-session baseline, so the world shows exactly one canonical set.
+// Reversible and save-neutral. Objects placed after the baseline stay visible and published.
 void  HideOwnSet(void (*logf)(const char*));
 void  RestoreOwnSet(void (*logf)(const char*));
+// Re-assert the hide: the replay editor's exit pass un-hides everything it registered, the adopted
+// set included. Called on a slow beat for as long as adoption stands.
+void  ReassertOwnSetHidden();
 bool  OwnSetHidden();
 
 // ---- remote objects ---------------------------------------------------------------------------
@@ -109,32 +124,27 @@ void  DestroyRemote(void* actor, void (*logf)(const char*));
 bool  IsRemote(void* actor);
 int   RemoteCount();
 
-// ---- THE SESSION'S OWN COPIES OF THE LEVEL'S PROPS -------------------------------------------------
-// The level's benches and barriers are NOT moved for a session. Instead each client HIDES its own
-// (which its save has arranged its own way) and everyone spawns a fresh copy at the prop's MAP
-// DEFAULT -- so every machine reconstructs the same starting layout with nothing transferred, because
-// "where the map put it" is the same everywhere by definition.
-// What that buys, and why the previous three attempts failed without it: a session prop is an actor
-// WE own, exactly like a peer's inventory object. Nothing writes to the game's own level actors, so
-// there is no drift correction fighting the game, no restoring poses on the way out, and no need to
-// know where a bench "should" be at leave time -- the copy is simply destroyed and the original
-// unhidden.
-// They are deliberately left PICKABLE, so anybody can rearrange them. That is safe only because of
-// the Save hook (see game_syms.h): a pickable prop of ours can otherwise be called back into the
-// local player's inventory and written into their profile.
-// Identity is the ORIGINAL actor's name, which is baked into the map package and therefore the same
-// on every install -- the one shared handle available for an object every client spawns for itself.
-bool  SessionWorldBegin(void* ownPawn, const char* actorName, void (*logf)(const char*));
-void* SessionWorldCopy(const char* actorName);       // our spawned copy, or null
-bool  SessionWorldPose(const char* actorName, float loc[3], float quat[4]);   // where OUR copy is now
-void  SessionWorldEnd(void (*logf)(const char*));    // destroy every copy, unhide every original
-// Put the hide back. The originals are real LEVEL actors, so things other than us have opinions about
-// their visibility -- the replay editor's exit pass restores whatever it has registered, which
-// un-hides every one of them and leaves the player looking at their own arrangement standing inside
-// the session's. Cheap enough to simply re-assert on a slow beat rather than trying to enumerate
-// everything that might interfere.
-void  ReassertSessionWorldHidden();
-int   SessionWorldCount();
+// ---- THE LEVEL'S OWN PROPS, moved for the session --------------------------------------------------
+// The session layout for the level's benches and barriers is THE HOST'S ARRANGEMENT, and each client
+// applies it to its OWN copy of the real actors -- nothing is hidden and nothing is spawned, because
+// the actor named already exists on every machine (it is baked into the map). Identity is therefore
+// the actor's own name, the one handle that is identical on every install.
+// WorldTouch is the single entry point: it resolves the actor, remembers the pose it is standing on
+// RIGHT NOW (= this player's own arrangement) the first time it is touched, and flips it Movable so
+// a transform write can land at all (a Static component silently discards them). Everything written
+// afterwards is reversible from that memory:
+//   * RestoreWorldAll puts every touched prop back on its remembered pose -- leaving a session gives
+//     you your own world back exactly.
+//   * WorldSaveRestoreBegin/End bracket the game's own save: originals go on for the write, session
+//     poses come back after, so a mid-session save records the player's OWN arrangement and never
+//     the host's. Without this, leaving the dropper mid-session would write the shared layout into
+//     the local profile -- the one kind of damage this feature must never do.
+void* WorldTouch(const char* actorName);             // resolve + remember + make movable; null = no such prop
+bool  WorldOriginalOf(const char* actorName, float loc[3], float quat[4]);
+void  RestoreWorldAll(void (*logf)(const char*));
+int   WorldTouchedCount();
+void  WorldSaveRestoreBegin();
+void  WorldSaveRestoreEnd();
 // Actor names of the level props THIS player's save has moved -- our contribution to the session's
 // set. A prop nobody has ever moved is already at its map default on every machine and needs no copy.
 int   MovedWorldNames(char out[][64], int cap);
@@ -178,8 +188,8 @@ struct Stats {
     int faults = 0;
     int driftFixes = 0;         // settled objects the game moved and we put back
     int madeMovable = 0;        // props flipped out of Static mobility so a write can land at all
-    int skipWorld = 0;          // the level's own props, left alone on purpose
-    int sessionWorld = 0;       // level props currently swapped for a session copy
+    int skipWorld = 0;          // the level's own props (they travel on their own lane, not this one)
+    int worldTouched = 0;       // level props currently standing on a session pose
     int worldMissing = 0;       // names a peer contributed that this install's map does not have
     int mapDefaults = 0;        // props whose map-default pose we captured at the Load seam
     int mapDefaultMissed = 0;   // ...and ones we could not read, which would be a silent hole
@@ -191,9 +201,11 @@ struct Stats {
 };
 const Stats& St();
 
-// Drop every remote object and un-hide our own set. Called on world change, on leaving a session and
-// on ResetAll -- a dropped-object actor does not survive a level load, and forgetting one would let a
-// stale pointer be destroyed later.
+// Drop every remote object and un-hide our own set -- a SESSION ending, with the world still alive.
+// Deliberately keeps the map-default table: the actors it describes are still standing, and wiping it
+// let the first-sight capture re-learn every prop's CURRENT pose as its "default", after which
+// MovedWorldNames reported an empty arrangement forever (field-logged as the host seeding 0 props on
+// a rejoin).
 void  ResetAll(void (*logf)(const char*));
 // The world changed under us: UE destroyed every actor. Forget the pointers WITHOUT touching them.
 void  Forget();

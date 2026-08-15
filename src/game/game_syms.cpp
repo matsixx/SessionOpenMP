@@ -425,6 +425,14 @@ static void* scanRange(const uint8_t* base, size_t len, const Pat& p, int* hits)
 }
 
 const Syms& Resolve(void (*logf)(const char*)) {
+    // ONCE. The scan now runs from the mod CONSTRUCTOR -- the game's boot-time level load applies
+    // the world-prop save ~7 s after process start, and the seams that must observe it used to
+    // install at unreal-init, ~8 s in: a sub-second COIN FLIP, field-measured landing both ways
+    // across one day's logs. Resolving at construction makes the race unlosable; the later
+    // unreal-init call gets the cached table.
+    static bool resolved = false;
+    if (resolved) return g_syms;
+    resolved = true;
     auto say = [&](const char* s) { if (logf) logf(s); };
     uint8_t* base = (uint8_t*)GetModuleHandleA(nullptr);
     auto* dos = (IMAGE_DOS_HEADER*)base;

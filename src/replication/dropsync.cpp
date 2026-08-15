@@ -23,7 +23,7 @@ namespace omp { namespace dropsync {
 // inventory ones; that feature was withdrawn and the flag with it, so the record layout changed again
 // and needs its own letter. OMPL and OMPM are RETIRED and must never be reused -- a stale build has
 // to reject these packets, not misparse a record whose length it disagrees about.
-static const uint32_t kMagic = 0x4E504D4Fu;   // "OMPN"
+static const uint32_t kMagic = 0x4F504D4Fu;   // "OMPO" -- OMPL/OMPM/OMPN retired, never reused
 // kWorldSet/kWorldMove are LATER ADDITIONS and need no magic bump: an older build's `default:`
 // ignores an unknown subtype, so a mixed pair simply does not share the level's props -- the
 // extension path replaysync's kAck established.
@@ -188,32 +188,66 @@ int SendSet(int peerIdx, uint8_t gen, uint64_t authKey, const Rec* recs, int n, 
     return parts;
 }
 
-int SendWorldSet(int peerIdx, uint8_t gen, const char* const* names, int n) {
-    if (!g_send || !names || n <= 0) return 0;
-    int sent = 0;
-    for (int at = 0; at < n; ) {
-        uint8_t pkt[kMaxPacket];
-        Wr w{ pkt, kMaxPacket, 0, true };
-        w.u32(kMagic); w.u8(kWorldSet); w.u8(gen);
-        const int countAt = w.n;
-        w.u8(0);
-        int took = 0, wrote = 0;
-        for (int i = at; i < n && wrote < kWorldNameBatch; i++) {
-            const int l = names[i] ? (int)strlen(names[i]) : 0;
-            took++;
-            if (!validName(names[i], l)) continue;    // consumed, not written
-            if (w.n + 1 + l > kMaxPacket) { took--; break; }
-            w.u8((uint8_t)l); w.b(names[i], l);
-            wrote++;
-        }
-        if (!w.ok || took == 0) break;
-        // The COUNT is what actually went in. A count that disagrees with the payload is how a
-        // reader walks off the end of a packet.
-        pkt[countAt] = (uint8_t)wrote;
-        if (wrote > 0) { g_send(peerIdx, pkt, w.n, true); g_st.sent++; sent++; }
-        at += took;
+// One world-set part. Records are self-contained (name inline), so unlike kSet there is no name
+// table -- but the ALL-OR-NOTHING rule is the same, for a sharper reason: a joiner reverts its own
+// moved props to their map defaults for every prop NOT in the layout, so a half-received layout
+// would actively move furniture to the wrong place rather than merely missing some.
+static int buildWorldPart(uint8_t* out, int cap, uint8_t gen, const char* map,
+                          uint8_t partIdx, uint8_t partCount,
+                          const WorldRec* recs, int first, int n, int* lenOut) {
+    Wr w{ out, cap, 0, true };
+    w.u32(kMagic); w.u8(kWorldSet); w.u8(gen);
+    w.u8(partIdx); w.u8(partCount);
+    // The map rides EVERY part (parts must parse alone); assembly takes part 0's copy.
+    const int ml = map ? (int)strlen(map) : 0;
+    w.u8((uint8_t)(ml > 39 ? 39 : ml));
+    if (ml) w.b(map, ml > 39 ? 39 : ml);
+    const int countAt = w.n;
+    w.u8(0);
+    int take = 0, wrote = 0;
+    for (int i = first; i < n && wrote < kWorldRecsPerPacket; i++) {
+        const int l = (int)strlen(recs[i].name);
+        if (!validName(recs[i].name, l)) { take++; g_st.unsendable++; continue; }   // consumed, not written
+        if (w.n + 1 + l + 28 > cap) break;
+        w.u8((uint8_t)l); w.b(recs[i].name, l);
+        for (int k = 0; k < 3; k++) w.f32(recs[i].loc[k]);
+        for (int k = 0; k < 4; k++) w.f32(recs[i].quat[k]);
+        take++; wrote++;
     }
-    return sent;
+    if (!w.ok || (take == 0 && first < n)) { *lenOut = 0; return 0; }
+    out[countAt] = (uint8_t)wrote;
+    *lenOut = w.n;
+    return take;
+}
+
+int SendWorldSet(int peerIdx, uint8_t gen, const char* map, const WorldRec* recs, int n, int budget) {
+    if (!g_send || n < 0 || n > kMaxWorldRecords) return 0;
+    if (map && !validName(map, (int)strlen(map))) map = "";
+    // Dry run first, exactly like SendSet: the part COUNT has to be known before part 0 goes.
+    const int kMaxParts = kMaxWorldRecords / 4 + 2;
+    int start[kMaxParts]; int parts = 0;
+    {
+        uint8_t scratch[kMaxPacket];
+        int at = 0;
+        do {
+            if (parts >= kMaxParts) return 0;
+            int len = 0;
+            const int took = buildWorldPart(scratch, kMaxPacket, gen, map, 0, 0, recs, at, n, &len);
+            if (len == 0) return 0;
+            start[parts++] = at;
+            at += took;
+            if (took == 0) break;                        // the empty layout: one part, zero records
+        } while (at < n);
+    }
+    if (budget > 0 && parts > budget) return 0;
+    for (int i = 0; i < parts; i++) {
+        uint8_t pkt[kMaxPacket]; int len = 0;
+        buildWorldPart(pkt, kMaxPacket, gen, map, (uint8_t)i, (uint8_t)parts, recs, start[i], n, &len);
+        if (len == 0) return i;
+        g_send(peerIdx, pkt, len, true);
+        g_st.sent++;
+    }
+    return parts;
 }
 
 int SendWorldMove(int peerIdx, uint8_t gen, const char* name, const float loc[3], const float quat[4],
@@ -300,8 +334,14 @@ struct PeerIn {
     uint8_t  asmGen = 0; int nextPart = -1, partCount = 0;
     Rec      scratch[kRecsPerPacket];                // decoded place/move records for this packet
     uint16_t ids[256];
-    char     worldBuf[kWorldNameBatch][kMaxNameLen + 1];
-    const char* worldPtr[kWorldNameBatch];
+    char     worldBuf[kMaxNameLen + 1];              // the kWorldMove name for this packet
+    // The world layout, assembled from parts exactly like the set above.
+    bool     whave = false;
+    WorldRec wset[kMaxWorldRecords];  int wsetN = 0;
+    char     wsetMap[40] = {0};
+    WorldRec wasm[kMaxWorldRecords];  int wasmN = 0;
+    char     wasmMap[40] = {0};
+    uint8_t  wAsmGen = 0; int wNextPart = -1, wPartCount = 0;
 };
 static PeerIn g_in[kPeers];
 
@@ -315,6 +355,13 @@ const Rec* SetRecords(int peerIdx, int* nOut) {
     if (peerIdx < 0 || peerIdx >= kPeers || !g_in[peerIdx].have) { if (nOut) *nOut = 0; return nullptr; }
     if (nOut) *nOut = g_in[peerIdx].setN;
     return g_in[peerIdx].set;
+}
+
+const WorldRec* WorldSetRecords(int peerIdx, int* nOut, const char** mapOut) {
+    if (peerIdx < 0 || peerIdx >= kPeers || !g_in[peerIdx].whave) { if (nOut) *nOut = 0; return nullptr; }
+    if (nOut) *nOut = g_in[peerIdx].wsetN;
+    if (mapOut) *mapOut = g_in[peerIdx].wsetMap;
+    return g_in[peerIdx].wset;
 }
 
 static bool readRec(Rd& r, Rec& out, const char* const* names, int nameN) {
@@ -350,6 +397,8 @@ bool OnPacket(int peerIdx, const uint8_t* d, int len, Update& out) {
         in.genSeen = true; in.gen = gen;
         in.have = false; in.setN = 0;
         in.nextPart = -1; in.asmN = 0;
+        in.whave = false; in.wsetN = 0;
+        in.wNextPart = -1; in.wasmN = 0;
         out.genReset = true;
     }
 
@@ -425,34 +474,73 @@ bool OnPacket(int peerIdx, const uint8_t* d, int len, Update& out) {
         return true;
     }
     case kWorldSet: {
-        const int n = (int)r.u8();
-        if (!r.ok || n <= 0 || n > kWorldNameBatch) { g_st.rejected++; return false; }
-        for (int i = 0; i < n; i++) {
+        const uint8_t partIdx   = r.u8();
+        const uint8_t partCount = r.u8();
+        char mapBuf[40] = {0};
+        {
+            const int ml = (int)r.u8();
+            if (!r.ok || ml > 39) { g_st.rejected++; return false; }
+            if (ml && !r.b(mapBuf, ml)) { g_st.rejected++; return false; }
+            mapBuf[ml] = 0;
+            if (ml && !validName(mapBuf, ml)) { g_st.rejected++; return false; }
+        }
+        const int recN = (int)r.u8();
+        if (!r.ok || partCount == 0 || partIdx >= partCount || recN > kWorldRecsPerPacket) {
+            g_st.rejected++; return false;
+        }
+        // Into a local first, like kSet: a part that fails halfway must not pollute the assembly.
+        WorldRec tmp[kWorldRecsPerPacket];
+        for (int i = 0; i < recN; i++) {
             const int l = (int)r.u8();
             if (!r.ok || l <= 0 || l > kMaxNameLen) { g_st.rejected++; return false; }
-            if (!r.b(in.worldBuf[i], l)) { g_st.rejected++; return false; }
-            in.worldBuf[i][l] = 0;
-            if (!validName(in.worldBuf[i], l)) { g_st.rejected++; return false; }
-            in.worldPtr[i] = in.worldBuf[i];
+            if (!r.b(tmp[i].name, l)) { g_st.rejected++; return false; }
+            tmp[i].name[l] = 0;
+            if (!validName(tmp[i].name, l)) { g_st.rejected++; return false; }
+            for (int k = 0; k < 3; k++) tmp[i].loc[k]  = r.f32();
+            for (int k = 0; k < 4; k++) tmp[i].quat[k] = r.f32();
+            if (!r.ok || !finite3(tmp[i].loc, kWorldLimit) || !unitQuat(tmp[i].quat)) {
+                g_st.rejected++; return false;
+            }
         }
         if (r.n != len) { g_st.rejected++; return false; }
-        out.nWorldSet = n; out.worldSet = in.worldPtr;
+
+        if (partIdx == 0) {
+            in.wasmN = 0; in.wNextPart = 0; in.wPartCount = partCount; in.wAsmGen = gen;
+            strncpy_s(in.wasmMap, sizeof(in.wasmMap), mapBuf, _TRUNCATE);
+        }
+        if (in.wNextPart != partIdx || in.wPartCount != partCount || in.wAsmGen != gen) {
+            in.wNextPart = -1; in.wasmN = 0;
+            g_st.partsDropped++;
+            g_st.recv++;
+            return true;
+        }
+        if (in.wasmN + recN > kMaxWorldRecords) { in.wNextPart = -1; in.wasmN = 0; g_st.rejected++; return false; }
+        for (int i = 0; i < recN; i++) in.wasm[in.wasmN++] = tmp[i];
+        in.wNextPart++;
+        if (in.wNextPart >= partCount) {
+            memcpy(in.wset, in.wasm, sizeof(WorldRec) * (size_t)in.wasmN);
+            in.wsetN = in.wasmN;
+            strncpy_s(in.wsetMap, sizeof(in.wsetMap), in.wasmMap, _TRUNCATE);
+            in.whave = true;
+            in.wNextPart = -1; in.wasmN = 0;
+            out.worldSetReady = true;
+        }
         g_st.recv++;
         return true;
     }
     case kWorldMove: {
         const int l = (int)r.u8();
         if (!r.ok || l <= 0 || l > kMaxNameLen) { g_st.rejected++; return false; }
-        if (!r.b(in.worldBuf[0], l)) { g_st.rejected++; return false; }
-        in.worldBuf[0][l] = 0;
-        if (!validName(in.worldBuf[0], l)) { g_st.rejected++; return false; }
+        if (!r.b(in.worldBuf, l)) { g_st.rejected++; return false; }
+        in.worldBuf[l] = 0;
+        if (!validName(in.worldBuf, l)) { g_st.rejected++; return false; }
         float loc[3], quat[4];
         for (int i = 0; i < 3; i++) loc[i]  = r.f32();
         for (int i = 0; i < 4; i++) quat[i] = r.f32();
         const bool claim = (r.u8() & 1) != 0;
         if (!r.ok || r.n != len) { g_st.rejected++; return false; }
         if (!finite3(loc, kWorldLimit) || !unitQuat(quat)) { g_st.rejected++; return false; }
-        out.haveWorldMove = true; out.worldMoveName = in.worldBuf[0];
+        out.haveWorldMove = true; out.worldMoveName = in.worldBuf;
         memcpy(out.worldMoveLoc, loc, sizeof(loc));
         memcpy(out.worldMoveQuat, quat, sizeof(quat));
         out.worldMoveClaim = claim;

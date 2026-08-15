@@ -91,6 +91,7 @@ struct Slot {
     // a peer with the feature off never sends one and can never be picked as the canonical set.
     uint64_t    dropAuthKey = 0;
     bool        haveDropAuth = false;
+    bool        worldSetFresh = false;   // a COMPLETE world layout from this peer awaits the frame
     // ---- dropped objects: the props THIS peer has in OUR world. The wire updates this table (ids,
     // target poses, what is new and what is gone); Frame does every game call from it. Splitting it
     // that way keeps actor spawning on the engine-tick anchor where the proxy spawn already lives,
@@ -138,25 +139,29 @@ static bool     g_dropResend = false;         // a new peer, or our world change
 static uint8_t  g_dropGen = 0;                // bumped whenever OUR localIds stop meaning what they meant
 static uint16_t g_dropNextId = 1;
 static bool     g_dropAdopted = false;        // we are the one hiding our own saved set
-// ---- THE LEVEL'S OWN PROPS. The session's set is the UNION of the names every player's save has
-// moved; each name becomes one copy on every machine, spawned at the map default, so the starting
-// layout needs nothing transferred. After that exactly one client at a time speaks for a prop: the
-// one holding it. Nobody re-asserts a resting prop, which is what makes this immune to the
-// everybody-republishes tug that sank the previous design.
+// ---- THE LEVEL'S OWN PROPS. The session layout is THE HOST'S ARRANGEMENT, applied by every client
+// to its OWN copy of the real actors (nothing is spawned -- the actor named is baked into the map).
+// This table is that layout: `tgt` is the pose the session says each prop stands on, seeded by the
+// host from its own world, folded forward by moves from whoever is holding a prop, and REPUBLISHED
+// by the host alone on the resync beat -- from this table, never from an actor readback, because an
+// actor mid-chase lags its target and echoing it is what made two clients fight. One writer per
+// prop at any moment: the holder while held, the host's stored value otherwise.
 struct WorldEntry {
     char     name[64];
-    bool     spawned;          // our copy is standing
     bool     mine;             // WE are holding it: we publish, and we ignore everyone else
     int      holder;           // peer index currently holding it, or -1
     uint64_t heldUs;           // when we last heard from that holder -- a claim goes stale
     float    tgtLoc[3], tgtQuat[4];
     float    curLoc[3], curQuat[4];
-    bool     driving;          // a peer's pose is being applied
+    bool     seeded;           // cur primed (a fresh entry is stamped, never slid across the map)
+    bool     driving;          // the actor is being driven toward tgt
+    bool     inSet;            // transient mark while applying a host layout
     float    lastSentLoc[3], lastSentQuat[4];
 };
-static WorldEntry g_world[128];
+static WorldEntry g_world[dropsync::kMaxWorldRecords];
 static int        g_worldN = 0;
-static bool       g_worldOn = false;          // the session's props are up
+static bool       g_worldOn = false;          // the session layout is applied
+static bool       g_worldSeeded = false;      // the HOST half: our arrangement has been tabled
 static const uint64_t kWorldClaimStaleUs = 2000000ull;
 
 static WorldEntry* worldFind(const char* name) {
@@ -173,8 +178,8 @@ static WorldEntry* worldAdd(const char* name) {
     return &w;
 }
 static void worldTearDown() {
-    game::dropper::SessionWorldEnd(g_logf);
-    g_worldN = 0; g_worldOn = false;
+    game::dropper::RestoreWorldAll(g_logf);
+    g_worldN = 0; g_worldOn = false; g_worldSeeded = false;
 }
 // Our published set, as of the last enumeration: the diff baseline. Keyed by ACTOR pointer, which is
 // stable for as long as the object exists and dies with the world (which is exactly when the
@@ -253,7 +258,7 @@ static Slot* slotFor(int peerIdx, uint64_t nowUs) {
         s.syncOn = false; s.syncReqSentUs = 0;
         for (auto& d : s.drop) d = Slot::DropObj();
         s.dropGenSeen = false; s.dropGen = 0;
-        s.dropAuthKey = 0; s.haveDropAuth = false;
+        s.dropAuthKey = 0; s.haveDropAuth = false; s.worldSetFresh = false;
         dropsync::ForgetPeer(peerIdx);
         g_cosResend = true;                          // they need OUR look too, now rather than in 10 s
         g_dropResend = true;                         // ...and our dropped objects, for the same reason
@@ -276,7 +281,14 @@ static Slot::DropObj* dropAlloc(Slot& s, uint16_t id) {
 static void dropSetTarget(Slot::DropObj& d, const dropsync::Rec& r, bool withClass) {
     memcpy(d.tgtLoc,  r.loc,  sizeof(d.tgtLoc));
     memcpy(d.tgtQuat, r.quat, sizeof(d.tgtQuat));
-    if (withClass && r.id[0]) strncpy_s(d.cls, sizeof(d.cls), r.id, _TRUNCATE);
+    if (withClass && r.id[0]) {
+        strncpy_s(d.cls, sizeof(d.cls), r.id, _TRUNCATE);
+        // A class-carrying record is a fresh chance: a spawn that failed TRANSIENTLY (the dangling
+        // resolve was one; an engine hiccup could be another) retries on the peer's next resync
+        // beat instead of staying a hole until their generation changes. Bounded by the 6 s beat,
+        // so a genuinely uninstallable object costs one attempt per beat, not a spawn storm.
+        d.spawnFailed = false;
+    }
     d.dead = false;
 }
 // Mark every object this peer still has for destruction. Frame does the destroying; a peer whose
@@ -328,13 +340,15 @@ static void applyDropUpdate(Slot& s, const dropsync::Update& up, int peerIdx, ui
     for (int i = 0; i < up.nRemove; i++)
         if (Slot::DropObj* d = dropFind(s, up.remove[i])) d->dead = true;
 
-    // ---- THE LEVEL'S OWN PROPS. Membership first: a name a peer contributes joins the session's set
-    // on every machine, and each machine spawns its own copy for it in Frame.
-    for (int i = 0; i < up.nWorldSet; i++) worldAdd(up.worldSet[i]);
+    // ---- THE LEVEL'S OWN PROPS. A complete layout is only a FLAG here: whether this peer is the
+    // one whose layout counts is the frame's decision (it knows who the host is), and the records
+    // stay retrievable from dropsync storage until then -- so a layout that arrives before authority
+    // resolves is simply picked up late rather than lost.
+    if (up.worldSetReady && g_dropPolicy == 2) s.worldSetFresh = true;
     // ...then a pose, from whoever is holding it. WE WIN WHILE WE HOLD IT: a pose for a prop in our
     // own hands would pull it out of them every packet, and both clients would pull against each
     // other for as long as both were dragging. Letting go hands it straight back.
-    if (up.haveWorldMove) {
+    if (up.haveWorldMove && g_dropPolicy == 2) {
         WorldEntry* w = worldAdd(up.worldMoveName);
         if (g_logf && debug::Get().dropWorld) { static int said = 0; if (said < 20) { said++; char m[200];
             snprintf(m, sizeof(m), "[drop/world] peer %d moved '%s' claim=%d -> %s", peerIdx,
@@ -635,7 +649,7 @@ void ForgetProxies() {
         s.dropGenSeen = false;
     }
     game::dropper::Forget();
-    g_worldN = 0; g_worldOn = false;   // the copies and originals died with the level
+    g_worldN = 0; g_worldOn = false; g_worldSeeded = false;   // the actors died with the level
     g_dropAdopted = false;               // the hidden list went with the world; nothing to restore
     dropNewGeneration("world changed");
     if (g_logf) g_logf("[session] world changed -- all proxy pointers dropped, spawning held until the world settles");
@@ -684,14 +698,27 @@ static void dropSendToAll(int kind, int nPeers, uint8_t gen,
 // Enumerate our own visible set, diff it against the baseline, and publish what changed. This is the
 // whole sender: place, duplicate, drag, stick-to-ground, revert and call-back are all just an added,
 // removed or moved entry, so none of them needs its own hook.
-static void dropPublishOwn(uint64_t nowUs, int nPeers, bool forceResync) {
+static void dropPublishOwn(uint64_t nowUs, int nPeers, bool forceResync, bool includeBaseline) {
     using namespace game;
     // STATIC, not stack: 256 objects across five buffers is ~100 KB, which is a lot to put on the
     // game thread's frame several times a second. Safe because everything here runs on that one
     // thread, like the rest of the session.
     static dropper::ObjRec recs[dropper::kMaxObjects];
     static void*           actors[dropper::kMaxObjects];
-    const int n = dropper::EnumerateOwn(recs, actors, dropper::kMaxObjects);
+    int n = dropper::EnumerateOwn(recs, actors, dropper::kMaxObjects);
+    // The publish filter (see dropFrame): pre-session objects travel only for the canonical set.
+    // Filtered here, before the diff, so an excluded object never enters the baseline table at all --
+    // to the wire it simply does not exist, and when canonical status flips the resync that the flip
+    // forces is what introduces (or withdraws) them wholesale.
+    if (!includeBaseline) {
+        int w = 0;
+        for (int i = 0; i < n; i++) {
+            if (dropper::IsPreSession(actors[i])) continue;
+            if (w != i) { recs[w] = recs[i]; actors[w] = actors[i]; }
+            w++;
+        }
+        n = w;
+    }
 
     static dropsync::Rec place[dropper::kMaxObjects]; int nPlace = 0;
     static dropsync::Rec move [dropper::kMaxObjects]; int nMove  = 0;
@@ -772,90 +799,195 @@ static void dropPublishOwn(uint64_t nowUs, int nPeers, bool forceResync) {
     if (nGone)  dropSendToAll(3, nPeers, g_dropGen, nullptr, nGone, gone);
 }
 
-// ---- THE LEVEL'S OWN PROPS, once per frame ---------------------------------------------------------
-// Every client hides the props its own save moved and stands a copy of each at the MAP DEFAULT, so
-// all machines reconstruct the same starting layout without a byte of pose travelling. From then on
-// exactly one client speaks for a prop -- whoever is holding it -- and a resting prop is published by
-// nobody at all. That last point is the whole design: the previous attempt had everyone re-asserting
-// every prop forever, which is what made them fight.
-static void worldFrame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, int nPeers, bool sessionLive,
-                       bool forceResync, float dt) {
+// Apply a complete layout from the host: every named prop's target becomes the host's pose, and any
+// prop OUR OWN save moved that the layout has no opinion about steps back onto its map default -- the
+// joiner's arrangement giving way to the host's, which is what "join someone's game and skate their
+// spot" means for the furniture.
+static void worldApplyHostSet(const dropsync::WorldRec* recs, int n) {
     using namespace game;
-    // OFF BY DEFAULT, and its own setting: this half is unfinished, and it must never be able to
-    // disturb the inventory sharing that works. Turning it off mid-session tears down cleanly --
-    // every copy destroyed, every original back.
-    if (MpPrefs_WorldMode() == MPWORLD_OFF) sessionLive = false;
+    for (int i = 0; i < g_worldN; i++) g_world[i].inSet = false;
+    for (int i = 0; i < n; i++) {
+        WorldEntry* w = worldAdd(recs[i].name);
+        if (!w) continue;
+        w->inSet = true;
+        if (w->mine) continue;                       // never yank a prop out of the local player's hands
+        memcpy(w->tgtLoc,  recs[i].loc,  sizeof(w->tgtLoc));
+        memcpy(w->tgtQuat, recs[i].quat, sizeof(w->tgtQuat));
+        w->driving = true;
+    }
+    // Our own moved props the host does not mention. The map default is known for exactly these: the
+    // Load seam captured it when our save moved them, and first-sight capture covers ones we dragged
+    // around during play.
+    static char names[dropsync::kMaxWorldRecords][64];
+    const int nOwn = dropper::MovedWorldNames(names, dropsync::kMaxWorldRecords);
+    for (int i = 0; i < nOwn; i++) {
+        WorldEntry* w = worldFind(names[i]);
+        if (w && w->inSet) continue;
+        void* actor = dropper::WorldTouch(names[i]);
+        if (!actor) continue;
+        float dl[3], dq[4];
+        if (!dropper::MapDefaultOf(actor, dl, dq)) continue;   // unknowable: leave it where it stands
+        w = worldAdd(names[i]);
+        if (!w || w->mine) continue;
+        memcpy(w->tgtLoc, dl, sizeof(w->tgtLoc));
+        memcpy(w->tgtQuat, dq, sizeof(w->tgtQuat));
+        w->driving = true; w->inSet = true;
+    }
+    if (g_logf) {
+        static int lastN = -1;
+        if (n != lastN) {
+            lastN = n;
+            char m[180];
+            snprintf(m, sizeof(m), "[drop/world] the host's layout: %d prop(s)%s", n,
+                     nOwn ? " (own extras step back to their map defaults)" : "");
+            g_logf(m);
+        }
+    }
+}
+
+// ---- THE LEVEL'S OWN PROPS, once per frame ---------------------------------------------------------
+// The host's arrangement is the session layout; every client moves its OWN real actors to it, and
+// exactly one client speaks for a prop afterwards -- whoever is holding it. A resting prop is
+// published by nobody except the host's slow resync FROM ITS TABLE, which is what carries the layout
+// to late joiners without ever echoing a chased pose.
+static void worldFrame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, int nPeers, bool sessionLive,
+                       bool forceResync, float dt, bool iAmCanonical, int canonicalPeer,
+                       bool authoritySettled) {
+    using namespace game;
+    // World sharing is PART OF "Share one set" -- the whole point is one arrangement, the host's.
+    if (g_dropPolicy != 2) sessionLive = false;
     if (!sessionLive) { if (g_worldOn) worldTearDown(); return; }
     if (!ownPawn || nowMs < g_settleUntilMs) return;
+
+    // THE SOURCE CHANGED. A migration (or the first resolution) means the layout everyone shows is a
+    // different player's arrangement now: put our own world back first, then reseed or reapply from
+    // the new source. The held-canonical rule upstream keeps this from firing during the gap itself.
+    {
+        static bool haveLast = false; static bool lastIAm = false; static int lastPeer = -2;
+        if (!haveLast || iAmCanonical != lastIAm || (!iAmCanonical && canonicalPeer != lastPeer)) {
+            if (haveLast && g_worldOn) {
+                worldTearDown();
+                if (g_logf) g_logf("[drop/world] the layout's owner changed -- reverting, then taking the new one");
+            }
+            haveLast = true; lastIAm = iAmCanonical; lastPeer = canonicalPeer;
+        }
+    }
+    if (!authoritySettled) return;                    // a guess is not a layout owner
     g_worldOn = true;
 
-    // OUR contribution to the set: the props this player's save has moved. Republished on the resync
-    // beat so a late joiner learns about them; membership is a union, so repeats are free.
-    static char names[dropsync::kWorldNameBatch][64];
-    if (forceResync) {
-        const int n = dropper::MovedWorldNames(names, dropsync::kWorldNameBatch);
-        for (int i = 0; i < n; i++) worldAdd(names[i]);
-        if (n > 0 && nPeers > 0) {
-            const char* ptrs[dropsync::kWorldNameBatch];
-            for (int i = 0; i < n; i++) ptrs[i] = names[i];
+    if (iAmCanonical) {
+        // HOSTING: my arrangement IS the layout. Seeded once, from where my props stand right now --
+        // which at rest is exactly where my save put them, so this is data my save told me, not a
+        // chased pose read back mid-flight.
+        if (!g_worldSeeded) {
+            g_worldSeeded = true;
+            static char names[dropsync::kMaxWorldRecords][64];
+            const int n = dropper::MovedWorldNames(names, dropsync::kMaxWorldRecords);
+            for (int i = 0; i < n; i++) {
+                void* actor = dropper::WorldTouch(names[i]);
+                if (!actor) continue;
+                float loc[3], quat[4];
+                if (!dropper::ActorPose(actor, loc, quat)) continue;
+                WorldEntry* w = worldAdd(names[i]);
+                if (!w) continue;
+                memcpy(w->tgtLoc, loc, sizeof(w->tgtLoc));
+                memcpy(w->tgtQuat, quat, sizeof(w->tgtQuat));
+                memcpy(w->curLoc, loc, sizeof(w->curLoc));
+                memcpy(w->curQuat, quat, sizeof(w->curQuat));
+                memcpy(w->lastSentLoc, loc, sizeof(w->lastSentLoc));
+                memcpy(w->lastSentQuat, quat, sizeof(w->lastSentQuat));
+                w->seeded = true;
+            }
+            // The table size rides along because "hosting: 0" has two very different meanings --
+            // an arrangement that IS the map default, and a map-default table that never got
+            // filled. One line tells them apart without another field round.
+            if (g_logf) { char m[180]; snprintf(m, sizeof(m),
+                "[drop/world] hosting the world layout: %d moved prop(s) (map-default table knows"
+                " %d, map '%s')", g_worldN, dropper::MapDefaultCount(),
+                g_ownMap[0] ? g_ownMap : "?"); g_logf(m); }
+        }
+        // ...and republished from the TABLE on the resync beat, so late joiners get the layout as it
+        // stands -- including props peers moved and released, whose poses were folded in on receive.
+        if (forceResync && nPeers > 0) {
+            static dropsync::WorldRec recs[dropsync::kMaxWorldRecords];
+            for (int i = 0; i < g_worldN; i++) {
+                strncpy_s(recs[i].name, sizeof(recs[i].name), g_world[i].name, _TRUNCATE);
+                memcpy(recs[i].loc,  g_world[i].tgtLoc,  sizeof(recs[i].loc));
+                memcpy(recs[i].quat, g_world[i].tgtQuat, sizeof(recs[i].quat));
+            }
             PeerStats ps;
-            for (int i = 0; i < nPeers; i++)
-                if (GetStats(i, &ps) && ps.state != 5)
-                    dropsync::SendWorldSet(i, g_dropGen, ptrs, n);
+            for (int p = 0; p < nPeers; p++)
+                if (GetStats(p, &ps) && ps.state != 5)
+                    dropsync::SendWorldSet(p, g_dropGen, g_ownMap, recs, g_worldN, SendBudget());
         }
-    }
-
-    // RE-ASSERT THE HIDE on a slow beat. The originals are the level's own actors, so other systems
-    // have opinions about their visibility -- the replay editor's exit pass restores everything it has
-    // registered, which un-hides them and leaves this player looking at their own arrangement standing
-    // inside the session's. Cheaper to simply put it back than to enumerate everything that might
-    // interfere.
-    {
-        static uint64_t lastHideUs = 0;
-        if (!lastHideUs || sinceUs(nowUs, lastHideUs) > 1000000ull) {
-            lastHideUs = nowUs;
-            dropper::ReassertSessionWorldHidden();
-        }
-    }
-
-    for (int i = 0; i < g_worldN; i++) {
-        WorldEntry& w = g_world[i];
-        if (!w.spawned) {
-            // The copy stands at the map default, computed locally -- captured at the Load seam if
-            // this player's save moved the prop, or simply read off the actor if it did not.
-            if (!dropper::SessionWorldBegin(ownPawn, w.name, g_logf)) continue;
-            w.spawned = true;
-            if (!dropper::SessionWorldPose(w.name, w.curLoc, w.curQuat)) continue;
-            if (!w.driving) {                       // nobody has moved it yet: the default IS the pose
-                memcpy(w.tgtLoc, w.curLoc, sizeof(w.tgtLoc));
-                memcpy(w.tgtQuat, w.curQuat, sizeof(w.tgtQuat));
-                memcpy(w.lastSentLoc, w.curLoc, sizeof(w.lastSentLoc));
-                memcpy(w.lastSentQuat, w.curQuat, sizeof(w.lastSentQuat));
+    } else {
+        // JOINED: the canonical peer's COMPLETE layout, whenever a fresh one has assembled -- or on
+        // the frame the canonical peer finally resolved, the one already sitting in dropsync storage.
+        Slot* cs = nullptr;
+        for (auto& s : g_slots) if (s.used && s.peerIdx == canonicalPeer) { cs = &s; break; }
+        static int appliedFromPeer = -2;
+        const bool sourceIsNew = (appliedFromPeer != canonicalPeer);
+        if (cs && (cs->worldSetFresh || sourceIsNew)) {
+            int n = 0;
+            const char* forMap = nullptr;
+            const dropsync::WorldRec* recs = dropsync::WorldSetRecords(canonicalPeer, &n, &forMap);
+            if (recs) {                              // null = nothing assembled yet: stay patient
+                cs->worldSetFresh = false;
+                // A LAYOUT IS FOR ONE MAP. The host mid-travel (or standing in another level
+                // entirely) legitimately publishes a layout that has nothing to do with our world --
+                // and an EMPTY one is not harmless there: it reads as "revert your furniture to its
+                // defaults". Refused on any mismatch; the 6-second beat re-delivers once the maps
+                // agree. An empty map string on EITHER side counts as a mismatch: "unknown" is not
+                // "the same place".
+                if (!forMap || !forMap[0] || !g_ownMap[0] || _stricmp(forMap, g_ownMap) != 0) {
+                    static int said = 0;
+                    if (g_logf && said < 8) { said++; char m[200];
+                        snprintf(m, sizeof(m), "[drop/world] holding the host's layout: it is for"
+                                 " '%s', we are on '%s'", (forMap && forMap[0]) ? forMap : "?",
+                                 g_ownMap[0] ? g_ownMap : "?");
+                        g_logf(m); }
+                } else {
+                    appliedFromPeer = canonicalPeer;
+                    worldApplyHostSet(recs, n);
+                }
             }
         }
-        void* copy = dropper::SessionWorldCopy(w.name);
-        // A CAPPED TRACE of what actually happens to each prop. The state machine here spans two
-        // machines -- claim, publish, receive, drive -- and the last three rounds were spent guessing
-        // which leg was missing. Forty lines settles it; after that it goes quiet on its own.
+        if (sourceIsNew && !cs) appliedFromPeer = -2;
+    }
+
+    // EVERYONE, host included: claims, publishing our own holds, driving everything else.
+    for (int i = 0; i < g_worldN; i++) {
+        WorldEntry& w = g_world[i];
+        void* actor = dropper::WorldTouch(w.name);   // resolves once, remembers the original once
         static int traced = 0;
         auto trace = [&](const char* what) {
             if (traced >= 40 || !g_logf || !debug::Get().dropWorld) return;
             traced++;
             char m[220];
-            snprintf(m, sizeof(m), "[drop/world] '%s' %s (spawned=%d copy=%p mine=%d driving=%d holder=%d)",
-                     w.name, what, (int)w.spawned, copy, (int)w.mine, (int)w.driving, w.holder);
+            snprintf(m, sizeof(m), "[drop/world] '%s' %s (actor=%p mine=%d driving=%d holder=%d)",
+                     w.name, what, actor, (int)w.mine, (int)w.driving, w.holder);
             g_logf(m);
         };
-        if (!copy) { trace("HAS NO COPY -- cannot be moved or driven"); continue; }
+        if (!actor) { trace("NOT IN THIS MAP -- cannot be moved or driven"); continue; }
+        if (!w.seeded) {
+            float loc[3], quat[4];
+            if (dropper::ActorPose(actor, loc, quat)) {
+                memcpy(w.curLoc, loc, sizeof(w.curLoc));
+                memcpy(w.curQuat, quat, sizeof(w.curQuat));
+                memcpy(w.lastSentLoc, loc, sizeof(w.lastSentLoc));
+                memcpy(w.lastSentQuat, quat, sizeof(w.lastSentQuat));
+                w.seeded = true;
+            }
+        }
 
         // ARE WE HOLDING IT? Picking a prop up is a discrete, observable event, which is why the claim
         // is keyed on it rather than inferred from poses that disagree -- inference is what turned
         // two clients into a tug of war last time.
-        const bool held = dropper::IsSelectedLocally(copy);
+        const bool held = dropper::IsSelectedLocally(actor);
         if (held && !w.mine) { w.mine = true; w.holder = -1; trace("CLAIMED locally"); }
         if (w.mine) {
             float loc[3], quat[4];
-            if (dropper::ActorPose(copy, loc, quat)) {
+            if (dropper::ActorPose(actor, loc, quat)) {
                 const float dx = loc[0]-w.lastSentLoc[0], dy = loc[1]-w.lastSentLoc[1], dz = loc[2]-w.lastSentLoc[2];
                 float qd = 0; for (int k = 0; k < 4; k++) { const float d = quat[k]-w.lastSentQuat[k]; qd += d*d; }
                 const float eps = dropper::g_tun.moveEpsCm;
@@ -888,8 +1020,8 @@ static void worldFrame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, int nPeers
         if (w.holder >= 0 && sinceUs(nowUs, w.heldUs) > kWorldClaimStaleUs) { w.holder = -1; w.driving = false; }
         if (w.driving) {
             static void* lastDriven = nullptr;
-            if (lastDriven != copy) { lastDriven = copy; trace("DRIVING from a peer"); }
-            dropper::DriveRemote(copy, w.tgtLoc, w.tgtQuat, w.curLoc, w.curQuat, dt);
+            if (lastDriven != actor) { lastDriven = actor; trace("DRIVING toward the session pose"); }
+            dropper::DriveRemote(actor, w.tgtLoc, w.tgtQuat, w.curLoc, w.curQuat, dt);
         }
     }
     g_st.dropWorld = g_worldN;
@@ -974,11 +1106,14 @@ static void dropFrame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, int nPeers,
         if (!anyPresent) everHadHost = false;            // session over: start clean next time
     }
     // Is the answer above WORTH ACTING ON YET? Straight after joining, no host has resolved and no
-    // peer key has arrived, so the default "canonical = me" is a guess, not a decision. Acting on it
-    // published our own placement of the level's furniture to the real host in that window -- they
-    // ended up with our bench positions. Inventory props are unaffected: publishing those early is
-    // harmless, and withholding them would just delay the set everyone is waiting for.
-    const bool authoritySettled = hostKnown || rankedAgainst > 0 || !anyPresent;
+    // peer key has arrived, so the default "canonical = me" is a guess, not a decision. And on a
+    // wire that HAS an owner concept, a peer key arriving first must not settle it either: EOS
+    // resolves the owner within moments of a join, and letting the key rule bridge that window
+    // handed the world layout to whichever player held the lower key -- both field logs show the
+    // JOINER seeding the layout and the real host adopting it. The key rule is for wires that will
+    // NEVER know (shared memory, UDP), not ones that do not know yet.
+    const bool authoritySettled = hostKnown || (rankedAgainst > 0 && !LobbyOwnershipKnowable())
+                                || !anyPresent;
     // THE DECISION, said out loud whenever it changes. Without this, "nobody adopted" and "everybody
     // thought they were canonical" look identical from a log -- and the second one is the failure
     // where two peers' keys never reached each other, which is a wire problem, not a policy one.
@@ -999,6 +1134,16 @@ static void dropFrame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, int nPeers,
             g_logf(m);
         }
     }
+    // ---- THE PRE-SESSION BASELINE. Taken at the moment the first peer appears -- before anything
+    // this frame publishes -- and cleared when the session empties. It is the single list that
+    // decides both what adoption hides and what the publish below is allowed to share.
+    {
+        static bool hadPresent = false;
+        if (anyPresent && !hadPresent) dropper::SnapshotPreSession();
+        if (!anyPresent && hadPresent) dropper::ClearPreSession();
+        hadPresent = anyPresent;
+    }
+
     // ---- ADOPTION. Only under the SHARED policy, only with somebody actually here, and only when
     // somebody else is canonical. Visual + collision, never a save.
     const bool wantAdopt = (g_dropPolicy == 2) && anyPresent && !iAmCanonical;
@@ -1009,6 +1154,28 @@ static void dropFrame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, int nPeers,
         g_dropResend = true;                     // what we contribute just changed
     }
 
+    // ---- WHOSE SAVED PARK TRAVELS. The baseline goes on the wire only while WE are the canonical
+    // set under Shared AND that answer is settled: before it settles, iAmCanonical is a default, not
+    // a decision, and publishing on it is exactly the joiner's-park-flash the field reported.
+    // Live-only never shares anybody's saved park. Post-session placements always travel. A flip in
+    // either direction is a content change: full resync.
+    const bool includeBaseline = (g_dropPolicy == 2) && iAmCanonical && authoritySettled;
+    {
+        static bool last = false; static bool haveLastIB = false;
+        if (!haveLastIB || includeBaseline != last) { haveLastIB = true; last = includeBaseline; g_dropResend = true; }
+    }
+
+    // ---- KEEP THE ADOPTION HIDDEN. The replay editor's exit pass un-hides everything it has
+    // registered -- the adopted-away park included, which then stayed visible to its owner for the
+    // rest of the session (field-logged). Re-asserted on a slow beat for as long as adoption stands.
+    if (g_dropAdopted) {
+        static uint64_t lastReassertUs = 0;
+        if (!lastReassertUs || sinceUs(nowUs, lastReassertUs) > 1000000ull) {
+            lastReassertUs = nowUs;
+            dropper::ReassertOwnSetHidden();
+        }
+    }
+
     // ---- PUBLISH. Every frame while the local player is actually in the dropper (that is when
     // objects move); a slow poll otherwise, because a set that nobody is editing cannot change.
     const bool active = dropper::LocalActive();
@@ -1016,13 +1183,13 @@ static void dropFrame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, int nPeers,
     const bool resyncDue = g_dropResend || !lastResyncUs || sinceUs(nowUs, lastResyncUs) > 6000000ull;
     if (!lastEnumUs || sinceUs(nowUs, lastEnumUs) >= enumPeriod || resyncDue) {
         lastEnumUs = nowUs;
-        dropPublishOwn(nowUs, nPeers, resyncDue);
+        dropPublishOwn(nowUs, nPeers, resyncDue, includeBaseline);
         if (resyncDue) { lastResyncUs = nowUs; g_dropResend = false; }
     }
 
-    // ---- THE LEVEL'S OWN PROPS. Its own lane: they belong to nobody, so they are not part of the
-    // per-peer object tables at all.
-    worldFrame(ownPawn, nowUs, nowMs, nPeers, anyPresent, resyncDue, dt);
+    // ---- THE LEVEL'S OWN PROPS. Its own lane, and the host's to define.
+    worldFrame(ownPawn, nowUs, nowMs, nPeers, anyPresent, resyncDue, dt,
+               iAmCanonical, canonicalPeer, authoritySettled);
 
     // ---- APPLY. Every game call for peers' objects happens here, on the engine-tick anchor the
     // proxy spawn already rides -- never inside the packet pump.

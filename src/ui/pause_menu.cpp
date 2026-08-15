@@ -369,10 +369,6 @@ static const int kMpDropAfter = 0;       // beside "Player names", under "Your n
 // ---- THE LEVEL'S OWN PROPS. Its own row rather than another state on "Dropped objects", because it
 // is a different feature with a different maturity: sharing the map's furniture is unfinished, and
 // keeping it separate means it cannot take the working half down with it.
-static uint8_t   g_worldRow[0x90];
-static FTextBlob g_worldOpts[2];
-static uint64_t  g_worldKey = 0;
-static int       g_worldAt  = -1;
 // ---- the posture row. An INFO row (label + right-hand value) rebuilt on every page build, like the
 // lobby rows, so it reports the LIVE configuration rather than whatever was true at startup. Its
 // strings come from the transport, so a future backend describes itself and this code does not grow a
@@ -623,14 +619,6 @@ static void buildRows() {
                             "the session and come back when you leave -- nothing is ever deleted.",
                             kDropOpts, 3, &g_dropKey, g_dropOpts))
             g_dropKey = 0;
-        static const char* kWorldOpts[2] = { "Leave alone", "Share them" };
-        if (!buildOptionRow(g_worldRow, "OmpWorldMode", "The level's own objects",
-                            "The benches and barriers the map comes with, which the dropper can also "
-                            "move. Share them and everyone gets one set standing where the map put "
-                            "them, which anybody can rearrange; yours come back when you leave. Still "
-                            "being worked on -- leave alone if anything looks wrong.",
-                            kWorldOpts, 2, &g_worldKey, g_worldOpts))
-            g_worldKey = 0;
         static const char* kModeOpts[3] = { "Off", "Off board only", "Always" };
         if (!buildOptionRow(g_nameModeRow, "OmpNameMode", "Show names",
                             "When to show a player's name above their head. Off board only keeps "
@@ -1021,7 +1009,7 @@ static const TArrayHdr* chooseArray(void* page, const TArrayHdr* items, TArrayHd
         // The roster goes on EVERY row of this page, so the right-hand panel keeps showing it no
         // matter which row the player happens to be sitting on.
         buildRosterText();
-        g_privacyAt = -1; g_dropAt = -1; g_worldAt = -1;
+        g_privacyAt = -1; g_dropAt = -1;
         for (int i = 0; i < kMpRowCount; i++) {
             uint8_t* row = g_mpRows + (size_t)i * off::kItemSize;
             setRowRoster(row);
@@ -1065,12 +1053,8 @@ static const TArrayHdr* chooseArray(void* page, const TArrayHdr* items, TArrayHd
         // independent-failure rule -- a key left at 0 is simply never added, so one broken control
         // still leaves the others usable.
         buildRosterText();
-        g_privacyAt = -1; g_dropAt = -1; g_worldAt = -1;
+        g_privacyAt = -1; g_dropAt = -1;
         if (g_namesOpenKey) add(g_namesOpenRow, true);
-        if (g_worldKey) {
-            *(int32_t*)(g_worldRow + off::kItemMultiStart) = MpPrefs_WorldMode();
-            g_worldAt = n; add(g_worldRow, true);
-        }
         if (g_dropKey) {
             // The value goes on the DEFINITION here (so the row reads right even if the stamp is
             // skipped) and onto the widget in stampValues, which is the only point at which it
@@ -1273,14 +1257,6 @@ static void stampValues(void* page) {
                 S.MenuMultiSetIndex(widget, MpPrefs_HideAddress() ? 1 : 0);
         }
         g_privacyAt = -1;                                 // one shot per build, like the guest pass
-    }
-    if (g_worldAt >= 0 && S.MenuMultiSetIndex) {
-        const TArrayHdr* pw = (const TArrayHdr*)((uint8_t*)page + off::kPageItemWidgets);
-        if (pw->data && g_worldAt < pw->num) {
-            if (void* widget = ((void**)pw->data)[g_worldAt])
-                S.MenuMultiSetIndex(widget, MpPrefs_WorldMode());
-        }
-        g_worldAt = -1;
     }
     // The dropped-objects row, same page and same argument as the privacy toggle.
     if (g_dropAt >= 0 && S.MenuMultiSetIndex) {
@@ -1802,10 +1778,6 @@ static bool handleValueChange(void* params, bool isSlider) {
         // cannot churn the settings file either.
         if (g_nameModeKey && k == g_nameModeKey && !isSlider) {
             MpPrefs_SetNameMode(*(const int32_t*)((const uint8_t*)params + off::kChangeParamsNew));
-            return true;
-        }
-        if (g_worldKey && k == g_worldKey && !isSlider) {
-            MpPrefs_SetWorldMode(*(const int32_t*)((const uint8_t*)params + off::kChangeParamsNew));
             return true;
         }
         if (g_dropKey && k == g_dropKey && !isSlider) {

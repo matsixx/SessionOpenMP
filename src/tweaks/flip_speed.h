@@ -29,3 +29,5 @@ float FlipSpeed_VelMax();  void FlipSpeed_SetVelMax(float v);
 const char* FlipSpeed_LastTrickName();
 // Ticks once per trick SELECTION, so a watcher can detect a fresh trick without the catch path.
 long FlipSpeed_TrickSerial();
+// Milliseconds since the last trick selection (-1 = none yet) -- catch-engage latency probing.
+int FlipSpeed_MsSinceTrick();

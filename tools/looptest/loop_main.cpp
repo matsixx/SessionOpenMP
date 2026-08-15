@@ -1059,20 +1059,59 @@ static bool dropSyncCheck() {
     if (!OnPacket(3, g_dropPkts[0].data(), (int)g_dropPkts[0].size(), up) || up.nRemove != 3 ||
         up.remove[2] != 65535) { printf("  drop: remove round-trip wrong\n"); return false; }
 
-    // ---- THE LEVEL'S OWN PROPS. Membership is names only; a move is one prop's pose from whoever is
-    // holding it. An unsendable name must be skipped WITHOUT corrupting the count, or the reader walks
-    // off the end of the packet.
+    // ---- THE LEVEL'S OWN PROPS. The layout is the host's arrangement: posed records, assembled
+    // from parts with the same all-or-nothing rule as kSet -- a half-received layout would move a
+    // joiner's furniture to the wrong place, not merely miss some. An unsendable name is skipped
+    // record-by-record; the empty layout is a real message and must round-trip.
     {
-        const char* q[4] = { "STM_NYC_TrashCan_9", "PBP_OBJ_AveBench_C", "Bench With Spaces_2", "" };
+        static WorldRec wr[kMaxWorldRecords];
+        const int wn = 37;                                   // > 3 parts at 10 records each
+        for (int i = 0; i < wn; i++) {
+            snprintf(wr[i].name, sizeof(wr[i].name), "STM_NYC_Bench_%02d", i);
+            for (int k = 0; k < 3; k++) wr[i].loc[k] = (float)(i * 100 + k);
+            wr[i].quat[0] = wr[i].quat[1] = wr[i].quat[2] = 0; wr[i].quat[3] = 1;
+        }
+        strncpy_s(wr[2].name, sizeof(wr[2].name), "Bench With Spaces_2", _TRUNCATE);   // legal: printable
         g_dropPkts.clear();
         ForgetPeer(7);
-        if (SendWorldSet(7, 3, q, 4) != 1) { printf("  drop: world set did not send\n"); return false; }
-        if (!OnPacket(7, g_dropPkts[0].data(), (int)g_dropPkts[0].size(), up) || up.nWorldSet != 3) {
-            printf("  drop: world set round-trip wrong (%d names, want 3)\n", up.nWorldSet); return false;
+        const int wparts = SendWorldSet(7, 3, "NYC01_LP_Persistent", wr, wn, 0);
+        if (wparts != 4) { printf("  drop: 37 world records should take 4 parts, took %d\n", wparts); return false; }
+        bool wready = false;
+        for (auto& p : g_dropPkts)
+            if (OnPacket(7, p.data(), (int)p.size(), up) && up.worldSetReady) wready = true;
+        int gotN = 0;
+        const char* gotMap = nullptr;
+        const WorldRec* got = WorldSetRecords(7, &gotN, &gotMap);
+        if (!wready || !got || gotN != wn) {
+            printf("  drop: world layout did not assemble (%d of %d)\n", gotN, wn); return false;
         }
-        if (strcmp(up.worldSet[0], q[0]) != 0 || strcmp(up.worldSet[2], q[2]) != 0) {
-            printf("  drop: world set names wrong\n"); return false;
+        if (!gotMap || strcmp(gotMap, "NYC01_LP_Persistent") != 0) {
+            printf("  drop: the layout's map did not travel\n"); return false;
         }
+        if (strcmp(got[2].name, wr[2].name) != 0 || got[11].loc[1] != wr[11].loc[1]) {
+            printf("  drop: world layout content wrong\n"); return false;
+        }
+        // A DROPPED PART must not complete -- and the storage must keep the LAST complete layout.
+        g_dropPkts.clear();
+        SendWorldSet(7, 3, "NYC01_LP_Persistent", wr, wn, 0);
+        g_dropPkts.erase(g_dropPkts.begin() + 1);
+        wready = false;
+        for (auto& p : g_dropPkts)
+            if (OnPacket(7, p.data(), (int)p.size(), up) && up.worldSetReady) wready = true;
+        if (wready) { printf("  drop: a world layout with a missing part completed\n"); return false; }
+        if (!WorldSetRecords(7, &gotN) || gotN != wn) {
+            printf("  drop: the previous complete layout was lost to a failed assembly\n"); return false;
+        }
+        // THE EMPTY LAYOUT is a real answer ("the host moved nothing") and must arrive as one.
+        g_dropPkts.clear();
+        if (SendWorldSet(7, 3, "NYC01_LP_Persistent", nullptr, 0, 0) != 1) { printf("  drop: empty world layout did not send\n"); return false; }
+        wready = false;
+        for (auto& p : g_dropPkts)
+            if (OnPacket(7, p.data(), (int)p.size(), up) && up.worldSetReady) wready = true;
+        if (!wready || !WorldSetRecords(7, &gotN) || gotN != 0) {
+            printf("  drop: empty world layout did not round-trip\n"); return false;
+        }
+        const char* q[1] = { "STM_NYC_TrashCan_9" };
         const float wl[3] = { -1234.5f, 6789.25f, 12.5f };
         const float wq[4] = { 0.5f, 0.5f, 0.5f, 0.5f };
         g_dropPkts.clear();
@@ -1107,10 +1146,14 @@ static bool dropSyncCheck() {
     SendPlace(4, 1, set[0]);
     SendMove(4, 1, set, 6);
     SendRemove(4, 1, ids, 3);
-    { const char* w2[2] = { "STM_NYC_TrashCan_9", "PBP_OBJ_AveBench_C" };
-      SendWorldSet(4, 1, w2, 2);
+    { static WorldRec w2[2];
+      strncpy_s(w2[0].name, sizeof(w2[0].name), "STM_NYC_TrashCan_9", _TRUNCATE);
+      strncpy_s(w2[1].name, sizeof(w2[1].name), "PBP_OBJ_AveBench_C", _TRUNCATE);
+      for (int i = 0; i < 2; i++) { for (int k = 0; k < 3; k++) w2[i].loc[k] = 1.f;
+          w2[i].quat[0]=w2[i].quat[1]=w2[i].quat[2]=0; w2[i].quat[3]=1; }
+      SendWorldSet(4, 1, "NYC01_LP_Persistent", w2, 2, 0);
       const float wl2[3] = {1.f,2.f,3.f}, wq2[4] = {0.f,0.f,0.f,1.f};
-      SendWorldMove(4, 1, w2[0], wl2, wq2, true); }
+      SendWorldMove(4, 1, w2[0].name, wl2, wq2, true); }
     int prefixesTried = 0;
     for (auto& p : g_dropPkts) {
         for (int cut = 1; cut < (int)p.size(); cut++) {

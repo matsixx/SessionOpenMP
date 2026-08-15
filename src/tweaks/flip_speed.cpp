@@ -188,8 +188,52 @@ static volatile float g_uiSpeed = 0.0f, g_uiPeak = 0.0f, g_uiStock = 0.0f, g_uiO
 // was being caught, and the catch path has no trick name of its own.
 static char g_lastTrick[80] = "?";
 const char* FlipSpeed_LastTrickName() { return g_lastTrick; }
+static volatile long long g_trickQpc = 0;   // QPC at the last trick selection
+// Milliseconds since the last trick SELECTION, or -1 with no trick yet. For the catch-engage
+// latency measurement: a catch engaging ~0 ms after the pop is the held-stick pop-time engage.
+int FlipSpeed_MsSinceTrick() {
+    const long long t0 = g_trickQpc;
+    if (!t0) return -1;
+    LARGE_INTEGER now, fq; QueryPerformanceCounter(&now); QueryPerformanceFrequency(&fq);
+    return (int)((now.QuadPart - t0) * 1000 / fq.QuadPart);
+}
 static volatile LONG g_trickSerial = 0;
 LONG FlipSpeed_TrickSerial() { return g_trickSerial; }
+
+
+// ---------------------------------------------------------------------------------------------
+// One-shot trick-definition dump, once per unique def per session. RECON for the base-game nollie
+// heelflip bug (bottom-right flick dips the NOSE instead of the tail, then the trick animation
+// gives way to a catch pose): trick-specific misbehaviour points at per-def DATA, and these are
+// the def's direction-sensitive fields -- BoardControlInversePitch and the pitch/roll board
+// control extras, the authored start/end pitch blocks, the flip-speed input type and its Inputs
+// list, and the catch targets. A session covering the bad trick and its well-behaved siblings
+// (nollie kickflip, regular heelflip) turns the diff into the diagnosis.
+static void DumpTrickDefOnce(void* def) {
+    if (!def) return;
+    static void* seen[32]; static int nSeen = 0;
+    for (int i = 0; i < nSeen; ++i) if (seen[i] == def) return;
+    if (nSeen < 32) seen[nSeen++] = def;
+    char nm[96]; CatchSound_ObjName(def, nm, sizeof(nm));
+    char ins[64]; int off = 0;
+    const int nIn = twkI(def, 0xe0);
+    void* inArr = twkP(def, 0xd8);
+    for (int i = 0; i < nIn && i < 8 && inArr && off < (int)sizeof(ins) - 5; ++i)
+        off += snprintf(ins + off, sizeof(ins) - off, "%s%d", i ? "," : "", (int)twkB(inArr, i));
+    TwkLog("[trickdef] '%s' | flipSpdInput=%d catchFoot=%d | invPitch=%d exPitch dn=%.1f up=%.1f "
+           "| exRollPitch dn=%.1f up=%.1f exRollScoop bs=%.1f fs=%.1f "
+           "| startPitch ovr=%d (%.1f..%.1f) endPitch (%.1f..%.1f) "
+           "| precatch %.0f/%.0f pitchPre %.1f..%.1f otherFoot=%.2f | catchTgt P=%.1f R=%.1f "
+           "| inputs[%d]=%s",
+           nm, (int)twkB(def, 0x1bc), (int)twkB(def, 0x50),
+           (int)twkB(def, 0x228), twkF(def, 0x22c), twkF(def, 0x230),
+           twkF(def, 0x234), twkF(def, 0x238), twkF(def, 0x244), twkF(def, 0x248),
+           (int)twkB(def, 0x1e0), twkF(def, 0x1e8 + 0xc), twkF(def, 0x1e8 + 0x10),
+           twkF(def, 0x208 + 0xc), twkF(def, 0x208 + 0x10),
+           twkF(def, 0x258), twkF(def, 0x25c), twkF(def, 0x260), twkF(def, 0x264),
+           twkF(def, 0x268), twkF(def, 0x26c), twkF(def, 0x270),
+           nIn, ins);
+}
 
 static float hkFlipMult(void* self, void* def, unsigned char inputType, void* inputs) {
     float stock = 1.0f;
@@ -206,7 +250,9 @@ static float hkFlipMult(void* self, void* def, unsigned char inputType, void* in
         // put a flip speed on tricks the game deliberately gives none.
         if (inputType == 0) return stock;
         if (def) CatchSound_ObjName(def, g_lastTrick, sizeof(g_lastTrick));
+        DumpTrickDefOnce(def);
         InterlockedIncrement(&g_trickSerial);          // a trick just started; the pump watches it
+        { LARGE_INTEGER t; QueryPerformanceCounter(&t); g_trickQpc = t.QuadPart; }
         void* skater = twkP(self, FTH_SKATER);
         void* db     = twkP(self, FTH_TRICKS_DB);
         if (!skater || !db) return stock;

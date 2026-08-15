@@ -50,7 +50,8 @@
 #include "tweaks_common.h"
 #include "ui/menu_ext.h"
 #include "catch_level.h"
-#include "catch_tweaks.h"    // CatchTweaks_Skater() -- so a proxy's component is never adopted
+#include "catch_tweaks.h"   // CatchTweaks_Skater() -- so a proxy's component is never adopted
+#include "flip_speed.h"    // FlipSpeed_MsSinceTrick() -- the extra-pitch probe window
 #include "foot_place.h"
 #include <cmath>
 #include "MinHook.h"
@@ -174,6 +175,8 @@ static void* g_orig = nullptr, *g_start = nullptr;
 const void* CatchLevel_ExtraPitchFn() { return g_start; }
 static void* g_setOrig = nullptr, *g_setStart = nullptr;
 static void* g_realComp = nullptr;      // learned + validated; the object that owns the pitch state
+static float g_assertWant = -999.0f;    // the setpoint the post-physics assert drives toward
+static volatile LONG g_assertWins = 0;  // frames the assert re-levelled (proves the race, in-log)
 
 // ------------------------------------------------------------------ per-trick state (game thread)
 static void*  g_skater     = nullptr;   // armed at trick fire, cleared when the window ends
@@ -267,12 +270,36 @@ static void* hkExtraPitch(void* self, void* trickDef, uint64_t inputType, void* 
 }
 
 // The whole feature: watch for the catch, then keep the game's own integrator aimed at level.
+void CatchLevel_PostPhysAssert() {
+    __try {
+        void* comp = g_realComp;
+        const float want = g_assertWant;
+        if (!comp || want < -900.0f || !g_on || !g_ok) return;
+        // Only while a held-over stick is what keeps the trick's pitch trajectory alive -- a fresh
+        // post-catch orient press makes HeldOverStale false and this stands down entirely.
+        if (!CatchTweaks_HeldOverStale()) return;
+        const float pitchNow = twkF(comp, MC_PITCH_NOW);
+        if (!(pitchNow > -180.0f && pitchNow < 180.0f)) return;
+        // Runs AFTER the physics pass (called from the UpdateFootAnchors detour inside the
+        // animation update), so this frame's re-arm by the game has already written: easing the
+        // rendered pitch from here means the leveller's value is what renders, and start/target
+        // are re-seated so the game's integrator continues from it next tick instead of snapping.
+        const float tau = ((g_responseMs > 5.0f) ? g_responseMs : 5.0f) / 1000.0f;
+        const float alpha = 1.0f - expf(-0.0166f / tau);
+        const float eased = pitchNow + (want - pitchNow) * alpha;
+        *(float*)((uint8_t*)comp + MC_PITCH_NOW)    = eased;
+        *(float*)((uint8_t*)comp + MC_PITCH_START)  = eased;
+        *(float*)((uint8_t*)comp + MC_PITCH_TARGET) = want;
+        InterlockedIncrement(&g_assertWins);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
 void CatchLevel_PumpFrame() {
     if (!g_skater) return;
     __try {
         void* skater = g_skater;
         const double now = NowSec();
-        if (now - g_armT > 6.0) { g_skater = nullptr; return; }   // stale trick; forget it
+        if (now - g_armT > 6.0) { g_skater = nullptr; g_assertWant = -999.0f; return; }   // stale trick
         // Use the LEARNED component, never `skater+0x550`. Writing the pitch block through
         // skater+0x550 does nothing: `target` reads back only the values written into it, the game
         // never overwrites it, and `pitch` sits at 0.00 at every catch -- that address is dead
@@ -344,6 +371,12 @@ void CatchLevel_PumpFrame() {
             if (g_levelling) {
                 *(float*)((uint8_t*)comp + MC_PITCH_START)  = pitchNow;
                 *(float*)((uint8_t*)comp + MC_PITCH_TARGET) = pitchNow;
+                g_assertWant = -999.0f;
+                if (g_assertWins) {
+                    if (g_log) TwkLog("[level] post-phys assert won %d frames against a held-over "
+                                      "stick's pitch drive", (int)g_assertWins);
+                    g_assertWins = 0;
+                }
                 if (g_log)
                     TwkLog("[level] RELEASED at %.2f, %.1f deg from %.2f (%s) -- setpoint parked",
                            pitchNow, fabsf(pitchNow - ((g_targetDeg > -180.0f) ? g_targetDeg : g_authored)),
@@ -360,7 +393,7 @@ void CatchLevel_PumpFrame() {
             if (g_levelling && g_log)
                 TwkLog("[level] GAVE UP at %.2f (target %.2f) -- CatchLevelMaxMs %.0f reached",
                        pitchNow, (g_targetDeg > -180.0f) ? g_targetDeg : g_authored, g_maxMs);
-            g_skater = nullptr; return;
+            g_skater = nullptr; g_assertWant = -999.0f; return;
         }
         if (!g_on || !g_ok) return;
 
@@ -422,6 +455,7 @@ void CatchLevel_PumpFrame() {
             g_startedMs = (float)sinceCatch;
             InterlockedIncrement(&g_uiLevels);
             if (g_log) TwkLog("[level] levelling %.2f -> %.2f", pitchNow, want);
+            g_assertWant = want;   // the post-physics assert mirrors the live setpoint
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         g_skater = nullptr; g_ok = 0;        // g_ok, NOT g_on -- a fault must not rewrite the ini
