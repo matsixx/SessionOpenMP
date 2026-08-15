@@ -169,7 +169,16 @@ private:
     bool       boardHidden_ = false, simOn_ = false, boardLogged_ = false;
     bool       present_ = true;           // false = concealed because the peer is in another level
     bool       nearLocal_ = true;         // default near: sim until the session has measured
-    bool       animThrottled_ = false;    // the tick-option write happens once per actor
+    // The offscreen anim throttle's driver state. The engine's own visibility flag proved capable
+    // of going stale on a mesh that is plainly being drawn (field: a skater frozen mid-pose ON
+    // SCREEN until a montage or ragdoll kicked the graph), so visibility is decided by OUR viewport
+    // projection and the engine byte is written both ways -- forced ticking while the proxy
+    // projects on screen, cull-when-unrendered otherwise. The engine keeps authority in the culled
+    // state, so a shadow still animates; our forcing only ever ADDS ticking.
+    uint8_t    animTickSaved_ = 0xff;     // the mesh's original tick option (0xff = not read yet)
+    uint8_t    animTickState_ = 0xff;     // what we last wrote (0xff = nothing)
+    uint64_t   animCheckUs_   = 0;        // projection cadence (~5 Hz per proxy)
+    uint64_t   animSeenUs_    = 0;        // last time the proxy projected on screen (hysteresis)
     uint8_t    lastPushState_ = 0, lastBrakeState_ = 0, lastBailing_ = 0;
     uint8_t    lastBroken_ = 0;           // last APPLIED brokenState -- only advances with the board
                                           // linked, so a break arriving before the board link still

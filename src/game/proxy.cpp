@@ -213,7 +213,8 @@ void Proxy::Forget() {
     for (auto& l : audioLoops_) { l.slot = 0; l.comp = nullptr; }
     actor_ = nullptr; world_ = nullptr; tries_ = 0; lastTryMs_ = 0;
     refreshed_ = repOff_ = boardRepOff_ = tickOff_ = boardHidden_ = simOn_ = boardLogged_ = false;
-    nearLocal_ = true; animThrottled_ = false; present_ = true;
+    nearLocal_ = true; present_ = true;
+    animTickSaved_ = 0xff; animTickState_ = 0xff; animCheckUs_ = 0; animSeenUs_ = 0;
     lastBailing_ = 0;
     lastBroken_ = 0;
     // change-edge caches too: a REPLACEMENT actor must get every write again even when the wire value
@@ -918,26 +919,45 @@ void Proxy::Apply(const repl::State& s, uint64_t nowMs, uint64_t nowUs, void (*l
         else if (!VelocityDrive(s, nowUs)) StampBoard(s);
     }
 
-    // ---- offscreen anim throttle, once per actor -- but NEVER while peers are recorded into the
-    // replay (the retired recordPeers mode): the game's recorder captures the EVALUATED pose, so
-    // any stretch the local camera was not looking at a peer recorded them frozen standing
-    // (field-confirmed, at both tick-option values). With peers OUT of the replay system this is
-    // free again, at the strongest setting: OnlyTickPoseWhenRendered (3) skips the whole anim
-    // update+evaluation for an unrendered proxy -- the largest per-proxy CPU cost -- and nothing
-    // observes the frozen graph: live viewers get the current pose the frame they look back, and
-    // replay sync renders from TRANSFERRED wire states, never from this client's anim instance.
-    // One byte, engine's own mechanism.
-    if (g_tun.offscreenAnimThrottle && !g_tun.recordPeers && !animThrottled_) {
+    // ---- offscreen anim throttle -- but NEVER while peers are recorded into the replay (the
+    // retired recordPeers mode): the game's recorder captures the EVALUATED pose, so any stretch
+    // the local camera was not looking at a peer recorded them frozen standing (field-confirmed).
+    // OnlyTickPoseWhenRendered (3) skips the whole anim update+evaluation for an unrendered proxy
+    // -- the largest per-proxy CPU cost. The byte used to be written ONCE and the engine's own
+    // rendered-recently flag trusted from there; that flag proved capable of going stale on a mesh
+    // that is plainly being drawn (field: a skater frozen ON SCREEN until their next board
+    // transition or bail kicked the graph). So visibility is OURS to decide now -- the nameplates'
+    // viewport projection, ~5 Hz per proxy with a second of hysteresis -- and the byte is driven
+    // both ways: the mesh's ORIGINAL option while the proxy projects on screen (the graph ticks no
+    // matter what the stale flag thinks), cull mode after it has been off screen for a beat. In
+    // cull mode the ENGINE keeps authority, so a skater visible only as a shadow still animates --
+    // our decision only ever ADDS ticking, never withholds it.
+    if (g_tun.offscreenAnimThrottle && !g_tun.recordPeers && nowUs >= animCheckUs_) {
+        animCheckUs_ = nowUs + 200000ull;                       // 5 Hz: cheaper than one bone
         void* mesh = safePtr(actor_, off::kSkaterMesh);
         if (mesh) {
 #ifdef _WIN32
-            __try {
-                *(uint8_t*)((uint8_t*)mesh + off::kMeshAnimTickOption) = 3;
-                animThrottled_ = true;
-                static bool said = false;
-                if (!said && logf) { said = true;
-                    logf("[proxy] offscreen anim throttle ON (OnlyTickPoseWhenRendered)"); }
-            } __except (EXCEPTION_EXECUTE_HANDLER) { animThrottled_ = true; }
+            float head[3], px[2], dist = 0.0f;
+            const bool onScreen = game::ActorHeadPoint(actor_, 20.0f, head) &&
+                                  game::ProjectWorldToViewport(head, px, &dist);
+            if (onScreen) animSeenUs_ = nowUs;
+            // A resolvable view that has not shown this proxy for a full second = genuinely away.
+            // An UNRESOLVABLE view (menus, loads) reads as never-seen and settles into cull mode,
+            // where the engine's own flag still animates whatever it renders -- the worst case is
+            // exactly the old behaviour, never a new freeze.
+            const bool wantCull = (nowUs - animSeenUs_) > 1000000ull;
+            const uint8_t want = wantCull ? 3 : (animTickSaved_ != 0xff ? animTickSaved_ : 0);
+            if (want != animTickState_) {
+                __try {
+                    uint8_t* opt = (uint8_t*)mesh + off::kMeshAnimTickOption;
+                    if (animTickSaved_ == 0xff) animTickSaved_ = *opt;   // the mesh's own default
+                    *opt = (want == 3) ? 3 : animTickSaved_;
+                    animTickState_ = (want == 3) ? 3 : animTickSaved_;
+                    static bool said = false;
+                    if (!said && logf) { said = true;
+                        logf("[proxy] offscreen anim throttle ON (projection-driven, cull after 1s off screen)"); }
+                } __except (EXCEPTION_EXECUTE_HANDLER) { animCheckUs_ = nowUs + 60000000ull; }
+            }
 #endif
         }
     }
