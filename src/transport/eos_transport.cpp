@@ -266,8 +266,17 @@ static void EOS_CALL onMemberStatus(const EOS_Lobby_LobbyMemberStatusReceivedCal
     // is proof we are still in it. Never while an operation is deciding (status 1): the callback
     // that will set g_lobbyId may not have run yet, and evicting ourselves from the lobby we are
     // entering would be worse than any stale event. There is always another event.
-    if (!d->LobbyId || !d->LobbyId[0] || _stricmp(d->LobbyId, g_lobbyId) != 0) {
-        if (g_lobbyStatus != 1 && d->LobbyId && d->LobbyId[0]) {
+    // Only an event that NAMES a different lobby is foreign. One with no lobby id cannot prove
+    // foreignness -- and the old shape treated it as foreign and returned without a line of log, so
+    // if EOS ever delivers these id-less, every member event dies silently and departures fall
+    // through to the 30-second quiet fallback. Said out loud (capped) so the field log can settle
+    // whether that is what has been happening.
+    if (!d->LobbyId || !d->LobbyId[0]) {
+        static int saidBare = 0;
+        if (saidBare < 4) { saidBare++;
+            Log("[lobby] member event carried NO lobby id -- treating it as ours"); }
+    } else if (_stricmp(d->LobbyId, g_lobbyId) != 0) {
+        if (g_lobbyStatus != 1) {
             static int said = 0;
             if (said < 8) { said++;
                 Log("[lobby] leaving a LINGERING membership in %s (we are in %s)",
