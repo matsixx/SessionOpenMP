@@ -283,6 +283,8 @@ static void  SwayDrive(void* comp, int slot, float dt);
 static int   g_direct   = 0;      // ClothDirectRender -- draw the simulation ourselves
 static int   g_directRefresh = 0; // ClothDirectRefresh -- costly test: force the renderer to re-read
 static bool  DirectArm(void* comp, void* mesh, int slot);   // defined with the direct-render block
+static void  DirectRelease(int slot);                       // ditto
+extern const char* g_dirWhy[];                              // the one-shot "not driving" reason, ditto
 static int   g_render   = 0;      // ClothRender -- feed the simulation back into the drawn mesh.
                                   // OFF by default: this is the first thing here that touches
                                   // render resources, and it edits a mesh other characters wear.
@@ -1533,7 +1535,71 @@ static void PristineSyncMesh(void* mesh) {
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
-static bool SetupGarment(void* comp, void* mesh, int slot) {
+// Re-arm the VERTEX DRIVER for a garment we are keeping.
+//
+// A driven garment's physics live entirely in DirectDrive, which needs DirectArm's captured state. Two
+// paths keep an existing cloth asset instead of rebuilding it -- the pump's "same mesh, asset already
+// there" branch and SetupGarment's re-adopt -- and neither re-armed the driver. That was invisible until
+// the garment mesh became STABLE: before it was rooted and reused, every dress produced a new mesh, so
+// those paths were almost never taken. Afterwards, a shop change (no character change, so nothing
+// releases) hit them every time and the unchanged garment silently lost its physics while the one you
+// actually swapped kept them.
+// Pristine first: DirectArm captures the current vertices as the rest pose, so it must not capture a
+// deformed one.
+// Rebuild, not re-arm. A driven garment's vertex driver needs the weld map that only a real asset
+// build produces, so "keep the asset and just re-arm" is not a thing that can work -- see DirectArm.
+// Re-adoption exists to preserve the ENGINE's cloth bindings, which a driven garment does not use, so
+// there is nothing to preserve and nothing lost by rebuilding.
+static bool RebuildIfDriven(void* comp, void* mesh, int slot);
+
+static void ReArmDirectIfDriven(void* comp, void* mesh, int slot) {
+    // Say what happened either way. The "not driving" reasons are one-shot per slot, so a re-arm that
+    // silently bails looks identical to one that never ran -- which is exactly what the shop-change
+    // report looked like.
+    if (!g_direct || !mesh) { TwkLog("[direct] slot %d: no re-arm (direct=%d mesh=%p)", slot,
+                                     g_direct, mesh); return; }
+    if (!ClothMerge_GarmentWantsDirect(mesh)) {
+        TwkLog("[direct] slot %d: no re-arm -- this garment is not driven", slot);
+        return;
+    }
+    PristineSyncMesh(mesh);
+    g_dirWhy[slot] = nullptr;      // the reason is one-shot per slot; clear it so a re-arm can report
+    bool ok = false;
+    __try { ok = DirectArm(comp, mesh, slot); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { ok = false; }
+    TwkLog("[direct] slot %d: re-armed after a re-dress -> %s", slot, ok ? "driving" : "FAILED");
+}
+
+// Hand ONE garment back before rebuilding it.
+//
+// A forced rebuild has to undo the previous build first: the mesh already carries our cloth asset, and
+// AttachToMesh correctly refuses to append a second one. Without this the forced rebuild failed, the
+// dress was never marked done, and the pump retried four times a second forever -- a garment with no
+// physics and a log growing by thousands of lines a minute.
+// This is ClothSim_ReleaseAll's per-mesh half: drop the asset from the mesh, forget it in the built
+// registry, put the sections back, and release the vertex driver for that slot.
+static void ReleaseGarmentForRebuild(void* mesh, int slot) {
+    if (!mesh) return;
+    __try {
+        DirectRelease(slot);
+        RestoreSections(mesh);
+        *(int*)((uint8_t*)mesh + SM_MESHCLOTH + 8) = 0;
+        for (int i = 0; i < kBuiltMeshes; i++)
+            if (g_doneMesh[i] == mesh) { g_doneMesh[i] = nullptr; g_doneAsset[i] = nullptr; }
+        if (slot >= 0 && slot < kSimSlots) g_sim[slot].asset = nullptr;
+        // ...and put the garment back to how it was BUILT, last of all.
+        //
+        // DirectRelease writes back the vertices captured when the driver was armed, and those were
+        // captured from a garment that had already been simulated -- so releasing here undoes the
+        // pristine restore that SetupGarment did on the way in, and the rebuild then captures the
+        // simulated shape as the new rest pose. That is the "rest pose is slightly off after a shop
+        // change" drift, and it compounds every time. Restoring after the release, not before, is what
+        // makes a rebuilt garment identical to a freshly built one.
+        PristineSyncMesh(mesh);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
+static bool SetupGarment(void* comp, void* mesh, int slot, bool forceRebuild) {
     // Both of these used to return in silence, which is why a garment could simply have no cloth with
     // nothing in the log to say why. The caller retries, so these are throttled to one per garment.
     if (!g_ready || !g_recreate) {
@@ -1555,7 +1621,20 @@ static bool SetupGarment(void* comp, void* mesh, int slot) {
                    slot, mesh); }
         return false;
     }
-    void* prior = AlreadyBuilt(mesh);
+    // The shortcut below keeps whatever was built before. It is keyed on the BUILT-MESH REGISTRY, not
+    // on our per-slot state -- clearing the slot does not bypass it, which is how a "forced rebuild"
+    // silently re-adopted instead and left the vertex driver with no weld map.
+    // A DRIVEN garment is NEVER re-adopted, from any caller.
+    //
+    // Re-adoption keeps what was built before, which is right for a garment the ENGINE renders as cloth
+    // -- its bindings survive. A driven garment is different: its physics come from the vertex driver,
+    // and arming that needs the weld map only a real build produces. Re-adopting one therefore hands
+    // back a garment that looks set up and moves not at all, which is exactly the "cloth only works on
+    // the item you changed" report: the garment you swapped was built fresh, the others were re-adopted.
+    // Deciding it here rather than per-caller means no future caller can get it wrong either.
+    const bool drivenHere = g_direct && ClothMerge_GarmentWantsDirect(mesh);
+    if (forceRebuild || drivenHere) ReleaseGarmentForRebuild(mesh, slot);   // or the attach is refused
+    void* prior = (forceRebuild || drivenHere) ? nullptr : AlreadyBuilt(mesh);
     if (prior && *(int*)((uint8_t*)mesh + SM_MESHCLOTH + 8) > 0) {
         // Everything we built the first time is still on the mesh -- the asset, the section marks and
         // the render binding. Only the component's own state is new.
@@ -1592,6 +1671,9 @@ static bool SetupGarment(void* comp, void* mesh, int slot) {
     // Drive only the garments that need it -- the ones whose own material cannot draw cloth. Tops
     // already have cloth-capable materials and stay on the engine's own, better path.
     const bool driveThis = g_direct && ClothMerge_GarmentWantsDirect(mesh);
+    TwkLog("[quad] slot %d: %s (direct=%d)", slot,
+           driveThis ? "driven -- the mod writes its vertices"
+                     : "bound -- the engine's cloth renderer draws it", g_direct);
 
     bool bound = false;
     if (driveThis) {
@@ -1805,7 +1887,7 @@ static void DirectRelease(int slot) {
 // applied to them, and hand the buffer back to the renderer.
 // Say once, per garment, exactly which step stopped us -- there are several ways to bail here and
 // silence tells you nothing.
-static const char* g_dirWhy[kSimSlots] = {};
+const char* g_dirWhy[kSimSlots] = {};
 static void DirWhy(int slot, const char* why) {
     if (slot < 0 || slot >= kSimSlots || g_dirWhy[slot]) return;
     g_dirWhy[slot] = why;
@@ -2089,25 +2171,33 @@ static bool DirectArm(void* comp, void* mesh, int slot) {
     uint8_t* rd = (uint8_t*)twkP(mesh, SM_RENDERDATA);
     uint8_t** lods = rd ? (uint8_t**)twkP(rd, RD_LODARRAY) : nullptr;
     uint8_t* lod = (lods && twkI(rd, RD_LODARRAY + 8) > 0) ? lods[0] : nullptr;
-    if (!lod) return false;
+    if (!lod) { DirWhy(slot, "no LOD render data"); return false; }
     uint8_t* posData = (uint8_t*)twkP(lod, LODRD_POSVB + POSVB_DATA);
     d.posStride = twkI(lod, LODRD_POSVB + POSVB_STRIDE);
     d.nVerts    = twkI(lod, LODRD_POSVB + POSVB_NUMVERTS);
-    if (!posData || d.posStride < 12 || d.nVerts <= 0) return false;
+    if (!posData || d.posStride < 12 || d.nVerts <= 0) {
+        DirWhy(slot, "no readable vertex buffer"); return false; }
 
     d.origPos = (uint8_t*)malloc((size_t)d.nVerts * d.posStride);
-    if (!d.origPos) return false;
+    if (!d.origPos) { DirWhy(slot, "out of memory saving the original vertices"); return false; }
     memcpy(d.origPos, posData, (size_t)d.nVerts * d.posStride);   // the garment as shipped
     d.mesh = mesh;
-    if (!g_weld || g_weldCount <= 0) { DirectRelease(slot); return false; }
+    // THE WELD MAP IS GLOBAL and belongs to the asset build that just ran. Arming outside a build --
+    // a bare "re-arm" after a re-dress -- finds it empty or belonging to another garment, and fails
+    // here silently. That was a garment losing its physics for a whole session with no explanation.
+    if (!g_weld || g_weldCount <= 0) {
+        DirWhy(slot, "no weld map -- this garment must be rebuilt, not re-armed");
+        DirectRelease(slot); return false; }
     d.weld = (int*)malloc((size_t)g_weldCount * sizeof(int));
-    if (!d.weld) { DirectRelease(slot); return false; }
+    if (!d.weld) { DirWhy(slot, "out of memory copying the weld map"); DirectRelease(slot); return false; }
     memcpy(d.weld, g_weld, (size_t)g_weldCount * sizeof(int));
     d.weldCount = g_weldCount; d.weldUnique = g_weldUnique;
-    if (!BuildInvRefPose(mesh, d)) { DirectRelease(slot); return false; }
+    if (!BuildInvRefPose(mesh, d)) { DirWhy(slot, "could not build the inverse rest pose");
+                                     DirectRelease(slot); return false; }
     d.boneMats = (float*)malloc((size_t)d.nBones * 12 * sizeof(float));
     d.boneOk   = (uint8_t*)malloc((size_t)d.nBones);
-    if (!d.boneMats || !d.boneOk) { DirectRelease(slot); return false; }
+    if (!d.boneMats || !d.boneOk) { DirWhy(slot, "out of memory for the bone tables");
+                                    DirectRelease(slot); return false; }
     d.armed = true;
     // Every buffer parameter this module READS, printed per garment. Three theories about why one
     // custom garment renders collapsed were each disproved by their own control, so this stops
@@ -2413,6 +2503,34 @@ static void ForgetAfterFault() {
     g_asset = nullptr;
 }
 
+// True when this garment is driven and has been rebuilt here.
+static bool RebuildIfDriven(void* comp, void* mesh, int slot) {
+    if (!g_direct || !mesh || !ClothMerge_GarmentWantsDirect(mesh)) return false;
+    g_dirWhy[slot] = nullptr;
+    g_sim[slot].asset = nullptr;
+    SetupGarment(comp, mesh, slot, /*forceRebuild*/ true);
+    // Report the DRIVER, not the build's return value: the build can succeed while the driver is not
+    // armed, and saying "driving" when it is not is how this hid for several rounds.
+    const bool driving = (g_dir[slot].mesh != nullptr);
+    TwkLog("[direct] slot %d: driven garment rebuilt after a re-dress -> %s", slot,
+           driving ? "driving" : "STILL NOT DRIVING");
+    return driving;
+}
+
+void ClothSim_SlaveGone(int slot) {
+    if (slot < 0 || slot >= kSimSlots) return;
+    // Our own allocations only -- the component and its mesh are the game's business, and the mesh is
+    // rooted and fine. This just stops us driving a slot whose component no longer exists.
+    free(g_dir[slot].origPos);   free(g_dir[slot].origTan); free(g_dir[slot].invRefPose);
+    free(g_dir[slot].weld);      free(g_dir[slot].boneMats); free(g_dir[slot].boneOk);
+    free(g_dir[slot].refPoseCS);
+    memset(&g_dir[slot], 0, sizeof(g_dir[slot]));
+    g_sim[slot].mesh = nullptr; g_sim[slot].asset = nullptr; g_sim[slot].serial = -1;
+    g_normalsChecked[slot] = false;
+    g_dirWhy[slot] = nullptr;
+    TwkLog("[quad] slot %d: simulation state dropped -- its component was destroyed", slot);
+}
+
 void ClothSim_PumpFrame() {
     if (!g_ok || !g_ready) return;
     // A shape knob changed and has settled: hand the garments back, which drops the asset registry
@@ -2484,30 +2602,46 @@ void ClothSim_PumpFrame() {
             if (g_on && serial != g_sim[slot].serial && armSettled) {
                 static double nextTry[kSimSlots] = {};
                 static double nextWhine[kSimSlots] = {};
+                // Give up after a few attempts at the SAME dress. A build that cannot succeed will not
+                // succeed on the hundredth try either, and retrying forever buries the log and the frame
+                // rate. Reset whenever a new dress arrives.
+                static int    tries[kSimSlots] = {};
+                static long   triesFor[kSimSlots] = {};
+                if (triesFor[slot] != serial) { triesFor[slot] = serial; tries[slot] = 0; }
                 bool ok = false;
                 if (!mesh) {
                     // Nothing worn in this slot: a real outcome, and settled -- take the serial.
                     g_sim[slot].mesh = nullptr; g_sim[slot].asset = nullptr;
                     ok = true;
                 } else if (mesh != g_sim[slot].mesh) {
-                    if (nowSec >= nextTry[slot]) {
+                    if (nowSec >= nextTry[slot] && tries[slot] < 5) {
                         nextTry[slot] = nowSec + 0.25;      // a failing build must not run every frame
-                        if (SetupGarment(comp, mesh, slot)) { g_sim[slot].mesh = mesh; ok = true; }
+                        tries[slot]++;
+                        if (SetupGarment(comp, mesh, slot, false)) { g_sim[slot].mesh = mesh; ok = true; }
                         else                               { g_sim[slot].asset = nullptr; }
                     }
                 } else if (g_sim[slot].asset) {
-                    // Same garment, fresh component state: the actors went with the old render
-                    // state, so re-create them rather than rebuilding the asset.
-                    *(uint8_t*)((uint8_t*)comp + SMC_DISABLECLOTH) = 0;
-                    if (g_recreate) g_recreate(comp);
-                    ok = true;
-                } else if (nowSec >= nextTry[slot]) {
+                    // Same garment, fresh component state. A DRIVEN garment has to be rebuilt (the
+                    // vertex driver needs the weld map a build produces); a bound one only needs its
+                    // actors re-created.
+                    if (RebuildIfDriven(comp, mesh, slot)) { ok = true; }
+                    else {
+                        *(uint8_t*)((uint8_t*)comp + SMC_DISABLECLOTH) = 0;
+                        if (g_recreate) g_recreate(comp);
+                        ok = true;
+                    }
+                } else if (nowSec >= nextTry[slot] && tries[slot] < 5) {
                     // Same mesh recorded but no asset -- a build that failed earlier. Retry it rather
                     // than sitting there with the slot marked handled.
                     nextTry[slot] = nowSec + 0.25;
-                    if (SetupGarment(comp, mesh, slot)) ok = true;
+                    if (SetupGarment(comp, mesh, slot, false)) ok = true;
                 }
-                if (ok) g_sim[slot].serial = serial;
+                if (ok) { g_sim[slot].serial = serial; tries[slot] = 0; }
+                else if (tries[slot] >= 5) {
+                    g_sim[slot].serial = serial;     // stop asking; the next dress gets a fresh chance
+                    TwkLog("[quad] slot %d: giving up on dress %ld after %d attempts", slot, serial,
+                           tries[slot]);
+                }
                 else if (nowSec >= nextWhine[slot]) {
                     nextWhine[slot] = nowSec + 2.0;
                     char gn[64];

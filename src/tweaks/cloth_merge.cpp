@@ -146,8 +146,13 @@ static void* g_origRefresh = nullptr, *g_startRefresh = nullptr;
 // Thread-local: dressing happens on the game thread, but scoping it to the thread costs nothing and
 // means a background dress (if one ever exists) can never be mistaken for the local player's.
 static thread_local void* t_dressing = nullptr;
+// Bumped at the start of every dress of OUR character; stamps the material records so a stale one is
+// never handed back. See GarmentMatRec.
+static long g_matGen = 0;
 
 static void hkRefreshVisuals(void* self) {
+    // A new dress: everything the last one resolved is now suspect. See GarmentMatRec.
+    if (self && self == CatchTweaks_Skater()) g_matGen++;
     void* prev = t_dressing;      // save/restore rather than clear: RefreshVisuals can nest
     t_dressing = self;
     __try { ((RefreshVisualsFn)g_origRefresh)(self); }
@@ -428,6 +433,7 @@ static void* volatile g_pendGarment[kMaxGarments] = {};   // the garment to wear
 // the garment's material on the body so it is not drawn twice, over the top of our own copy.
 static bool volatile g_pendHideOnBody[kMaxGarments] = {};
 static bool          g_hidOnBody[kMaxGarments] = {};   // already hidden for this character
+static void*         g_builtSet[kMaxGarments]  = {};   // the outfit the current build was made for
 static volatile LONG  g_pendSerial  = 0;
 static volatile LONG  g_appliedSerial = 0;
 static double g_pendT = 0.0;
@@ -456,7 +462,7 @@ void ClothMerge_ReadConfig(const char* buf) {
     g_nExcl = SplitList(excl, &g_excl[0][0], kMaxExcl, 40);
     g_requireClothMat = TwkIniInt(buf, "ClothRequireMaterialFlag", 1);
     g_matSwap         = TwkIniInt(buf, "ClothMaterialSwap", 1);
-    g_recapture       = TwkIniInt(buf, "ClothRecapture", 0);
+    g_recapture       = TwkIniInt(buf, "ClothRecapture", 1);
     g_driveMulti      = TwkIniInt(buf, "ClothDriveMultiSection", 1);
     g_tintFromColor   = TwkIniInt(buf, "ClothTintFromColour", 0);
     g_tintGain        = TwkIniInt(buf, "ClothTintGainPct", 200);
@@ -684,8 +690,54 @@ static void hkDoMerge(void* self, void* refPose) {
 }
 
 // ------------------------------------------------------------------ the slave build (PUMP ONLY)
+// Is this component still a live component of THIS character?
+//
+// A wardrobe change rebuilds the character's components, taking ours with them -- and a destroyed
+// UObject's memory gets reused, so the cached pointer stays non-null and reads return whatever moved
+// in. Reusing one silently produced a garment with no physics for the rest of the session (the pump
+// read its "mesh" and got 0198040428091800), and hiding through a stale BODY component put the hide on
+// something else entirely, which is what kept taking the shoes.
+// Checked by ownership rather than by reading a field and hoping: a live slave's Outer is the skater
+// we are dressing. Anything else -- unreadable, or owned by someone else -- means rebuild.
+static bool ComponentStillOurs(void* comp, void* skater) {
+    if (!comp || !skater) return false;
+    bool ok = false;
+    __try {
+        char cn[96];
+        // Literals: this sits above the offset enums. 0x10 = UObject::ClassPrivate (UOBJ_CLASS),
+        // 0x20 = UObject::OuterPrivate (UOBJ_OUTER).
+        void* cls = twkP(comp, 0x10);
+        ok = (twkP(comp, 0x20) == skater)
+          && cls && CatchSound_ObjName(cls, cn, sizeof(cn))
+          && strstr(cn, "SkeletalMeshComponent") != nullptr;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { ok = false; }
+    return ok;
+}
+
+// EVERY caller gets a validated component, not just the dress path.
+//
+// The component dies AFTER a dress, not during it: the field log has slot 0 dressed correctly and then,
+// twenty seconds later, the cloth pump reading 428900002DC4001C out of it. Validating only when we dress
+// therefore proved nothing -- for every frame in between, a destroyed component was handed to the
+// simulation, which is why one garment lost its physics for the rest of the session and the body hide
+// landed on freed memory (the vanishing shoes).
+// So the check lives HERE, on the accessor everything goes through. When a slave has gone, it is
+// forgotten and a fresh dress is requested, which rebuilds it the way a map change would.
 void* ClothMerge_SlaveComponent(int i) {
-    return (i >= 0 && i < kMaxGarments) ? g_slave[i] : nullptr;
+    if (i < 0 || i >= kMaxGarments) return nullptr;
+    void* comp = g_slave[i];
+    if (!comp) return nullptr;
+    void* skater = CatchTweaks_Skater();
+    if (skater && !ComponentStillOurs(comp, skater)) {
+        TwkLog("[cloth] slot %d: its garment component is gone (destroyed by a re-dress) -- forgetting "
+               "it and asking for a fresh dress", i);
+        g_slave[i]     = nullptr;
+        g_hidOnBody[i] = false;      // whatever it hid on the body went with it
+        g_builtSet[i]  = nullptr;    // force the outfit check to rebuild
+        ClothSim_SlaveGone(i);       // drop the simulation state that pointed at it
+        return nullptr;
+    }
+    return comp;
 }
 int ClothMerge_SlaveCount() { return kMaxGarments; }
 void* ClothMerge_MasterComponent() { return g_masterComp; }
@@ -1030,7 +1082,14 @@ static const char* SIG_GET_ITEM_MAT =
 // handed to a live component. Clearing it on the skater change was tried while chasing a random crash
 // that turned out to belong to ANOTHER MOD, and was reverted with the rest of that work.
 enum { kMatRecords = 24 };
-struct GarmentMatRec { void* mesh; void* mat; int matIdx; };
+// GENERATION-STAMPED. Both fields are raw UObject pointers with nothing keeping them alive: the
+// material the customization resolves is usually a per-dress dynamic instance, so it dies with the
+// dress that made it. Kept and handed back later, it goes onto a LIVE component -- and garbage
+// collection then walks a freed UMaterialInstance and takes the game down, on a worker thread, minutes
+// away from anything to do with clothes. Reproducible by entering the shop twice.
+// Stamping each record with the dress it came from means a stale one is never returned: it simply does
+// not match the current generation, and gets overwritten in place.
+struct GarmentMatRec { void* mesh; void* mat; int matIdx; long gen; };
 static GarmentMatRec g_matRec[kMatRecords] = {};
 
 static void LogGarmentMat(const char* what, void* mesh, int idx, void* mat) {
@@ -1045,7 +1104,7 @@ static void RecordGarmentMat(void* mesh, int matIdx, void* mat) {
     for (int i = 0; i < kMatRecords; i++) {
         if (g_matRec[i].mesh == mesh) {
             const bool changed = (g_matRec[i].mat != mat);
-            g_matRec[i].mat = mat; g_matRec[i].matIdx = matIdx;
+            g_matRec[i].mat = mat; g_matRec[i].matIdx = matIdx; g_matRec[i].gen = g_matGen;
             if (changed) LogGarmentMat("changed", mesh, matIdx, mat);
             return;
         }
@@ -1053,6 +1112,7 @@ static void RecordGarmentMat(void* mesh, int matIdx, void* mat) {
     }
     if (free < 0) free = 0;                       // wrap: the oldest is the least interesting
     g_matRec[free].mesh = mesh; g_matRec[free].mat = mat; g_matRec[free].matIdx = matIdx;
+    g_matRec[free].gen  = g_matGen;
     LogGarmentMat("learned", mesh, matIdx, mat);
 }
 
@@ -1060,7 +1120,7 @@ static void RecordGarmentMat(void* mesh, int matIdx, void* mat) {
 int ClothMerge_GarmentMaterialIndex(void* mesh) {
     mesh = SourceOfOwn(mesh);
     for (int i = 0; i < kMatRecords; i++)
-        if (g_matRec[i].mesh == mesh) return g_matRec[i].matIdx;
+        if (g_matRec[i].mesh == mesh && g_matRec[i].gen == g_matGen) return g_matRec[i].matIdx;
     return -1;
 }
 
@@ -1084,6 +1144,7 @@ void* ClothMerge_ConfiguredMaterial(void* mesh, int* outIdx) {
     mesh = SourceOfOwn(mesh);
     for (int i = 0; i < kMatRecords; i++)
         if (g_matRec[i].mesh == mesh) {
+            if (g_matRec[i].gen != g_matGen) return nullptr;   // an older dress: that material may be gone
             if (outIdx) *outIdx = g_matRec[i].matIdx;
             return g_matRec[i].mat;
         }
@@ -1664,33 +1725,113 @@ static int BodyMaterialIndexFor(void* bodyMesh, void* garment) {
     void*     bm   = twkP(bodyMesh, SM_MATS);
     const int bnum = twkI(bodyMesh, SM_MATS + 8);
     if (!gm || !bm || gnum <= 0 || bnum <= 0 || gnum > 16 || bnum > 32) return -1;
+
+    // Matching on the ROOT material was far too coarse and hid the wrong thing: it walks up to the
+    // base Material, and many garments share one master, so a pair of trousers matched the SHOES and
+    // the shoes vanished. Compare the actual instances instead, most specific first, and give up
+    // rather than hide something at random -- a garment drawn twice is cosmetic, a vanished item is not.
     for (int g = 0; g < gnum; g++) {
-        void* want = BaseMaterialOf(twkP((uint8_t*)gm + (size_t)g * SKELMAT_STRIDE, 0));
-        if (!want) continue;
+        void* gmat = twkP((uint8_t*)gm + (size_t)g * SKELMAT_STRIDE, 0);
+        if (!gmat) continue;
         for (int b = 0; b < bnum; b++)
-            if (BaseMaterialOf(twkP((uint8_t*)bm + (size_t)b * SKELMAT_SZ, 0)) == want) return b;
+            if (twkP((uint8_t*)bm + (size_t)b * SKELMAT_SZ, 0) == gmat) return b;   // the same object
+    }
+    for (int g = 0; g < gnum; g++) {                                   // ...or the same direct parent
+        void* gmat = twkP((uint8_t*)gm + (size_t)g * SKELMAT_STRIDE, 0);
+        void* gpar = gmat ? twkP(gmat, MI_PARENT_P) : nullptr;
+        if (!gpar) continue;
+        for (int b = 0; b < bnum; b++) {
+            void* bmat = twkP((uint8_t*)bm + (size_t)b * SKELMAT_SZ, 0);
+            if (!bmat) continue;
+            if (bmat == gpar || twkP(bmat, MI_PARENT_P) == gpar) return b;
+        }
     }
     return -1;
 }
 
-// Stop the BODY drawing a garment we are drawing ourselves. Per-component and through the engine's own
-// call, so the shared mesh is untouched and the next character is unaffected; across every LOD, because
-// the body drops to lower LODs at distance and a hide is per-LOD.
+// Stop the BODY drawing a garment we are drawing ourselves.
+//
+// HOW ShowMaterialSection ACTUALLY WORKS -- read from the disassembly, because assuming it cost a day:
+//   void ShowMaterialSection(int32 MaterialID, int32 SectionIndex, bool bShow, int32 LODIndex)
+// It hides the material belonging to the SECTION AT SectionIndex. `MaterialID` is discarded (the
+// compiled body zeroes the register). So passing the material index and SectionIndex 0 hides whatever
+// section 0 happens to use -- on the merged character that is the SHOES, which is exactly what kept
+// vanishing no matter which material we computed.
+// Therefore: walk the body's render sections, find the ones whose MaterialIndex is the garment's, and
+// hide THOSE by section index. Per-component and through the engine's own call, so the shared mesh is
+// untouched.
+enum { SMESH_RENDERDATA = 0x78,   // USkeletalMesh::SkeletalMeshRenderData
+       SRD_LODARRAY     = 0x00,   // FSkeletalMeshRenderData::LODRenderData (TIndirectArray -> ptrs)
+       SLOD_SECTIONS    = 0x10,   // FSkeletalMeshLODRenderData::RenderSections
+       SSEC_STRIDE      = 232,    // sizeof(FSkelMeshRenderSection)
+       SSEC_MATIDX      = 0x00 }; // FSkelMeshRenderSection::MaterialIndex (uint16)
+
+// Clear every hide on the body before applying this dress's.
+//
+// THE UNDERLYING BUG, not a shoe fix: ShowMaterialSection records hides in a HiddenMaterials array that
+// lives on the COMPONENT and is indexed by MATERIAL INDEX. Change clothes and the merged body mesh is
+// rebuilt with its materials in a different order, while the component -- and its flags -- survive. The
+// index that meant "the trousers I am drawing myself" now means something else, and that item vanishes.
+// It was the shoes because they happened to land on the freed index; it could be any item, and it
+// depends on bone counts only because those decide which garment gets hidden in the first place.
+// A map change never showed it: a new character means a new component with no flags.
+// So: show everything, every dress, then hide what THIS outfit needs. Same discipline the slave
+// components already use.
+static void ShowAllBodySections(void* masterComp) {
+    if (!masterComp || !g_showMatSection) return;
+    void*     bodyMesh = twkP(masterComp, SMC_SKELMESH_M);
+    uint8_t*  rd    = bodyMesh ? (uint8_t*)twkP(bodyMesh, SMESH_RENDERDATA) : nullptr;
+    uint8_t** lods  = rd ? (uint8_t**)twkP(rd, SRD_LODARRAY) : nullptr;
+    const int nLods = rd ? twkI(rd, SRD_LODARRAY + 8) : 0;
+    if (!lods || nLods <= 0 || nLods > 16) return;
+    int shown = 0;
+    for (int l = 0; l < nLods; l++) {
+        uint8_t*  lod  = lods[l];
+        uint8_t*  secs = lod ? (uint8_t*)twkP(lod, SLOD_SECTIONS) : nullptr;
+        const int nSec = lod ? twkI(lod, SLOD_SECTIONS + 8) : 0;
+        if (!secs || nSec <= 0 || nSec > 64) continue;
+        for (int sIdx = 0; sIdx < nSec; sIdx++) {
+            const int secMat = *(uint16_t*)(secs + (size_t)sIdx * SSEC_STRIDE + SSEC_MATIDX);
+            __try { g_showMatSection(masterComp, secMat, sIdx, true, l); shown++; }
+            __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+    }
+    if (shown) TwkLog("[cloth] body: cleared %d section hide(s) from the previous outfit", shown);
+}
+
 static void HideGarmentOnBody(void* masterComp, void* garment, int slot) {
     if (!masterComp || !garment || !g_showMatSection) return;
     void* bodyMesh = twkP(masterComp, SMC_SKELMESH_M);
-    const int idx = BodyMaterialIndexFor(bodyMesh, garment);
-    if (idx < 0) { TwkLog("[cloth] slot %d: could not find this garment on the body -- not hiding it "
-                          "(it will draw twice)", slot); return; }
-    int lods = bodyMesh ? twkI(bodyMesh, SM_LODINFO_M + 8) : 0;
-    if (lods < 1 || lods > 16) lods = 1;
-    for (int l = 0; l < lods; l++) {
-        __try { g_showMatSection(masterComp, idx, 0, false, l); }
-        __except (EXCEPTION_EXECUTE_HANDLER) {}
+    const int matIdx = BodyMaterialIndexFor(bodyMesh, garment);
+    if (matIdx < 0) {
+        TwkLog("[cloth] slot %d: could not find this garment among the body's materials -- not hiding "
+               "it (it will draw twice, which is cosmetic; hiding the wrong thing is not)", slot);
+        return;
+    }
+    uint8_t*  rd   = bodyMesh ? (uint8_t*)twkP(bodyMesh, SMESH_RENDERDATA) : nullptr;
+    uint8_t** lods = rd ? (uint8_t**)twkP(rd, SRD_LODARRAY) : nullptr;
+    const int nLods = rd ? twkI(rd, SRD_LODARRAY + 8) : 0;
+    if (!lods || nLods <= 0 || nLods > 16) {
+        TwkLog("[cloth] slot %d: body has no readable LODs -- not hiding", slot); return;
+    }
+    int hidden = 0;
+    for (int l = 0; l < nLods; l++) {
+        uint8_t*  lod  = lods[l];
+        uint8_t*  secs = lod ? (uint8_t*)twkP(lod, SLOD_SECTIONS) : nullptr;
+        const int nSec = lod ? twkI(lod, SLOD_SECTIONS + 8) : 0;
+        if (!secs || nSec <= 0 || nSec > 64) continue;
+        for (int sIdx = 0; sIdx < nSec; sIdx++) {
+            const int secMat = *(uint16_t*)(secs + (size_t)sIdx * SSEC_STRIDE + SSEC_MATIDX);
+            if (secMat != matIdx) continue;
+            __try { g_showMatSection(masterComp, matIdx, sIdx, false, l); hidden++; }
+            __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
     }
     g_hidOnBody[slot] = true;
-    TwkLog("[cloth] slot %d: hidden on the body (material %d across %d LOD(s)) -- the character keeps "
-           "every bone it shipped with, and our copy is what you see", slot, idx, lods);
+    char mn[96]; void* bmats = twkP(bodyMesh, SM_MATS);
+    void* hm = bmats ? twkP((uint8_t*)bmats + (size_t)matIdx * SKELMAT_SZ, 0) : nullptr;
+    TwkLog("[cloth] slot %d: hid %d body section(s) using material %d '%s' across %d LOD(s)",
+           slot, hidden, matIdx, (hm && CatchSound_ObjName(hm, mn, sizeof(mn))) ? mn : "?", nLods);
 }
 
 static bool BuildOrRefreshSlave(void* skater, void* masterComp, void* garment, int slot) {
@@ -1707,6 +1848,13 @@ static bool BuildOrRefreshSlave(void* skater, void* masterComp, void* garment, i
         return false;
     }
     __try {
+        // Never reuse a component that did not survive the last dress -- see ComponentStillOurs.
+        if (g_slave[slot] && !ComponentStillOurs(g_slave[slot], skater)) {
+            TwkLog("[cloth] slot %d: the previous garment component did not survive the re-dress -- "
+                   "building a new one", slot);
+            g_slave[slot] = nullptr;
+            g_hidOnBody[slot] = false;      // whatever it hid on the body went with it
+        }
         if (!g_slave[slot]) {
             void* cls = FindClassByName(L"SkeletalMeshComponent", "Class");
             if (!cls) { TwkLog("[cloth] SkeletalMeshComponent class not found -- un-merge off"); g_okBuild = 0; return false; }
@@ -1913,6 +2061,7 @@ void ClothMerge_PumpFrame() {
                 g_slave[i] = nullptr;
                 g_capturedMat[i] = nullptr; g_capturedFor[i] = nullptr; g_seenGarment[i] = nullptr;
                 g_hidOnBody[i] = false;      // new body component -- the hide is per-component
+                g_builtSet[i]  = nullptr;
             }
             ClothSim_ReleaseAll();     // these meshes are shared, and the new character merges them
             g_logBudget = 60;          // a new character is worth describing again (replay, respawn)
@@ -1994,12 +2143,27 @@ void ClothMerge_PumpFrame() {
         // -- the game must dress normally once more before its configured material exists to borrow.
         // Bounded by construction: a capture that fails leaves capturedFor null, which cannot match
         // again, so this can never become a loop.
-        for (int slot = 0; slot < kMaxGarments; slot++) {
-            void* g2 = g_pendGarment[slot];
-            if (!g_recapture || !g2 || !g_capturedFor[slot] || g2 == g_capturedFor[slot]) continue;
+        // ANY change to the garment SET rebuilds from scratch, exactly as a map change does.
+        //
+        // This used to trigger only when a slot that already had a garment got a different one, which
+        // missed the common case: garments are slotted by TAG, so changing trousers can move them from
+        // one slot to another (slot 1 emptied, slot 3 appeared) and neither slot looked "changed".
+        // Everything then limped along on incremental updates -- the unchanged shirt kept a cloth asset
+        // nobody was driving, the body kept a hide belonging to the previous garment -- and that
+        // half-updated state is what crashed on entering replay.
+        //
+        // Rebuilding wholesale is what already works on every map change. It costs one extra dress.
+        bool setChanged = false;
+        for (int i = 0; i < kMaxGarments && !setChanged; i++)
+            if (g_pendGarment[i] != g_builtSet[i]) setChanged = true;
+        // Only once the previous build has settled, or the two-pass would re-enter itself.
+        if (g_recapture && setChanged && g_captureDone && !g_capturePass) {
             char n1[96];
-            TwkLog("[cloth] slot %d is wearing something new ('%s') -- re-reading its material",
-                   slot, CatchSound_ObjName(g2, n1, sizeof(n1)) ? n1 : "?");
+            void* g2 = nullptr;
+            for (int i = 0; i < kMaxGarments && !g2; i++)
+                if (g_pendGarment[i] != g_builtSet[i]) g2 = g_pendGarment[i];
+            TwkLog("[cloth] the outfit changed ('%s') -- rebuilding from scratch, the same way a map "
+                   "change does", (g2 && CatchSound_ObjName(g2, n1, sizeof(n1))) ? n1 : "nothing");
             // Stop drawing the garments first, THEN unmark the meshes -- a live render proxy must
             // never be left pointing at cloth data we have just taken away.
             for (int i = 0; i < kMaxGarments; i++)
@@ -2014,6 +2178,10 @@ void ClothMerge_PumpFrame() {
                 g_capturedMat[i] = nullptr; g_capturedVariant[i] = nullptr;
                 g_capturedFor[i] = nullptr; g_seenGarment[i] = nullptr;
             }
+            for (int i = 0; i < kMaxGarments; i++) {
+                g_hidOnBody[i] = false;    // the body's hide belongs to the OLD outfit
+                g_builtSet[i]  = nullptr;
+            }
             g_captureDone = false;
             InterlockedExchange(&g_capturePass, 1);
             void* prev = t_dressing;
@@ -2024,8 +2192,13 @@ void ClothMerge_PumpFrame() {
             return;
         }
 
+        // Every dress starts from a body with nothing hidden -- see ShowAllBodySections.
+        ShowAllBodySections(meshComp);
+        for (int i = 0; i < kMaxGarments; i++) g_hidOnBody[i] = false;
+
         for (int slot = 0; slot < kMaxGarments; slot++) {
             void* garment = g_pendGarment[slot];
+            g_builtSet[slot] = garment;              // what this build is for -- see the outfit check
             if (garment) {
                 BuildOrRefreshSlave(skater, meshComp, garment, slot);
             } else if (g_slave[slot]) {

@@ -23,6 +23,9 @@ void ClothSim_SaveConfig(char* iniText, size_t cap);
 void ClothSim_ResetDefaults();
 void ClothSim_Install();
 void ClothSim_PumpFrame();
+// A garment's component was destroyed under us: drop every cached pointer for that slot so the next
+// dress rebuilds instead of driving a corpse.
+void ClothSim_SlaveGone(int slot);
 // Undo every mark we made on the garment meshes. Required before a marked garment can be merged
 // again -- see the note on the definition.
 void ClothSim_ReleaseAll();
