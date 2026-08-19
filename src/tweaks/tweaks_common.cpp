@@ -123,7 +123,16 @@ void TwkIniStr(const char* text, const char* key, char* out, size_t cap, const c
     }
 }
 
+static int TwkIniIntImpl(const char* text, const char* key, int def, bool report);
+// Same lookup, but says nothing. For PROBING whether a key is present at all (pass a sentinel
+// default), where the divergence line below would be noise rather than news.
+int TwkIniIntQuiet(const char* text, const char* key, int def) {
+    return TwkIniIntImpl(text, key, def, false);
+}
 int TwkIniInt(const char* text, const char* key, int def) {
+    return TwkIniIntImpl(text, key, def, true);
+}
+static int TwkIniIntImpl(const char* text, const char* key, int def, bool report) {
     const size_t klen = strlen(key);
     for (const char* line = text; *line; ) {
         const char* eol = strpbrk(line, "\r\n");
@@ -137,7 +146,17 @@ int TwkIniInt(const char* text, const char* key, int def) {
             if (q < end && *q == '=') {
                 q++;
                 while (q < end && (*q == ' ' || *q == '\t')) q++;
-                return atoi(q);
+                const int got = atoi(q);
+                // A saved key always wins over the built-in default, so a value written by an OLDER
+                // build silently pins behaviour that later versions changed -- and the machine this
+                // mod is developed on has the oldest ini of anyone. That is how a code path shipped
+                // having never once run: the developer's ini held the previous default, so every
+                // test validated a branch that was switched off. Say so, in every log, for every key
+                // that disagrees, so the difference between a reporter's build and ours is readable
+                // from the first page of their log instead of guessed at.
+                if (report && got != def)
+                    TwkLog("[ini] %s=%d (built-in default is %d)", key, got, def);
+                return got;
             }
         }
         line = eol ? eol + 1 : end;

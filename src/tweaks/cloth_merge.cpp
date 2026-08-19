@@ -445,77 +445,32 @@ static void* g_masterComp  = nullptr;   // the body component our garments follo
                                         // component has no bones of its own, they live here
 static void* g_slaveSkater = nullptr;   // the skater they were built on (map change invalidates ALL)
 
+// The settled half of this module's settings; see the note on kRetiredKeys in cloth_sim.cpp for why
+// they are code now. g_unmerge, g_ownMesh, g_requireClothMat, g_matSwap and g_driveMulti are the
+// pipeline itself -- with any of them off, cloth either does nothing or does it wrongly, so there was
+// never a second value worth offering. g_recapture is the rebuild path that shipped looping.
+// g_unfitProbe was a bisect knob whose upper levels crash by design.
 void ClothMerge_ReadConfig(const char* buf) {
-    g_unmerge = TwkIniInt(buf, "ClothUnmerge", 1);
-    // Bisect knob, ships at 0. Deliberately NOT written back by SaveConfig: every level above 0 can
-    // crash by design, and it should not appear in an ordinary user's ini to be discovered. Read only,
-    // for someone who has been told to set it.
-    g_unfitProbe = TwkIniInt(buf, "ClothUnfitProbe", 0);
-    // ClothOwnMesh: build the mod's own copy of each garment mesh instead of modifying the shared
-    // wardrobe asset. This is the fix for the map-change crashes; off until it is proven in the field.
-    g_ownMesh    = TwkIniInt(buf, "ClothOwnMesh", 1);
-    if (g_unfitProbe < 0) g_unfitProbe = 0; else if (g_unfitProbe > 5) g_unfitProbe = 5;
     char tags[128], excl[512];
     TwkIniStr(buf, "ClothGarmentTags", tags, sizeof(tags), "_UB_,_LB_");
     TwkIniStr(buf, "ClothExclude",     excl, sizeof(excl), "");
     g_nTags = SplitList(tags, &g_tags[0][0], kMaxGarments, 16);
     g_nExcl = SplitList(excl, &g_excl[0][0], kMaxExcl, 40);
-    g_requireClothMat = TwkIniInt(buf, "ClothRequireMaterialFlag", 1);
-    g_matSwap         = TwkIniInt(buf, "ClothMaterialSwap", 1);
-    g_recapture       = TwkIniInt(buf, "ClothRecapture", 1);
-    g_driveMulti      = TwkIniInt(buf, "ClothDriveMultiSection", 1);
-    g_tintFromColor   = TwkIniInt(buf, "ClothTintFromColour", 0);
-    g_tintGain        = TwkIniInt(buf, "ClothTintGainPct", 200);
-    {   char rules[512] = {};
-        TwkIniStr(buf, "ClothTintPerGarment", rules, sizeof(rules), "");
-        g_nTintRules = 0;
-        for (char* p2 = rules; *p2 && g_nTintRules < kMaxTintRules; ) {
-            while (*p2 == ' ' || *p2 == ',') p2++;
-            if (!*p2) break;
-            char* colon = strchr(p2, ':');
-            char* comma = strchr(p2, ',');
-            if (!colon || (comma && colon > comma)) { p2 = comma ? comma + 1 : p2 + strlen(p2); continue; }
-            const size_t n = (size_t)(colon - p2);
-            if (n > 0 && n < sizeof(g_tintRuleName[0])) {
-                memcpy(g_tintRuleName[g_nTintRules], p2, n);
-                g_tintRuleName[g_nTintRules][n] = 0;
-                g_tintRuleGain[g_nTintRules] = atoi(colon + 1);
-                g_nTintRules++;
-            }
-            p2 = comma ? comma + 1 : p2 + strlen(p2);
-        }
-        if (g_nTintRules) TwkLog("[mat] %d per-garment tint rule(s) from '%s'", g_nTintRules, rules);
-    }
+    // ClothTintPerGarment is retired with the tint feature that consumed it: the master flag
+    // gating every tint application is off for good, so these rules parsed into a gain nothing
+    // applied -- a setting that silently does nothing, which is the whole class being removed.
     if (g_nTags <= 0) { strcpy(g_tags[0], "_UB_"); g_nTags = 1; }
-    if (g_unfitProbe > 0)
-        TwkLog("[probe] ClothUnfitProbe=%d -- a garment that does NOT fit the body's skeleton will be "
-               "un-merged anyway, with its setup stopped after step %d. THIS CAN CRASH; that is the "
-               "point. Set it back to 0 when finished.", g_unfitProbe, g_unfitProbe);
-    TwkLog("[cloth] config: ClothOwnMesh=%d", g_ownMesh);
-    TwkLog("[cloth] config: ClothUnmerge=%d tags='%s' (%d) exclude='%s' (%d)",
-           g_unmerge, tags, g_nTags, excl, g_nExcl);
+    TwkLog("[cloth] config: tags='%s' (%d) exclude='%s' (%d)", tags, g_nTags, excl, g_nExcl);
 }
 void ClothMerge_SaveConfig(char* buf, size_t cap) {
-    TwkIniSetInt(buf, cap, "ClothUnmerge", g_unmerge);
-    TwkIniSetInt(buf, cap, "ClothOwnMesh",  g_ownMesh);
+    // Only what is still configurable -- the garment tag lists and the tint rules. See the note on
+    // ClothMerge_ReadConfig for why the rest is code now.
     {
         char tags[128] = {}, excl[512] = {};
         for (int i = 0; i < g_nTags; i++) { if (i) strcat(tags, ","); strcat(tags, g_tags[i]); }
         for (int i = 0; i < g_nExcl; i++) { if (i) strcat(excl, ","); strcat(excl, g_excl[i]); }
         TwkIniSetStr(buf, cap, "ClothGarmentTags", tags);
         TwkIniSetStr(buf, cap, "ClothExclude",     excl);
-        TwkIniSetInt(buf, cap, "ClothRequireMaterialFlag", g_requireClothMat);
-        TwkIniSetInt(buf, cap, "ClothMaterialSwap", g_matSwap);
-        TwkIniSetInt(buf, cap, "ClothRecapture", g_recapture);
-        TwkIniSetInt(buf, cap, "ClothDriveMultiSection", g_driveMulti);
-        TwkIniSetInt(buf, cap, "ClothTintFromColour", g_tintFromColor);
-        TwkIniSetInt(buf, cap, "ClothTintGainPct", g_tintGain);
-        {   char rules[512] = {}; size_t at = 0;
-            for (int i = 0; i < g_nTintRules; i++)
-                at += (size_t)_snprintf_s(rules + at, sizeof(rules) - at, _TRUNCATE, "%s%s:%d",
-                                          i ? "," : "", g_tintRuleName[i], g_tintRuleGain[i]);
-            TwkIniSetStr(buf, cap, "ClothTintPerGarment", rules);
-        }
     }
 }
 void ClothMerge_ResetDefaults() {
@@ -2156,8 +2111,43 @@ void ClothMerge_PumpFrame() {
         bool setChanged = false;
         for (int i = 0; i < kMaxGarments && !setChanged; i++)
             if (g_pendGarment[i] != g_builtSet[i]) setChanged = true;
-        // Only once the previous build has settled, or the two-pass would re-enter itself.
-        if (g_recapture && setChanged && g_captureDone && !g_capturePass) {
+        // ...but only against a set we actually built. The capture pass dresses NORMALLY -- no
+        // garment is excluded, so it publishes an EMPTY set and returns without recording one. The
+        // separated dress that follows it therefore always differs from the empty baseline and looks
+        // like a wardrobe change, which re-armed the capture and re-dressed, forever: ~30 rebuilds a
+        // second, clothes flashing, animation destroyed. It reached release because the machine it
+        // was written on had ClothRecapture=0 saved from before the default flipped, so the branch
+        // never ran there. With nothing built there is also nothing to tear down -- the fall-through
+        // below builds the garments and records the set, which is exactly what this branch would
+        // have asked for.
+        bool hadBuild = false;
+        for (int i = 0; i < kMaxGarments && !hadBuild; i++) if (g_builtSet[i]) hadBuild = true;
+        // Belt and braces after the above shipped: a rebuild asks the game to dress twice, so any
+        // future path that mistakes its own re-dress for a wardrobe change melts the character
+        // rather than degrading. Nobody changes clothes six times in three seconds; a burst like
+        // that is a loop, and dropping back to the incremental path leaves cloth imperfect instead
+        // of leaving the player unable to play.
+        static double rebuildTimes[6] = {};
+        static int    rebuildAt = 0;
+        static bool   runawaySaid = false;
+        bool runaway = false;
+        if (g_recapture && hadBuild && setChanged && g_captureDone && !g_capturePass) {
+            const double now = CmNow();
+            const double oldest = rebuildTimes[rebuildAt];   // the 6th most recent
+            if (oldest > 0.0 && now - oldest < 3.0) {
+                runaway = true;
+                if (!runawaySaid) {
+                    runawaySaid = true;
+                    TwkLog("[cloth] REFUSING to rebuild again -- 6 outfit rebuilds in under 3 s is a "
+                           "loop, not a wardrobe. Falling back to updating in place; cloth may be "
+                           "imperfect until the next map change. Please report this log.");
+                }
+            } else {
+                rebuildTimes[rebuildAt] = now;
+                rebuildAt = (rebuildAt + 1) % 6;
+            }
+        }
+        if (g_recapture && hadBuild && setChanged && g_captureDone && !g_capturePass && !runaway) {
             char n1[96];
             void* g2 = nullptr;
             for (int i = 0; i < kMaxGarments && !g2; i++)

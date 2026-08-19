@@ -43,4 +43,8 @@ void ClothSim_Rebuild();
 bool  ClothSim_Enabled();          void ClothSim_SetEnabled(bool on);
 float ClothSim_TravelCm();         void ClothSim_SetTravelCm(float v);
 float ClothSim_HemPushMm();        void ClothSim_SetHemPushMm(float v);
+// How far up the garment the lift reaches, as a percentage of its height. The push is strongest at
+// the bottom edge and fades to nothing at the top of this band, so raising it flares more of the
+// garment rather than just its rim.
+float ClothSim_HemPushBandPct();   void ClothSim_SetHemPushBandPct(float v);
 float ClothSim_CuffGripPct();      void ClothSim_SetCuffGripPct(float v);

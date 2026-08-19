@@ -235,7 +235,12 @@ struct CosmeticItem {
     int32_t  cat     = 0;         // the game's category key within its map
     int32_t  variant = 0;         // UsedVariantId (on the PROFILE)
     uint8_t  inst    = 0;         // UsedInstanceId
-    char     name[40] = {};       // the item's FName as a STRING; empty = slot cleared
+    // 64, not 40: a real item name reached 39 characters -- 'CIT_UB_TEE_LiquidDeath_ExclusiveDeathTe'
+    // -- which is exactly what a 40-byte field holds once its terminator is counted, so the name was
+    // silently cut and could never resolve on the far side. The giveaway was the WEARER'S OWN client
+    // failing to resolve an item it was itself wearing. The wire is length-prefixed, so a longer
+    // field costs nothing for ordinary names; only a genuinely longer name sends more bytes.
+    char     name[64] = {};       // the item's FName as a STRING; empty = slot cleared
     // ---- the attributes that live on the INVENTORY INSTANCE, not the profile. Without these a peer's
     // index selects the RECEIVER'S OWN instance, so their custom colours and variants silently render
     // as yours.
@@ -291,6 +296,20 @@ struct ChatMsg {
 int  PackChat(const ChatMsg& m, uint8_t* out, int cap);
 bool UnpackChat(const uint8_t* data, int len, ChatMsg& out);
 bool IsChatPacket(const uint8_t* data, int len);
+
+// ---- THE SKELETON FINGERPRINT ------------------------------------------------------------------
+// A further message type on the same transport, routed by magic like the others, and sent on the
+// cadence cosmetics are: once when a peer appears and again whenever our own skeleton changes. It is
+// what makes a transported pose apply correctly to a player whose character is built differently
+// from ours -- see game_syms.h SkeletonBoneHashes for why a NAME is the only handle that survives
+// the trip. About 390 B, a handful of times per session; never per frame.
+struct SkelPrint {
+    uint8_t  n = 0;
+    uint32_t hash[kPoseMaxBones] = {};
+};
+int  PackSkeleton(const SkelPrint& s, uint8_t* out, int cap);
+bool UnpackSkeleton(const uint8_t* data, int len, SkelPrint& out);
+bool IsSkeletonPacket(const uint8_t* data, int len);
 
 // One remote sender's stream: snapshot ring + playback clock. Feed Push() from the transport,
 // call Sample() whenever a consumer needs the pose; both take YOUR clock in microseconds.

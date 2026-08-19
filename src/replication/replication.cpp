@@ -668,6 +668,37 @@ bool UnpackCosmetics(const uint8_t* d, int len, CosmeticSet& out, uint8_t* secti
 // of the file before claiming another letter.
 static const uint32_t kChatMagic = 0x48504D4Fu;   // "OMPH"
 
+// ---- THE SKELETON FINGERPRINT ------------------------------------------------------------------
+static const uint32_t kSkelMagic = 0x50504D4Fu;   // "OMPP"
+
+bool IsSkeletonPacket(const uint8_t* d, int len) {
+    if (!d || len < 4) return false;
+    uint32_t m = 0; memcpy(&m, d, 4);
+    return m == kSkelMagic;
+}
+
+int PackSkeleton(const SkelPrint& s, uint8_t* out, int cap) {
+    if (!out || !s.n || s.n > kPoseMaxBones) return 0;
+    Wr w{out, cap, 0, true};
+    w.u32(kSkelMagic);
+    w.u8(s.n);
+    for (int i = 0; i < s.n; i++) w.u32(s.hash[i]);
+    return w.ok ? w.n : 0;
+}
+
+bool UnpackSkeleton(const uint8_t* d, int len, SkelPrint& out) {
+    if (!d || len < 5) return false;
+    Rd r{d, len, 0, true};
+    if (r.u32() != kSkelMagic) return false;
+    const int n = (int)r.u8();
+    if (!r.ok || n <= 0 || n > kPoseMaxBones) return false;
+    out = SkelPrint();
+    for (int i = 0; i < n; i++) out.hash[i] = r.u32();
+    if (!r.ok || r.n != len) return false;
+    out.n = (uint8_t)n;
+    return true;
+}
+
 bool IsChatPacket(const uint8_t* d, int len) {
     if (!d || len < 4) return false;
     uint32_t m = 0; memcpy(&m, d, 4);

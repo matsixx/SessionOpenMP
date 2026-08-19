@@ -461,6 +461,13 @@ bool ObjectName(const void* obj, char* out, int cap);
 // A skater's mesh component, and the bone count of the skeleton it is drawing.
 void* SkaterMeshOf(void* skaterActor);
 int   SkeletonBoneCount(void* meshComp);
+// The merged skeleton's bones as name hashes, in index order. A NAME is the only handle on a bone
+// that survives the trip between two players: a character is merged from body + garments and the
+// merge takes the UNION of their bones, so two people's skeletons agree on names and on nothing
+// else -- not count, not order, not which index is the head. An index-keyed pose therefore drives
+// the wrong bones the moment either side wears something the other does not.
+// Cached, because resolving ~95 FNames is not something to do per frame.
+int   SkeletonBoneHashes(void* meshComp, uint32_t* out, int cap);
 bool LocalSkaterName(void* pawn, char* out, int cap);   // gi -> FSkaterInstance::SkaterName
 bool LocalMapName(void* pawn, char* out, int cap);      // the UWorld object's own name
 // ---- pretty map labels. The internal level name is what travels, but it is a long asset name and
@@ -527,6 +534,7 @@ namespace off {
     constexpr int kMeshSkeletalMesh     = 0x480;
     constexpr int kSkelMeshRefSkeleton  = 0x1b0;
     constexpr int kRefSkelFinalBoneInfo = 0x20;
+    constexpr int kMeshBoneInfoStride   = 12;    // FMeshBoneInfo { FName Name; int32 ParentIndex; }
     constexpr int kSkaterMoveComp     = 0x550;   // -> USkaterMovementComponent
     constexpr int kSkaterBoard        = 0x568;   // -> ASkateboardEx   (ownership MUST be back-link checked)
     constexpr int kBoardSkater        = 0x4d8;   // ASkateboardEx -> owning skater (the back-link)

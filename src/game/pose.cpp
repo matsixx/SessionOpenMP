@@ -49,6 +49,15 @@ struct Slot {
     // LOCAL replay nothing produces another one (see the header), so this is what the skeleton wears
     // instead of collapsing. A slot exists for every proxy mesh, not only for one with a transported
     // pose, so `n == 0` does not mean "no slot".
+    // The SENDER's skeleton, and the map from our bone index to theirs. Built lazily at stamp time
+    // and only when the fingerprint or the mesh changes; -1 means "they have no bone of this name",
+    // which is exactly what a garment of ours they are not wearing should get.
+    uint8_t  peerN = 0;
+    uint32_t peerHash[kPoseMaxBones] = {};
+    int16_t  map[kPoseMaxBones];
+    bool     mapReady = false;
+    void*    mapBuiltFor = nullptr;
+    uint8_t  mapPeerN = 0;
     uint8_t  holdN = 0;
     float    holdRot[kPoseMaxBones][4];
     float    holdPos[kPoseMaxBones][3];
@@ -150,6 +159,29 @@ void* FirstProxyMesh() {
     for (auto& sl : g_slots) if (sl.mesh) return sl.mesh;
     return nullptr;
 }
+bool SetPeerSkeleton(void* mesh, const uint32_t* hashes, int n) {
+    if (!g_tun.enabled || !g_tun.skeletonSync || !mesh) return false;
+    Slot* sl = slotFor(mesh);
+    if (!sl) {
+        // CLAIM one, exactly as Note and the hook do. A fingerprint routinely arrives before this
+        // mesh has ever carried a pose, and refusing it here would throw it away for good because
+        // the caller has already marked the peer fed. A slot is inert until a pose is written.
+        if (!hashes || n <= 0) return false;                  // nothing to remember: do not claim
+        for (auto& c : g_slots) if (!c.mesh) { sl = &c; break; }
+        if (!sl) return false;                                // all busy: the caller retries
+        sl->mesh = mesh; sl->n = 0; sl->freshMs = 0; sl->holdN = 0;
+    }
+    if (!hashes || n <= 0) { sl->peerN = 0; sl->mapReady = false; sl->mapBuiltFor = nullptr; return true; }
+    if (n > kPoseMaxBones) n = kPoseMaxBones;
+    // Only a CHANGED fingerprint invalidates the map -- the same one arriving again (a new peer
+    // joining makes everyone re-send) must not throw away a map that is already correct.
+    if (sl->peerN == (uint8_t)n && memcmp(sl->peerHash, hashes, sizeof(uint32_t) * (size_t)n) == 0) return true;
+    sl->peerN = (uint8_t)n;
+    memcpy(sl->peerHash, hashes, sizeof(uint32_t) * (size_t)n);
+    sl->mapReady = false; sl->mapBuiltFor = nullptr;
+    return true;
+}
+
 void Note(void* mesh, const State& s, uint64_t nowMs) {
     if (!g_tun.enabled || !mesh) return;
     if (!s.poseN) {
@@ -158,7 +190,10 @@ void Note(void* mesh, const State& s, uint64_t nowMs) {
         // would throw away the snapshot on the very frame the peer stops sending -- i.e. always,
         // since a live peer never sends one.
         Slot* sl = slotFor(mesh);
-        if (sl) { sl->n = 0; sl->freshMs = 0; }
+        if (sl) {
+            if (sl->n) g_st.wiped++;      // a completed pose thrown away by a pose-less frame
+            sl->n = 0; sl->freshMs = 0;
+        }
         return;
     }
     Slot* sl = slotFor(mesh);
@@ -175,9 +210,9 @@ void Note(void* mesh, const State& s, uint64_t nowMs) {
     }
     const int first = s.poseFirst;
     int cnt = s.poseCount;
-    if (first >= total) return;
+    if (first >= total) { g_st.noSlice++; return; }
     if (first + cnt > total) cnt = total - first;
-    if (cnt <= 0) return;
+    if (cnt <= 0) { g_st.noSlice++; return; }
     memcpy(&sl->rot[first], &s.poseRot[first], sizeof(float) * 4 * (size_t)cnt);
     memcpy(&sl->pos[first], &s.posePos[first], sizeof(float) * 3 * (size_t)cnt);
     for (int b = first; b < first + cnt; b++) sl->cov[b >> 5] |= (1u << (b & 31));
@@ -186,7 +221,10 @@ void Note(void* mesh, const State& s, uint64_t nowMs) {
     // partially-refreshed pose is imperceptible, where withholding it entirely is a frozen skater.
     bool whole = true;
     for (int b = 0; b < total && whole; b++) whole = (sl->cov[b >> 5] & (1u << (b & 31))) != 0;
+    g_st.sliceBones = (uint8_t)cnt;
+    if (whole && !sl->n) g_st.sweeps++;
     if (whole) sl->n = (uint8_t)total;
+    g_st.liveN = sl->n;
     sl->freshMs = nowMs;                      // slices keep the stream alive even mid-sweep
     g_st.noted++;
 }
@@ -245,6 +283,45 @@ void OnFinalizeBones(void* mesh, uint64_t nowMs) {
         // index prefix of every merge, so the prefix IS the body: stamp what both sides have. Any
         // local bones past their count are garment extras left un-stamped -- and in the common
         // direction (their outfit is richer than our stripped-down proxy) there are none.
+        // ---- BY NAME, when the sender has told us what their bones are called. Built once per
+        // (mesh, fingerprint): read THIS mesh's names, then for each local bone find the sender's
+        // bone of the same name. Two players' merged skeletons agree on names and on nothing else,
+        // so this is the only mapping that stays correct when either side is wearing something the
+        // other is not -- including a garment the bone floor has substituted.
+        if (g_tun.skeletonSync && g_tun.nameKeyedBones && sl->peerN &&
+            (!sl->mapReady || sl->mapBuiltFor != mesh || sl->mapPeerN != sl->peerN)) {
+            uint32_t localHash[kPoseMaxBones];
+            const int ln = game::SkeletonBoneHashes(mesh, localHash, kPoseMaxBones);
+            if (ln > 0) {
+                int mapped = 0;
+                for (int b = 0; b < kPoseMaxBones; b++) sl->map[b] = -1;
+                for (int b = 0; b < ln && b < kPoseMaxBones; b++) {
+                    for (int r = 0; r < (int)sl->peerN; r++)
+                        if (sl->peerHash[r] == localHash[b]) { sl->map[b] = (int16_t)r; mapped++; break; }
+                }
+                sl->mapReady = true; sl->mapBuiltFor = mesh; sl->mapPeerN = sl->peerN;
+                g_st.mappedBones = (uint8_t)(mapped > 255 ? 255 : mapped);
+                g_st.unmappedBones = (uint8_t)((ln - mapped) > 255 ? 255 : (ln - mapped));
+            }
+        }
+        if (g_tun.skeletonSync && g_tun.nameKeyedBones && sl->mapReady && sl->mapBuiltFor == mesh &&
+            g_st.mappedBones > 0) {
+            __try {
+                const int nLocal = num < kPoseMaxBones ? num : kPoseMaxBones;
+                for (int b = 0; b < nLocal; b++) {
+                    const int r = sl->map[b];
+                    // A bone the sender does not have keeps whatever the local graph put there --
+                    // a garment bone of ours they cannot speak for, which is exactly right.
+                    if (r < 0 || r >= (int)sl->n) continue;
+                    uint8_t* t = cs + (size_t)b * off::kTransformStride;
+                    memcpy(t + off::kTransformRotOff, sl->rot[r], 16);
+                    memcpy(t + off::kTransformPosOff, sl->pos[r], 12);
+                }
+                g_st.applied++; g_st.mappedStamps++;
+            } __except (EXCEPTION_EXECUTE_HANDLER) { g_st.faults++; }
+            return;
+        }
+        // ---- BY INDEX. No fingerprint (a peer on an older build), or their names matched nothing.
         int nStamp = (int)sl->n;
         if (num != (int)sl->n) {
             if (!g_tun.prefixOnMismatch) { g_st.skippedCount++; return; }

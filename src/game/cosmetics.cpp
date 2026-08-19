@@ -87,7 +87,13 @@ static uint8_t* mapElem(const MapWalk& w, int i) { return w.data + (size_t)i * k
 // leaked for the life of the process. An FName's text never changes, so one conversion per distinct
 // name is both correct and permanent, and it makes sampling cheap enough to notice a wardrobe change
 // quickly without spending a byte on the wire.
+// Set when the last conversion did not fit. A CUT NAME IS A SILENT FAILURE otherwise: it looks
+// like a perfectly good name, travels, and then simply never resolves anywhere -- the item
+// vanishes off the peer with nothing in the log to follow. This function has no logger; its
+// caller does, so the fact is left here to be picked up.
+static bool g_nameTruncated = false;
 static bool fnameToString(const void* fnamePtr, char* out, int cap) {
+    g_nameTruncated = false;
     out[0] = 0;
     const Syms& S = Get();
     if (!S.FNameToString || !fnamePtr) return false;
@@ -95,7 +101,8 @@ static bool fnameToString(const void* fnamePtr, char* out, int cap) {
     __try { key = *(const uint64_t*)fnamePtr; } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
     if (!key) return false;                                  // NAME_None: nothing to convert
 
-    struct Entry { uint64_t key; char name[48]; };
+    struct Entry { uint64_t key; char name[64]; };   // sized WITH CosmeticItem::name -- a shorter
+                                                     // cache would re-introduce the truncation
     static Entry cache[128];
     static int   nCached = 0;
     for (int i = 0; i < nCached; i++) {
@@ -110,6 +117,7 @@ static bool fnameToString(const void* fnamePtr, char* out, int cap) {
         int k = 0;
         for (; k < fs.n && k < cap - 1 && fs.d[k]; k++) out[k] = (char)(fs.d[k] < 128 ? fs.d[k] : '?');
         out[k] = 0;                       // the FString itself is still leaked -- ONCE per distinct name
+        if (k >= cap - 1 && fs.n > k) g_nameTruncated = true;
         if (k > 0 && nCached < (int)(sizeof(cache)/sizeof(cache[0]))) {
             cache[nCached].key = key;
             strncpy_s(cache[nCached].name, sizeof(cache[nCached].name), out, _TRUNCATE);
@@ -481,6 +489,13 @@ static bool readMapInto(void* map, repl::CosmeticItem* dst, int cap, uint8_t& co
             it.variant = *(int32_t*)(e + kElemValue + 0x0c);
         } __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
         fnameToString(e + kElemValue, it.name, sizeof(it.name));   // ItemName is the value's first field
+        if (g_nameTruncated && logf) {
+            char m[220];
+            snprintf(m, sizeof(m), "[cosmetics] item name TRUNCATED ('%s') -- it cannot resolve "
+                                   "on any client, including this one; the name buffer is too "
+                                   "small for it", it.name);
+            logf(m);
+        }
         // A cleared slot (empty ItemName) is not a worn item -- receivers already treat it as
         // absent, and a dress restore leaves cleared keys behind, which would otherwise flap the
         // own-look change detector forever (an extra "item" appearing after every dress).

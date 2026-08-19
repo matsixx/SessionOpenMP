@@ -286,6 +286,53 @@ void* SkaterMeshOf(void* skaterActor) {
     __try { return *(void**)((uint8_t*)skaterActor + off::kSkaterMesh); }
     __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
 }
+
+// CACHED, because the caller polls. Resolving a name goes through FName::ToString, which allocates
+// an FString this code deliberately leaks -- a one-shot habit from the lobby/audio paths, and a
+// 2 Hz caller would turn it into ~190 leaked strings a second for an answer that only changes when
+// the character is rebuilt. The key is (mesh, bone count): reading the count is a plain integer
+// load, so the common case costs one deref and a memcpy, and a re-dress -- which produces a
+// different merged mesh, and usually a different bone count -- misses the cache and re-reads.
+struct BoneHashCache { void* mesh; int32_t num; int n; uint32_t hash[96]; };
+static BoneHashCache g_boneCache[4];
+static int g_boneCacheNext = 0;
+
+int SkeletonBoneHashes(void* meshComp, uint32_t* out, int cap) {
+    if (!meshComp || !out || cap <= 0) return 0;
+    __try {
+        void* skelMesh = *(void**)((uint8_t*)meshComp + off::kMeshSkeletalMesh);
+        if (!skelMesh) return 0;
+        const uint8_t* refSkel = (const uint8_t*)skelMesh + off::kSkelMeshRefSkeleton;
+        struct TArr { const uint8_t* data; int32_t num; int32_t max; } a{};
+        memcpy(&a, refSkel + off::kRefSkelFinalBoneInfo, sizeof(a));
+        if (!a.data || a.num <= 0 || a.num > 4096 || a.max < a.num) return 0;
+        for (const auto& c : g_boneCache) {
+            if (c.mesh != meshComp || c.num != a.num || c.n <= 0) continue;
+            const int k = c.n < cap ? c.n : cap;
+            memcpy(out, c.hash, sizeof(uint32_t) * (size_t)k);
+            return k;
+        }
+        int n = 0;
+        for (int i = 0; i < a.num && n < cap; i++) {
+            char nm[96];
+            if (!fnameToAscii(a.data + (size_t)i * off::kMeshBoneInfoStride, nm, sizeof(nm))) return 0;
+            // Lowercased: the same bone must hash identically whatever an exporter capitalised it as.
+            uint32_t h = 2166136261u;
+            for (const char* p = nm; *p; p++) {
+                const unsigned char c = (unsigned char)((*p >= 'A' && *p <= 'Z') ? (*p + 32) : *p);
+                h ^= c; h *= 16777619u;
+            }
+            out[n++] = h ? h : 1;             // 0 is the "no name" sentinel the mapper tests for
+        }
+        if (n > 0) {
+            BoneHashCache& c = g_boneCache[g_boneCacheNext++ & 3];
+            c.mesh = meshComp; c.num = a.num;
+            c.n = n < (int)(sizeof(c.hash) / sizeof(c.hash[0])) ? n : (int)(sizeof(c.hash) / sizeof(c.hash[0]));
+            memcpy(c.hash, out, sizeof(uint32_t) * (size_t)c.n);
+        }
+        return n;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
 // Three derefs and an integer load: no names resolved, nothing allocated. Bounds are checked
 // because a read taken mid-re-dress can land on a half-built mesh, and 0 means "do not know",
 // which every caller treats as "change nothing".
@@ -413,6 +460,7 @@ bool LocalMapName(void* pawn, char* out, int cap) {
 bool ObjectName(const void*, char* o, int c) { if (o && c) o[0] = 0; return false; }
 void* SkaterMeshOf(void*)      { return nullptr; }
 int   SkeletonBoneCount(void*) { return 0; }
+int   SkeletonBoneHashes(void*, uint32_t*, int) { return 0; }
 bool LocalSkaterName(void*, char* o, int c) { if (o && c) o[0] = 0; return false; }
 bool LocalMapName(void*, char* o, int c)    { if (o && c) o[0] = 0; return false; }
 #endif

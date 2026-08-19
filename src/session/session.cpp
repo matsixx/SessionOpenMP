@@ -92,6 +92,12 @@ struct Slot {
     uint64_t    dropAuthKey = 0;
     bool        haveDropAuth = false;
     bool        worldSetFresh = false;   // a COMPLETE world layout from this peer awaits the frame
+    // THE SENDER'S SKELETON, by bone-name hash. Arrives on its own rare message and is HELD here
+    // until their proxy mesh exists to attach it to -- the packet routinely beats the spawn. Fed to
+    // the pose layer whenever either side of that pair changes.
+    repl::SkelPrint skel;
+    bool        haveSkel = false;
+    void*       skelFedFor = nullptr;    // the mesh we last fed it to; a respawn re-feeds
     // ---- dropped objects: the props THIS peer has in OUR world. The wire updates this table (ids,
     // target poses, what is new and what is gone); Frame does every game call from it. Splitting it
     // that way keeps actor spawning on the engine-tick anchor where the proxy spawn already lives,
@@ -129,6 +135,7 @@ static Stats  g_st;
 static void (*g_logf)(const char*) = nullptr;
 static uint64_t g_lastPubUs = 0;
 static bool     g_cosResend = false;   // a new peer appeared: re-send our look without waiting 10 s
+static bool     g_skelResend = false;  // ...and our skeleton, for the same reason
 static bool     g_anyPeerReplaying = false;   // somebody is scrubbing and needs our finished pose
 static repl::State g_ownLast;      // last successfully gathered own state (for spawn placement)
 static bool        g_haveOwn = false;
@@ -259,7 +266,9 @@ static Slot* slotFor(int peerIdx, uint64_t nowUs) {
         for (auto& d : s.drop) d = Slot::DropObj();
         s.dropGenSeen = false; s.dropGen = 0;
         s.dropAuthKey = 0; s.haveDropAuth = false; s.worldSetFresh = false;
+        s.skel = repl::SkelPrint(); s.haveSkel = false; s.skelFedFor = nullptr;
         dropsync::ForgetPeer(peerIdx);
+        g_skelResend = true;                         // they need OUR skeleton too
         g_cosResend = true;                          // they need OUR look too, now rather than in 10 s
         g_dropResend = true;                         // ...and our dropped objects, for the same reason
         if (g_logf) { char m[120]; snprintf(m, sizeof(m), "[session] stream opened for peer %d", peerIdx); g_logf(m); }
@@ -385,6 +394,24 @@ void OnPacket(int peerIdx, const uint8_t* data, int len, uint64_t nowUs) {
         if (!ds) return;
         applyDropUpdate(*ds, up, peerIdx, nowUs);
         return;                                            // NOT a snapshot: no stream push, no liveness
+    }
+    // The sender's skeleton, by bone name. Rare, and it must be HELD rather than applied here: the
+    // pose layer is keyed by the MESH that wears the pose, and their proxy may not exist yet.
+    if (repl::IsSkeletonPacket(data, len)) {
+        repl::SkelPrint sp;
+        if (!repl::UnpackSkeleton(data, len, sp)) return;
+        Slot* ss = slotFor(peerIdx, nowUs);
+        if (!ss) return;
+        const bool changed = !ss->haveSkel || ss->skel.n != sp.n ||
+                             memcmp(ss->skel.hash, sp.hash, sizeof(uint32_t) * (size_t)sp.n) != 0;
+        ss->skel = sp; ss->haveSkel = true;
+        if (changed) {
+            ss->skelFedFor = nullptr;                // re-feed: their character was rebuilt
+            if (g_logf) { char m[140]; snprintf(m, sizeof(m),
+                "[pose] peer %d skeleton: %d bones (poses map by name)", peerIdx, (int)sp.n);
+                g_logf(m); }
+        }
+        return;                                      // NOT a snapshot: no stream push, no liveness
     }
     // Several message types share this transport, routed by magic. Cosmetics are rare and large; the
     // 60 Hz snapshot stays small and self-contained.
@@ -1295,12 +1322,14 @@ static void EnforceBoneFloor(void* proxyActor, const repl::CosmeticSet& theirs, 
         repl::CosmeticSet trial = theirs;
         if (!borrowOurItem(trial, theirs.chr[i].cat)) continue;
         game::DressProxy(proxyActor, trial, &unresolved, g_logf);
+        const int wasShort = have;                  // the count that TRIGGERED this, not the result
         have = proxyBones(proxyActor);
         if (have >= mine) {
-            if (g_logf) { char m[220]; snprintf(m, sizeof(m),
-                "[cosmetics] bone floor: peer's '%s' swapped for ours -- their proxy was %d bone(s) "
-                "against our %d, which crashes the replay editor. Only that item looks wrong.",
-                theirs.chr[i].name[0] ? theirs.chr[i].name : "?", have, mine); g_logf(m); }
+            if (g_logf) { char m[240]; snprintf(m, sizeof(m),
+                "[cosmetics] bone floor: peer's '%s' swapped for ours -- their proxy came out %d "
+                "bone(s) against our %d, which crashes the replay editor; now %d. Only that item "
+                "looks wrong.",
+                theirs.chr[i].name[0] ? theirs.chr[i].name : "?", wasShort, mine, have); g_logf(m); }
             return;
         }
     }
@@ -1463,6 +1492,16 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
                 for (auto& sl : g_slots) if (sl.used && sl.peerReplaying) { anyScrub = true; break; }
                 if (anyScrub) {
                     repl::State posed = own;
+                    // THE DRIVERS ARE DEAD WEIGHT IN THIS PACKET. It goes only to peers with the
+                    // replay editor open, and the whole reason the pose exists is that their anim
+                    // graph cannot evaluate our drivers -- they are not running a skater. Carrying
+                    // them anyway costs a few hundred bytes of a 1 KB mailbox, and the pose is what
+                    // gets squeezed: a 95-bone skeleton that would fit whole then takes several
+                    // frames of slices to arrive, which reads as a peer animating at a fraction of
+                    // the frame rate. Dropping them here buys those bytes back for the one lane this
+                    // packet exists to serve. Everyone NOT scrubbing keeps the ordinary driver
+                    // packet, untouched.
+                    posed.animLen = 0;
                     if (game::pose::CaptureFromPawn(ownPawn, posed)) {
                         if (poseCursor >= posed.poseN) poseCursor = 0;
                         posed.poseFirst = (uint8_t)poseCursor;
@@ -1510,6 +1549,39 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
         // per item.
         if (!lastCosCheckUs || sinceUs(nowUs, lastCosCheckUs) > 500000ull) {
             lastCosCheckUs = nowUs;
+            // OUR SKELETON, on the same beat. What a transported pose MEANS depends on it: a
+            // character is merged from body + garments and the merged skeleton is the UNION of their
+            // bones, so two players agree on bone NAMES and on nothing else. Sampled here rather
+            // than per frame because it walks a runtime merge and resolves ~95 names, and sent only
+            // when it actually differs, plus a slow heartbeat and whenever a peer appears.
+            {
+                static uint64_t lastSkelSendUs = 0;
+                static repl::SkelPrint lastSkel;
+                static bool haveLastSkel = false;
+                void* mesh = game::SkaterMeshOf(ownPawn);
+                repl::SkelPrint mineSk;
+                const int sn = mesh ? game::SkeletonBoneHashes(mesh, mineSk.hash, repl::kPoseMaxBones) : 0;
+                if (sn > 0) {
+                    mineSk.n = (uint8_t)sn;
+                    const bool changed = !haveLastSkel || lastSkel.n != mineSk.n ||
+                                         memcmp(lastSkel.hash, mineSk.hash, sizeof(uint32_t) * (size_t)sn) != 0;
+                    const bool heartbeat = !lastSkelSendUs || sinceUs(nowUs, lastSkelSendUs) > 10000000ull;
+                    if (changed || heartbeat || g_skelResend) {
+                        uint8_t pkt[520];
+                        const int len = repl::PackSkeleton(mineSk, pkt, sizeof(pkt));
+                        if (len > 0) {
+                            PeerStats ps;
+                            for (int i = 0; i < nPeers; i++)
+                                if (GetStats(i, &ps) && ps.state != 5) Send(i, pkt, len, true);   // reliable
+                            lastSkel = mineSk; haveLastSkel = true;
+                            lastSkelSendUs = nowUs; g_skelResend = false;
+                            if (changed && g_logf) { char m[120];
+                                snprintf(m, sizeof(m), "[pose] published our skeleton: %d bones", sn);
+                                g_logf(m); }
+                        }
+                    }
+                }
+            }
             repl::CosmeticSet own;
             if (game::GatherOwnCosmetics(ownPawn, own, g_logf)) {
                 g_ownLook = own; g_haveOwnLook = true;   // the bone floor borrows garments from this
@@ -1743,6 +1815,15 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
         // Wait for the same construction beat the game's own rebuild waits for, and then OWN that
         // rebuild (MarkVisualsRefreshed): otherwise the plain rebuild fires later and re-reads the
         // restored LOCAL profile, which renders as the proxy wearing the local player's clothes.
+        // Their skeleton, handed to the pose layer as soon as their mesh exists. Keyed on the MESH,
+        // because that is what the pose slots are keyed by and what a re-dress replaces. One pointer
+        // compare per frame until something actually changes.
+        if (s.haveSkel && s.proxy.actor()) {
+            void* pmesh = game::SkaterMeshOf(s.proxy.actor());
+            if (pmesh && pmesh != s.skelFedFor) {
+                if (game::pose::SetPeerSkeleton(pmesh, s.skel.hash, s.skel.n)) s.skelFedFor = pmesh;
+            }
+        }
         if (s.haveCosmetics && s.proxy.actor() && s.proxy.actor() != s.wornForActor
             && s.proxy.VisualsSettled(nowMs)) {
             s.wornForActor = s.proxy.actor();             // one attempt per look PER ACTOR: no storm,

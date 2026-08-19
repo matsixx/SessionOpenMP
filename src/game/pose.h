@@ -77,12 +77,34 @@ struct Tuning {
     // degenerate one this file already documents as a heap of clothes. So the ease ran from garbage
     // toward the good pose and never arrived. Anything that smooths a transported pose must keep its
     // OWN copy of the previous stamp -- never read back what it wrote last frame.
+    // ---- THE SKELETON LANE. Publish our merged skeleton as bone-name hashes, and apply a peer's
+    // pose BY NAME instead of by index. Without it the pose is stamped index-for-index, which is
+    // only correct while both characters merged the same way: a garment either side is wearing that
+    // the other has not got -- or that the bone floor has substituted to keep the counts equal --
+    // shifts what every index after the body MEANS, so the sender's garment bones drive ours and
+    // the garment deforms wildly. Field-reported as two players in modded clothing seeing each other
+    // break in the replay editor.
+    // Sampling walks a runtime-created merge and resolves ~95 FNames, so it is cached and polled at
+    // 2 Hz, never per frame. (An earlier note here blamed this sampler for a fatal in the renderer's
+    // draw-command build; that was disproven -- the crash reproduced with this whole lane disabled.)
+    bool skeletonSync = true;
+    // Map bones by NAME when a fingerprint is in hand. Inert while skeletonSync is off, because no
+    // fingerprint is published or applied then.
+    bool nameKeyedBones = true;
 };
 Tuning& Tune();
 
 struct Stats {
     uint32_t captured = 0, applied = 0, skippedCount = 0, faults = 0;
     uint32_t prefixStamps = 0;   // mismatched-count frames stamped as a prefix (see prefixOnMismatch)
+    uint32_t mappedStamps = 0;   // frames stamped through a NAME map -- the correct path
+    uint32_t sweeps = 0;         // slice sets that COMPLETED: without these a pose is never usable
+    uint32_t wiped = 0;          // a pose-less frame cleared a pose that had completed
+    uint32_t noSlice = 0;        // pose frames that carried no slice for us at all
+    uint8_t  liveN = 0;          // the newest slot's usable bone count (0 = nothing to stamp)
+    uint8_t  sliceBones = 0;     // bones in the last slice: skeleton/this = frames per refresh
+    uint8_t  mappedBones  = 0;   // how many of the local skeleton's bones that map resolves
+    uint8_t  unmappedBones = 0;  // ...and how many the sender simply does not have
     uint32_t hookCalls = 0, noted = 0, stale = 0;
     // held        = frames a proxy's own finished pose was snapshotted (normal play)
     // holdApplied = frames that snapshot was re-stamped during a local replay
@@ -101,6 +123,12 @@ bool Capture(void* mesh, repl::State& s);
 bool CaptureFromPawn(void* pawn, repl::State& s);
 
 // ---- receiver: remember a proxy's transported pose, keyed by the mesh that must wear it.
+// The peer whose pose this mesh wears, and what their bones are called. Fed by the session when a
+// fingerprint arrives; the remote-index -> local-index map is built lazily at stamp time, where the
+// local mesh (and therefore ITS names) is finally in hand. Passing n = 0 forgets it. False = it
+// could not be stored (no free slot), and the caller MUST retry rather than marking the peer fed:
+// a fingerprint normally arrives before this mesh has ever carried a pose.
+bool SetPeerSkeleton(void* mesh, const uint32_t* hashes, int n);
 void Note(void* mesh, const repl::State& s, uint64_t nowMs);
 void Forget(void* mesh);
 // Called from the FinalizeBoneTransform pre-hook for EVERY skeletal mesh in the game; cheap and

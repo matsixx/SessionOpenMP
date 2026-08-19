@@ -54,7 +54,7 @@
 #include "ue4ss_abi.h"
 #include "ui/menu_ext.h"
 
-#define TWEAKS_VERSION "3.19.11"
+#define TWEAKS_VERSION "3.19.14"
 #define TWK_WIDEN(x) STR(x)   // STR() prepends L before the macro expands; expand first
 
 // ------------------------------------------------------------------ log (own file, fresh per launch)
@@ -221,6 +221,7 @@ static const char* const kTwkAnyRev   = "TwkCatchAnyRevolution";
 static const char* const kTwkCloth     = "TwkCloth";
 static const char* const kTwkClothMove = "TwkClothMove";
 static const char* const kTwkClothHem  = "TwkClothHemLift";
+static const char* const kTwkClothHemUp = "TwkClothHemLiftReach";
 static const char* const kTwkClothCuff = "TwkClothCuffGrip";
 static const char* const kTwkCamFollow    = "TwkCamFollow";
 static const char* const kTwkCamPitchDrop = "TwkCamPitchDrop";
@@ -287,6 +288,7 @@ static void pageValue(const char* key, int iv, float fv, void*) {
     else if (!strcmp(key, kTwkCloth))     ClothSim_SetEnabled(iv != 0);
     else if (!strcmp(key, kTwkClothMove)) ClothSim_SetTravelCm(fv);
     else if (!strcmp(key, kTwkClothHem))  ClothSim_SetHemPushMm(fv);
+    else if (!strcmp(key, kTwkClothHemUp)) ClothSim_SetHemPushBandPct(fv);
     else if (!strcmp(key, kTwkClothCuff)) ClothSim_SetCuffGripPct(fv);
     else if (!strcmp(key, kTwkCamFollow))    CameraHeight_SetFollowEnabled(iv != 0);
     else if (!strcmp(key, kTwkCamPitchDrop)) CameraHeight_SetPitchOnDropEnabled(iv != 0);
@@ -327,6 +329,7 @@ static int pageGet(const char* key, int* oi, float* of, void*) {
     else if (!strcmp(key, kTwkCloth))     { *oi = ClothSim_Enabled() ? 1 : 0;    return 1; }
     else if (!strcmp(key, kTwkClothMove)) { *of = ClothSim_TravelCm();            return 1; }
     else if (!strcmp(key, kTwkClothHem))  { *of = ClothSim_HemPushMm();           return 1; }
+    else if (!strcmp(key, kTwkClothHemUp)) { *of = ClothSim_HemPushBandPct();     return 1; }
     else if (!strcmp(key, kTwkClothCuff)) { *of = ClothSim_CuffGripPct();         return 1; }
     else if (!strcmp(key, kTwkCamFollow))    { *oi = CameraHeight_FollowEnabled()      ? 1 : 0; return 1; }
     else if (!strcmp(key, kTwkCamPitchDrop)) { *oi = CameraHeight_PitchOnDropEnabled() ? 1 : 0; return 1; }
@@ -425,6 +428,8 @@ static const OmpPageItem2 kTwkClothItems[] = {
       nullptr, nullptr, 50.0f, 100.0f, 5.0f },
     { OMP_ITEM_SLIDER, kTwkClothHem,  "  Shirt hem lift (mm)","Holds a shirt's bottom edge clear of your trousers instead of clipping through",
       nullptr, nullptr, 0.0f, 30.0f, 1.0f },
+    { OMP_ITEM_SLIDER, kTwkClothHemUp,"  Hem lift reach (%)", "How far up the shirt the lift reaches. Low only lifts the bottom edge; higher flares more of the garment",
+      nullptr, nullptr, 10.0f, 80.0f, 5.0f },
 };
 static const OmpPageItem2 kTwkCameraItems[] = {
     { OMP_ITEM_TOGGLE, kTwkCamFollow, "Camera always follows height",

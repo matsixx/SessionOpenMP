@@ -148,6 +148,9 @@ static inline bool TwkCompQuat(const void* comp, float q[4]) {
 // substring search would match a key inside its own explanatory comment and silently disable the
 // feature.
 int TwkIniInt(const char* text, const char* key, int def);
+// As above but silent. Use when PROBING for a key's presence (sentinel default), where the
+// "differs from the built-in default" line would be misleading rather than informative.
+int TwkIniIntQuiet(const char* text, const char* key, int def);
 
 // In-place ini value update: replaces the value of `Key=...` (same line matching as TwkIniInt, so
 // comments are preserved untouched) or appends `Key=value` at the end. Returns 0 if the text would

@@ -1308,6 +1308,44 @@ static bool poseSliceCheck() {
     return ok;
 }
 
+// ---- SKELETON FINGERPRINT ----------------------------------------------------------------------
+// The fingerprint is what lets a pose be applied by bone NAME instead of by index, which is the only
+// mapping that survives two players merging their characters differently. If the codec loses or
+// reorders a hash the map silently points at the wrong bones and the peer deforms -- indistinguishable
+// from the index-keyed bug it exists to fix, so it is worth proving the round trip exactly.
+static bool skelPrintCheck() {
+    printf("\n-- skeleton fingerprint (bone names on the wire) --\n");
+    bool ok = true;
+    const int sizes[3] = { 70, 95, omp::repl::kPoseMaxBones };
+    for (int si = 0; si < 3; si++) {
+        const int n = sizes[si];
+        omp::repl::SkelPrint a;
+        a.n = (uint8_t)n;
+        for (int i = 0; i < n; i++) a.hash[i] = 2166136261u ^ (uint32_t)(i * 2654435761u);
+        uint8_t pkt[600];
+        const int len = omp::repl::PackSkeleton(a, pkt, (int)sizeof(pkt));
+        if (len <= 0) { printf("  %d bones: pack FAILED\n", n); ok = false; continue; }
+        if (!omp::repl::IsSkeletonPacket(pkt, len)) { printf("  %d bones: not recognised by magic\n", n); ok = false; continue; }
+        omp::repl::SkelPrint b;
+        if (!omp::repl::UnpackSkeleton(pkt, len, b)) { printf("  %d bones: unpack FAILED\n", n); ok = false; continue; }
+        bool same = (b.n == a.n);
+        for (int i = 0; i < n && same; i++) same = (b.hash[i] == a.hash[i]);
+        printf("  %3d bones: %d B, round trip %s\n", n, len, same ? "exact   PASS" : "CORRUPT  FAIL");
+        ok = ok && same;
+    }
+    // A skeleton packet must never be mistaken for a snapshot, and vice versa -- they share a
+    // transport and are told apart by magic alone.
+    uint8_t junk[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+    if (omp::repl::IsSkeletonPacket(junk, (int)sizeof(junk))) {
+        printf("  a foreign packet was accepted as a fingerprint   FAIL\n"); ok = false;
+    }
+    omp::repl::SkelPrint tooBig; tooBig.n = 0;
+    if (omp::repl::PackSkeleton(tooBig, junk, (int)sizeof(junk)) != 0) {
+        printf("  an empty fingerprint packed anyway   FAIL\n"); ok = false;
+    }
+    return ok;
+}
+
 int main(int argc, char**) {
     const bool dbg = argc > 1;                      // any arg = per-second clock internals, clean profile
     printf("SessionOpenMP replication loop test\n");
@@ -1319,6 +1357,7 @@ int main(int argc, char**) {
     if (!syncTransferCheck()) { printf("\nSYNC TRANSFER FAIL\n"); return 1; }
     if (!dropSyncCheck()) { printf("\nDROP SYNC FAIL\n"); return 1; }
     if (!poseSliceCheck()) { printf("\nPOSE SLICE FAIL\n"); return 1; }
+    if (!skelPrintCheck()) { printf("\nSKEL PRINT FAIL\n"); return 1; }
     printf("%-13s %8s %8s %8s %6s %7s %7s %7s %7s\n",
            "profile", "outEwma", "outMax", "delay", "alpha", "starve", "resync", "extrap", "verdict");
     bool allPass = true;

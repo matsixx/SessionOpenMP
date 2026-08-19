@@ -255,8 +255,8 @@ static const char* SIG_RECREATE_RENDER =
 static const char* SIG_ASSETS_IN_USE =
     "48 89 4C 24 08 41 56 41 57 48 83 EC 48 8B 42 0C 4C 8B FA C7 42 08 00 00 00 00 4C 8B F1";
 
-static int   g_on = 0;            // ClothQuad -- OFF by default (see the safety note above)
-static int   g_realMesh = 1;      // ClothRealMesh -- simulate the GARMENT, not the test quad
+static int   g_on = 0;            // ClothPhysics -- the master switch, OFF by default (opt-in)
+static const int g_realMesh = 1;  // SETTLED: simulate the GARMENT. The test quad it replaced is gone.
 // Defined further down with the mesh builder; declared here because the config reader needs them.
 extern float ClothSim_Gravity;
 extern float ClothSim_MaxTravel;
@@ -270,22 +270,27 @@ extern float ClothSim_HemGripLower;
 extern float ClothSim_HemPush;
 extern float ClothSim_HemPushBand;
 extern int   ClothSim_AutoWinding;
-static int   g_lag       = 1;     // ClothLag -- the garment sits slightly behind the body
+static const int g_lag   = 1;     // SETTLED ON -- the garment sits slightly behind the body.
+                                  // ClothLagMaxMm = 0 turns the effect off; it needs no flag of its own.
 static float g_lagRate   = 9.0f;  // how quickly it catches up (lower = looser)
 static float g_lagMax    = 4.0f;  // cm it may ever sit behind
 static void  LagDrive(void* comp, int slot, float dt);
-static int   g_sway      = 0;     // ClothBoneSway -- OFF: see the T-pose note below -- give the garment its own, lagging bones
+static const int g_sway  = 0;     // WITHDRAWN: hand-written bones never reached the renderer, so the
+                                  // garment stood in its rest pose. See the T-pose note below.
 static float g_swayRate  = 14.0f; // how quickly it catches up (lower = looser)
 static float g_swayMax   = 9.0f;  // cm a bone may trail the body
 static float g_swayRot   = 12.0f; // ...and degrees
 static bool  SwayArm(void* comp, int slot);
 static void  SwayDrive(void* comp, int slot, float dt);
-static int   g_direct   = 0;      // ClothDirectRender -- draw the simulation ourselves
-static int   g_directRefresh = 0; // ClothDirectRefresh -- costly test: force the renderer to re-read
+static const int g_direct = 1;    // SETTLED ON. Draw the simulation ourselves. Was declared 0 and
+                                  // lifted to 1 only by the ini default -- retiring that key without
+                                  // fixing this would have shipped invisible cloth all over again.
+static const int g_directRefresh = 0; // SETTLED OFF -- a costly experiment: force the renderer to re-read
 static bool  DirectArm(void* comp, void* mesh, int slot);   // defined with the direct-render block
 static void  DirectRelease(int slot);                       // ditto
 extern const char* g_dirWhy[];                              // the one-shot "not driving" reason, ditto
-static int   g_render   = 0;      // ClothRender -- feed the simulation back into the drawn mesh.
+static const int g_render = 1;    // SETTLED ON. Feed the simulation back into the drawn mesh. Same
+                                  // trap as g_direct above: the declared value was never the used one.
                                   // OFF by default: this is the first thing here that touches
                                   // render resources, and it edits a mesh other characters wear.
 static int   g_ok = 1;            // runtime kill-switch; never saved
@@ -309,35 +314,50 @@ static void* g_builtOnMesh = nullptr;
 static long  g_builtSerial = -1;
 static char  g_status[96] = "not built";
 
+// Settings whose value is SETTLED. Each was a question once; each was answered, in the game, and
+// then left behind as a toggle. A toggle is a promise that both values work, and for these only one
+// ever did -- so a stale line in one user's file could silently select a build nobody has run since
+// the day the question was settled. That is not hypothetical: cloth shipped invisible because both
+// renderers defaulted off, and shipped looping because a rebuild path defaulted on. The answers now
+// live in code, where they cannot be un-answered, and the names below are recognised only to say
+// they are ignored. Everything still configurable is a NUMBER -- a shape, not a code path.
+static const char* const kRetiredKeys[] = {
+    "ClothRealMesh", "ClothRender", "ClothDirectRender", "ClothDirectRefresh", "ClothBoneSway",
+    "ClothLag", "ClothSwayRate", "ClothSwayMaxMm", "ClothSwayMaxDeg", "ClothFlipNormals",
+    "ClothTangentMode", "ClothLightFlip", "ClothSimXform", "ClothAutoWinding",
+    "ClothUnmerge", "ClothUnfitProbe", "ClothOwnMesh", "ClothRequireMaterialFlag",
+    "ClothMaterialSwap", "ClothRecapture", "ClothDriveMultiSection", "ClothTintFromColour",
+    "ClothTintGainPct", "ClothTintPerGarment",
+};
+// Report them once, by name, so a file carrying an old value explains itself rather than the value
+// quietly doing nothing and looking like the setting failed.
+static void ClothSim_ReportRetiredKeys(const char* buf) {
+    char line[420]; int n = 0; int used = 0;
+    for (const char* k : kRetiredKeys) {
+        // -424242 cannot be a real value, so it means "absent" without a separate lookup.
+        if (TwkIniIntQuiet(buf, k, -424242) == -424242) continue;
+        const int w = snprintf(line + used, sizeof(line) - used, "%s%s", n ? ", " : "", k);
+        if (w > 0 && used + w < (int)sizeof(line) - 1) { used += w; n++; }
+    }
+    if (n) TwkLog("[cloth] %d setting(s) in SessionTweaks.ini no longer exist and are IGNORED: %s "
+                  "-- these picked between code paths, and the working one is now built in. Delete "
+                  "the lines whenever you like; they do nothing.", n, line);
+}
+
 void ClothSim_ReadConfig(const char* buf) {
-    g_on = TwkIniInt(buf, "ClothQuad", 0);
-    g_realMesh = TwkIniInt(buf, "ClothRealMesh", 1);
-    // THESE ARE THE ONLY TWO WAYS CLOTH REACHES THE SCREEN, and both shipped OFF by mistake in
-    // 3.19.0: turning cloth on built the asset and ticked the solver while nothing bound it to the
-    // renderer and nothing wrote vertices, so garments simply never moved. Field report: "enabled the
-    // option, no cloth physics" -- correct behaviour for the config, and nobody could have guessed it.
-    g_render   = TwkIniInt(buf, "ClothRender", 1);
-    g_direct   = TwkIniInt(buf, "ClothDirectRender", 1);
-    g_directRefresh = TwkIniInt(buf, "ClothDirectRefresh", 0);
-    // Giving a garment its own skeleton is DISABLED outright, not merely defaulted off: the
-    // hand-written bones never reached the renderer, so the garment was left with nothing posing it
-    // and stood in its rest pose. A setting left over in someone's file must not be able to bring
-    // that back, so the value is read and then forced off.
-    g_sway     = TwkIniInt(buf, "ClothBoneSway", 0);
-    if (g_sway) { TwkLog("[sway] ClothBoneSway is set but the feature is withdrawn -- ignoring it"); }
-    g_sway = 0;
-    g_lag      = TwkIniInt(buf, "ClothLag", 1);
+    // The master switch. It was called ClothQuad when cloth was one hand-built test quad, which made
+    // every log and every support conversation start by explaining that the quad is the whole
+    // feature. Renamed; an existing ClothQuad line is adopted once so nobody's cloth turns itself
+    // off, and the new name is what gets written from then on.
+    g_on = TwkIniIntQuiet(buf, "ClothPhysics", -1);
+    if (g_on < 0) {
+        g_on = TwkIniInt(buf, "ClothQuad", 0);
+        if (g_on) TwkLog("[cloth] adopted your ClothQuad=1 as ClothPhysics=1 (the setting was renamed)");
+    }
     g_lagRate  = (float)TwkIniInt(buf, "ClothLagRate",  9);
     g_lagMax   = (float)TwkIniInt(buf, "ClothLagMaxMm", 40) / 10.0f;
-    g_swayRate = (float)TwkIniInt(buf, "ClothSwayRate",    14) ;
-    g_swayMax  = (float)TwkIniInt(buf, "ClothSwayMaxMm",   90) / 10.0f;
-    g_swayRot  = (float)TwkIniInt(buf, "ClothSwayMaxDeg",  12);
     ClothSim_Gravity   = (float)TwkIniInt(buf, "ClothGravityPct",  0)   / 100.0f;
     ClothSim_MaxTravel = (float)TwkIniInt(buf, "ClothTravelMm",    60)  / 10.0f;
-    ClothSim_FlipNormals = TwkIniInt(buf, "ClothFlipNormals", 0);
-    ClothSim_TangentMode = TwkIniInt(buf, "ClothTangentMode", 0);
-    ClothSim_LightFlip   = TwkIniInt(buf, "ClothLightFlip", 1);
-    ClothSim_SimXform    = TwkIniInt(buf, "ClothSimXform", 2);
     g_debugLog           = TwkIniInt(buf, "ClothDebugLog", 0);
     // ClothMaxVerts: the sanity ceiling on a garment section, RAW section verts before welding (UV
     // and tangent splits inflate this well above the cloth particle count in the build line).
@@ -346,16 +366,8 @@ void ClothSim_ReadConfig(const char* buf) {
     // modded garment. (The random crash first blamed on that garment turned out to belong to another
     // mod entirely.) Lower it to exclude a garment that misbehaves -- below its vertex count is a
     // per-garment off switch needing no rebuild.
-    // Repair, not just a default: the ini is written with every key on first run, so anyone who ever
-    // launched an earlier build has ClothRender=0 SAVED and a new default would never reach them.
-    // Cloth with neither renderer is not a configuration anyone can have wanted -- it can only look
-    // broken -- so it is corrected and saved.
-    if (!g_render && !g_direct) {
-        g_render = 1; g_direct = 1;
-        TwkLog("[quad] neither cloth renderer was enabled -- cloth could never have been visible; "
-               "turning both on and saving");
-        TwkMarkDirty();
-    }
+    // (The repair that used to sit here -- forcing both renderers back on for anyone whose file had
+    // them saved off -- is gone because it cannot be needed: neither is read from the file any more.)
     g_maxVerts           = TwkIniInt(buf, "ClothMaxVerts", 120000);
     g_armDelayMs         = TwkIniInt(buf, "ClothArmDelayMs", 750);
     if (g_armDelayMs < 0) g_armDelayMs = 0; else if (g_armDelayMs > 10000) g_armDelayMs = 10000;
@@ -367,29 +379,24 @@ void ClothSim_ReadConfig(const char* buf) {
     ClothSim_HemGripLower = (float)TwkIniInt(buf, "ClothHemGripPctLower", 12) / 100.0f;
     ClothSim_HemPush      = (float)TwkIniInt(buf, "ClothHemPushMm",   0) / 10.0f;
     ClothSim_HemPushBand  = (float)TwkIniInt(buf, "ClothHemPushBandPct", 30) / 100.0f;
-    ClothSim_AutoWinding = TwkIniInt(buf, "ClothAutoWinding", 1);
-    TwkLog("[quad] config: ClothQuad=%d ClothRealMesh=%d ClothRender=%d ClothMaxVerts=%d ArmDelayMs=%d",
-           g_on, g_realMesh, g_render, g_maxVerts, g_armDelayMs);
+    TwkLog("[cloth] config: ClothPhysics=%d MaxVerts=%d ArmDelayMs=%d | shape: travel=%.1fcm "
+           "gravity=%d%% wind=%d%% peak=%d%% hemGrip=%d%%/%d%% hemLift=%.1fmm reach=%d%%",
+           g_on, g_maxVerts, g_armDelayMs, ClothSim_MaxTravel,
+           (int)(ClothSim_Gravity * 100.0f + 0.5f), g_windPct,
+           (int)(ClothSim_PeakAt * 100.0f + 0.5f), (int)(ClothSim_HemGrip * 100.0f + 0.5f),
+           (int)(ClothSim_HemGripLower * 100.0f + 0.5f), ClothSim_HemPush * 10.0f,
+           (int)(ClothSim_HemPushBand * 100.0f + 0.5f));
+    ClothSim_ReportRetiredKeys(buf);
 }
+// Only what is still configurable is written. A retired key already in the file is left alone and
+// ignored -- rewriting somebody's settings file to delete lines is a bigger risk than a few dead
+// ones sitting in it, and ReportRetiredKeys names them at every startup.
 void ClothSim_SaveConfig(char* buf, size_t cap) {
-    TwkIniSetInt(buf, cap, "ClothQuad", g_on);
-    TwkIniSetInt(buf, cap, "ClothRealMesh", g_realMesh);
-    TwkIniSetInt(buf, cap, "ClothRender", g_render);
-    TwkIniSetInt(buf, cap, "ClothDirectRender", g_direct);
-    TwkIniSetInt(buf, cap, "ClothDirectRefresh", g_directRefresh);
-    TwkIniSetInt(buf, cap, "ClothBoneSway",   g_sway);
-    TwkIniSetInt(buf, cap, "ClothLag",        g_lag);
+    TwkIniSetInt(buf, cap, "ClothPhysics", g_on);
     TwkIniSetInt(buf, cap, "ClothLagRate",    (int)g_lagRate);
     TwkIniSetInt(buf, cap, "ClothLagMaxMm",   (int)(g_lagMax * 10.0f + 0.5f));
-    TwkIniSetInt(buf, cap, "ClothSwayRate",   (int)g_swayRate);
-    TwkIniSetInt(buf, cap, "ClothSwayMaxMm",  (int)(g_swayMax * 10.0f + 0.5f));
-    TwkIniSetInt(buf, cap, "ClothSwayMaxDeg", (int)g_swayRot);
     TwkIniSetInt(buf, cap, "ClothGravityPct", (int)(ClothSim_Gravity * 100.0f + 0.5f));
     TwkIniSetInt(buf, cap, "ClothTravelMm",   (int)(ClothSim_MaxTravel * 10.0f + 0.5f));
-    TwkIniSetInt(buf, cap, "ClothFlipNormals", ClothSim_FlipNormals);
-    TwkIniSetInt(buf, cap, "ClothTangentMode", ClothSim_TangentMode);
-    TwkIniSetInt(buf, cap, "ClothLightFlip",   ClothSim_LightFlip);
-    TwkIniSetInt(buf, cap, "ClothSimXform",    ClothSim_SimXform);
     TwkIniSetInt(buf, cap, "ClothDebugLog",    g_debugLog);
     TwkIniSetInt(buf, cap, "ClothMaxVerts",    g_maxVerts);
     TwkIniSetInt(buf, cap, "ClothArmDelayMs",  g_armDelayMs);
@@ -399,11 +406,11 @@ void ClothSim_SaveConfig(char* buf, size_t cap) {
     TwkIniSetInt(buf, cap, "ClothHemGripPctLower", (int)(ClothSim_HemGripLower * 100.0f + 0.5f));
     TwkIniSetInt(buf, cap, "ClothHemPushMm",   (int)(ClothSim_HemPush * 10.0f + 0.5f));
     TwkIniSetInt(buf, cap, "ClothHemPushBandPct", (int)(ClothSim_HemPushBand * 100.0f + 0.5f));
-    TwkIniSetInt(buf, cap, "ClothAutoWinding", ClothSim_AutoWinding);
 }
-// Reset leaves cloth OFF (it is opt-in) but must leave the RENDERERS on -- otherwise "reset defaults"
-// recreates the 3.19.0 bug where enabling cloth does nothing at all.
-void ClothSim_ResetDefaults() { g_on = 0; g_ok = 1; g_render = 1; g_direct = 1; }
+// Cloth is opt-in, so a reset leaves it off. It no longer has to remember to re-enable the two
+// renderers: they are not settings any more, so "reset defaults" cannot switch cloth into a state
+// where it is on and invisible.
+void ClothSim_ResetDefaults() { g_on = 0; g_ok = 1; }
 
 // A UE TArray is { void* Data; int32 Num; int32 Max }. Building one means allocating with the
 // engine's allocator and filling all three fields -- Max matters as much as Num: the engine reads
@@ -2229,9 +2236,11 @@ static bool DirectArm(void* comp, void* mesh, int slot) {
 bool  ClothSim_Enabled()      { return g_on != 0; }
 float ClothSim_TravelCm()     { return ClothSim_MaxTravel; }
 float ClothSim_HemPushMm()    { return ClothSim_HemPush * 10.0f; }
+float ClothSim_HemPushBandPct() { return ClothSim_HemPushBand * 100.0f; }
 float ClothSim_CuffGripPct()  { return (1.0f - ClothSim_HemGripLower) * 100.0f; }
 void  ClothSim_SetTravelCm(float v)    { ClothSim_MaxTravel = v; ClothSim_Rebuild(); TwkMarkDirty(); }
 void  ClothSim_SetHemPushMm(float v)   { ClothSim_HemPush = v / 10.0f; ClothSim_Rebuild(); TwkMarkDirty(); }
+void  ClothSim_SetHemPushBandPct(float v) { ClothSim_HemPushBand = v / 100.0f; ClothSim_Rebuild(); TwkMarkDirty(); }
 void  ClothSim_SetCuffGripPct(float v) { ClothSim_HemGripLower = 1.0f - v / 100.0f; ClothSim_Rebuild(); TwkMarkDirty(); }
 // Turning cloth off hands every garment back exactly as it shipped; turning it on rebuilds on the
 // next frame. Both take effect immediately -- no reload, nothing left half-applied.

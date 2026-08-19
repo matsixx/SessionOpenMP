@@ -850,9 +850,12 @@ static void GameThreadFrame() {
             if (p.captured || p.noted || p.applied || p.faults || p.holdApplied) {
                 snprintf(m, sizeof(m),
                          "[pose] cap=%u(%uB) noted=%u hook=%u applied=%u pfx=%u stale=%u skipCnt=%u"
-                         " meshBones=%u faults=%u held=%u holdApplied=%u",
+                         " meshBones=%u faults=%u held=%u holdApplied=%u"
+                         " | sweeps=%u liveN=%u slice=%u wiped=%u noSlice=%u mapped=%u/%u",
                          p.captured, p.bones, p.noted, p.hookCalls, p.applied, p.prefixStamps,
-                         p.stale, p.skippedCount, p.meshBones, p.faults, p.held, p.holdApplied);
+                         p.stale, p.skippedCount, p.meshBones, p.faults, p.held, p.holdApplied,
+                         p.sweeps, p.liveN, p.sliceBones, p.wiped, p.noSlice, p.mappedBones,
+                         p.unmappedBones);
                 logLine(m);
                 // Measurement only, and silent outside replay playback: whether proxy anim graphs
                 // still UPDATE while the local player scrubs, and the state of the standard
