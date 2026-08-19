@@ -27,3 +27,5 @@ CHANGELOG.md
 # fill in your own values. (The secret is in every shipped main.dll anyway; keeping it out of the
 # repo is about not handing it to credential scanners, not about it being truly secret.)
 src/transport/eos_creds.h
+# Local scratch: abandoned work kept as patches for reference, never part of the tree.
+backup/

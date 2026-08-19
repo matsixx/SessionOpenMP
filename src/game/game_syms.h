@@ -458,6 +458,9 @@ bool ProxyRefAt(int i, void** actor, void** board);
 // an FString that is deliberately leaked, so a per-frame caller corrupts the heap. Enumerating fonts
 // once at startup is fine.
 bool ObjectName(const void* obj, char* out, int cap);
+// A skater's mesh component, and the bone count of the skeleton it is drawing.
+void* SkaterMeshOf(void* skaterActor);
+int   SkeletonBoneCount(void* meshComp);
 bool LocalSkaterName(void* pawn, char* out, int cap);   // gi -> FSkaterInstance::SkaterName
 bool LocalMapName(void* pawn, char* out, int cap);      // the UWorld object's own name
 // ---- pretty map labels. The internal level name is what travels, but it is a long asset name and
@@ -517,6 +520,13 @@ namespace off {
     constexpr int kCompQuat           = 0x1c0;   // USceneComponent::ComponentToWorld.Rotation (FQuat)
     constexpr int kCompPos            = 0x1d0;   // ...Translation (FVector)
     constexpr int kSkaterMesh         = 0x280;   // ASkaterCharacterBase mesh component
+    // The merged skeleton's size. USkinnedMeshComponent::SkeletalMesh -> USkeletalMesh::RefSkeleton
+    // -> FReferenceSkeleton::FinalRefBoneInfo (TArray<FMeshBoneInfo>) -- FinalRefBoneInfo, not Raw:
+    // it is the array the component-space transforms are indexed by. A garment carrying its own rig
+    // merges to 95 where the stock body is 70.
+    constexpr int kMeshSkeletalMesh     = 0x480;
+    constexpr int kSkelMeshRefSkeleton  = 0x1b0;
+    constexpr int kRefSkelFinalBoneInfo = 0x20;
     constexpr int kSkaterMoveComp     = 0x550;   // -> USkaterMovementComponent
     constexpr int kSkaterBoard        = 0x568;   // -> ASkateboardEx   (ownership MUST be back-link checked)
     constexpr int kBoardSkater        = 0x4d8;   // ASkateboardEx -> owning skater (the back-link)

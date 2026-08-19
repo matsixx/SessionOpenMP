@@ -281,6 +281,26 @@ bool ObjectName(const void* obj, char* out, int cap) {
     if (!obj || !out || cap <= 0) return false;
     return fnameToAscii((const uint8_t*)obj + off::kObjNamePrivate, out, cap);
 }
+void* SkaterMeshOf(void* skaterActor) {
+    if (!skaterActor) return nullptr;
+    __try { return *(void**)((uint8_t*)skaterActor + off::kSkaterMesh); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+}
+// Three derefs and an integer load: no names resolved, nothing allocated. Bounds are checked
+// because a read taken mid-re-dress can land on a half-built mesh, and 0 means "do not know",
+// which every caller treats as "change nothing".
+int SkeletonBoneCount(void* meshComp) {
+    if (!meshComp) return 0;
+    __try {
+        void* skelMesh = *(void**)((uint8_t*)meshComp + off::kMeshSkeletalMesh);
+        if (!skelMesh) return 0;
+        const uint8_t* refSkel = (const uint8_t*)skelMesh + off::kSkelMeshRefSkeleton;
+        struct TArr { const uint8_t* data; int32_t num; int32_t max; } a{};
+        memcpy(&a, refSkel + off::kRefSkelFinalBoneInfo, sizeof(a));
+        if (!a.data || a.num <= 0 || a.num > 4096 || a.max < a.num) return 0;
+        return a.num;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
 bool LocalSkaterName(void* pawn, char* out, int cap) {
     if (out && cap) out[0] = 0;
     if (!pawn || !g_syms.GetGameInstance || !out) return false;
@@ -391,6 +411,8 @@ bool LocalMapName(void* pawn, char* out, int cap) {
 }
 #else
 bool ObjectName(const void*, char* o, int c) { if (o && c) o[0] = 0; return false; }
+void* SkaterMeshOf(void*)      { return nullptr; }
+int   SkeletonBoneCount(void*) { return 0; }
 bool LocalSkaterName(void*, char* o, int c) { if (o && c) o[0] = 0; return false; }
 bool LocalMapName(void*, char* o, int c)    { if (o && c) o[0] = 0; return false; }
 #endif
