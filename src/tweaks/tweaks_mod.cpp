@@ -43,6 +43,8 @@
 #include "run_out.h"
 #include "catch_level.h"
 #include "catch_sound.h"
+#include "cloth_merge.h"
+#include "cloth_sim.h"
 #include "pitch_range.h"
 #include "foot_place.h"
 #include "foot_steer.h"
@@ -51,6 +53,9 @@
 #include "MinHook.h"
 #include "ue4ss_abi.h"
 #include "ui/menu_ext.h"
+
+#define TWEAKS_VERSION "3.19.0"
+#define TWK_WIDEN(x) STR(x)   // STR() prepends L before the macro expands; expand first
 
 // ------------------------------------------------------------------ log (own file, fresh per launch)
 static FILE* g_log = nullptr;
@@ -83,6 +88,8 @@ static void saveSettings() {
     RunOut_SaveConfig(buf, sizeof(buf));
     CatchLevel_SaveConfig(buf, sizeof(buf));
     CatchSound_SaveConfig(buf, sizeof(buf));
+    ClothMerge_SaveConfig(buf, sizeof(buf));
+    ClothSim_SaveConfig(buf, sizeof(buf));
     PitchRange_SaveConfig(buf, sizeof(buf));
     FootPlace_SaveConfig(buf, sizeof(buf));
     FootSteer_SaveConfig(buf, sizeof(buf));
@@ -117,6 +124,8 @@ static void readConfig(const char* dir) {
     RunOut_ReadConfig(buf);
     CatchLevel_ReadConfig(buf);
     CatchSound_ReadConfig(buf);
+    ClothMerge_ReadConfig(buf);
+    ClothSim_ReadConfig(buf);
     PitchRange_ReadConfig(buf);
     FootPlace_ReadConfig(buf);
     FootSteer_ReadConfig(buf);
@@ -143,6 +152,8 @@ static void resetAllDefaults() {
     RunOut_ResetDefaults();
     CatchLevel_ResetDefaults();
     CatchSound_ResetDefaults();
+    ClothMerge_ResetDefaults();
+    ClothSim_ResetDefaults();
     PitchRange_ResetDefaults();
     FootPlace_ResetDefaults();
     FootSteer_ResetDefaults();
@@ -163,6 +174,10 @@ static void drawSection(const OmpMenuApi* api, void*) {
     CatchLevel_DrawMenu(api);
     api->Separator();
     CatchSound_DrawMenu(api);
+    api->Separator();
+    ClothMerge_DrawMenu(api);
+    ClothSim_DrawMenu(api);
+    api->Separator();
     api->Separator();
     PitchRange_DrawMenu(api);
     api->Separator();
@@ -193,7 +208,6 @@ static const char* const kTwkVelMin   = "TwkScoopVelMin";
 static const char* const kTwkVelMax   = "TwkScoopVelMax";
 static const char* const kTwkCatchX   = "TwkCatchWindowPct";
 static const char* const kTwkDsZone   = "TwkDarkslideZone";
-static const char* const kTwkCatchSnd = "TwkCatchSound";
 static const char* const kTwkSndVol   = "TwkCatchSoundVol";
 static const char* const kTwkLevel    = "TwkCatchLevel";
 static const char* const kTwkGPitch   = "TwkGrindPitch";
@@ -204,6 +218,10 @@ static const char* const kTwkPitch    = "TwkPitchRange";
 static const char* const kTwkPitchAmt = "TwkPitchSpread";
 static const char* const kTwkStopFlip = "TwkCatchStopsFlip";
 static const char* const kTwkAnyRev   = "TwkCatchAnyRevolution";
+static const char* const kTwkCloth     = "TwkCloth";
+static const char* const kTwkClothMove = "TwkClothMove";
+static const char* const kTwkClothHem  = "TwkClothHemLift";
+static const char* const kTwkClothCuff = "TwkClothCuffGrip";
 static const char* const kTwkCamFollow    = "TwkCamFollow";
 static const char* const kTwkCamPitchDrop = "TwkCamPitchDrop";
 static const char* const kTwkCamPitch  = "TwkCamPitch";
@@ -241,7 +259,6 @@ static void pageValue(const char* key, int iv, float fv, void*) {
     else if (!strcmp(key, kTwkVelMax)) ScoopSpeed_SetVelMax(fv * 10.0f);
     else if (!strcmp(key, kTwkCatchX)) CatchTweaks_SetWindowMultPct(fv);
     else if (!strcmp(key, kTwkDsZone)) CatchTweaks_SetDarkslideZoneDeg(fv);
-    else if (!strcmp(key, kTwkCatchSnd)) CatchSound_SetEnabled(iv != 0);
     else if (!strcmp(key, kTwkSndVol))   CatchSound_SetVolumePct(fv);
     else if (!strcmp(key, kTwkLevel))    CatchLevel_SetEnabled(iv != 0);
     else if (!strcmp(key, kTwkStopFlip)) CatchTweaks_SetStopsFlip(iv != 0);
@@ -267,6 +284,10 @@ static void pageValue(const char* key, int iv, float fv, void*) {
     else if (!strcmp(key, kTwkBoneX))     CatchTweaks_SetBoneAdd(0, fv);
     else if (!strcmp(key, kTwkBoneY))     CatchTweaks_SetBoneAdd(1, fv);
     else if (!strcmp(key, kTwkBoneZ))     CatchTweaks_SetBoneAdd(2, fv);
+    else if (!strcmp(key, kTwkCloth))     ClothSim_SetEnabled(iv != 0);
+    else if (!strcmp(key, kTwkClothMove)) ClothSim_SetTravelCm(fv);
+    else if (!strcmp(key, kTwkClothHem))  ClothSim_SetHemPushMm(fv);
+    else if (!strcmp(key, kTwkClothCuff)) ClothSim_SetCuffGripPct(fv);
     else if (!strcmp(key, kTwkCamFollow))    CameraHeight_SetFollowEnabled(iv != 0);
     else if (!strcmp(key, kTwkCamPitchDrop)) CameraHeight_SetPitchOnDropEnabled(iv != 0);
     else if (!strcmp(key, kTwkCamPitch))  CameraHeight_SetPitchDeg(fv);
@@ -282,7 +303,6 @@ static int pageGet(const char* key, int* oi, float* of, void*) {
     else if (!strcmp(key, kTwkVelMax)) { *of = ScoopSpeed_VelMax() / 10.0f;  return 1; }
     else if (!strcmp(key, kTwkCatchX)) { *of = CatchTweaks_WindowMultPct();  return 1; }
     else if (!strcmp(key, kTwkDsZone)) { *of = CatchTweaks_DarkslideZoneDeg(); return 1; }
-    else if (!strcmp(key, kTwkCatchSnd)) { *oi = CatchSound_Enabled() ? 1 : 0; return 1; }
     else if (!strcmp(key, kTwkSndVol))   { *of = CatchSound_VolumePct();       return 1; }
     else if (!strcmp(key, kTwkLevel))    { *oi = CatchLevel_Enabled() ? 1 : 0; return 1; }
     else if (!strcmp(key, kTwkStopFlip)) { *oi = CatchTweaks_StopsFlip() ? 1 : 0; return 1; }
@@ -304,6 +324,10 @@ static int pageGet(const char* key, int* oi, float* of, void*) {
     else if (!strcmp(key, kTwkSteerAxY))  { *of = FootSteer_AxisY();              return 1; }
     else if (!strcmp(key, kTwkSteerTw))   { *of = FootSteer_TwistDeg();           return 1; }
     else if (!strcmp(key, kTwkSteerTwA))  { *of = FootSteer_TwistAxis();          return 1; }
+    else if (!strcmp(key, kTwkCloth))     { *oi = ClothSim_Enabled() ? 1 : 0;    return 1; }
+    else if (!strcmp(key, kTwkClothMove)) { *of = ClothSim_TravelCm();            return 1; }
+    else if (!strcmp(key, kTwkClothHem))  { *of = ClothSim_HemPushMm();           return 1; }
+    else if (!strcmp(key, kTwkClothCuff)) { *of = ClothSim_CuffGripPct();         return 1; }
     else if (!strcmp(key, kTwkCamFollow))    { *oi = CameraHeight_FollowEnabled()      ? 1 : 0; return 1; }
     else if (!strcmp(key, kTwkCamPitchDrop)) { *oi = CameraHeight_PitchOnDropEnabled() ? 1 : 0; return 1; }
     else if (!strcmp(key, kTwkCamPitch))  { *of = CameraHeight_PitchDeg();            return 1; }
@@ -325,6 +349,7 @@ static const OmpPageItem2 kTwkRootItems[] = {
     { OMP_ITEM_PAGE, "Grinds",         "Grinds",          "Pitch control and pop swing coming out of a grind" },
     { OMP_ITEM_PAGE, "Feet",           "Feet",            "Move your feet with the sticks while you are in the air" },
     { OMP_ITEM_PAGE, "Camera",         "Camera",          "Make the camera's height follow your skater everywhere" },
+    { OMP_ITEM_PAGE, "Clothing",       "Clothing",        "Cloth physics on your shirt and trousers" },
     // Kept on the front page deliberately: it resets EVERY Session Tweaks setting, not one category.
     { OMP_ITEM_ACTION, kTwkReset,  "Reset to defaults",   "Restore every Session Tweaks setting to its shipped value" },
 };
@@ -357,8 +382,7 @@ static const OmpPageItem2 kTwkCatchItems[] = {
     { OMP_ITEM_TOGGLE, kTwkAnyRev,  "Foot always attaches",    "A caught board ends its flip flat under your foot, whatever revolution it was on" },
     { OMP_ITEM_TOGGLE, kTwkFootLvl, "  Foot levels the board", "The deck rolls flat in step with the foot coming down on it" },
     { OMP_ITEM_TOGGLE, kTwkLevel,   "Level board on catch",   "Eases the board flat when it hits your foot" },
-    { OMP_ITEM_TOGGLE, kTwkCatchSnd, "Catch sound fix",       "A catch sound on every catch, and never too quiet" },
-    { OMP_ITEM_SLIDER, kTwkSndVol,  "  Catch sound (%)",      "100 = the game's own volume",
+    { OMP_ITEM_SLIDER, kTwkSndVol,  "Catch sound (%)",        "Our replay-recorded catch sound; 100 = the cue's authored level",
       nullptr, nullptr, 50.0f, 300.0f, 10.0f },
     { OMP_ITEM_TOGGLE, kTwkRunOut, "Run out instead of bail", "Low missed tricks run out on foot (needs manual Catch Mode)" },
     { OMP_ITEM_SLIDER, kTwkDrop,   "  Real bail if drop over (cm)", "Above this drop a missed trick still bails",
@@ -393,6 +417,15 @@ static const OmpPageItem2 kTwkFeetItems[] = {
     { OMP_ITEM_SLIDER, kTwkBoneZ,    "  Bone add Z (cm)",    "Added on top of the scaled bone -- raise whichever axis lifts the deck",
       nullptr, nullptr, -100.0f, 100.0f, 2.0f },
 };
+static const OmpPageItem2 kTwkClothItems[] = {
+    { OMP_ITEM_TOGGLE, kTwkCloth,     "Cloth physics",        "Your shirt and trousers move instead of being painted on" },
+    { OMP_ITEM_SLIDER, kTwkClothMove, "  Movement (cm)",      "How far the loose part of a garment may swing from the body",
+      nullptr, nullptr, 1.0f, 15.0f, 1.0f },
+    { OMP_ITEM_SLIDER, kTwkClothCuff, "  Cuff tightness (%)", "How firmly trouser cuffs are held to the ankle; higher shows less gap",
+      nullptr, nullptr, 50.0f, 100.0f, 5.0f },
+    { OMP_ITEM_SLIDER, kTwkClothHem,  "  Shirt hem lift (mm)","Holds a shirt's bottom edge clear of your trousers instead of clipping through",
+      nullptr, nullptr, 0.0f, 30.0f, 1.0f },
+};
 static const OmpPageItem2 kTwkCameraItems[] = {
     { OMP_ITEM_TOGGLE, kTwkCamFollow, "Camera always follows height",
       "The camera tracks your height on every air, not just onto obstacles higher than you" },
@@ -411,7 +444,8 @@ static_assert(sizeof(kTwkRootItems)  / sizeof(kTwkRootItems[0])  <= 13 &&
               sizeof(kTwkCatchItems) / sizeof(kTwkCatchItems[0]) <= 13 &&
               sizeof(kTwkGrindItems) / sizeof(kTwkGrindItems[0]) <= 13 &&
               sizeof(kTwkFeetItems)  / sizeof(kTwkFeetItems[0])  <= 13 &&
-              sizeof(kTwkCameraItems) / sizeof(kTwkCameraItems[0]) <= 13,
+              sizeof(kTwkCameraItems) / sizeof(kTwkCameraItems[0]) <= 13 &&
+              sizeof(kTwkClothItems)  / sizeof(kTwkClothItems[0])  <= 13,
               "A Session Tweaks page exceeds the engine's visible-row window (14 incl. the Back row "
               "the host appends). Split it into another category page rather than raising this.");
 
@@ -451,6 +485,7 @@ static bool tryRegisterMenu() {
                 TWK_SUBPAGE("Grinds",         kTwkGrindItems);
                 TWK_SUBPAGE("Feet",           kTwkFeetItems);
                 TWK_SUBPAGE("Camera",         kTwkCameraItems);
+                TWK_SUBPAGE("Clothing",       kTwkClothItems);
                 #undef TWK_SUBPAGE
                 if (regp("Session Tweaks", kTwkRootItems,
                          (int)(sizeof(kTwkRootItems) / sizeof(kTwkRootItems[0])),
@@ -468,7 +503,9 @@ void Tweaks_PumpFrame() {
     RunOut_PumpFrame();              // the armed post-conversion fall watch + facing
     CatchTweaks_PumpFrame();         // per-trick board-rotation watch
     CatchLevel_PumpFrame();          // catch-triggered board leveling
-    CatchSound_PumpFrame();          // catch-sound telemetry (the fixes live in the hooks, not here)
+    CatchSound_PumpFrame();
+    ClothMerge_PumpFrame();
+    ClothSim_PumpFrame();
     FootPlace_PumpFrame();
     FootSteer_PumpFrame();           // liveness only: it applies from inside foot_place's hook
     GrindPop_PumpFrame();            // grind-exit pop records: names resolved and logged out here
@@ -488,8 +525,9 @@ class SessionTweaks : public RC::CppUserModBase
 public:
     SessionTweaks() {
         ModName = STR("SessionTweaks");
-        // Version history is kept with the releases, not in the source.
-        ModVersion = STR("2.67.1");
+        // Version history is kept with the releases, not in the source. ONE definition -- the log
+        // banner used to carry its own copy and silently drifted five versions behind.
+        ModVersion = TWK_WIDEN(TWEAKS_VERSION);
         ModDescription = STR("Gameplay fixes: real-stick-sweep scoop speed, wider manual catch window, darkslide-aware catch fix, run out on missed tricks");
         ModAuthors = STR("matsix");
         char dir[MAX_PATH]{};
@@ -498,7 +536,7 @@ public:
         char path[MAX_PATH];
         snprintf(path, sizeof(path), "%sSessionTweaks.log", dir);
         g_log = fopen(path, "w");
-        TwkLog("=== SessionTweaks 2.67.1 loading (UE4SS C++ mod) ===");
+        TwkLog("=== SessionTweaks " TWEAKS_VERSION " loading (UE4SS C++ mod) ===");
         readConfig(dir);
     }
     ~SessionTweaks() override {
@@ -516,6 +554,8 @@ public:
         CatchTweaks_Install();
         CatchLevel_Install();
         CatchSound_Install();
+    ClothMerge_Install();
+    ClothSim_Install();
         PitchRange_Install();
         FootPlace_Install();
         FootSteer_Install();

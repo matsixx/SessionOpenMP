@@ -220,6 +220,8 @@ if(EXISTS "${UE4SS_LIB}")
             src/tweaks/run_out.cpp
             src/tweaks/catch_level.cpp
             src/tweaks/catch_sound.cpp
+            src/tweaks/cloth_merge.cpp
+            src/tweaks/cloth_sim.cpp
             src/tweaks/pitch_range.cpp
             src/tweaks/foot_place.cpp
             src/tweaks/foot_steer.cpp

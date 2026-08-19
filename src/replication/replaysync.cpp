@@ -98,6 +98,9 @@ static const int kChunkData  = 900;                  // + 13 B header stays unde
 static const int kOutMax     = 4;                    // concurrent requesters (same-session peers)
 static const int kResendCap  = 512;
 struct OutXfer {
+    uint32_t tickBlocked = 0;    // ticks with chunks left but the window shut (waiting on an ACK)
+    uint32_t tickSent = 0;       // ticks that actually pushed at least one chunk
+    uint64_t firstSendUs = 0;
     bool     active = false;
     int      peerIdx = -1;
     uint32_t reqId = 0;
@@ -115,7 +118,29 @@ struct OutXfer {
 };
 static OutXfer g_out[kOutMax];
 
-static void outFree(OutXfer& x) { delete[] x.buf; x = OutXfer{}; }
+static void (*g_outLog)(const char*) = nullptr;   // set per Tick so outFree can report
+
+static void outFree(OutXfer& x) {
+    // THE NUMBER THAT DECIDES THE FIX. `blocked` counts ticks where chunks were waiting but the
+    // window was shut, i.e. the sender had nothing to do but wait for an acknowledgement; `sent`
+    // counts ticks that actually pushed. Mostly blocked = the window is too small for this path's
+    // round-trip and wants to adapt. Mostly sent = the window is irrelevant and the transport is the
+    // ceiling, in which case a bigger window would only queue up more and help nothing.
+    if (g_outLog && x.active && (x.tickSent || x.tickBlocked)) {
+        const double secs = (x.firstSendUs && x.lastActUs > x.firstSendUs)
+                          ? (double)(x.lastActUs - x.firstSendUs) / 1e6 : 0.0;
+        const double kb = (double)x.total / 1024.0;
+        char m[220];
+        snprintf(m, sizeof(m),
+                 "[sync] sent %u/%u chunk(s) in %.1f s (%.0f KB/s) -- ticks: %u sending, %u"
+                 " window-blocked (%.0f%% waiting on ACKs)",
+                 x.swept, x.chunkCount, secs, secs > 0.01 ? kb / secs : 0.0,
+                 x.tickSent, x.tickBlocked,
+                 (x.tickSent + x.tickBlocked) ? 100.0 * x.tickBlocked / (x.tickSent + x.tickBlocked) : 0.0);
+        g_outLog(m);
+    }
+    delete[] x.buf; x = OutXfer{};
+}
 
 static void sendHdr(const OutXfer& x) {
     uint8_t p[5 + 4 + 4 + 2 + 2 + 4 + 8 + 8];
@@ -137,7 +162,8 @@ static void sendChunk(OutXfer& x, uint16_t idx) {
     if (g_send) g_send(x.peerIdx, p, 13 + (int)dlen, true);
 }
 
-static void beginOutgoing(int peerIdx, uint32_t reqId, uint64_t nowUs, void (*logf)(const char*)) {
+static void beginOutgoing(int peerIdx, uint32_t reqId, uint64_t nowUs, uint16_t wantSec,
+                          void (*logf)(const char*)) {
     // A repeat REQ with the SAME id is the requester saying "I never saw your header" -- re-send
     // the header, keep the transfer exactly where it is. Only a NEW id (a fresh toggle) rebuilds.
     // The old restart-on-every-REQ turned the requester's 3 s retry into a permanent reset loop
@@ -153,10 +179,19 @@ static void beginOutgoing(int peerIdx, uint32_t reqId, uint64_t nowUs, void (*lo
     // scrubbing peer at, and the scrub-side interp blends between entries -- half the bytes, same
     // scrub fidelity. The newest entry is always kept: it anchors the timeline mapping.
     const uint64_t minGapUs = (uint64_t)(g_tun.historyMinGapMs * 1000.f);
+    // ...and TRIMMED to what they asked for. Every snapshot carries a whole skeleton -- 951 of its
+    // ~1084 bytes when the sender wears a garment with its own rig -- so a 79 s ring is ~2.5 MB and
+    // most of it is footage nobody is going to scrub back to. The requester names the window because
+    // the requester is the one waiting for it. 0 = everything, and the newest entry always survives:
+    // it anchors the timeline mapping.
+    const uint64_t newestUsAll = g_ownCount > 0 ? ownAt(g_ownCount - 1).us : 0;
+    const uint64_t cutoffUs = (wantSec && newestUsAll > (uint64_t)wantSec * 1000000ull)
+                              ? newestUsAll - (uint64_t)wantSec * 1000000ull : 0;
     uint32_t total = 0, kept = 0;
     uint64_t lastKeptUs = 0;
     for (int i = 0; i < g_ownCount; i++) {
         OwnEntry& e = ownAt(i);
+        if (cutoffUs && e.us < cutoffUs && i != g_ownCount - 1) continue;
         if (i > 0 && i != g_ownCount - 1 && e.us - lastKeptUs < minGapUs) continue;
         total += 10u + e.len; kept++; lastKeptUs = e.us;
     }
@@ -167,6 +202,7 @@ static void beginOutgoing(int peerIdx, uint32_t reqId, uint64_t nowUs, void (*lo
     lastKeptUs = 0;
     for (int i = 0; i < g_ownCount; i++) {
         OwnEntry& e = ownAt(i);
+        if (cutoffUs && e.us < cutoffUs && i != g_ownCount - 1) continue;
         if (i > 0 && i != g_ownCount - 1 && e.us - lastKeptUs < minGapUs) continue;
         wU16(x->buf + w, e.len); wU64(x->buf + w + 2, e.us);
         memcpy(x->buf + w + 10, g_arena + (e.vOff % kArena), e.len);
@@ -214,6 +250,7 @@ struct InXfer {
     uint16_t chunkCount = 0, chunkSize = 0;
     uint64_t newestUs = 0, oldestUs = 0;
     uint64_t startUs = 0, lastActUs = 0, lastNakUs = 0, lastAckUs = 0;
+    uint32_t ackedGot = 0;          // `got` as of the last progress report -- see the ACK below
     int      reqRetries = 0;
     bool     failed = false;
 };
@@ -263,14 +300,22 @@ static void sendSimple(int peerIdx, uint8_t type, uint32_t reqId) {
     if (g_send) g_send(peerIdx, p, 9, true);
 }
 
-bool RequestSync(int peerIdx, uint64_t nowUs) {
+bool RequestSync(int peerIdx, uint64_t nowUs, int seconds) {
     if (g_in.active) return false;
     if (ReadyBuf* r = readyFor(peerIdx)) readyFree(*r);   // a re-sync replaces the old window
     g_in = InXfer{};
     g_in.active = true; g_in.peerIdx = peerIdx;
     g_in.reqId = (uint32_t)(nowUs ^ (nowUs >> 17)) | 1u;
     g_in.startUs = g_in.lastActUs = nowUs;
-    sendSimple(peerIdx, kReq, g_in.reqId);
+    // REQ carries the wanted length. Two bytes on the end of the old 9-byte message: a sender built
+    // before this reads the first 9 and sends everything, which is the old behaviour and not a fault.
+    {
+        uint8_t p[11];
+        wU32(p, kMagic); p[4] = kReq; wU32(p + 5, g_in.reqId);
+        const int sec = (seconds < 0) ? 0 : (seconds > 65535 ? 65535 : seconds);
+        wU16(p + 9, (uint16_t)sec);
+        if (g_send) g_send(peerIdx, p, 11, true);
+    }
     return true;
 }
 
@@ -305,7 +350,8 @@ void OnPacket(int peerIdx, const uint8_t* d, int len, uint64_t nowUs, void (*log
     const uint32_t reqId = rU32(d + 5);
     switch (type) {
     case kReq:
-        beginOutgoing(peerIdx, reqId, nowUs, logf);
+        // Length is optional: an older requester sends 9 bytes and gets the whole ring.
+        beginOutgoing(peerIdx, reqId, nowUs, (len >= 11) ? rU16(d + 9) : 0, logf);
         break;
     case kCancel:
         for (auto& o : g_out) if (o.active && o.peerIdx == peerIdx && o.reqId == reqId) outFree(o);
@@ -384,6 +430,7 @@ void OnPacket(int peerIdx, const uint8_t* d, int len, uint64_t nowUs, void (*log
 }
 
 void Tick(uint64_t nowUs, void (*logf)(const char*)) {
+    g_outLog = logf;
     // ---- pace outgoing chunks: resends first (they are the requester's actual holes), then the sweep
     for (auto& o : g_out) {
         if (!o.active) continue;
@@ -405,16 +452,21 @@ void Tick(uint64_t nowUs, void (*logf)(const char*)) {
         // window would ratchet shut on every recovered loss. SIGNED and clamped: a quiet-period NAK
         // names every missing chunk including not-yet-swept ones, so resends can push `got` PAST
         // `swept` -- unsigned math would wrap that into a permanently shut window.
+        const uint32_t sentBefore = o.swept;
+        bool blocked = false;
         while (budget > 0 && o.sweep < o.chunkCount) {
             int outstanding = (int)o.swept - (int)o.ackedGot;
             if (outstanding < 0) outstanding = 0;
-            if (outstanding >= g_tun.windowChunks) break;
+            if (outstanding >= g_tun.windowChunks) { blocked = true; break; }
             sendChunk(o, (uint16_t)o.sweep++); o.swept++; budget--;
         }
+        if (o.swept != sentBefore) { o.tickSent++; if (!o.firstSendUs) o.firstSendUs = nowUs; }
+        else if (blocked)          o.tickBlocked++;
         if (o.sweep >= o.chunkCount && o.rCount == 0 &&
             nowUs - o.lastActUs > (uint64_t)(g_tun.stallTimeoutMs * 1000.f))
             outFree(o);                              // requester went quiet; DONE/NAK never came
     }
+    g_outLog = nullptr;
     // ---- requester: REQ retry, NAK holes, stall failure
     if (g_in.active && !g_in.failed) {
         if (!g_in.haveHdr) {
@@ -427,13 +479,22 @@ void Tick(uint64_t nowUs, void (*logf)(const char*)) {
                 } else { sendSimple(g_in.peerIdx, kReq, g_in.reqId); g_in.lastActUs = nowUs; }
             }
         } else if (g_in.got < g_in.chunkCount) {
-            // Progress report for the sender's flow-control window, on its own cadence -- tiny,
-            // reliable, and what the sweep's throughput is made of.
-            if (nowUs - g_in.lastAckUs > (uint64_t)(g_tun.ackIntervalMs * 1000.f)) {
+            // Progress report for the sender's flow-control window -- tiny, reliable, and what the
+            // sweep's throughput is made of. SELF-CLOCKED, not merely periodic: the sweep may only
+            // run `windowChunks` ahead of the last reported count, so on a timer alone throughput is
+            // window/interval no matter how fast the path is -- measured at ~346 KB/s over SHARED
+            // MEMORY, 7.5 s for one 2.5 MB history, which is all dead time waiting to say "keep
+            // going". Reporting as soon as half the window has landed lets a fast path run at its
+            // own speed while the timer stays as the floor for a slow or lossy one. This CANNOT
+            // bring back the open-loop flooding that this window exists to prevent: in-flight bytes
+            // are still capped by the window, and only the acknowledgement gets quicker.
+            const uint32_t ackStride = (uint32_t)(g_tun.windowChunks > 1 ? g_tun.windowChunks / 2 : 1);
+            const bool halfWindowIn  = (g_in.got - g_in.ackedGot) >= ackStride;
+            if (halfWindowIn || nowUs - g_in.lastAckUs > (uint64_t)(g_tun.ackIntervalMs * 1000.f)) {
                 uint8_t p[13];
                 wU32(p, kMagic); p[4] = kAck; wU32(p + 5, g_in.reqId); wU32(p + 9, g_in.got);
                 if (g_send) g_send(g_in.peerIdx, p, 13, true);
-                g_in.lastAckUs = nowUs;
+                g_in.lastAckUs = nowUs; g_in.ackedGot = g_in.got;
             }
             if (nowUs - g_in.startUs > (uint64_t)(g_tun.stallTimeoutMs * 1000.f) &&
                 nowUs - g_in.lastActUs > (uint64_t)(g_tun.stallTimeoutMs * 1000.f)) {

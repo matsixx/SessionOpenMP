@@ -541,6 +541,25 @@ static volatile LONG g_spectatePending = kSpecNoPending;   // a PEER ID, posted 
 static uint8_t   g_viewRow[0x90];
 static uint64_t  g_viewKey = 0;
 static FTextBlob g_viewOpts[2];
+// ---- "Synced replay length", sitting with Look At and Sync Replay because that is the feature it
+// belongs to. A MultiOption, not a slider: both its neighbours are, this page injects a fixed row
+// count onto a NATIVE page and has no path to stamp a progress bar's current value onto its widget
+// (a slider here builds but shows nothing), and presets are what anyone actually wants -- the dial
+// is really "how long am I willing to wait", and every snapshot of their history carries a whole
+// skeleton, so the seconds and the wait are the same number.
+static const int kSyncLenCount = 5;
+static const int kSyncLenSecs[kSyncLenCount] = { 15, 30, 60, 120, 0 };   // 0 = everything they have
+static const char* const kSyncLenNames[kSyncLenCount] = { "15 s", "30 s", "60 s", "120 s", "All" };
+static uint8_t   g_syncLenRow[0x90];
+static uint64_t  g_syncLenKey = 0;
+static FTextBlob g_syncLenOpts[kSyncLenCount];
+static int       g_syncLenSel = 1;
+static int syncLenIndexFromPrefs() {
+    const int want = MpPrefs_SyncSeconds();
+    int best = 1;
+    for (int i = 0; i < kSyncLenCount; i++) if (kSyncLenSecs[i] == want) { best = i; break; }
+    return best;
+}
 static int       g_viewSel = 0;                            // display only, rebuilt with the page
 static volatile LONG g_viewPending = kSpecNoPending;
 
@@ -673,6 +692,26 @@ static void buildRows() {
                 *(int32_t*)(g_viewRow + off::kItemMultiStart)        = 0;
             } else g_viewKey = 0;
         } else g_viewKey = 0;
+        // The length row fails independently too: losing it must not cost the page its other rows.
+        if (g_replayPageKey &&
+            buildRow(g_syncLenRow, "OmpSyncLen", "Synced replay length",
+                     "How far back Sync Replay fetches, newest first. Shorter is a much faster "
+                     "sync -- 15 s covers a trick, where the whole history is mostly footage "
+                     "nobody scrubs back to. Your setting decides your own wait, not theirs.",
+                     &g_syncLenKey)) {
+            bool okAll = true;
+            for (int i = 0; i < kSyncLenCount && okAll; i++) {
+                const FTextBlob* t = cachedText(kSyncLenNames[i]);
+                if (t) g_syncLenOpts[i] = *t; else okAll = false;
+            }
+            if (okAll) {
+                *(g_syncLenRow + off::kItemType) = 2;                       // MultiOption
+                *(void**)  (g_syncLenRow + off::kItemMultiTexts)        = g_syncLenOpts;
+                *(int32_t*)(g_syncLenRow + off::kItemMultiTexts + 0x08) = kSyncLenCount;
+                *(int32_t*)(g_syncLenRow + off::kItemMultiTexts + 0x0c) = kSyncLenCount;
+                *(int32_t*)(g_syncLenRow + off::kItemMultiStart)        = syncLenIndexFromPrefs();
+            } else g_syncLenKey = 0;
+        } else g_syncLenKey = 0;
     }
     if (!buildRow(g_playersOpenRow, "OmpPlayers", "Players",
                   "Kick or ban someone from the game you are hosting", &g_playersOpenKey) ||
@@ -943,7 +982,7 @@ static const TArrayHdr* chooseArray(void* page, const TArrayHdr* items, TArrayHd
         if (g_spectateSel == 0) g_spectateSelPeer = -1;
         *(int32_t*)(g_spectateRow + off::kItemMultiTexts + 0x08) = g_spectateCount;
         *(int32_t*)(g_spectateRow + off::kItemMultiStart)        = g_spectateSel;
-        const int extra = 1 + (g_viewKey ? 1 : 0);
+        const int extra = 1 + (g_viewKey ? 1 : 0) + (g_syncLenKey ? 1 : 0);
         if (items->num + extra > PauseMenu_Tuning().maxItems || items->num + extra > kRowCap) return items;
         uint8_t* out2 = g_rowBuf;
         for (int i = 0; i < items->num; i++)
@@ -959,6 +998,15 @@ static const TArrayHdr* chooseArray(void* page, const TArrayHdr* items, TArrayHd
             *(int32_t*)(g_viewRow + off::kItemMultiStart) = g_viewSel;
             memcpy(out2 + (size_t)(items->num + 1) * off::kItemSize, g_viewRow, off::kItemSize);
             stampTemplate(out2 + (size_t)(items->num + 1) * off::kItemSize);
+        }
+        if (g_syncLenKey) {
+            // Re-read at build time like the rows above: opening the menu is when a setting should
+            // show what it actually is.
+            g_syncLenSel = syncLenIndexFromPrefs();
+            *(int32_t*)(g_syncLenRow + off::kItemMultiStart) = g_syncLenSel;
+            const int at = items->num + 1 + (g_viewKey ? 1 : 0);
+            memcpy(out2 + (size_t)at * off::kItemSize, g_syncLenRow, off::kItemSize);
+            stampTemplate(out2 + (size_t)at * off::kItemSize);
         }
         ours->data = out2; ours->num = items->num + extra; ours->max = ours->num;
         return ours;
@@ -1778,6 +1826,14 @@ static bool handleValueChange(void* params, bool isSlider) {
         // cannot churn the settings file either.
         if (g_nameModeKey && k == g_nameModeKey && !isSlider) {
             MpPrefs_SetNameMode(*(const int32_t*)((const uint8_t*)params + off::kChangeParamsNew));
+            return true;
+        }
+        if (g_syncLenKey && k == g_syncLenKey && !isSlider) {
+            const int idx = *(const int32_t*)((const uint8_t*)params + off::kChangeParamsNew);
+            if (idx >= 0 && idx < kSyncLenCount) {
+                g_syncLenSel = idx;
+                MpPrefs_SetSyncSeconds(kSyncLenSecs[idx]);
+            }
             return true;
         }
         if (g_dropKey && k == g_dropKey && !isSlider) {

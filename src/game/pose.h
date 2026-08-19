@@ -70,6 +70,13 @@ struct Tuning {
     // posed. false = the old exact-match refuse, kept for A/B: if the prefix assumption were wrong
     // it would show instantly as a scrambled pose, and this switch restores the refuse.
     bool prefixOnMismatch = true;
+    // NO SMOOTHING HERE -- TESTED AND REVERTED. Easing each bone toward the transported pose looked
+    // like the obvious way to take the staircase off a sliced skeleton, and it BROKE the animation
+    // outright. The blend read the component-space array as "last frame's pose", but the animator
+    // re-evaluates and re-stomps that array every frame, and during a replay its output is the
+    // degenerate one this file already documents as a heap of clothes. So the ease ran from garbage
+    // toward the good pose and never arrived. Anything that smooths a transported pose must keep its
+    // OWN copy of the previous stamp -- never read back what it wrote last frame.
 };
 Tuning& Tune();
 

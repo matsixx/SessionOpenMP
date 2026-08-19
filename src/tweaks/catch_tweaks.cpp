@@ -222,8 +222,9 @@ static LONG  g_uiFlickFixes = 0;     // how many orients this has corrected, for
 //     authored pose, which shoves the board away from the feet by design;
 //   * the second stick modulates the pitch/yaw RATIOS on the same state, blending toward an
 //     authored pose variant with the feet lifted.
-// While held, incoming two-stick states are narrowed back to the engaged foot and the ratios stay
-// pinned at their engage-time values. Gated to real trick airs (CatchAirIsTrick) so the boned
+// While held, incoming two-stick states are narrowed back to the engaged foot. The ratios are left
+// ALONE -- they are how the catch is steered, see the note at the narrowing. Gated to real trick airs
+// (CatchAirIsTrick) so the boned
 // ollie's own two-stick pose is never touched, and darkslide states pass through and drop the
 // hold. Each rewrite kind edge-logs once per catch, so which mechanism actually fired is readable
 // straight from the log.
@@ -237,8 +238,7 @@ static LONG  g_uiFlickFixes = 0;     // how many orients this has corrected, for
 // pass; ollies are exempt (CatchAirIsTrick); the record clears on grounding.
 static int   g_holdPose   = 1;       // CatchHoldPose
 static int   g_holdState  = 0;       // the engaged one-foot state being held (0 = not holding)
-static float g_holdPitch  = 0.0f, g_holdYaw = 0.0f;   // ratios captured at engage
-static int   g_holdLoggedState = 0, g_holdLoggedRatio = 0;   // one edge log per catch, per kind
+static int   g_holdLoggedState = 0;  // one edge log per catch for the state-narrowing
 static LONG  g_uiHoldFixes = 0;
 static int   g_airCaughtFoot = 0;    // nonzero = a catch was taken THIS AIR (one catch per air)
 static int   g_airCatchZeros = 0;    // consecutive state-0 setter calls since it -- >= 2 = it ended
@@ -320,6 +320,22 @@ static long long g_deflStartL = 0, g_deflStartR = 0;   // QPC when each stick's 
                                                        // began; 0 = centred right now
 static int   g_vetoAdmitted = 0;      // this catch passed the veto once -- stop checking
 static long  g_vetoLogged   = -1;     // trick serial the veto last logged for
+// CatchMinSpinDeg: a catch may not ENGAGE until the board has actually turned this far into the
+// trick. The fresh-flick veto covers the manual case -- it asks "has a new stick edge arrived?" -- but
+// AUTO catch has no flick to time, so nothing stopped a very slow flip being caught before the deck
+// had begun to spin. Degrees, not milliseconds, so it holds however slowly the board turns.
+//
+// This is NOT the reverted 2.62.2 guard. That one un-ended the flip AFTER the catch had registered, by
+// refusing to park _boardFlipTargetAngle; it treated the symptom and was pulled. This refuses the
+// engage itself, in the same place and the same way as the flick veto -- the mechanism that worked.
+// AUTO CATCH ONLY (AutoCatchActive) -- manual has the flick veto.
+static int   g_minSpinDeg   = 45;     // 0 = off
+// CatchMaxCutDeg: how much unfinished rotation "foot always attaches" may throw away. Past this the
+// flip is left alone to finish on its own. 0 = no limit (the old behaviour).
+// AUTO CATCH ONLY (AutoCatchActive) -- on manual an over-rotation must still level out under the foot.
+static int   g_maxCutDeg    = 180;
+static float g_trickTravelDeg = 0.0f; // degrees the board has turned since the current trick started
+static int   g_spinLogged   = -1;     // trick serial the spin gate last logged for
 static int   g_unstick      = 1;      // CatchUnstick -- ini kill-switch only, no menu row: it is
                                       // a bug fix, always on (like CatchHoldPose and FootFixShoeHeight)
 static int   g_unstickMs    = 1000;   // CatchUnstickMs -- how long the pose must be stuck on the
@@ -345,6 +361,20 @@ static volatile LONG g_uiDsMasked = 0;                          // masked stretc
 static volatile LONG g_uiDsHonored = 0;                         // grip-down stretches left stock
 
 int CatchTweaks_ManualMode() { return g_manualMode; }
+
+// Both 3.18 guards below exist for AUTO catch only and are locked to it. Manual catch was already
+// right: the fresh-flick veto covers its early-engage case, and on manual an over-rotation is caught
+// deliberately -- the foot is supposed to attach and level the deck, which is exactly what
+// CatchMaxCutDeg was refusing to do (field: kickflip over-rotations stopped levelling out).
+// `g_uiCatchMode` is the live menu setting, so switching modes in-game switches the guards with it.
+// Manual is only KNOWN once it has been learned (or set in the ini); until then assume auto, so a
+// player who never touches manual still gets the fix. The learn fires on the first manual-mode frame.
+static bool AutoCatchActive()
+{
+    const int manual = g_manualMode;
+    if (manual < 0) return true;                       // not yet learned -- assume auto
+    return (int)g_uiCatchMode != manual;
+}
 
 // The live skater, published for other modules' pump-side polling. Updated OUTSIDE both guarded
 // blocks in hkCanCatchOrient: the sampler's g_samplerOK and the widen gate's handler each disable
@@ -430,6 +460,10 @@ void CatchTweaks_ReadConfig(const char* buf) {
     g_holdPose     = TwkIniInt(buf, "CatchHoldPose", 1);
     g_needFlick    = TwkIniInt(buf, "CatchNeedsFreshFlick", 1);
     g_unstick      = TwkIniInt(buf, "CatchUnstick", 1);
+    g_minSpinDeg   = TwkIniInt(buf, "CatchMinSpinDeg", 45);
+    g_maxCutDeg    = TwkIniInt(buf, "CatchMaxCutDeg", 180);
+    if (g_maxCutDeg < 0) g_maxCutDeg = 0; else if (g_maxCutDeg > 1080) g_maxCutDeg = 1080;
+    if (g_minSpinDeg < 0) g_minSpinDeg = 0; else if (g_minSpinDeg > 360) g_minSpinDeg = 360;
     g_unstickMs    = TwkIniInt(buf, "CatchUnstickMs", 1000);
     if (g_unstickMs < 300)  g_unstickMs = 300;
     if (g_unstickMs > 5000) g_unstickMs = 5000;
@@ -470,6 +504,8 @@ void CatchTweaks_SaveConfig(char* buf, size_t cap) {
     TwkIniSetInt(buf, cap, "CatchHoldPose",       g_holdPose);
     TwkIniSetInt(buf, cap, "CatchNeedsFreshFlick", g_needFlick);
     TwkIniSetInt(buf, cap, "CatchUnstick",        g_unstick);
+    TwkIniSetInt(buf, cap, "CatchMinSpinDeg",     g_minSpinDeg);
+    TwkIniSetInt(buf, cap, "CatchMaxCutDeg",      g_maxCutDeg);
     TwkIniSetInt(buf, cap, "CatchUnstickMs",      g_unstickMs);
     TwkIniSetInt(buf, cap, "CatchStopsFlip",      g_stopFlip);
     TwkIniSetInt(buf, cap, "CatchStopFlipDeg",    g_stopFlipDeg);
@@ -1278,7 +1314,7 @@ static void hkSetCatchOrient(void* self, uint8_t state, float pitchRatio, float 
     float usePitch = pitchRatio, useYaw = yawRatio;
     if (state == 0) {   // catch ended -- release the latch, the pose hold and the veto admission
         g_flickLatch = 0; g_latchIdle = 0;
-        g_holdState = 0; g_holdLoggedState = 0; g_holdLoggedRatio = 0;
+        g_holdState = 0; g_holdLoggedState = 0;
         g_vetoAdmitted = 0;
         if (g_airCaughtFoot != 0) ++g_airCatchZeros;
         // Post-catch orient calls flow through HERE with live ratios; a held-over stick's are
@@ -1344,6 +1380,27 @@ static void hkSetCatchOrient(void* self, uint8_t state, float pitchRatio, float 
                     }
                 }
             }
+            // ---- and a catch needs the board to have actually SPUN (see CatchMinSpinDeg) -----
+            // Deliberately after the flick veto and before everything else: like the veto this only
+            // refuses the engage, so the game keeps asking and the catch lands the moment the deck
+            // has turned far enough. Ollies never stamp a trick, darkslides are exempt.
+            // NOT gated on g_vetoAdmitted: that flag means "a fresh flick was seen", which says
+            // nothing about whether the board has turned. Copying it from the veto meant that on any
+            // trick the flick check admitted, the spin check never ran at all.
+            if (!vetoed && g_minSpinDeg > 0 && AutoCatchActive() && isMine &&
+                (oneFoot || twoFoot) && !(state >= 7 && state <= 9)) {
+                const int msTrick = FlipSpeed_MsSinceTrick();
+                if (msTrick >= 0 && msTrick <= 2000 && g_trickTravelDeg < (float)g_minSpinDeg) {
+                    use = 0; vetoed = true;
+                    const long serial = FlipSpeed_TrickSerial();
+                    if (g_spinLogged != serial) {
+                        g_spinLogged = (int)serial;
+                        TwkLog("[catch] catch held off +%d ms into '%s' -- the board has only turned "
+                               "%.0f of %d deg", msTrick, FlipSpeed_LastTrickName(),
+                               g_trickTravelDeg, g_minSpinDeg);
+                    }
+                }
+            }
             // Same held-over rule for an ENGAGED catch's ratios: the pose hold pins whatever it
             // captures at engage, and for a held stick the engage snapshot IS the stale value.
             // Zeroing before the hold arms means it pins zeros. Darkslides keep theirs.
@@ -1406,10 +1463,6 @@ static void hkSetCatchOrient(void* self, uint8_t state, float pitchRatio, float 
                     g_holdState = 0;
                 } else if (g_holdState == 0 && (use == 1 || use == 2)) {
                     g_holdState = use;              // the catch engaged one-footed: hold this pose
-                    // Capture the EFFECTIVE ratios (post any narrowing drop), never the raw args --
-                    // capturing the raw pair would re-pin exactly the two-stick pitch the
-                    // narrowing just removed.
-                    g_holdPitch = usePitch; g_holdYaw = useYaw;
                 } else if (g_holdState != 0) {
                     if (use == 5 || use == 10 || use == 11) {
                         if (!g_holdLoggedState) {
@@ -1420,17 +1473,15 @@ static void hkSetCatchOrient(void* self, uint8_t state, float pitchRatio, float 
                         use = (uint8_t)g_holdState;
                         InterlockedIncrement(&g_uiHoldFixes);
                     }
-                    if (fabsf(usePitch - g_holdPitch) > 0.15f ||
-                        fabsf(useYaw   - g_holdYaw)   > 0.15f) {
-                        if (!g_holdLoggedRatio) {
-                            g_holdLoggedRatio = 1;
-                            TwkLog("[catch] catch pose ratios moved mid-catch (pitch %.2f -> %.2f, "
-                                   "yaw %.2f -> %.2f) -- pinned at the engage values",
-                                   g_holdPitch, usePitch, g_holdYaw, useYaw);
-                        }
-                        InterlockedIncrement(&g_uiHoldFixes);
-                    }
-                    usePitch = g_holdPitch; useYaw = g_holdYaw;
+                    // ⛔ The pitch/yaw ratios are NOT pinned here, and must not be. Pinning them was
+                    // added speculatively alongside the state-narrowing, and the round after measured
+                    // that neither ever fires on the bug they were written for -- the working half is
+                    // ONE CATCH PER AIR. Kept as "harmless", it was not: STEERING THE CATCH IS DONE
+                    // THROUGH THESE RATIOS. Holding a stick over to rotate the legs round into a
+                    // tailslide writes a new yaw ratio every call, and pinning overwrote every one of
+                    // them, so post-catch orient control was dead on any flip trick while ollies --
+                    // exempt via CatchAirIsTrick -- still steered fine. Field-reported and confirmed
+                    // from a log where the catch engaged normally (state 2, +449 ms) every time.
                 }
             }
             // Behind CatchDiag now that the foot selection is settled. It stays available because a
@@ -1498,7 +1549,7 @@ void CatchTweaks_SetEnabled(bool on) { g_catchFix = on ? 1 : 0; TwkMarkDirty(); 
 // nothing" -- resetting it would silently switch the whole catch feature off.
 void CatchTweaks_ResetDefaults() {
     g_catchFix = 1; g_catchMult = 2.0f; g_catchBeatsDS = 1; g_dsAngleDeg = 60; g_catchDiag = 0;
-    g_anyRev = 1; g_anyRevDeg = 60; g_footLevel = 1; g_unstick = 1; g_unstickMs = 1000; g_holdPose = 1; g_needFlick = 1;
+    g_anyRev = 1; g_anyRevDeg = 60; g_footLevel = 1; g_unstick = 1; g_minSpinDeg = 45; g_maxCutDeg = 180; g_unstickMs = 1000; g_holdPose = 1; g_needFlick = 1;
     g_stopFlip = 1; g_stopFlipDeg = 168; g_snapMs = 90;
     g_snapMaxDeg = 200; g_snapMaxBoost = 3; g_flipAxis = 0;
     g_boneScale = 100; g_boneAdd[0] = g_boneAdd[1] = g_boneAdd[2] = 0;
@@ -1742,7 +1793,7 @@ void CatchTweaks_PumpFrame() {
     // setter simply STOPS being called instead, the latch would otherwise persist into the next one.
     if ((g_flickLatch != 0 || g_holdState != 0) && ++g_latchIdle > 10) {
         g_flickLatch = 0; g_latchIdle = 0;
-        g_holdState = 0; g_holdLoggedState = 0; g_holdLoggedRatio = 0;
+        g_holdState = 0; g_holdLoggedState = 0;
         if (g_airCaughtFoot != 0) g_airCatchZeros = 99;   // setter went quiet = the catch ended
     }
     // THE "was this air a trick" LATCH IS MAINTAINED HERE, EVERY FRAME -- not only when
@@ -1765,7 +1816,7 @@ void CatchTweaks_PumpFrame() {
     // trace flag -- doing so silently disabled a fix the moment logging was turned off for release.
     // Each part checks its own switch below, and every switch must appear here: leaving one out
     // quietly ties that feature to whichever OTHER switch happens to be on.
-    if (!g_flipTrace && !g_stopFlip && !g_anyRev && !g_footLevel && !g_unstick) return;
+    if (!g_flipTrace && !g_stopFlip && !g_anyRev && !g_footLevel && !g_unstick && !g_minSpinDeg) return;
     __try {
         void* skater = g_lastSkater;
         if (!skater) return;
@@ -1775,6 +1826,23 @@ void CatchTweaks_PumpFrame() {
         static bool  watching = false;
         static float prev = 0.0f, travel = 0.0f;
         static int   still = 0, frames = 0;
+
+        // ---- how far the board has actually turned since this trick started -----------------------
+        // Maintained EVERY frame and independently of the trace, because the catch setter reads it.
+        // The fresh-flick veto cannot cover AUTO catch -- there is no flick to time -- so a very slow
+        // flip could be caught before the deck had turned at all. This is the measurement that rule
+        // needs, and it is degrees rather than milliseconds so it holds however slowly the deck spins.
+        {
+            static long  spinSerial = -1;
+            static float spinPrev = -1.0f;
+            const long ser = FlipSpeed_TrickSerial();
+            if (ser != spinSerial) { spinSerial = ser; g_trickTravelDeg = 0.0f; spinPrev = ang; }
+            else if (spinPrev >= 0.0f) {
+                const float d = fabsf(ang - spinPrev);
+                if (d < 170.0f) g_trickTravelDeg += d;   // ignore the wrap at 360
+                spinPrev = ang;
+            }
+        }
         // ---- the fix: a registered catch ends the flip at the first grip-up ----------------------
         // `_boardFlipRate` is zeroed rather than the angle being written: the deck is already AT the
         // orientation a completed flip ends on, so removing the rate leaves it exactly there and lets
@@ -1852,7 +1920,23 @@ void CatchTweaks_PumpFrame() {
                 // Only ever touch a flip that is genuinely still running and still owes rotation.
                 // Without this the write fired while simply rolling along -- the catch state sits
                 // non-zero for long stretches -- and invented a flip target out of nothing.
-                if (owed > 1.0f && fabsf(rate) > 1.0f) {
+                // ...and on AUTO catch, never cut a flip that has barely begun. Aiming at the nearest
+                // flat is right for a board coming home; on a SLOW flip caught early it throws away
+                // most of the trick -- field: a tre flip caught 52 deg in, "game wanted 303 more", and
+                // the flip stopped as it started. If the board still owes more than this, let it finish
+                // and let CatchStopsFlip end it at grip-up instead.
+                // MANUAL is exempt (AutoCatchActive): there the catch is a deliberate press, and on an
+                // over-rotation the foot is meant to attach and level the deck. Applying the limit
+                // there stopped that -- the game just extended the target to a second revolution.
+                if (owed > (float)g_maxCutDeg && AutoCatchActive()) {
+                    static long cutLogged = -1;
+                    const long ser = FlipSpeed_TrickSerial();
+                    if (cutLogged != ser) {
+                        cutLogged = ser;
+                        TwkLog("[catch] caught at %.0f deg but the flip still owes %.0f -- letting it "
+                               "finish rather than aiming it at flat", ang, owed);
+                    }
+                } else if (owed > 1.0f && fabsf(rate) > 1.0f) {
                     const float toFlat = 180.0f - ang;      // deck degrees still to roll to grip-up
                     const float aimMag = fabsf(cur) + toFlat;
                     const float aim = (tgt < 0.0f) ? -aimMag : aimMag;

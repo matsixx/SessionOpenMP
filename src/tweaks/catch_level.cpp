@@ -241,6 +241,20 @@ static void hkSetPitch(void* self, double angle) {
     }
 }
 
+// Hand the pitch block back to the game: park start AND target on the CURRENT pitch, so the
+// integrator has nothing left to pull toward, and stand the post-physics assert down. The board
+// holds where it is, with no jump.
+static void ParkSetpoint(const char* why) {
+    void* comp = g_realComp;
+    if (!comp) return;
+    const float pitchNow = twkF(comp, MC_PITCH_NOW);
+    if (!(pitchNow > -180.0f && pitchNow < 180.0f)) return;
+    *(float*)((uint8_t*)comp + MC_PITCH_START)  = pitchNow;
+    *(float*)((uint8_t*)comp + MC_PITCH_TARGET) = pitchNow;
+    g_assertWant = -999.0f;
+    if (g_log) TwkLog("[level] setpoint parked at %.2f (%s)", pitchNow, why);
+}
+
 static void* hkExtraPitch(void* self, void* trickDef, uint64_t inputType, void* inputs, void* out) {
     void* r = nullptr;
     __try { r = ((ExtraPitchFn)g_orig)(self, trickDef, inputType, inputs, out); }
@@ -251,6 +265,14 @@ static void* hkExtraPitch(void* self, void* trickDef, uint64_t inputType, void* 
     __try {
         void* skater = self ? twkP(self, FTH_SKATER) : nullptr;
         if (skater) {
+            // A new trick can arm while we are still levelling the last one -- a LATE trick does it
+            // in the same air, moments after the catch. Clearing the flag below without parking left
+            // our setpoint live on the pitch block with nobody watching it: the game's integrator
+            // went on pulling the board toward the old level target, so the next pop found the deck
+            // held flat and the tail could not drop. The release path cannot catch this -- it is
+            // gated on the very flag this is about to clear.
+            if (g_levelling) ParkSetpoint("a new trick armed mid-level");
+
             g_skater      = skater;
             g_authored    = trickDef ? twkF(trickDef, DEF_CATCH_TGT_PITCH) : 0.0f;
             if (g_authored < -180.0f || g_authored > 180.0f) g_authored = 0.0f;

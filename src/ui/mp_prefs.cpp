@@ -20,6 +20,7 @@
 
 static void (*g_log)(const char*) = nullptr;
 static char  g_path[512] = {0};
+static int   g_syncSeconds = MPSYNC_SEC_DEFAULT;
 
 // The default is the SAFE one. A player who has never opened the menu gets their address hidden;
 // turning it off is a deliberate act by someone who wants the latency back.
@@ -55,6 +56,7 @@ static void saveAll() {
     fprintf(f, "HideAddress=%d\n", g_hideAddress ? 1 : 0);
     fprintf(f, "# Player names above heads: 0 off, 1 only while off your board, 2 always.\n");
     fprintf(f, "NameMode=%d\n", g_nameMode);
+    fprintf(f, "SyncSeconds=%d\n", g_syncSeconds);
     fprintf(f, "NameDistM=%d\n", g_nameDistM);
     fprintf(f, "BubbleDistM=%d\n", g_bubbleDistM);
     fprintf(f, "# Dropped objects: 0 off, 1 only what is placed during the session, 2 share one set.\n");
@@ -113,6 +115,17 @@ void MpPrefs_SetDropMode(int mode) {
                                                                   : "share one set");
     say(m);
 }
+int  MpPrefs_SyncSeconds() { return g_syncSeconds; }
+void MpPrefs_SetSyncSeconds(int seconds) {
+    seconds = clampI(seconds, MPSYNC_SEC_MIN, MPSYNC_SEC_MAX);
+    if (seconds == g_syncSeconds) return;           // a no-op write must not churn the file
+    g_syncSeconds = seconds;
+    saveAll();
+    char m[120];
+    snprintf(m, sizeof(m), "[prefs] synced replay length: %d s", seconds);
+    say(m);
+}
+
 int  MpPrefs_NameDistM()   { return g_nameDistM; }
 int  MpPrefs_BubbleDistM() { return g_bubbleDistM; }
 
@@ -163,6 +176,7 @@ void MpPrefs_Init(const char* dir, void (*logf)(const char*)) {
             // mean "stop hiding my address".
             if (!_stricmp(key, "HideAddress")) g_hideAddress = (val[0] != '0');
             else if (!_stricmp(key, "NameMode"))    g_nameMode    = clampI(atoi(val), MPNAME_OFF, MPNAME_ALWAYS);
+            else if (!_stricmp(key, "SyncSeconds")) g_syncSeconds = clampI(atoi(val), MPSYNC_SEC_MIN, MPSYNC_SEC_MAX);
             else if (!_stricmp(key, "NameDistM"))   g_nameDistM   = clampI(atoi(val), MPNAME_DIST_MIN, MPNAME_DIST_MAX);
             else if (!_stricmp(key, "BubbleDistM")) g_bubbleDistM = clampI(atoi(val), MPBUBBLE_DIST_MIN, MPBUBBLE_DIST_MAX);
             else if (!_stricmp(key, "DropMode"))    g_dropMode    = clampI(atoi(val), MPDROP_OFF, MPDROP_SHARED);

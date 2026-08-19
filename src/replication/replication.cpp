@@ -227,7 +227,8 @@ static void audioWriteEvent(Wr& w, const AudioEvent& e) {
     w.u16(e.ageMs);
 }
 
-int Pack(const State& s, uint64_t senderUs, uint8_t* out, int cap) {
+int Pack(const State& s, uint64_t senderUs, uint8_t* out, int cap, int* poseWrote) {
+    if (poseWrote) *poseWrote = 0;
     // A packet without a valid board pose never ships; Unpack enforces the same gate on arrival.
     if (!out || !unitQuat(s.deckQuat) || !finite3(s.deckPos, 1e7f) || !finite3(s.bodyPos, 1e7f)) return 0;
     if (s.animLen > sizeof(s.anim)) return 0;
@@ -333,14 +334,24 @@ int Pack(const State& s, uint64_t senderUs, uint8_t* out, int cap) {
     // sounds when both compete for the same packet -- and ALL OR NOTHING: half a skeleton is not a
     // degraded pose, it is a scrambled one.
     {
-        const int n = (s.poseN > kPoseMaxBones) ? 0 : s.poseN;
-        const int need = 1 + n * (4 + 3 * 2);
-        if (n > 0 && w.ok && w.n + need <= cap) {
-            w.u8((uint8_t)n);
-            for (int b = 0; b < n; b++) {
+        // SLICED, because a whole skeleton does not always fit: 95 bones is 951 B against a 1024 B
+        // mailbox, and the old all-or-nothing write dropped it silently every frame. Take as much as
+        // the remaining room allows, starting where the last frame stopped, and let the receiver
+        // reassemble. 70 bones still ships whole in one frame; 95 takes two, so a scrubbing peer
+        // updates at 30 Hz instead of 60 -- which is what watching someone scrub can afford, and
+        // infinitely better than not animating at all.
+        const int total = (s.poseN > kPoseMaxBones) ? 0 : s.poseN;
+        const int room  = w.ok ? (cap - w.n - 3) : 0;      // -3 for total/first/count
+        const int fit   = room > 0 ? room / (4 + 3 * 2) : 0;
+        if (total > 0 && fit > 0) {
+            const int first = (s.poseFirst < total) ? s.poseFirst : 0;
+            const int n     = (total - first) < fit ? (total - first) : fit;
+            w.u8((uint8_t)total); w.u8((uint8_t)first); w.u8((uint8_t)n);
+            for (int b = first; b < first + n; b++) {
                 w.u32(qPack(s.poseRot[b]));
                 for (int c = 0; c < 3; c++) w.h16(clampf(s.posePos[b][c], 1000.f));
             }
+            if (poseWrote) *poseWrote = n;
         } else {
             w.u8(0);
         }
@@ -455,14 +466,20 @@ bool Unpack(const uint8_t* d, int len, State& out, uint64_t* senderUs) {
     }
     // ---- THE POSE LANE.
     {
-        const int pn = r.u8();
-        if (pn > kPoseMaxBones) return false;             // hostile/other-build packet
-        for (int b = 0; b < pn; b++) {
+        const int total = r.u8();
+        if (total > kPoseMaxBones) return false;           // hostile/other-build packet
+        int first = 0, pn = 0;
+        if (total > 0) {
+            first = r.u8();
+            pn    = r.u8();
+            if (first >= kPoseMaxBones || pn > kPoseMaxBones || first + pn > total) return false;
+        }
+        for (int b = first; b < first + pn; b++) {
             qUnpack(r.u32(), out.poseRot[b]);
             for (int c = 0; c < 3; c++) out.posePos[b][c] = r.h16();
             if (!finite3(out.posePos[b], 1e5f)) { out.posePos[b][0] = out.posePos[b][1] = out.posePos[b][2] = 0; }
         }
-        out.poseN = (uint8_t)pn;
+        out.poseN = (uint8_t)total; out.poseFirst = (uint8_t)first; out.poseCount = (uint8_t)pn;
     }
     // ---- AUDIO. Absent entirely on a silent frame: two zero bytes.
     {
@@ -819,9 +836,15 @@ void InterpStates(const State& a, const State& b, float t, State& out) {
         // snapshot, some skip one -- which reads as a low-refresh skater while the lerped deck and
         // body glide (the replay-sync field symptom). Mismatched counts step from `a` (out = a
         // already), the all-or-nothing rule the codec applies on the wire.
-        if (a.poseN && a.poseN == b.poseN) {
-            const int n = a.poseN < kPoseMaxBones ? a.poseN : kPoseMaxBones;
-            for (int bn = 0; bn < n; bn++) {
+        // Only two frames carrying the SAME SLICE of the same skeleton can be blended; consecutive
+        // frames now usually carry DIFFERENT slices, and lerping one slice against another mixes
+        // unrelated bones. Mismatched slices step from `a` (out = a already), the same all-or-
+        // nothing rule the codec applies on the wire.
+        if (a.poseN && a.poseN == b.poseN && a.poseCount && a.poseCount == b.poseCount &&
+            a.poseFirst == b.poseFirst) {
+            const int lo = a.poseFirst;
+            const int hi = (lo + a.poseCount < kPoseMaxBones) ? lo + a.poseCount : kPoseMaxBones;
+            for (int bn = lo; bn < hi; bn++) {
                 qLerp(a.poseRot[bn], b.poseRot[bn], t, out.poseRot[bn]);
                 lerp3(a.posePos[bn], b.posePos[bn], t, out.posePos[bn]);
             }

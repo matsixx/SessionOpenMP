@@ -41,6 +41,7 @@
 #include "ui/version_tag.h"
 #include "ui/mp_name.h"
 #include "ui/chat.h"
+#include "replication/replaysync.h"   // the sync-progress bubble below
 #include "ui/nameplates.h"
 #include "game/game_font.h"
 #include "session/banlist.h"
@@ -585,7 +586,13 @@ static void publishNameplates() {
     // No plates inside the replay editor (playback): a floating name over a replay -- yours or a
     // synced peer's -- is clutter in what is essentially a camera shot. Publishing the empty list
     // fades them out; live play resumes them the frame the editor closes.
-    if (T.enabled && game::LocalReplayMode() != 2 && g_ownPawn && game::ViewportSize(&vw, &vh)) {
+    // ONE EXCEPTION: a peer whose replay is being FETCHED right now. That transfer takes seconds --
+    // longer over a relay -- and it is started from inside the editor, so this gate is exactly where
+    // the person waiting for it is standing. Their progress is the one thing worth drawing over a
+    // replay, and nothing else gets through: the loop below drops every peer that is not mid-sync
+    // while `inReplay`, and `show` stays false so no NAME fades in behind it.
+    const bool inReplay = game::LocalReplayMode() == 2;
+    if (T.enabled && g_ownPawn && game::ViewportSize(&vw, &vh)) {
         // The fade follows OUR board, not theirs: names are for looking around on foot, and a clean
         // screen is for skating.
         bool onBoard = false;
@@ -619,7 +626,31 @@ static void publishNameplates() {
             it.y = px[1] / (float)vh;
             it.distCm = dist;
             uint32_t age = 0;
-            if (const char* said = liveChatBubble(peerId, ms, &age)) {
+            // A SYNC IN PROGRESS OUTRANKS ANYTHING THEY SAID. Fetching a peer's replay takes seconds
+            // -- longer over a relay -- and until now nothing on screen distinguished "working" from
+            // "hung", which is most of why the wait felt broken. The transfer already knows exactly
+            // where it is (the sender announces the chunk count, the requester counts what landed),
+            // so this is a real percentage, not a guess. It rides the chat-bubble lane deliberately:
+            // bubbles ignore the on/off-board fade, which is what makes this visible inside the
+            // replay editor where the nameplates themselves are held down.
+            int syncPct = 0;
+            const replaysync::SyncState ss = replaysync::PeerSyncState(s, &syncPct);
+            const bool syncing = (ss == replaysync::SyncState::Transferring ||
+                                  ss == replaysync::SyncState::Failed);
+            if (inReplay && !syncing) { n--; continue; }   // in the editor, ONLY a sync shows
+            // A sync readout is not chat and must not be culled or faded by the chat-bubble
+            // distance: the peer being fetched is frequently across the map, and "no indicator"
+            // is indistinguishable from "hung", which is the whole reason this exists. Reporting
+            // zero distance keeps it fully opaque at any range; the plate itself is already
+            // suppressed, so nothing else rides in on it.
+            if (syncing) it.distCm = 0.0f;
+            if (ss == replaysync::SyncState::Transferring) {
+                snprintf(it.msg, sizeof(it.msg), "syncing replay  %d%%", syncPct);
+                it.msgAgeMs = 0;                      // never fades while it is still going
+            } else if (ss == replaysync::SyncState::Failed) {
+                strncpy_s(it.msg, "replay sync failed", _TRUNCATE);
+                it.msgAgeMs = 0;
+            } else if (const char* said = liveChatBubble(peerId, ms, &age)) {
                 strncpy_s(it.msg, said, _TRUNCATE);
                 it.msgAgeMs = age;
             } else if (session::PeerTyping(peerId)) {
@@ -641,7 +672,9 @@ static void publishNameplates() {
         // Names OFF does not mean plates off: the bubbles ride the same list and are a separate
         // setting, so the items are still published and only the fade target is held down.
         const int mode = MpPrefs_NameMode();
-        show = anyPeer && (mode == MPNAME_ALWAYS || (mode == MPNAME_OFFBOARD && !onBoard));
+        // Never in the editor: the sync bubble rides the bubble lane, which ignores this fade, so a
+        // progress readout does not drag a nameplate onto the shot with it.
+        show = !inReplay && anyPeer && (mode == MPNAME_ALWAYS || (mode == MPNAME_OFFBOARD && !onBoard));
     }
     // Published every frame, empty list included -- that is what makes the plates go away when the
     // session does, instead of hanging over a world that has moved on.

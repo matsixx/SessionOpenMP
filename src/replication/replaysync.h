@@ -56,7 +56,11 @@ void Tick(uint64_t nowUs, void (*logf)(const char*));
 
 // ---- requester control (driven by the session on behalf of the menu).
 enum class SyncState : uint8_t { None = 0, Transferring = 1, Ready = 2, Failed = 3 };
-bool      RequestSync(int peerIdx, uint64_t nowUs);   // false = another transfer is in flight
+// `seconds` = how much of their history to ask for, newest-first; 0 = everything they have. The
+// REQUESTER chooses, not the sender: it is the requester who waits for the transfer, so it is the
+// requester who gets to decide how long that wait is. A sender on an older build ignores the field
+// and sends its whole ring, which is exactly the previous behaviour.
+bool      RequestSync(int peerIdx, uint64_t nowUs, int seconds = 0);   // false = one already in flight
 void      CancelSync(int peerIdx);                    // abandon transfer and/or drop the buffer
 SyncState PeerSyncState(int peerIdx, int* pctOut);    // pct meaningful while Transferring
 void      DropAll();                                  // playback ended / session reset: free everything

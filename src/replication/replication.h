@@ -188,14 +188,26 @@ struct State {
     // blob can never carry it. Without it a proxy animates every push at 1.0x while its transported
     // body accelerates at the real rate: the push looks disconnected from its own speed.
     float pushSpeed = 1.0f;
-    uint8_t poseN = 0;
+    // poseN is the TOTAL bone count of the sender's skeleton; poseFirst/poseCount say which SLICE
+    // of it this frame carries. A whole 95-bone pose is 951 B against a 1024 B mailbox and never
+    // fit -- it was silently dropped every frame (the `else { w.u8(0); }` below), so a scrubbing
+    // player with a rig-carrying garment transmitted NO pose at all and observers saw them freeze
+    // with only position and rotation tracking. Slicing spreads one skeleton over consecutive
+    // frames; the receiver accumulates and only calls the pose usable once it has seen all of it.
+    uint8_t poseN = 0;          // total bones in the sender's skeleton (0 = no pose this frame)
+    uint8_t poseFirst = 0;      // index of the first bone in this frame's slice
+    uint8_t poseCount = 0;      // bones carried this frame; poseRot/posePos hold them AT THEIR OWN
+                                // indices, not packed from zero
     float   poseRot[kPoseMaxBones][4];
     float   posePos[kPoseMaxBones][3];
 };
 
 // Wire <-> State. Pack stamps the sender clock; Unpack validates (magic, finiteness, unit quat) --
 // P2P input is untrusted even when today's only sender is a friend.
-int  Pack(const State& s, uint64_t senderUs, uint8_t* out, int cap);                 // -> bytes or 0
+// `poseWrote`, when given, reports how many bones of the pose this packet actually carried, so the
+// caller can advance its own slice cursor. Callers with a big cap (the replay ring) take the whole
+// skeleton in one go and simply pass null.
+int  Pack(const State& s, uint64_t senderUs, uint8_t* out, int cap, int* poseWrote = nullptr);                 // -> bytes or 0
 bool Unpack(const uint8_t* data, int len, State& out, uint64_t* senderUs);
 
 // Interpolate two states at alpha t in [0,1]: positions and quats blend, whitelisted continuous anim

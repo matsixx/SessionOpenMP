@@ -9,6 +9,7 @@
 // Additional permission under GNU GPL version 3 section 7: you may link and convey this
 // work combined with the Epic Online Services SDK and the proprietary game runtime it
 // loads into. See LICENSE-EXCEPTION.txt.
+#include <cmath>
 #include "pose.h"
 #include "game_syms.h"
 #include "proxy.h"
@@ -35,6 +36,12 @@ static const int kSlots = 8;
 struct Slot {
     void*    mesh = nullptr;
     uint8_t  n = 0;                       // TRANSPORTED pose (0 = none in hand)
+    // Slice reassembly. A skeleton too big for one packet arrives over consecutive frames, so bones
+    // land here as they come and `n` stays 0 -- the pose is not usable, and must not be stamped --
+    // until a whole sweep has been seen. `covTotal` is the total the slices claim; a change means
+    // the peer was re-dressed and everything collected so far describes a different skeleton.
+    uint32_t cov[3] = {0, 0, 0};
+    uint8_t  covTotal = 0;
     uint64_t freshMs = 0;
     float    rot[kPoseMaxBones][4];
     float    pos[kPoseMaxBones][3];
@@ -160,11 +167,27 @@ void Note(void* mesh, const State& s, uint64_t nowMs) {
         if (!sl) return;
         sl->mesh = mesh;
     }
-    const int n = s.poseN < kPoseMaxBones ? s.poseN : kPoseMaxBones;
-    memcpy(sl->rot, s.poseRot, sizeof(float) * 4 * n);
-    memcpy(sl->pos, s.posePos, sizeof(float) * 3 * n);
-    sl->n = (uint8_t)n;
-    sl->freshMs = nowMs;
+    const int total = s.poseN < kPoseMaxBones ? s.poseN : kPoseMaxBones;
+    if (sl->covTotal != (uint8_t)total) {     // re-dressed: what we have describes another skeleton
+        sl->cov[0] = sl->cov[1] = sl->cov[2] = 0;
+        sl->covTotal = (uint8_t)total;
+        sl->n = 0;
+    }
+    const int first = s.poseFirst;
+    int cnt = s.poseCount;
+    if (first >= total) return;
+    if (first + cnt > total) cnt = total - first;
+    if (cnt <= 0) return;
+    memcpy(&sl->rot[first], &s.poseRot[first], sizeof(float) * 4 * (size_t)cnt);
+    memcpy(&sl->pos[first], &s.posePos[first], sizeof(float) * 3 * (size_t)cnt);
+    for (int b = first; b < first + cnt; b++) sl->cov[b >> 5] |= (1u << (b & 31));
+    // Usable only once every bone has arrived at least once. After that the pose STAYS usable and
+    // later slices refresh it in place: a scrubbing skeleton barely moves between frames, so a
+    // partially-refreshed pose is imperceptible, where withholding it entirely is a frozen skater.
+    bool whole = true;
+    for (int b = 0; b < total && whole; b++) whole = (sl->cov[b >> 5] & (1u << (b & 31))) != 0;
+    if (whole) sl->n = (uint8_t)total;
+    sl->freshMs = nowMs;                      // slices keep the stream alive even mid-sweep
     g_st.noted++;
 }
 void Forget(void* mesh) {

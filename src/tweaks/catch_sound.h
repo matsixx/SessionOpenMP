@@ -9,10 +9,11 @@
 // Additional permission under GNU GPL version 3 section 7: you may link and convey this
 // work combined with the Epic Online Services SDK and the proprietary game runtime it
 // loads into. See LICENSE-EXCEPTION.txt.
-// SessionTweaks -- CATCH SOUND: the board-catch sound is inconsistent and sometimes quiet. It is an
-// ANIM NOTIFY that flip-trick catch animations do not carry at all; this module floors the volume,
-// attaches the sound to the skater instead of a fixed world point, plays the cue itself when nothing
-// else does, and measures what is left.
+// SessionTweaks -- CATCH SOUND, rebuilt: the game's own catch sound (an anim notify most flip-trick
+// catch animations lack, and which fires late where it exists) is disabled for the local skater, and
+// OUR sound plays on every catch edge through UReplayAudioManager::SpawnSoundAttached -- so it is
+// written into the replay recording (co-op's audio source of truth) and captured by OpenMP's sync
+// funnel. One source, no race. The designers' no-catch-sound blacklist (ollies) is honoured.
 #pragma once
 struct OmpMenuApi;
 void  CatchSound_ReadConfig(const char* iniText);
@@ -30,3 +31,5 @@ void  CatchSound_SetVolumePct(float pct);
 // UObject -> its object name, for logging (e.g. naming a trick definition). Cached by FName value.
 // Lives here because this module already resolves FName::ToString; false = unresolvable.
 bool CatchSound_ObjName(const void* obj, char* out, int cap);
+// Raw-FName -> text (a bone name is an FName inside a struct, not a UObject). Same cache and rules.
+bool CatchSound_FNameText(const void* fname, char* out, int cap);

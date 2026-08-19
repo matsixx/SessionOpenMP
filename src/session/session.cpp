@@ -1422,7 +1422,20 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
             uint8_t pkt[1024];             // the shm mailbox's exact message cap; EOS P2P allows more.
                                            // Audio rides the snapshot and is sized LAST, so a full
                                            // frame drops trailing sounds, never pose.
-            const int n = repl::Pack(own, nowUs, pkt, sizeof(pkt));
+            // WHERE THIS FRAME'S SLICE STARTS. A skeleton too big for the 1 KB wire packet ships
+            // over consecutive frames (95 bones is 951 B and never fit -- it was dropped silently,
+            // which is why a scrubbing player in rig-carrying trousers animated for nobody). The
+            // cursor lives here, not inside Pack: the replay ring packs the SAME state with a 2 KB
+            // cap and takes the whole skeleton, and a cursor shared with it would be reset every
+            // frame, so the wire packet would resend the opening slice forever and the tail bones
+            // would never arrive.
+            static int poseCursor = 0;
+            if (own.poseN && poseCursor >= own.poseN) poseCursor = 0;
+            own.poseFirst = (uint8_t)poseCursor;
+            int wroteBones = 0;
+            const int n = repl::Pack(own, nowUs, pkt, sizeof(pkt), &wroteBones);
+            if (wroteBones > 0)
+                poseCursor = (poseCursor + wroteBones >= own.poseN) ? 0 : poseCursor + wroteBones;
             // Retain a FAT copy for the replay-sync ring: drivers + anim blob + our CAPTURED
             // skeleton. The bones are the piece playback cannot live without -- the requester's
             // anim graph cannot evaluate a skater during their local replay (the heap-of-clothes,
@@ -1432,6 +1445,7 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
             if (n > 0) {
                 repl::State ringSt = own;
                 game::pose::CaptureFromPawn(ownPawn, ringSt);
+                ringSt.poseFirst = 0;                    // 2 KB cap: the ring takes the whole skeleton
                 uint8_t ringPkt[2048];
                 const int rn = repl::Pack(ringSt, nowUs, ringPkt, sizeof(ringPkt));
                 replaysync::RecordOwn(rn > 0 ? ringPkt : pkt, rn > 0 ? rn : n, nowUs);
@@ -1449,8 +1463,14 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
                 for (auto& sl : g_slots) if (sl.used && sl.peerReplaying) { anyScrub = true; break; }
                 if (anyScrub) {
                     repl::State posed = own;
-                    if (game::pose::CaptureFromPawn(ownPawn, posed))
-                        pn = repl::Pack(posed, nowUs, posePkt, sizeof(posePkt));
+                    if (game::pose::CaptureFromPawn(ownPawn, posed)) {
+                        if (poseCursor >= posed.poseN) poseCursor = 0;
+                        posed.poseFirst = (uint8_t)poseCursor;
+                        int wrote = 0;
+                        pn = repl::Pack(posed, nowUs, posePkt, sizeof(posePkt), &wrote);
+                        if (wrote > 0)
+                            poseCursor = (poseCursor + wrote >= posed.poseN) ? 0 : poseCursor + wrote;
+                    }
                 }
             }
             if (n > 0) {
@@ -1573,7 +1593,8 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
             // with g_playbackEnteredUs (one clock per subtraction)
             if (actor && s.syncOn && !s.syncReqSentUs &&
                 replaysync::PeerSyncState(s.peerIdx, nullptr) == replaysync::SyncState::None) {
-                if (replaysync::RequestSync(s.peerIdx, nowUs)) s.syncReqSentUs = nowUs;
+                if (replaysync::RequestSync(s.peerIdx, nowUs, MpPrefs_SyncSeconds()))
+                    s.syncReqSentUs = nowUs;
             }
             bool syncDriven = false;
             if (actor && s.syncOn && s.syncReqSentUs &&

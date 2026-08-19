@@ -42,6 +42,15 @@ void MpPrefs_SetHideAddress(bool on);
 // Distances are in METRES, not centimetres, because the pause menu draws them on a slider and the
 // game prints a slider's value with "%d" -- the units have to be ones whose integers mean something.
 enum { MPNAME_OFF = 0, MPNAME_OFFBOARD = 1, MPNAME_ALWAYS = 2 };
+// How far back a synced replay reaches, in seconds. Every snapshot of a peer's history carries a
+// whole skeleton, so the length is what the transfer costs: 15 s is a trick, 80 s is mostly footage
+// nobody scrubs back to. The REQUESTER's setting is the one that counts -- it is their wait.
+// 0 = everything they have. The menu offers presets (15/30/60/120/All); the range here only
+// has to admit those, and 0 has to survive the clamp or "All" could never be stored.
+enum { MPSYNC_SEC_MIN = 0, MPSYNC_SEC_MAX = 600, MPSYNC_SEC_DEFAULT = 30 };
+int  MpPrefs_SyncSeconds();
+void MpPrefs_SetSyncSeconds(int seconds);
+
 int  MpPrefs_NameMode();                 // MPNAME_* -- default MPNAME_OFFBOARD
 void MpPrefs_SetNameMode(int mode);
 int  MpPrefs_NameDistM();                // how far away a name is still drawn

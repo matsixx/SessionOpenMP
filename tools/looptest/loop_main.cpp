@@ -1237,6 +1237,77 @@ static bool dropSyncCheck() {
     return true;
 }
 
+// ---- POSE SLICING -----------------------------------------------------------------------------
+// A whole 95-bone pose is 951 B against the 1024 B wire mailbox and NEVER fit: the codec's
+// all-or-nothing write dropped it silently every frame, so a scrubbing player wearing a garment that
+// carries its own rig transmitted no skeleton at all and observers watched them freeze -- position
+// and rotation tracking, every joint dead. Nothing reports that but the frozen skater itself, which
+// is exactly why it needs a gate. Pack the same skeleton frame after frame at the REAL wire cap,
+// accumulate the slices the way game::pose::Note does, and require every bone to arrive, at the
+// right index, within a few frames -- for a 70-bone rig (fits whole) and a 95-bone one (must slice).
+static bool poseSliceCheck() {
+    printf("\n-- pose slicing (a skeleton too big for one packet) --\n");
+    bool ok = true;
+    // The last two cases squeeze the mailbox deliberately. An empty test State has almost no
+    // preamble, so 95 bones happen to fit a 1024 B packet whole -- in the real game the drivers,
+    // transforms and audio written ahead of the pose push it over, which is the case that was
+    // silently dropping. Shrinking the cap reproduces that pressure, and is the only way this gate
+    // exercises reassembly at all rather than the single-packet path.
+    const int totals[4] = { 70, 95, 95, 95 };
+    const int caps[4]   = { 1024, 1024, 512, 320 };
+    for (int ti = 0; ti < 4; ti++) {
+        const int total = totals[ti];
+        const int cap   = caps[ti];
+        omp::repl::State s{};
+        s.poseN = (uint8_t)total;
+        for (int b = 0; b < total; b++) {                 // a distinct, recoverable value per bone
+            s.poseRot[b][0] = 0.f; s.poseRot[b][1] = 0.f; s.poseRot[b][2] = 0.f; s.poseRot[b][3] = 1.f;
+            s.posePos[b][0] = (float)b;
+            s.posePos[b][1] = (float)(-b);
+            s.posePos[b][2] = 0.5f * (float)b;
+        }
+        bool  covered[omp::repl::kPoseMaxBones] = {};
+        float gotX[omp::repl::kPoseMaxBones]    = {};
+        int cursor = 0, frames = 0, packets = 0;
+        bool broke = false;
+        for (; frames < 16; frames++) {
+            s.poseFirst = (uint8_t)cursor;
+            uint8_t pkt[1024];                            // the REAL wire cap, not a generous one
+            int wrote = 0;
+            const int n = omp::repl::Pack(s, 1000ull * (uint64_t)frames, pkt, cap, &wrote);
+            if (n <= 0 || n > cap) {
+                printf("  pack returned %d bytes for a %d B mailbox\n", n, cap);
+                ok = false; broke = true; break;
+            }
+            if (wrote > 0) { packets++; cursor = (cursor + wrote >= total) ? 0 : cursor + wrote; }
+            omp::repl::State r{};
+            if (!omp::repl::Unpack(pkt, n, r, nullptr)) { printf("  unpack FAILED\n"); ok = false; broke = true; break; }
+            if (r.poseN != (uint8_t)total) {
+                printf("  total mangled on the wire: %d\n", (int)r.poseN); ok = false; broke = true; break;
+            }
+            for (int b = r.poseFirst; b < r.poseFirst + r.poseCount; b++) {
+                covered[b] = true; gotX[b] = r.posePos[b][0];
+            }
+            bool whole = true;
+            for (int b = 0; b < total && whole; b++) whole = covered[b];
+            if (whole) break;
+        }
+        if (broke) continue;
+        int missing = 0, wrong = 0;
+        for (int b = 0; b < total; b++) {
+            if (!covered[b]) { missing++; continue; }
+            if (gotX[b] < (float)b - 0.6f || gotX[b] > (float)b + 0.6f) wrong++;   // h16 quantisation
+        }
+        const bool pass = (missing == 0 && wrong == 0);
+        printf("  %2d bones in a %4d B packet: whole skeleton within %d frame(s), %d packet(s)   %s\n",
+               total, cap, frames + 1, packets, pass ? "PASS" : "FAIL");
+        if (missing) printf("    %d bone(s) NEVER arrived -- a slice is being dropped\n", missing);
+        if (wrong)   printf("    %d bone(s) landed at the wrong index -- slices mis-assembled\n", wrong);
+        ok = ok && pass;
+    }
+    return ok;
+}
+
 int main(int argc, char**) {
     const bool dbg = argc > 1;                      // any arg = per-second clock internals, clean profile
     printf("SessionOpenMP replication loop test\n");
@@ -1247,6 +1318,7 @@ int main(int argc, char**) {
     if (!animLerpCheck()) { printf("\nANIM LERP FAIL\n"); return 1; }
     if (!syncTransferCheck()) { printf("\nSYNC TRANSFER FAIL\n"); return 1; }
     if (!dropSyncCheck()) { printf("\nDROP SYNC FAIL\n"); return 1; }
+    if (!poseSliceCheck()) { printf("\nPOSE SLICE FAIL\n"); return 1; }
     printf("%-13s %8s %8s %8s %6s %7s %7s %7s %7s\n",
            "profile", "outEwma", "outMax", "delay", "alpha", "starve", "resync", "extrap", "verdict");
     bool allPass = true;
