@@ -16,7 +16,7 @@
 // animations mostly do not carry at all, and where they do it fires ~250-300 ms AFTER the catch
 // engages. The first version of this module RACED the two sources -- the game's late notify against
 // our own catch-edge play -- with a correlation window, a grace period and a suppression timer, all
-// timing heuristics, all least reliable exactly where the user played most (co-op). Rebuilt model:
+// timing heuristics, all least reliable exactly where the game is played most (co-op). Rebuilt model:
 //
 //   * the game's catch sound is DISABLED outright for the local skater (its notify's Sound is nulled
 //     for the duration of the call -- see the hook for why the call itself must still run), and

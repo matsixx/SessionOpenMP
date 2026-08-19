@@ -1461,7 +1461,7 @@ static bool BuildClothMapping(void* mesh, uint8_t* lod, uint8_t* sec) {
 // cloth build rewrites section fields. Both are supposed to be undone on release -- but a fault during
 // teardown (one happens on every map change) drops our saved originals without restoring them, so the
 // last deformation is baked in. The next map then captures THAT as the rest pose and deforms from there:
-// the drift the user sees getting worse with every map change, and the section state that comes back
+// the drift that gets visibly worse with every map change, and the section state that comes back
 // wrong as a changed texture a few seconds after spawn.
 //
 // So we keep our own copy of both, taken the FIRST time we see the mesh -- straight after the merge,
