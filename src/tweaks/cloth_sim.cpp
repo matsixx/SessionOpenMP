@@ -310,8 +310,12 @@ static char  g_status[96] = "not built";
 void ClothSim_ReadConfig(const char* buf) {
     g_on = TwkIniInt(buf, "ClothQuad", 0);
     g_realMesh = TwkIniInt(buf, "ClothRealMesh", 1);
-    g_render   = TwkIniInt(buf, "ClothRender", 0);
-    g_direct   = TwkIniInt(buf, "ClothDirectRender", 0);
+    // THESE ARE THE ONLY TWO WAYS CLOTH REACHES THE SCREEN, and both shipped OFF by mistake in
+    // 3.19.0: turning cloth on built the asset and ticked the solver while nothing bound it to the
+    // renderer and nothing wrote vertices, so garments simply never moved. Field report: "enabled the
+    // option, no cloth physics" -- correct behaviour for the config, and nobody could have guessed it.
+    g_render   = TwkIniInt(buf, "ClothRender", 1);
+    g_direct   = TwkIniInt(buf, "ClothDirectRender", 1);
     g_directRefresh = TwkIniInt(buf, "ClothDirectRefresh", 0);
     // Giving a garment its own skeleton is DISABLED outright, not merely defaulted off: the
     // hand-written bones never reached the renderer, so the garment was left with nothing posing it
@@ -340,6 +344,16 @@ void ClothSim_ReadConfig(const char* buf) {
     // modded garment. (The random crash first blamed on that garment turned out to belong to another
     // mod entirely.) Lower it to exclude a garment that misbehaves -- below its vertex count is a
     // per-garment off switch needing no rebuild.
+    // Repair, not just a default: the ini is written with every key on first run, so anyone who ever
+    // launched an earlier build has ClothRender=0 SAVED and a new default would never reach them.
+    // Cloth with neither renderer is not a configuration anyone can have wanted -- it can only look
+    // broken -- so it is corrected and saved.
+    if (!g_render && !g_direct) {
+        g_render = 1; g_direct = 1;
+        TwkLog("[quad] neither cloth renderer was enabled -- cloth could never have been visible; "
+               "turning both on and saving");
+        TwkMarkDirty();
+    }
     g_maxVerts           = TwkIniInt(buf, "ClothMaxVerts", 120000);
     g_armDelayMs         = TwkIniInt(buf, "ClothArmDelayMs", 750);
     if (g_armDelayMs < 0) g_armDelayMs = 0; else if (g_armDelayMs > 10000) g_armDelayMs = 10000;
@@ -385,7 +399,9 @@ void ClothSim_SaveConfig(char* buf, size_t cap) {
     TwkIniSetInt(buf, cap, "ClothHemPushBandPct", (int)(ClothSim_HemPushBand * 100.0f + 0.5f));
     TwkIniSetInt(buf, cap, "ClothAutoWinding", ClothSim_AutoWinding);
 }
-void ClothSim_ResetDefaults() { g_on = 0; g_ok = 1; }
+// Reset leaves cloth OFF (it is opt-in) but must leave the RENDERERS on -- otherwise "reset defaults"
+// recreates the 3.19.0 bug where enabling cloth does nothing at all.
+void ClothSim_ResetDefaults() { g_on = 0; g_ok = 1; g_render = 1; g_direct = 1; }
 
 // A UE TArray is { void* Data; int32 Num; int32 Max }. Building one means allocating with the
 // engine's allocator and filling all three fields -- Max matters as much as Num: the engine reads
@@ -1273,7 +1289,7 @@ static void LogGeometry(void* mesh) {
 // position and so yields the vertex normal itself.
 // Meshes whose ClothVertexBuffer we have already handed to BeginInitResource.
 //
-// ⚠️ NEVER cleared, and deliberately NOT part of the release registry. BeginInitResource links a render
+// NEVER cleared, and deliberately NOT part of the release registry. BeginInitResource links a render
 // resource into the engine's global list, and there is no matching release here -- so calling it twice
 // on the same buffer leaves it linked twice, and the next teardown walks a corrupt list. The garment
 // mesh is a shared wardrobe asset that outlives every map, so this happened on the SECOND map change,
@@ -2364,7 +2380,7 @@ void ClothSim_ReleaseAll() {
         }
         g_asset = nullptr;
 
-        // ⛔ DO NOT rebuild the slave components' render proxies from here. It was added in 3.17.1 so
+        // DO NOT rebuild the slave components' render proxies from here. It was added in 3.17.1 so
         // that switching cloth off returned a BOUND garment immediately instead of leaving it frozen
         // in its last simulated shape -- but this function also runs on a map change, where those
         // components belong to a character that no longer exists, and rebuilding a proxy on one is a
@@ -2417,7 +2433,7 @@ void ClothSim_PumpFrame() {
         // the renderer while teardown is in flight. The field log showed cloth arming 100 ms into the
         // load dress, and the process gone 17 ms later.
         //
-        // ⚠️ This is a TIMING mitigation, not a proven mechanism. `ClothArmDelayMs` exists so it can be
+        // This is a TIMING mitigation, not a proven mechanism. `ClothArmDelayMs` exists so it can be
         // measured rather than believed: if a crash survives the default, raising it well up (3000) and
         // finding it clean says the race is real and the window is just longer; still crashing at 3000
         // says the cause is elsewhere and this should come back out.
@@ -2456,7 +2472,7 @@ void ClothSim_PumpFrame() {
             // pooled, so a mesh pointer neither reliably changes on a re-dress nor proves the slave
             // is wearing anything. Validate before building -- a mesh whose name will not resolve
             // is one that must not be handed to a solver (that faulted in the first field run).
-            // ⚠️ THE SERIAL IS CONSUMED ONLY ON SUCCESS. It used to be taken at the top, before any of
+            // THE SERIAL IS CONSUMED ONLY ON SUCCESS. It used to be taken at the top, before any of
             // the work: one transient failure (SetupGarment bails silently if the mesh's name will not
             // resolve yet) therefore threw that dress away for good, and cloth stayed missing until
             // something dressed the character again. Field symptom: fine at load, fine on the first map

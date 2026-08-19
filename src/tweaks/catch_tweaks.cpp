@@ -13,12 +13,12 @@
 // SessionTweaks -- MANUAL CATCH. Two fixes, both manual-only by construction (auto catch is tuned to
 // look a specific way and must not change):
 //
-//  * THE WINDOW. The feet can only take the board within `BoardFlipPreCatchAngle` /
+// * THE WINDOW. The feet can only take the board within `BoardFlipPreCatchAngle` /
 //    `BoardRotationPreCatchAngle` of its target (USkateboardMovementComponent::UpdateFeetCatchInfo).
 //    Both ship 60 deg on every def -- at a measured ~1960 deg/s flip that is a ~31 ms window, about
 //    two frames. Widened by CatchWindowMult while in manual, restored the moment it is not.
 //
-//  * THE EATEN INPUT. While `_shouldCancelSingleStickInputForDarkSlide` is nonzero,
+// * THE EATEN INPUT. While `_shouldCancelSingleStickInputForDarkSlide` is nonzero,
 //    CheckForCatchOrient_Default SKIPS the single-stick verdict wholesale (0x10469d1) -- no catch,
 //    no bail, no feedback. The dark-slide input window overlaps the board-level moment, so it eats
 //    precisely the well-timed griptape-up flicks. The flag is not a bug, it is a RESERVATION: a
@@ -1473,7 +1473,7 @@ static void hkSetCatchOrient(void* self, uint8_t state, float pitchRatio, float 
                         use = (uint8_t)g_holdState;
                         InterlockedIncrement(&g_uiHoldFixes);
                     }
-                    // ⛔ The pitch/yaw ratios are NOT pinned here, and must not be. Pinning them was
+                    // The pitch/yaw ratios are NOT pinned here, and must not be. Pinning them was
                     // added speculatively alongside the state-narrowing, and the round after measured
                     // that neither ever fires on the bug they were written for -- the working half is
                     // ONE CATCH PER AIR. Kept as "harmless", it was not: STEERING THE CATCH IS DONE

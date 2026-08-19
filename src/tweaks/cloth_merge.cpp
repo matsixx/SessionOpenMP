@@ -70,7 +70,7 @@ static const char* SIG_STATIC_FIND =
     "48 89 5C 24 08 48 89 74 24 18 55 57 41 54 41 56 41 57 48 8B EC 48 83 EC 60 80 3D ?? ?? ?? ?? 00 "
     "45 0F B6 F1 49 8B F8 48 8B DA 4C 8B";
 // StaticConstructObject_Internal(const FStaticConstructObjectParameters&) -- Epic 0x152fef0 /
-// Steam 0x14f1160. ⚠️ ANCHORED MID-FUNCTION (+0x30), NOT at the prologue: something detours this
+// Steam 0x14f1160. ANCHORED MID-FUNCTION (+0x30), NOT at the prologue: something detours this
 // function's first bytes at load (UE4SS itself -- it must intercept object construction for its
 // object listeners), so a prologue pattern that sigmake proves in the FILE finds nothing in
 // MEMORY. The entry address is still perfectly callable (the detour chains); it just cannot be
@@ -103,7 +103,7 @@ static const char* SIG_SET_MASTER =
 // ---- the SKATER-side DoMerge call sites, matched by RETURN ADDRESS. Each sig's bytes START AT
 // the return address, so a scan hit IS the retaddr -- no offset arithmetic.
 //
-// ⚠️ HOW THESE WERE DERIVED, because the first attempt was wrong in a way worth naming: the mod
+// HOW THESE WERE DERIVED, because the first attempt was wrong in a way worth naming: the mod
 // logs runtime RVAs of the RUNNING exe, and this user plays the STEAM build -- but every tool in
 // SessionMPDev	ools (pdbsym/sigmake/disasm) targets the EPIC exe, which is the only one with a
 // PDB. Feeding a logged Steam RVA to those tools reads a DIFFERENT, unrelated function; the sigs
@@ -130,7 +130,7 @@ static const char* SIG_SITE_WARDROBE_IN =  // CustomizationCharacter.cpp:552
     "48 8B 07 48 8B 88 28 02 00 00 48 8B 90 D0 04 00";
 
 // ASkaterCharacterBase::RefreshVisuals -- Epic 0x1000590 / Steam 0xfc03c0.
-// ⚠️ THE IDENTITY SOURCE, and the reason this hook exists at all. The dress paths are METHODS ON
+// THE IDENTITY SOURCE, and the reason this hook exists at all. The dress paths are METHODS ON
 // THE SKATER BASE CLASS, so they run for EVERY skater in the world: the wardrobe's preview
 // character and, in co-op, every remote player's proxy. A call site therefore only says "a skater
 // is being dressed", never WHICH -- and excluding on call site alone stripped the garment off
@@ -177,7 +177,7 @@ static int  g_ownMesh = 1;            // ClothOwnMesh -- build our own garment m
                                       // the shared wardrobe asset; see OwnGarmentMesh for why
 // Keyed on the garment's NAME, not its pointer.
 //
-// ⚠️ The wardrobe's garment meshes are RE-CREATED on every map load (measured: the same garment has a
+// The wardrobe's garment meshes are RE-CREATED on every map load (measured: the same garment has a
 // different USkeletalMesh address, and different render data, after each switch). Keying this on the
 // pointer therefore missed on every map change and built a brand-new multi-megabyte mesh each time --
 // and once the table filled, it rebuilt on EVERY DRESS, unbounded, releasing nothing. That is the
@@ -330,7 +330,7 @@ static int GarmentSlot(const char* name) {
 // A garment that fails is left MERGED -- exactly what the game would do without this mod.
 // ClothUnfitProbe -- BISECT ONLY, ships at 0.
 //
-// ⚠️ ALREADY ANSWERED, 2026-08-17: **level 1 crashes**, and level 1 builds nothing at all -- it only
+// ALREADY ANSWERED, 2026-08-17: **level 1 crashes**, and level 1 builds nothing at all -- it only
 // strips the garment from the merge. The component, its materials, ShowMaterialSection and the render
 // config are all innocent; the STRIP is the damage, so there is no step to fix. Kept because it is the
 // tool that established that, and it is the way to test the next odd garment.
@@ -413,7 +413,7 @@ static int   g_nSites = 0;
 
 // ---- the hook -> pump handoff. One pending slot; the newest merge wins (wardrobe scrubs at
 // ~300 ms replace it faster than staleness matters).
-// ⚠️ The hook publishes an EVENT, deliberately NOT a mesh pointer to compare against: merged output
+// The hook publishes an EVENT, deliberately NOT a mesh pointer to compare against: merged output
 // meshes are POOLED AND REUSED, so a re-dress very often lands on the SAME USkeletalMesh address.
 // Change-detection by pointer identity therefore misses most re-dresses -- measured as a wardrobe
 // full of exclusions with the garment stripped and the slave never re-dressed (no top on screen).
@@ -726,7 +726,7 @@ static void* FindClassByName(const wchar_t* wname, const char* expect) {
 // as the body does (decals, every shadow flag, custom depth/stencil, draw distances, DPG).
 // Flags are BITFIELDS packed several to a byte, so this copies BYTES, not bits -- which is also why
 // the spans are picked precisely:
-// ⚠️ 0x210, 0x211 and 0x217 are EXCLUDED ON PURPOSE. They hold streaming-manager registration bits
+// 0x210, 0x211 and 0x217 are EXCLUDED ON PURPOSE. They hold streaming-manager registration bits
 // (bAttachedToStreamingManagerAsDynamic/Static, bHandledByStreamingManagerAsDynamic) and a
 // collideable-descendants CACHE -- per-component RUNTIME STATE, not configuration. Copying another
 // component's registration state is how you get a component the streaming manager thinks it owns
@@ -2041,7 +2041,7 @@ void ClothMerge_PumpFrame() {
 }
 
 void ClothMerge_Install() {
-    // ⚠️ ORDER: resolve EVERYTHING before the hook goes live. The first field round proved the
+    // ORDER: resolve EVERYTHING before the hook goes live. The first field round proved the
     // race: the skater's boot dress fired between MH_EnableHook and the site scans finishing, ran
     // through the hook with an empty site table, and was classified "other" -- the one merge of
     // the session went unexcluded. Sites and functions first; the detour is the last thing armed.
