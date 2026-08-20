@@ -221,7 +221,10 @@ void Note(void* mesh, const State& s, uint64_t nowMs) {
     // partially-refreshed pose is imperceptible, where withholding it entirely is a frozen skater.
     bool whole = true;
     for (int b = 0; b < total && whole; b++) whole = (sl->cov[b >> 5] & (1u << (b & 31))) != 0;
-    g_st.sliceBones = (uint8_t)cnt;
+    // The LARGEST slice seen, not the last: the final slice of a sweep is whatever remainder is
+    // left (five bones of a 95-bone skeleton, say), so reporting the last one makes a healthy
+    // stream look starved. The max is the sender's actual per-packet budget.
+    if ((uint8_t)cnt > g_st.sliceBones) g_st.sliceBones = (uint8_t)cnt;
     if (whole && !sl->n) g_st.sweeps++;
     if (whole) sl->n = (uint8_t)total;
     g_st.liveN = sl->n;

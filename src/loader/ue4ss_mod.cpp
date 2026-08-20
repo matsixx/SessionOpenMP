@@ -755,6 +755,10 @@ static void GameThreadFrame() {
     // -- cheaper than the check that would decide whether to run it.
     // ...unless peers are being RECORDED (the default): then their components stay registered and
     // the replay system captures everyone. The old prune remains the kill-switch path.
+    // The replay camera's subject, checked before anything else this frame can use it: the engine
+    // dereferences that pointer on its own tick, so it has to stop being a dead actor here rather
+    // than at the next teardown that happens to notice.
+    game::spectate::ValidateLookTarget(&logLine);
     if (!game::Proxy::Tuning().recordPeers) {
         game::spectate::PruneProxyComponents(&logLine);
     } else {

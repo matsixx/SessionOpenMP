@@ -545,6 +545,26 @@ bool SampleAt(int peerIdx, uint64_t targetUs, repl::State& out) {
     return true;
 }
 
+int AudioEventsBetween(int peerIdx, uint64_t fromUs, uint64_t toUs, repl::AudioEvent* out, int cap) {
+    ReadyBuf* r = readyFor(peerIdx);
+    if (!r || r->count < 1 || !out || cap <= 0 || toUs <= fromUs) return 0;
+    // Binary search for the first entry PAST fromUs, then walk forward. The interval is one frame of
+    // scrub at a 30 Hz recording -- usually zero, one or two entries -- so the unpacks are trivial.
+    uint32_t lo = 0, hi = r->count;
+    while (lo < hi) {
+        const uint32_t mid = (lo + hi) / 2;
+        if (r->idx[mid].us <= fromUs) lo = mid + 1; else hi = mid;
+    }
+    int n = 0;
+    for (uint32_t i = lo; i < r->count && n < cap; i++) {
+        if (r->idx[i].us > toUs) break;
+        repl::State st; uint64_t su = 0;
+        if (!repl::Unpack(r->blob + r->idx[i].off, r->idx[i].len, st, &su)) continue;
+        for (int e = 0; e < (int)st.nEvents && n < cap; e++) out[n++] = st.events[e];
+    }
+    return n;
+}
+
 uint64_t BufferNewestUs(int peerIdx) { ReadyBuf* r = readyFor(peerIdx); return r ? r->newestUs : 0; }
 uint64_t BufferOldestUs(int peerIdx) { ReadyBuf* r = readyFor(peerIdx); return r ? r->oldestUs : 0; }
 

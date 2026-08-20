@@ -53,6 +53,11 @@ void* Target();
 // stack. Safe and near-free to call for every retiring proxy: it returns immediately unless the actor
 // is the one being watched.
 void OnActorGone(void* actor, void (*logf)(const char*));
+// Per-frame safety net for the camera's subject. OnActorGone covers the teardowns the mod runs
+// itself; this covers every other way a proxy can stop existing, because the engine reads that
+// pointer on its own tick and a stale one faults inside the camera with this DLL nowhere in the
+// stack (AReplayCamera::GetLookAtLocation, field-reported).
+void ValidateLookTarget(void (*logf)(const char*));
 
 // ---- KEEP PEERS OUT OF YOUR RECORDING ---------------------------------------------------------------
 // A proxy's replay components register THEMSELVES into ASessionReplayManager at BeginPlay -- a proxy is

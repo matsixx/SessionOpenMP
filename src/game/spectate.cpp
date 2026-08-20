@@ -290,6 +290,11 @@ void SetPeerShownInReplay(void* skaterActor, bool shown, void (*logf)(const char
 static bool    g_camSaved     = false;
 static void*   g_savedLookAt  = nullptr;
 static uint8_t g_savedCamType = 0;
+// WHICH camera those values came from. The replay camera is not guaranteed to be the same object
+// across a trip in and out of the editor, and putting camera A's saved pointer back into camera B
+// hands the engine a target that was never B's -- read every frame by GetLookAtLocation, with this
+// DLL nowhere in the stack.
+static void*   g_savedCam     = nullptr;
 
 bool SetLookTarget(void* actor, void (*logf)(const char*)) {
     // The LAST line of defence against aiming the engine at a freed actor. Callers are supposed to
@@ -312,8 +317,9 @@ bool SetLookTarget(void* actor, void (*logf)(const char*)) {
         if (toPeer) {
             // Save the user's camera ONCE, on the first override, so a peer->peer switch does not
             // overwrite the original with the previous override.
-            if (!g_camSaved) {
+            if (!g_camSaved || g_savedCam != cam) {
                 g_camSaved     = true;
+                g_savedCam     = cam;
                 g_savedLookAt  = *(void**)((uint8_t*)cam + off::kReplayCamLookAt);
                 g_savedCamType = *(uint8_t*)((uint8_t*)cam + off::kReplayCamActiveType);
             }
@@ -330,6 +336,10 @@ bool SetLookTarget(void* actor, void (*logf)(const char*)) {
             // was found.
             if (!g_camSaved) return true;
             g_camSaved = false;
+            // Only restore into the camera the values were taken from. A different object never had
+            // that target, and writing it there invents a dangling pointer rather than undoing one.
+            if (g_savedCam != cam) { g_savedCam = nullptr; return true; }
+            g_savedCam = nullptr;
             *(void**)((uint8_t*)cam + off::kReplayCamLookAt) = g_savedLookAt;
             if (S.ReplayCamSetType) {
                 *(uint8_t*)((uint8_t*)cam + off::kReplayCamActiveType) = 0;   // force the full path
@@ -346,6 +356,20 @@ bool SetLookTarget(void* actor, void (*logf)(const char*)) {
 #else
     (void)logf; return false;
 #endif
+}
+
+// Called every frame while a session is up. OnActorGone covers the teardowns the mod performs
+// itself, but an actor can also stop being ours without either of them running -- the game destroys
+// it, a respawn replaces it, a level unloads underneath it. The camera reads this pointer on its own
+// tick regardless, so the only durable guarantee is to keep checking that the subject is still a
+// live proxy. A scan of a 16-entry table, once a frame.
+void ValidateLookTarget(void (*logf)(const char*)) {
+    if (!g_camSaved || !g_target) return;
+    if (IsProxyActor(g_target)) return;
+    if (logf) logf("[spectate] the player the replay camera was watching is gone -- camera handed"
+                   " back to your own skater");
+    g_target = nullptr;
+    SetLookTarget(nullptr, nullptr);
 }
 
 void OnActorGone(void* actor, void (*logf)(const char*)) {

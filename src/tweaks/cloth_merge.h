@@ -16,6 +16,15 @@
 // merge's caller and source meshes, so the exclusion filter and the re-dress cadence are designed
 // from measured names rather than guesses.
 #pragma once
+// How many garments can be simulated at once, and -- because a garment is assigned the slot of the
+// ClothGarmentTags entry it matched -- how many tags can be defined. Both files index by slot, so
+// this must be ONE number: cloth_sim iterates ClothMerge_SlaveCount() while indexing its own
+// per-slot arrays, and when those two disagreed it walked off the end of them. It lives here so
+// neither side can raise it alone; cloth_sim static_asserts against it.
+//
+// It was 4, which was also the tag limit, so a fifth tag was silently discarded -- the whole reason
+// a custom garment could be tagged and still not simulate.
+enum { kClothMaxGarments = 12 };
 struct OmpMenuApi;
 void ClothMerge_ReadConfig(const char* iniText);
 void ClothMerge_SaveConfig(char* iniText, size_t cap);

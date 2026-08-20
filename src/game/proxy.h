@@ -159,7 +159,11 @@ private:
     // keep the parameters current). One-shots arrive separately, off the stream's playback clock, so
     // they land with the animation instead of a buffer-delay early.
     void  AudioApply(const repl::State& s, void* bd);
+public:
+    // Also the session's lever when synced-replay playback stops driving this proxy: nothing
+    // reconciles its loop set again until live play resumes, so the sync path stops them itself.
     void  AudioStopAll();
+private:
 
     void*      actor_ = nullptr;
     void*      world_ = nullptr;

@@ -70,6 +70,13 @@ void      DropAll();                                  // playback ended / sessio
 // anchors below. Clamps to the buffer's ends (scrubbing before the peer's history holds their
 // oldest moment). False = no ready buffer for this peer.
 bool     SampleAt(int peerIdx, uint64_t targetUs, repl::State& out);
+// The one-shot AUDIO EVENTS recorded in (fromUs, toUs] of this peer's history, oldest first. Events
+// cannot ride SampleAt: interpolation re-reads the same snapshot pair for many frames, and an event
+// is edge data that must fire exactly once -- the live path drains them from the stream's own queue
+// for the same reason. The synced path has no stream, so the caller keeps a cursor and asks for
+// each frame's interval instead. Returns how many were written.
+int      AudioEventsBetween(int peerIdx, uint64_t fromUs, uint64_t toUs,
+                            repl::AudioEvent* out, int cap);
 uint64_t BufferNewestUs(int peerIdx);                 // 0 = no ready buffer
 uint64_t BufferOldestUs(int peerIdx);
 

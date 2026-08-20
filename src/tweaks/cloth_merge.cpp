@@ -211,8 +211,12 @@ static void* SourceOfOwn(void* mesh) {
 // One slot per garment kind, in tag order: slot 0 is tops, slot 1 bottoms. Keying the slot to the
 // TAG rather than to the order garments happen to appear in a merge keeps a given garment on the
 // same component across re-dresses, which is what lets the simulation keep its state.
-enum { kMaxGarments = 4, kMaxExcl = 12 };
-static char g_tags[kMaxGarments][16] = { "_UB_", "_LB_" };
+enum { kMaxGarments = kClothMaxGarments, kMaxExcl = 12 };
+// 32, not 16: 'AMXX_Double_Knee' is exactly 16 characters and was being stored as 15 plus a
+// terminator. It kept working only because a truncated tag is still a substring of the name it was
+// meant to match -- a longer name that differs only past character 15 would have matched wrongly.
+enum { kTagLen = 32 };
+static char g_tags[kMaxGarments][kTagLen] = { "_UB_", "_LB_" };
 static int  g_nTags = 2;
 static char g_excl[kMaxExcl][40] = {};
 static int  g_nExcl = 0;
@@ -285,16 +289,31 @@ static const char* SIG_SET_VECPARAM =
 static bool MaterialSupportsCloth(void* garmentMesh);   // defined with the material helpers below
 
 // Split "a,b,c" into the table. Blank entries are skipped so a trailing comma is harmless.
-static int SplitList(const char* src, char* dst, int maxItems, int itemLen) {
-    int n = 0, w = 0;
+// `what` names the setting so a list that does not fit says so. It used to drop the overflow in
+// silence, which is how a tagged garment could go un-simulated with nothing in the log to explain it:
+// the fifth tag in a four-tag array simply ceased to exist. Truncated ENTRIES matter too -- a clipped
+// tag still matches as a substring, so it half-works and misleads.
+static int SplitList(const char* src, char* dst, int maxItems, int itemLen, const char* what) {
+    int n = 0, w = 0; bool overLen = false, overCount = false;
     for (const char* c = src; ; c++) {
         if (*c == ',' || *c == 0) {
-            if (w > 0) { dst[n * itemLen + w] = 0; n++; w = 0; if (n >= maxItems) break; }
+            if (w > 0) {
+                dst[n * itemLen + w] = 0; n++; w = 0;
+                if (n >= maxItems) { overCount = (*c != 0 && *(c + 1) != 0); break; }
+            }
             if (*c == 0) break;
-        } else if (w < itemLen - 1 && *c != ' ') {
-            dst[n * itemLen + w] = *c; w++;
+        } else if (*c != ' ') {
+            if (w < itemLen - 1) { dst[n * itemLen + w] = *c; w++; }
+            else overLen = true;
         }
     }
+    if (overCount)
+        TwkLog("[cloth] %s holds more than %d entries -- the rest are IGNORED. Everything past entry "
+               "%d does nothing; shorten the list or reuse a tag that already matches.",
+               what, maxItems, maxItems);
+    if (overLen)
+        TwkLog("[cloth] an entry in %s is longer than %d characters and was cut short. It may still "
+               "match, but it will also match anything else starting the same way.", what, itemLen - 1);
     return n;
 }
 
@@ -348,7 +367,7 @@ static int GarmentSlot(const char* name) {
 //   4  + the material apply
 //   5  + ShowMaterialSection  (== the full un-merge, expected to crash)
 static int g_unfitProbe = 0;
-static bool g_slotUnfit[4] = {};      // kMaxGarments; sized below by static_assert-free convention
+static bool g_slotUnfit[kMaxGarments] = {};   // was a hardcoded 4 next to a comment saying so
 
 enum { SM_LODINFO_M = 0xf8,   // USkeletalMesh::LODInfo    (count at +8)
        SM_REFSKEL_M = 0x1b0,  // USkeletalMesh::RefSkeleton
@@ -451,11 +470,11 @@ static void* g_slaveSkater = nullptr;   // the skater they were built on (map ch
 // never a second value worth offering. g_recapture is the rebuild path that shipped looping.
 // g_unfitProbe was a bisect knob whose upper levels crash by design.
 void ClothMerge_ReadConfig(const char* buf) {
-    char tags[128], excl[512];
+    char tags[512], excl[512];
     TwkIniStr(buf, "ClothGarmentTags", tags, sizeof(tags), "_UB_,_LB_");
     TwkIniStr(buf, "ClothExclude",     excl, sizeof(excl), "");
-    g_nTags = SplitList(tags, &g_tags[0][0], kMaxGarments, 16);
-    g_nExcl = SplitList(excl, &g_excl[0][0], kMaxExcl, 40);
+    g_nTags = SplitList(tags, &g_tags[0][0], kMaxGarments, kTagLen, "ClothGarmentTags");
+    g_nExcl = SplitList(excl, &g_excl[0][0], kMaxExcl, 40, "ClothExclude");
     // ClothTintPerGarment is retired with the tint feature that consumed it: the master flag
     // gating every tint application is off for good, so these rules parsed into a gain nothing
     // applied -- a setting that silently does nothing, which is the whole class being removed.
@@ -473,9 +492,20 @@ void ClothMerge_SaveConfig(char* buf, size_t cap) {
         TwkIniSetStr(buf, cap, "ClothExclude",     excl);
     }
 }
+// The garment tag and exclusion lists SURVIVE a reset, deliberately.
+//
+// Reset Defaults restores tunables -- values with a known-good setting that a user can always move
+// back. These two are not that: they are names the user typed in, found by reading which garments the
+// log said were not simulated. Nothing can regenerate them, so clearing them destroyed work silently
+// and unrecoverably (field report: custom shirt lost its physics an hour after a reset, with the
+// cause a session and a half earlier). Clearing exclusions is worse still -- it re-enables the very
+// garment someone excluded for misbehaving.
 void ClothMerge_ResetDefaults() {
     g_unmerge = 1; g_okBuild = 1;
-    strcpy(g_tags[0], "_UB_"); strcpy(g_tags[1], "_LB_"); g_nTags = 2; g_nExcl = 0;
+    if (g_nTags > 2 || g_nExcl > 0)
+        TwkLog("[cloth] reset: keeping your %d garment tag(s) and %d exclusion(s) -- reset restores "
+               "settings, and these are names only you can know. Edit them in SessionTweaks.ini.",
+               g_nTags, g_nExcl);
 }
 
 static double CmNow() {
@@ -584,6 +614,17 @@ static void hkDoMerge(void* self, void* refPose) {
                                    "the body and drawn from our own copy instead", nm, gb, bb, gl, bl);
                         }
                         // Worn, but NOT stripped: the pump dresses a slave and hides it on the body.
+                        // It counts as SEEN by the capture pass all the same. This branch returns
+                        // before the g_capturePass block below that normally records that, so an
+                        // unfit garment used to be invisible to the capture -- and if EVERY garment
+                        // on the character is unfit, the pass then found nothing, never completed,
+                        // and no garment was ever built: cloth silently absent for the whole
+                        // session, with the log stopping after "building now". It needed a whole
+                        // outfit of custom items to show up, which is why it took until someone
+                        // wore a custom shirt AND custom trousers. The capture wants this garment
+                        // anyway: it is still in the merged body, which is exactly where the
+                        // material match looks.
+                        if (g_capturePass) g_seenGarment[slot] = mesh;
                         unfitGarment[slot] = mesh;
                         i++; continue;
                     }
@@ -1665,6 +1706,9 @@ static void* OwnGarmentMesh(void* src) {
            "touched", srcName, copy, bones, mats);
     LogMeshFields("BUILT  ", srcName, copy);
     LogMeshFields("source ", srcName, src);      // what a HEALTHY mesh looks like, for comparison
+    // Those two lines compare counts only -- bones, LODs, materials -- which have always matched even
+    // when a garment rendered wrongly. This compares the DATA: positions, skin weights, bone maps.
+    ClothSim_CompareCopyToSource(copy, src, srcName);
     return copy;
 }
 
@@ -2078,6 +2122,18 @@ void ClothMerge_PumpFrame() {
         if (g_capturePass && !g_captureDone) {
             bool any = false;
             for (int i = 0; i < kMaxGarments; i++) if (g_seenGarment[i]) any = true;
+            // Finding nothing is a DEAD END, not a wait: this pass only ever sees what the merge hook
+            // recorded, and if that was empty once it will be empty every time. It used to return here
+            // in silence forever. Say it once -- an unbuildable state that produces no log entry cost
+            // an afternoon to find, twice.
+            if (!any) {
+                static int quiet = 0;
+                if (++quiet == 30)
+                    TwkLog("[cloth] the material capture has nothing to work with -- no garment was "
+                           "recorded during the dress, so nothing can be built. Cloth is OFF for this "
+                           "character. If your clothing is all custom/replacement gear, this is a bug "
+                           "-- please report the log.");
+            }
             if (any) {
                 __try { CaptureGarmentMaterials(meshComp); }
                 __except (EXCEPTION_EXECUTE_HANDLER) { TwkLog("[mat] capture faulted"); }

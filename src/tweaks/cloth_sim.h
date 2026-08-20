@@ -29,6 +29,10 @@ void ClothSim_SlaveGone(int slot);
 // Undo every mark we made on the garment meshes. Required before a marked garment can be merged
 // again -- see the note on the definition.
 void ClothSim_ReleaseAll();
+// Read-only audit of the mod-built garment copy against the asset it was copied from: vertex
+// positions, skin weights and section bone maps. Everything downstream assumes these are the same
+// mesh; nothing verified it. A difference indicts the un-merge, identical output clears it.
+void ClothSim_CompareCopyToSource(void* copy, void* src, const char* name);
 // 1 when the garment draws itself from the simulation, so no cloth-capable material is needed and
 // the game's own configured material can be used as-is.
 int  ClothSim_DirectRender();

@@ -98,6 +98,12 @@ struct Slot {
     repl::SkelPrint skel;
     bool        haveSkel = false;
     void*       skelFedFor = nullptr;    // the mesh we last fed it to; a respawn re-feeds
+    // Synced-replay AUDIO. The cursor is the owner-clock time up to which their history's one-shot
+    // events have already been fired; each frame fires (cursor, now] exactly once. A scrub JUMP --
+    // backwards, or forward by more than a breath -- resyncs the cursor silently instead of firing
+    // the gap: jumping the timeline must not burst-replay every sound in between.
+    uint64_t    syncAudioUs = 0;
+    bool        syncWasDriven = false;   // falling edge stops any loops the sync playback started
     // ---- dropped objects: the props THIS peer has in OUR world. The wire updates this table (ids,
     // target poses, what is new and what is gone); Frame does every game call from it. Splitting it
     // that way keeps actor spawning on the engine-tick anchor where the proxy spawn already lives,
@@ -267,6 +273,7 @@ static Slot* slotFor(int peerIdx, uint64_t nowUs) {
         s.dropGenSeen = false; s.dropGen = 0;
         s.dropAuthKey = 0; s.haveDropAuth = false; s.worldSetFresh = false;
         s.skel = repl::SkelPrint(); s.haveSkel = false; s.skelFedFor = nullptr;
+        s.syncAudioUs = 0; s.syncWasDriven = false;
         dropsync::ForgetPeer(peerIdx);
         g_skelResend = true;                         // they need OUR skeleton too
         g_cosResend = true;                          // they need OUR look too, now rather than in 10 s
@@ -1458,6 +1465,27 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
             // cap and takes the whole skeleton, and a cursor shared with it would be reset every
             // frame, so the wire packet would resend the opening slice forever and the tail bones
             // would never arrive.
+            // WHILE WE SCRUB, OUR DRIVERS ARE DEAD WEIGHT TOO. Capture only fills poseN during replay
+            // playback, and a scrubbing player is not skating: their anim drivers are inert (measured
+            // at 0 of 97 fields moving), so every receiver is animating them from the POSE and from
+            // nothing else. Carrying the blob anyway leaves almost nothing for the skeleton in a
+            // 1 KB mailbox, and the pose is what gets cut -- field-measured at FIVE bones per packet,
+            // which is nineteen frames per refresh of a 95-bone character and reads as a peer stuck
+            // in a stuttering animation. The mirror case (serving a scrubbing peer while we skate)
+            // already drops them for the same reason; this is the case where WE are the one scrubbing.
+            if (own.poseN) {
+                own.animLen = 0;
+                // ...and the FEET and HANDS with them, for the same reason and the same 6 bones.
+                // Both are world transforms the receiver uses to place IK targets for the DRIVER
+                // path; a transported pose stamps every bone of the skeleton directly, feet and
+                // hands included, so they decide nothing while one is in hand. They cost 72 B --
+                // and the measurement said the skeleton was missing a single packet by 6 bones
+                // (slice=89 of 95), which is 60. Dropping them is what puts a whole 95-bone
+                // character in one packet instead of two, doubling how often it refreshes.
+                // The flags are the wire's own "absent" signal, so a receiver needs no change.
+                own.feetOk = false;
+                own.handOk = false;
+            }
             static int poseCursor = 0;
             if (own.poseN && poseCursor >= own.poseN) poseCursor = 0;
             own.poseFirst = (uint8_t)poseCursor;
@@ -1502,6 +1530,8 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
                     // packet exists to serve. Everyone NOT scrubbing keeps the ordinary driver
                     // packet, untouched.
                     posed.animLen = 0;
+                    posed.feetOk = false;   // same reasoning as the scrubbing branch above:
+                    posed.handOk = false;   // a full pose already places every bone
                     if (game::pose::CaptureFromPawn(ownPawn, posed)) {
                         if (poseCursor >= posed.poseN) poseCursor = 0;
                         posed.poseFirst = (uint8_t)poseCursor;
@@ -1682,16 +1712,41 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
                     const uint64_t back = (s.syncReqSentUs - g_playbackEnteredUs)
                                         + (uint64_t)((double)(total - cur) * 1e6);
                     repl::State rs;
-                    if (replaysync::SampleAt(s.peerIdx, newest > back ? newest - back : 0, rs)) {
-                        // their history replays VISUALS only: no sounds, no ragdoll trigger, and
-                        // never the scrubbing flag (that is a live-routing signal)
-                        rs.nLoops = 0; rs.nEvents = 0; rs.bailing = 0; rs.replaying = 0;
+                    const uint64_t tPos = newest > back ? newest - back : 0;
+                    if (replaysync::SampleAt(s.peerIdx, tPos, rs)) {
+                        // No ragdoll trigger and never the scrubbing flag (a live-routing signal).
+                        // AUDIO does replay now, in the two shapes it actually has:
+                        //  * LOOPS are a reconciled SET -- fed straight from the sampled snapshot
+                        //    while the scrub is moving forward, so rolling starts and stops exactly
+                        //    as it did when it was recorded. A paused or rewinding scrub feeds the
+                        //    empty set instead: a frozen frame must not drone.
+                        //  * one-shot EVENTS cannot ride the sample (the same snapshot pair is
+                        //    re-read for many frames) -- they fire from the history interval the
+                        //    cursor crossed this frame, exactly once, below.
+                        const bool advancing = s.syncAudioUs && tPos > s.syncAudioUs;
+                        if (!advancing) rs.nLoops = 0;
+                        rs.nEvents = 0; rs.bailing = 0; rs.replaying = 0;
                         s.proxy.SetNearLocal(false);      // the board STAMPS at the replayed pose
                         s.proxy.Apply(rs, nowMs, nowUs, g_logf);
+                        if (advancing && tPos - s.syncAudioUs < 400000ull) {
+                            repl::AudioEvent ev[repl::kAudioMaxEvents * 2];
+                            const int nev = replaysync::AudioEventsBetween(
+                                s.peerIdx, s.syncAudioUs, tPos, ev, (int)(sizeof(ev) / sizeof(ev[0])));
+                            if (nev > 0) s.proxy.PlayAudioEvents(ev, nev);
+                        }
+                        s.syncAudioUs = tPos;             // a jump lands here too: resync, no burst
                         syncDriven = true;
                     }
                 }
             }
+            if (s.syncWasDriven && !syncDriven) {
+                // Sync stopped driving this proxy (toggled off, buffer gone, playback restarted):
+                // nothing will reconcile its loops again until live play resumes, so stop them here
+                // rather than leave a rolling sound orbiting a concealed skater.
+                s.proxy.AudioStopAll();
+                s.syncAudioUs = 0;
+            }
+            s.syncWasDriven = syncDriven;
             if (actor) {
                 if (!syncDriven && s.replayConcealedActor != actor) {
                     game::spectate::SetPeerShownInReplay(actor, false, g_logf);

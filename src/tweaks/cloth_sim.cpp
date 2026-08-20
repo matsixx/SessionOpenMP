@@ -306,7 +306,11 @@ static int   g_armDelayMs = 750;  // ClothArmDelayMs -- settle time after a dres
 static int   g_maxVerts = 120000; // ClothMaxVerts -- see the read; a garbage guard, not a poly budget
 // One entry per garment slot the un-merge owns (tops, bottoms, ...). Each garment gets its own
 // cloth asset; the weld map is scratch, consumed by the render binding in the same pass.
-enum { kSimSlots = 4 };
+// One number with cloth_merge, asserted rather than assumed: this file iterates
+// ClothMerge_SlaveCount() while indexing arrays sized from here, so a private copy of the count
+// that drifted from the merge side would index off the end of every one of them.
+enum { kSimSlots = kClothMaxGarments };
+static_assert(kSimSlots == kClothMaxGarments, "cloth slot counts must not diverge");
 struct SimSlot { void* mesh; void* asset; long serial; };
 static SimSlot g_sim[kSimSlots] = {};
 static void* g_asset = nullptr;      // most recent, for the status line only
@@ -2032,11 +2036,84 @@ static void DirectDrive(void* comp, void* mesh, int slot) {
                     if (dist > 1.0f) differing++;
                     if (dist > worst) worst = dist;
                 }
-                if (differing > 0)
+                if (differing > 0) {
                     TwkLog("[direct] slot %d: BIND POSE MISMATCH -- %d of %d mapped bones sit up to "
                            "%.1f cm from where the body has them. Separated, the garment is skinned "
                            "against a rest pose the body does not share, which collapses it.",
                            slot, differing, compared, worst);
+                    // NAME the offenders. The count alone cannot distinguish the two causes, and they
+                    // need opposite fixes: if a garment bone maps to the body bone of the SAME name
+                    // and they still sit far apart, the garment was authored against a different rest
+                    // pose and only its author can fix it; if it maps to a DIFFERENT name, our bone
+                    // matching put it there and the bug is ours. Whether the cloth mesh actually uses
+                    // the bone matters just as much -- a garment can mismatch on bones it never
+                    // touches and look perfect, which is exactly why trousers at 12 cm were fine
+                    // while a shirt at 34 cm had its sleeves placed as rigid lumps in the wrong spot.
+                    uint8_t* gInfo = (uint8_t*)twkP((uint8_t*)mesh + SM_REFSKELETON, REFSK_BONEINFO);
+                    const int nGInfo = twkI((uint8_t*)mesh + SM_REFSKELETON, REFSK_BONEINFO + 8);
+                    // How many VERTICES actually ride each bone, read from the skin weights. The
+                    // previous version of this used boneOk, which only means "the bone resolved" --
+                    // so it cheerfully reported that a t-shirt USES a toe bone, and sent me chasing
+                    // leaf bones that drive no geometry at all. A mismatch only matters in
+                    // proportion to how much of the garment hangs off that bone.
+                    uint8_t* sd  = (uint8_t*)twkP(lod, LODRD_SKINVB + SKINVB_DATA);
+                    const int mi = twkI(lod, LODRD_SKINVB + SKINVB_MAXINFL);
+                    const int b16 = (*(uint8_t*)(lod + LODRD_SKINVB + SKINVB_16BITBONE)) ? 1 : 0;
+                    uint16_t* smap  = (uint16_t*)twkP(secs, SEC_BONEMAP);
+                    const int smapN = twkI(secs, SEC_BONEMAP + 8);
+                    int* vtx = (int*)calloc((size_t)d.nBones, sizeof(int));
+                    if (sd && mi > 0 && vtx) {
+                        const int stride = mi * (b16 ? 2 : 1) + mi;
+                        for (int v = 0; v < d.weldCount; v++) {
+                            const uint8_t* sw = sd + (size_t)v * stride;
+                            const uint8_t* wt = sw + mi * (b16 ? 2 : 1);
+                            for (int k = 0; k < mi; k++) {
+                                if (wt[k] < 26) continue;          // ignore <10% dustings
+                                // The skin buffer stores SECTION-LOCAL bone indices; the section's
+                                // own map turns those into skeleton bones. Counting without it
+                                // credited whichever bone happened to share the index -- which is
+                                // how trousers appeared to hang 12794 vertices off a TOE bone.
+                                const int sb = b16 ? (int)((const uint16_t*)sw)[k] : (int)sw[k];
+                                if (sb < 0 || sb >= smapN) continue;
+                                const int gb = smap[sb];
+                                if (gb >= 0 && gb < d.nBones) vtx[gb]++;
+                            }
+                        }
+                    }
+                    // Worst first: an ordered list is the difference between "24 bones differ" and
+                    // "the one bone holding the sleeves is 30 cm out".
+                    // Detail only under ClothDebugLog: fourteen lines per garment per dress is a
+                    // diagnostic, not something every user's log should carry. The header line
+                    // above already says a mismatch exists; this says which bones, and whether any
+                    // geometry actually rides them.
+                    for (int shown = 0; g_debugLog && shown < 14; shown++) {
+                        int best = -1; float bestD = 1.0f;
+                        static int done[512];
+                        if (shown == 0) memset(done, 0, sizeof(done));
+                        for (int b = 0; b < d.nBones && b < 512; b++) {
+                            if (done[b]) continue;
+                            int mb = (boneXlat && b < nXlat) ? boneXlat[b] : b;
+                            if (mb < 0 || mb >= nBInfo) continue;
+                            const float* g = d.refPoseCS + b*12;
+                            const float* y = bcs + mb*12;
+                            const float dx = g[3]-y[3], dy = g[7]-y[7], dz = g[11]-y[11];
+                            const float dist = sqrtf(dx*dx + dy*dy + dz*dz);
+                            if (dist > bestD) { bestD = dist; best = b; }
+                        }
+                        if (best < 0) break;
+                        done[best] = 1;
+                        const int mb = (boneXlat && best < nXlat) ? boneXlat[best] : best;
+                        char gn[96] = "?", bn[96] = "?";
+                        if (gInfo && best < nGInfo)
+                            CatchSound_FNameText(gInfo + (size_t)best * BONEINFO_STRIDE, gn, sizeof(gn));
+                        CatchSound_FNameText(bInfo + (size_t)mb * BONEINFO_STRIDE, bn, sizeof(bn));
+                        const int nv = vtx ? vtx[best] : -1;
+                        TwkLog("[direct]   %-28s -> %-28s %6.1f cm | %5d vertices ride it%s",
+                               gn, bn, bestD, nv,
+                               nv > 0 ? "  <-- MATTERS" : "  (drives nothing here)");
+                    }
+                    free(vtx);
+                }
                 else
                     TwkLog("[direct] slot %d: bind pose agrees with the body across %d mapped bones "
                            "(worst %.2f cm)", slot, compared, worst);
@@ -2125,6 +2202,14 @@ static void DirectDrive(void* comp, void* mesh, int slot) {
         MatXfmPos(inv, pt, out);
         // Never hand the card a broken vertex: one bad transform used to spray NaN through the mesh.
         if (!(out[0]==out[0]) || !(out[1]==out[1]) || !(out[2]==out[2])) continue;
+        // A distance clamp against the plain pose was tried here (3.19.17) and REMOVED. The idea was
+        // that the simulation cannot move a vertex further than its travel limit, so anything beyond
+        // that must be arithmetic garbage. It is not a safe test: on a garment that renders perfectly
+        // it rejected 44677 of 55651 vertices in a single frame, because the plain pose and the
+        // simulated position are not always expressed the same way while the character is moving.
+        // It also silently capped the deviation readout at the clamp value, destroying the only
+        // number that showed how far things were really going. Do not re-add without first proving,
+        // on a KNOWN-GOOD garment, that it never fires.
 
         float* dst = (float*)(posData + (size_t)(baseVert + i) * d.posStride);
         // How far this is from where the garment would sit unsimulated. If these stay near zero the
@@ -2590,6 +2675,22 @@ void ClothSim_PumpFrame() {
         float simTime = 0.0f;
         void* firstSim = nullptr;
 
+        // "Building now" followed by nothing at all was a real field report: every slot was empty, so
+        // the loop below did nothing, silently, forever. An empty build is worth exactly one line.
+        if (g_on && armSettled) {
+            bool anyComp = false;
+            for (int s = 0; s < nSlots && s < kSimSlots && !anyComp; s++)
+                anyComp = ClothMerge_SlaveComponent(s) != nullptr;
+            static bool saidEmpty = false;
+            if (!anyComp) {
+                if (!saidEmpty) {
+                    saidEmpty = true;
+                    TwkLog("[quad] nothing to build -- the un-merge produced no garment component. "
+                           "Cloth cannot appear in this state; the reason is on the [cloth] lines above.");
+                }
+            } else saidEmpty = false;
+        }
+
         for (int slot = 0; slot < nSlots && slot < kSimSlots; slot++) {
             void* comp = ClothMerge_SlaveComponent(slot);
             if (!comp) continue;
@@ -2829,4 +2930,100 @@ void ClothSim_DrawMenu(const OmpMenuApi* api) {
     api->SameLine(); api->TextDisabled("(hand-built cloth on the un-merged shirt; re-dress to apply)");
     snprintf(b, sizeof(b), "solver: %s", g_status);
     api->TextDisabled(b);
+}
+
+// =====================================================================================================
+// COPY vs SOURCE -- is the mesh we build actually the mesh we were given?
+// =====================================================================================================
+// The un-merge hands a garment to the renderer as OUR OWN copy, produced by running the engine's
+// mesh merge over a single source. Everything downstream -- the simulation, the write-back, the
+// bind-pose comparison -- assumes that copy is the source. Nothing ever checked.
+//
+// It is worth checking because of WHEN a garment was reported broken: before the cloth had built, at
+// the moment the copy first replaced the original. If the merge alters vertices or weights, that is
+// exactly what it would look like, it would only show on garments whose layout the merge handles
+// differently (this one carries 8 bone influences per vertex against the usual 4), and it would be
+// invisible in vanilla, which never copies the mesh at all.
+//
+// Read-only, once per garment, both sides guarded: a difference here indicts the mod, and no
+// difference clears it and rules out the whole un-merge stage.
+void ClothSim_CompareCopyToSource(void* copy, void* src, const char* name) {
+    // Under ClothDebugLog only. It walks every vertex twice, and the answer only matters when a
+    // garment is misbehaving -- but when one is, this is the first thing worth knowing.
+    if (!copy || !src || !g_debugLog) return;
+    __try {
+        uint8_t* rdC = (uint8_t*)twkP(copy, SM_RENDERDATA);
+        uint8_t* rdS = (uint8_t*)twkP(src,  SM_RENDERDATA);
+        if (!rdC || !rdS) { TwkLog("[cmp] '%s': no render data on one side", name); return; }
+        uint8_t** lodsC = (uint8_t**)twkP(rdC, RD_LODARRAY);
+        uint8_t** lodsS = (uint8_t**)twkP(rdS, RD_LODARRAY);
+        const int nC = twkI(rdC, RD_LODARRAY + 8), nS = twkI(rdS, RD_LODARRAY + 8);
+        if (!lodsC || !lodsS || nC < 1 || nS < 1) { TwkLog("[cmp] '%s': no LODs", name); return; }
+        uint8_t* lC = lodsC[0]; uint8_t* lS = lodsS[0];
+        if (!lC || !lS) { TwkLog("[cmp] '%s': LOD0 missing", name); return; }
+
+        const int vC = twkI(lC, LODRD_POSVB + POSVB_NUMVERTS), vS = twkI(lS, LODRD_POSVB + POSVB_NUMVERTS);
+        const int sC = twkI(lC, LODRD_POSVB + POSVB_STRIDE),   sS = twkI(lS, LODRD_POSVB + POSVB_STRIDE);
+        const int iC = twkI(lC, LODRD_SKINVB + SKINVB_MAXINFL), iS = twkI(lS, LODRD_SKINVB + SKINVB_MAXINFL);
+        const int bC = *(uint8_t*)(lC + LODRD_SKINVB + SKINVB_16BITBONE) ? 1 : 0;
+        const int bS = *(uint8_t*)(lS + LODRD_SKINVB + SKINVB_16BITBONE) ? 1 : 0;
+        const int secC = twkI(lC, LODRD_SECTIONS + 8), secS = twkI(lS, LODRD_SECTIONS + 8);
+        TwkLog("[cmp] '%s': verts %d/%d  posStride %d/%d  influences %d/%d  bone16 %d/%d  sections %d/%d "
+               "(copy/source)", name, vC, vS, sC, sS, iC, iS, bC, bS, secC, secS);
+        if (vC != vS || iC != iS || secC != secS)
+            TwkLog("[cmp] '%s': THE COPY IS NOT THE SOURCE -- the merge changed the mesh's shape", name);
+
+        // ---- positions, vertex by vertex.
+        uint8_t* pC = (uint8_t*)twkP(lC, LODRD_POSVB + POSVB_DATA);
+        uint8_t* pS = (uint8_t*)twkP(lS, LODRD_POSVB + POSVB_DATA);
+        if (pC && pS && vC == vS && sC == sS && sC >= 12) {
+            int differ = 0; float worst = 0.0f; int firstAt = -1;
+            for (int v = 0; v < vC; v++) {
+                const float* a = (const float*)(pC + (size_t)v * sC);
+                const float* b = (const float*)(pS + (size_t)v * sS);
+                const float dx = a[0]-b[0], dy = a[1]-b[1], dz = a[2]-b[2];
+                const float d2 = dx*dx + dy*dy + dz*dz;
+                if (d2 > 0.0001f) { differ++; if (firstAt < 0) firstAt = v;
+                                    if (d2 > worst) worst = d2; }
+            }
+            if (differ) TwkLog("[cmp] '%s': %d of %d VERTEX POSITIONS differ, worst %.2f cm, first at %d "
+                               "-- our copy is not shaped like the garment", name, differ, vC,
+                               sqrtf(worst), firstAt);
+            else        TwkLog("[cmp] '%s': all %d vertex positions identical", name, vC);
+        } else TwkLog("[cmp] '%s': positions not comparable (cpu data %p/%p)", name, pC, pS);
+
+        // ---- skin weights, byte for byte. This is what decides where every vertex ends up.
+        uint8_t* wC = (uint8_t*)twkP(lC, LODRD_SKINVB + SKINVB_DATA);
+        uint8_t* wS = (uint8_t*)twkP(lS, LODRD_SKINVB + SKINVB_DATA);
+        if (wC && wS && vC == vS && iC == iS && bC == bS && iC > 0) {
+            const int stride = iC * (bC ? 2 : 1) + iC;
+            int differ = 0, firstAt = -1;
+            for (int v = 0; v < vC; v++)
+                if (memcmp(wC + (size_t)v * stride, wS + (size_t)v * stride, (size_t)stride) != 0) {
+                    differ++; if (firstAt < 0) firstAt = v;
+                }
+            if (differ) TwkLog("[cmp] '%s': %d of %d SKIN WEIGHTS differ (first at %d) -- the merge "
+                               "re-bound the garment to the skeleton differently", name, differ, vC, firstAt);
+            else        TwkLog("[cmp] '%s': all %d skin weights identical", name, vC);
+        } else TwkLog("[cmp] '%s': weights not comparable (data %p/%p, infl %d/%d)", name, wC, wS, iC, iS);
+
+        // ---- the section bone maps: which skeleton bone each section-local index means.
+        uint8_t* secsC = (uint8_t*)twkP(lC, LODRD_SECTIONS);
+        uint8_t* secsS = (uint8_t*)twkP(lS, LODRD_SECTIONS);
+        if (secsC && secsS && secC == secS) {
+            for (int k = 0; k < secC && k < 8; k++) {
+                uint8_t* a = secsC + (size_t)k * SEC_STRIDE, *b = secsS + (size_t)k * SEC_STRIDE;
+                uint16_t* ma = (uint16_t*)twkP(a, SEC_BONEMAP); const int na = twkI(a, SEC_BONEMAP + 8);
+                uint16_t* mb = (uint16_t*)twkP(b, SEC_BONEMAP); const int nb = twkI(b, SEC_BONEMAP + 8);
+                if (na != nb) { TwkLog("[cmp] '%s': section %d bone map is %d entries, source has %d "
+                                       "-- vertices will follow DIFFERENT BONES", name, k, na, nb); continue; }
+                int bad = -1;
+                if (ma && mb) for (int e = 0; e < na; e++) if (ma[e] != mb[e]) { bad = e; break; }
+                if (bad >= 0) TwkLog("[cmp] '%s': section %d bone map diverges at %d (%d vs %d) "
+                                     "-- vertices will follow DIFFERENT BONES", name, k, bad,
+                                     (int)ma[bad], (int)mb[bad]);
+                else TwkLog("[cmp] '%s': section %d bone map identical (%d entries)", name, k, na);
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { TwkLog("[cmp] '%s': comparison faulted", name); }
 }
