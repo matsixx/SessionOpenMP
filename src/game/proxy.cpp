@@ -204,6 +204,8 @@ void Proxy::Forget() {
     // OnActorGone must run BEFORE DropProxyActor: it asks IsProxyActor whether this is still ours, so
     // clearing the registry first makes it decline to clean up the very actor it exists to clean up.
     spectate::OnActorGone(actor_, nullptr);
+    cvPinned_ = false; cvAn_ = nullptr; cvOff_ = 0; cvLingerMs_ = 0;   // instance died with the world:
+                                                                       // nothing to restore INTO
     DropProxyActor(actor_);               // no longer one of ours -- drop it before the pointer dies
     DropAnimSlot(this);                   // the anim instance died with the world; never post-apply to it
     { void* pm = actor_ ? safePtr(actor_, off::kSkaterMesh) : nullptr; if (pm) pose::Forget(pm); }
@@ -845,6 +847,7 @@ void Proxy::Apply(const repl::State& s, uint64_t nowMs, uint64_t nowUs, void (*l
     // board link resolved, and audio must not depend on any state a proxy may fail to have. A null
     // board just means board-attached sounds fall back to a world position.
     AudioApply(s, bd);
+    CrankVisApply(s);
     // ---- 7. the BOARD.
     if (!bd) return;
     // While the owner's board is BROKEN its pieces belong to the local break physics: stamping or
@@ -1072,6 +1075,95 @@ bool Proxy::VelocityDrive(const repl::State& s, uint64_t nowUs) {
 // decides WHETHER a sound should happen; that decision was made on the machine that was simulating.
 // See audio.h for why this is the only layer at which that is true.
 // =====================================================================================================
+// ==== THE ANALOG CROUCH, REPLAYED =====================================================================
+// SessionTweaks scrubs the sender's CrankIn descent clock to the stick; the wire carries that clock
+// (State.crankClock, sentinel -1 when absent) and this writes it into the PROXY's own CrankIn node so
+// observers see the held depth instead of the vanilla full dive. Every number and rule here was paid
+// for on the sender side (tweaks rounds 53-58, all field-verified):
+//   * the node is FOUND, not fixed: read the CrankInBlendSpace asset pointer at instance+0x4a0, scan
+//     the BP property area (+0x7e8 up, 8-aligned) for that value, node base = hit - 0x50. Field
+//     sanity (weight 0..1, time 0..100, |rate| < 100) skips the phantom the node's own
+//     PreviousBlendSpace produces 0x90 later. A fault mid-scan is the object edge -- a normal end.
+//   * PlayRate is pinned to 0 while writing: state machines auto-exit on TIME REMAINING, which is
+//     computed against the rate, so rate 0 = the state cannot churn (the round-54 weight-collapse).
+//   * on release the pin LINGERS until the node's blend weight collapses (0.5 s cap): restoring
+//     immediately lets the frozen clip resume forward as the exit blend's source -- the round-58
+//     "finishes the crouch on release" bug.
+static const uintptr_t kCvAssetPtr  = 0x4a0;   // USkaterAnimInstance::CrankInBlendSpace (PDB)
+static const uintptr_t kCvScanFrom  = 0x7e8;   // BP property area start -- skips the asset slot itself
+static const uintptr_t kCvScanTo    = 0x40000;
+static const uintptr_t kCvWeight    = 0x1c;    // FAnimNode_BlendSpacePlayer (engine PDB)
+static const uintptr_t kCvTime      = 0x20;    //   InternalTimeAccumulator -- THE clock
+static const uintptr_t kCvRate      = 0x44;
+static const uintptr_t kCvBs        = 0x50;    //   BlendSpace* -- the scan key
+
+void Proxy::CrankVisApply(const repl::State& s) {
+#ifdef _WIN32
+    const bool want = s.crankOn && s.crankClock >= 0.f;
+    if (!want && !cvPinned_) return;                       // the common case costs two compares
+    void* mesh = actor_ ? safePtr(actor_, off::kSkaterMesh) : nullptr;
+    void* an   = mesh ? safePtr(mesh, off::kMeshAnimInstance) : nullptr;
+    if (an != cvAn_) {                                     // respawn / re-dress: instance replaced
+        CrankVisRelease();                                 // old instance may be dead; Release is SEH'd
+        cvAn_ = an; cvOff_ = 0; cvNextScanMs_ = 0;
+    }
+    if (!an) return;
+    const uint64_t now = GetTickCount64();
+    if (want && !cvOff_ && now >= cvNextScanMs_) {
+        cvNextScanMs_ = now + 1000;                        // pin-bound nodes fill their asset pointer
+        __try {                                            // on first UPDATE -- rescan until found
+            void* bsIn = *(void**)((uint8_t*)an + kCvAssetPtr);
+            if (bsIn) {
+                for (uintptr_t off = kCvScanFrom; off < kCvScanTo; off += 8) {
+                    if (*(void**)((uint8_t*)an + off) != bsIn) continue;
+                    uint8_t* node = (uint8_t*)an + off - kCvBs;
+                    const float w = *(float*)(node + kCvWeight);
+                    const float t = *(float*)(node + kCvTime);
+                    const float r = *(float*)(node + kCvRate);
+                    if (w >= 0.f && w <= 1.f && t >= 0.f && t <= 100.f && r > -100.f && r < 100.f) {
+                        cvOff_ = off - kCvBs;
+                        break;
+                    }
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}          // the object edge: normal end-of-scan
+    }
+    if (want && cvOff_) {
+        cvLingerMs_ = 0;
+        __try {
+            uint8_t* node = (uint8_t*)an + cvOff_;
+            if (!cvPinned_) {
+                cvOrigRate_ = *(float*)(node + kCvRate);
+                if (cvOrigRate_ == 0.0f) cvOrigRate_ = 1.5f;   // never restore a stuck zero
+                cvPinned_ = true;
+            }
+            *(float*)(node + kCvRate) = 0.0f;
+            *(float*)(node + kCvTime) = s.crankClock;      // the sender's smoothing is baked in
+        } __except (EXCEPTION_EXECUTE_HANDLER) { CrankVisRelease(); cvOff_ = 0; }
+    } else if (cvPinned_ && cvOff_) {
+        bool handBack = false;
+        __try {
+            const float w = *(float*)((uint8_t*)an + cvOff_ + kCvWeight);
+            if (!cvLingerMs_) cvLingerMs_ = now;
+            handBack = (w < 0.05f) || (now - cvLingerMs_ > 500);
+        } __except (EXCEPTION_EXECUTE_HANDLER) { handBack = true; }
+        if (handBack) CrankVisRelease();
+    }
+#else
+    (void)s;
+#endif
+}
+
+void Proxy::CrankVisRelease() {
+#ifdef _WIN32
+    if (cvPinned_ && cvAn_ && cvOff_) {
+        __try { *(float*)((uint8_t*)cvAn_ + cvOff_ + kCvRate) = cvOrigRate_; }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+#endif
+    cvPinned_ = false; cvLingerMs_ = 0;
+}
+
 void Proxy::AudioApply(const repl::State& s, void* bd) {
     if (!actor_) return;
     for (int i = 0; i < 3; i++) lastBodyPos_[i] = s.bodyPos[i];
@@ -1204,6 +1296,8 @@ void Proxy::SetPresent(bool present, void (*logf)(const char*)) {
 void Proxy::Retire(void (*logf)(const char*)) {
     if (!actor_) return;
     spectate::OnActorGone(actor_, logf); // if the replay camera was watching them, hand it back first
+    CrankVisRelease();                   // a retired skater must not keep a rate-0 descent node
+    cvAn_ = nullptr; cvOff_ = 0;
     OnQuiet(logf);                       // stops the board simulating and silences their loops
     AudioStopAll();
     const Syms& S = Get();

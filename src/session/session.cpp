@@ -20,6 +20,11 @@
 #include "../game/spectate.h"
 #include "../game/dropper.h"
 #include "../ui/mp_prefs.h"
+#ifdef _WIN32
+#define PSAPI_VERSION 2          // K32EnumProcessModules from kernel32 -- no psapi.lib dependency
+#include <windows.h>
+#include <psapi.h>
+#endif
 #include "../replication/replaysync.h"
 #include "../replication/dropsync.h"
 #include <cstring>
@@ -98,6 +103,9 @@ struct Slot {
     repl::SkelPrint skel;
     bool        haveSkel = false;
     void*       skelFedFor = nullptr;    // the mesh we last fed it to; a respawn re-feeds
+    // The per-peer name cache for interned loop/trick names -- see AudioNameCache. Applied at
+    // OnPacket, before the state reaches the stream, so everything downstream is complete.
+    repl::AudioNameCache nameCache;
     // Synced-replay AUDIO. The cursor is the owner-clock time up to which their history's one-shot
     // events have already been fired; each frame fires (cursor, now] exactly once. A scrub JUMP --
     // backwards, or forward by more than a breath -- resyncs the cursor silently instead of firing
@@ -142,6 +150,34 @@ static void (*g_logf)(const char*) = nullptr;
 static uint64_t g_lastPubUs = 0;
 static bool     g_cosResend = false;   // a new peer appeared: re-send our look without waiting 10 s
 static bool     g_skelResend = false;  // ...and our skeleton, for the same reason
+static bool     g_nameResend = false;  // ...and un-interned loop/trick names, ditto
+// SessionTweaks' analog-crouch clock, resolved by GetProcAddress -- the same seam its menu pages use
+// to find OUR exports, run the other way. Both mods ship as main.dll in different folders, so module
+// enumeration + a distinctive export name is the only sane linkage. Probed until found, then cached;
+// a session without SessionTweaks (or an older one) simply never resolves it, and every cranked
+// frame carries the "not scrubbed" sentinel -- peers play the vanilla descent, exactly as today.
+typedef int (*TwkCrankVisClockFn)(float*);
+static TwkCrankVisClockFn twkCrankVisClock() {
+#ifdef _WIN32
+    static TwkCrankVisClockFn fn = nullptr;
+    static uint64_t nextProbeMs = 0;
+    if (fn) return fn;
+    const uint64_t now = GetTickCount64();
+    if (now < nextProbeMs) return nullptr;
+    nextProbeMs = now + 1000;
+    HMODULE mods[512]; DWORD need = 0;
+    if (EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &need)) {
+        const int n = (int)(need / sizeof(HMODULE));
+        for (int i = 0; i < n && i < 512; i++) {
+            auto f = (TwkCrankVisClockFn)GetProcAddress(mods[i], "Twk_CrankVisClock");
+            if (f) { fn = f; break; }
+        }
+    }
+    return fn;
+#else
+    return nullptr;
+#endif
+}
 static bool     g_anyPeerReplaying = false;   // somebody is scrubbing and needs our finished pose
 static repl::State g_ownLast;      // last successfully gathered own state (for spawn placement)
 static bool        g_haveOwn = false;
@@ -274,8 +310,19 @@ static Slot* slotFor(int peerIdx, uint64_t nowUs) {
         s.dropAuthKey = 0; s.haveDropAuth = false; s.worldSetFresh = false;
         s.skel = repl::SkelPrint(); s.haveSkel = false; s.skelFedFor = nullptr;
         s.syncAudioUs = 0; s.syncWasDriven = false;
+        // THE NAME CACHE DIES WITH THE SLOT. It is keyed by the SENDER's loop handles, which mean
+        // nothing across peers -- a recycled slot that kept it would resolve a new peer's interned
+        // (nameless) loops and tricks to the PREVIOUS peer's names, on every packet that is not a
+        // refresh. That is 3 packets in 4 carrying a wrong trick name, which reads as a proxy stuck
+        // in an animation that never ends, and it never self-heals because the wrong answer is
+        // always available. Missed in the interning round; a reconnect is exactly when it bites.
+        s.nameCache = repl::AudioNameCache{};
         dropsync::ForgetPeer(peerIdx);
         g_skelResend = true;                         // they need OUR skeleton too
+        g_nameResend = true;                         // ...and full loop/trick NAMES on the next
+                                                     // publish: the refresh counters are per-process,
+                                                     // so a peer joining mid-trick would otherwise
+                                                     // wait on a cycle that is not theirs
         g_cosResend = true;                          // they need OUR look too, now rather than in 10 s
         g_dropResend = true;                         // ...and our dropped objects, for the same reason
         if (g_logf) { char m[120]; snprintf(m, sizeof(m), "[session] stream opened for peer %d", peerIdx); g_logf(m); }
@@ -518,6 +565,9 @@ void OnPacket(int peerIdx, const uint8_t* data, int len, uint64_t nowUs) {
     }
     Slot* sl = slotFor(peerIdx, nowUs);
     if (!sl) return;
+    // Interned names filled in HERE, before the state reaches the stream: named entries teach the
+    // cache, nameless ones draw from it, and everything downstream still sees complete states.
+    sl->nameCache.Resolve(s);
     sl->stream.Push(s, senderUs, nowUs);
     sl->lastPacketUs = nowUs;
     sl->quietHandled = false;
@@ -1354,7 +1404,25 @@ static void EnforceBoneFloor(void* proxyActor, const repl::CosmeticSet& theirs, 
 }
 
 void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
+    game::pose::SetLogger(g_logf);           // idempotent; the stale-pose line needs a voice
     if (!g_cfg.enabled) return;
+    // The bone floor's substitutions are judged against OUR merged bone count, and nothing else
+    // re-judges them when WE change clothes: a peer kept wearing our lent shirt after we no longer
+    // wore a rig-carrying garment (field-reported as a wrongly dressed skater), and the reverse --
+    // changing INTO one -- leaves every proxy short until its next look change, which is exactly the
+    // crash window the floor exists to close. So our merged count changing re-dresses everyone.
+    // Cheap: an integer read per frame, and the rebuilds only happen on a wardrobe-change cadence.
+    {
+        static int lastMine = 0;
+        const int mine = ownPawn ? game::SkeletonBoneCount(game::SkaterMeshOf(ownPawn)) : 0;
+        if (mine > 0 && lastMine > 0 && mine != lastMine) {
+            for (auto& sl : g_slots) if (sl.used) sl.wornForActor = nullptr;
+            if (g_logf) { char m[170]; snprintf(m, sizeof(m),
+                "[cosmetics] our skeleton changed (%d -> %d bones) -- re-dressing every peer so the"
+                " bone floor can re-judge its substitutions", lastMine, mine); g_logf(m); }
+        }
+        if (mine > 0) lastMine = mine;
+    }
     // Both thresholds live in microseconds here so they are compared against nowUs and nothing else.
     // `nowMs` is passed through to the PROXY only (its own spawn/visual timers are self-consistent).
     const uint64_t quietUs = (uint64_t)(g_cfg.quietMs * 1000.0f);
@@ -1419,9 +1487,13 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
     // above the max there is NO rate limiting at all: a limiter whose period is within a frame of the
     // frame time ALIASES against it (16666 us against a ~16600 us frame halves the real send rate and
     // reads as lag). There is nothing to limit when one packet per frame IS the target.
-    float hz = g_cfg.publishHzMax / (float)(sendable > 0 ? sendable : 1);
-    if (hz > g_cfg.publishHzMax) hz = g_cfg.publishHzMax;
-    if (hz < g_cfg.publishHzMin) hz = g_cfg.publishHzMin;
+    // 60 / 45 / 30 by peer count, not 60 / 30: the size batch (interned names, h16 limbs, the
+    // shrunk timestamp, conditional crank) cut the steady packet by roughly a third, and this curve
+    // spends that saving on rate. Two peers at 45 Hz costs about what two at 30 used to; the floor
+    // stays where it was for a full lobby.
+    float hz = g_cfg.publishHzMax;
+    if (sendable == 2)     hz = (g_cfg.publishHzMax + g_cfg.publishHzMin) * 0.5f;
+    else if (sendable > 2) hz = g_cfg.publishHzMin;
     g_st.publishHz = hz;
     const bool unlimited = (hz >= g_cfg.publishHzMax);
     const uint64_t period = unlimited ? 0 : (uint64_t)(1.0e6f / hz);
@@ -1455,6 +1527,29 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
             // playing. Gathered HERE rather than in gatherOwn because it is not read off the pawn --
             // it is what the audio funnel captured, on its own schedule, between publishes.
             game::audio::Gather(own, nowUs);
+            // Trick and grind names: full string on change and every 4th packet; the sentinel
+            // between. The counter is per-name so a trick change mid-grind refreshes only itself.
+            {
+                static char lastTrick[40] = {}, lastGrind[40] = {};
+                static int trickTick = 0, grindTick = 0;
+                if (g_nameResend) { trickTick = 0; grindTick = 0; lastTrick[0] = 0; lastGrind[0] = 0; }
+                if (own.trickName[0] && !strcmp(own.trickName, lastTrick) && (++trickTick & 3) != 0)
+                    own.trickNamed = 0;
+                else { strncpy_s(lastTrick, own.trickName, _TRUNCATE); own.trickNamed = 1; trickTick = 0; }
+                if (own.grindName[0] && !strcmp(own.grindName, lastGrind) && (++grindTick & 3) != 0)
+                    own.grindNamed = 0;
+                else { strncpy_s(lastGrind, own.grindName, _TRUNCATE); own.grindNamed = 1; grindTick = 0; }
+                if (g_nameResend) { game::audio::ForceNames(); g_nameResend = false; }
+            }
+            // The analog-crouch clock, when SessionTweaks is scrubbing one. Read at publish time so
+            // the transported value is the frame's rendered depth, not an earlier tick's.
+            own.crankClock = -1.f;
+            if (own.crankOn) {
+                if (TwkCrankVisClockFn f = twkCrankVisClock()) {
+                    float c = -1.f;
+                    if (f(&c) && c >= 0.f) own.crankClock = c;
+                }
+            }
             uint8_t pkt[1024];             // the shm mailbox's exact message cap; EOS P2P allows more.
                                            // Audio rides the snapshot and is sized LAST, so a full
                                            // frame drops trailing sounds, never pose.
@@ -1503,6 +1598,11 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
                 repl::State ringSt = own;
                 game::pose::CaptureFromPawn(ownPawn, ringSt);
                 ringSt.poseFirst = 0;                    // 2 KB cap: the ring takes the whole skeleton
+                // The ring must stay SELF-CONTAINED: its entries are unpacked seconds later, on
+                // another machine, with no name cache in reach -- an interned entry there would play
+                // silence. Names on, trick names in full; the 2 KB cap has room to spare.
+                for (int li = 0; li < (int)ringSt.nLoops; li++) ringSt.loops[li].sendNames = 1;
+                ringSt.trickNamed = 1; ringSt.grindNamed = 1;
                 uint8_t ringPkt[2048];
                 const int rn = repl::Pack(ringSt, nowUs, ringPkt, sizeof(ringPkt));
                 replaysync::RecordOwn(rn > 0 ? ringPkt : pkt, rn > 0 ? rn : n, nowUs);

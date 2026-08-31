@@ -63,6 +63,7 @@ struct Slot {
     float    holdPos[kPoseMaxBones][3];
 };
 static Slot g_slots[kSlots];
+static void (*g_logf)(const char*) = nullptr;   // optional; set via SetLogger
 
 #ifdef _WIN32
 // ---- the component-space buffer that is CURRENTLY BEING BUILT (the editable one). Before the flip
@@ -159,6 +160,8 @@ void* FirstProxyMesh() {
     for (auto& sl : g_slots) if (sl.mesh) return sl.mesh;
     return nullptr;
 }
+void SetLogger(void (*logf)(const char*)) { g_logf = logf; }
+
 bool SetPeerSkeleton(void* mesh, const uint32_t* hashes, int n) {
     if (!g_tun.enabled || !g_tun.skeletonSync || !mesh) return false;
     Slot* sl = slotFor(mesh);
@@ -279,7 +282,21 @@ void OnFinalizeBones(void* mesh, uint64_t nowMs) {
     // A stale one must NOT be re-stamped forever -- hand the skeleton back rather than freezing it
     // mid-motion (the anim post-pass's freshness rule, same reasoning).
     const bool haveFresh = sl->n && !(nowMs > sl->freshMs && nowMs - sl->freshMs > g_tun.freshMs);
-    if (sl->n && !haveFresh) g_st.stale++;
+    if (sl->n && !haveFresh) {
+        g_st.stale++;
+        // Field logs showed stale climbing into the thousands while observing a scrubbing peer;
+        // believed benign (a PAUSED scrubber publishes no fresh pose), but believed is not known --
+        // one throttled line makes the cause readable instead of inferred.
+        static uint64_t lastSaidMs = 0;
+        if (nowMs > lastSaidMs + 5000) {
+            lastSaidMs = nowMs;
+            if (g_logf) { char m[160];
+                snprintf(m, sizeof(m), "[pose] transported pose is STALE (age %u ms) -- the sender has"
+                         " stopped publishing poses (paused scrub, or their stream stalled)",
+                         (unsigned)(nowMs - sl->freshMs));
+                g_logf(m); }
+        }
+    }
     if (haveFresh) {
         // Count mismatch = the two ends MERGED different meshes for this player (garments carry rig
         // bones, and an item not installed here changes the merged mesh). The base skeleton is the

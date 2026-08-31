@@ -30,6 +30,10 @@ struct ProxyTuning {
     bool  velocityDrive   = true;         // false = teleport stamp only
     bool  driveGroundedOnly = true;       // airborne/trick frames use the stamp: a flip outruns the chase
     float driveSnapCm     = 120.0f;       // beyond this: teleport (join/respawn), not drive
+    // NOTE: a peer's board CAN wedge against yours and be pushed around -- the velocity chase loses
+    // to a solid contact below driveSnapCm. An automatic "stamp out of the trap" escape was built and
+    // REMOVED on purpose: board-to-board contact is wanted, players do deliberate things with it, and
+    // an escape that teleports a peer out of your way takes that away. Leave it physical.
     float driveSnapAngRad = 1.75f;        // ~100 deg: an upside-down deck is an energy trap the angular
                                           // chase cannot escape (it would have to rotate THROUGH the
                                           // ground), so stamp the pose instead of chasing it
@@ -159,6 +163,14 @@ private:
     // keep the parameters current). One-shots arrive separately, off the stream's playback clock, so
     // they land with the animation instead of a buffer-delay early.
     void  AudioApply(const repl::State& s, void* bd);
+    // SessionTweaks' analog crouch, replayed on the proxy: while the wire carries a scrubbed CrankIn
+    // clock, the node's PlayRate is pinned to 0 and the clock written each frame, so this skater
+    // holds the sender's crouch DEPTH instead of playing the vanilla full dive. The whole technique
+    // -- the node scan, the rate pin, the lingering release -- is the one SessionTweaks proved on
+    // the sender over its rounds 53-58; this is the same machinery run against the proxy's instance.
+    void  CrankVisApply(const repl::State& s);
+    void  CrankVisRelease();              // restore the rate on EVERY exit path -- a dangling rate-0
+                                          // freezes all future descents for this skater
 public:
     // Also the session's lever when synced-replay playback stops driving this proxy: nothing
     // reconciles its loop set again until live play resumes, so the sync path stops them itself.
@@ -166,6 +178,13 @@ public:
 private:
 
     void*      actor_ = nullptr;
+    // ---- crank-visual replay state (see CrankVisApply)
+    void*      cvAn_ = nullptr;           // the anim instance the node offset was found on
+    uintptr_t  cvOff_ = 0;                // CrankIn player node offset within it; 0 = not found
+    uint64_t   cvNextScanMs_ = 0;         // 1 Hz rescan while a scrubbed clock is arriving
+    bool       cvPinned_ = false;
+    float      cvOrigRate_ = 1.5f;
+    uint64_t   cvLingerMs_ = 0;           // release: rate stays pinned through the blend-out
     void*      world_ = nullptr;
     uint64_t   bornMs_ = 0, lastTryMs_ = 0, lastDriveUs_ = 0;
     int        tries_ = 0;

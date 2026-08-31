@@ -1869,7 +1869,22 @@ static bool BuildOrRefreshSlave(void* skater, void* masterComp, void* garment, i
             *(uint32_t*)(params + 0x18) = 0x40;         // RF_Transient
             void* comp = g_sco(params);
             if (!comp) { TwkLog("[cloth] StaticConstructObject returned null -- un-merge off"); g_okBuild = 0; return false; }
+            // VISUAL-ONLY: a fresh skeletal mesh component ships with the CLASS-DEFAULT
+            // collision (a blocking profile), and two garment components colliding with the
+            // world rode along with the skater for months -- field-reported as "the ragdoll
+            // gets stuck on things / more friction since the cloth work". NoCollision is
+            // written into the component's BodyInstance BEFORE registration, so no physics
+            // body is ever created for a garment at all.
+            *((uint8_t*)comp + 0x2c8 /*BodyInstance*/ + 0x20 /*CollisionEnabled*/) = 0;
             g_regWorld(comp, world, nullptr);
+            // Invisible-surface diagnostic: prove whether the garment can collide at all.
+            // Registration may re-derive collision state, and a merged mesh may or may not
+            // create physics bodies -- read back AFTER registering.
+            {
+                const int gb = *(int*)((uint8_t*)comp + 0x980 /*Bodies*/ + 8);
+                TwkLog("[cloth] slave after register: collisionEnabled=%d physicsBodies=%d",
+                       (int)*((uint8_t*)comp + 0x2c8 + 0x20), gb);
+            }
             // SnapToTarget on all three axes: a master-posed slave renders from the master's bone
             // buffer, but its component transform should still sit exactly on the body.
             const uint8_t rules[4] = { 2, 2, 2, 0 };    // Location/Rotation/Scale = SnapToTarget, no weld

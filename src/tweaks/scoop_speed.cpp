@@ -29,6 +29,7 @@
 #include "ui/menu_ext.h"
 #include "scoop_speed.h"
 #include "tweaks_mod.h"
+#include "pop_probe.h"       // the injection experiment's two write points in this module's tick hook
 #include <cmath>
 #include "MinHook.h"
 
@@ -221,18 +222,33 @@ bool ScoopSpeed_FlickMeasure(bool rightStick, float windowSec, float* outSpeed, 
     // made while already deflected identically; dividing by the burst's own duration keeps it
     // frame-rate independent. The radial version it replaced also rejected genuine flicks whose peak
     // was only ~0.25, which is where this game's tricks actually fire.
-    int start = M.n - 1;                                     // walk back over the current movement
-    for (int i = M.n - 1; i > first; i--) {
+    // The burst may have ENDED just before the query. A trick is recognised at the END of its
+    // flick, so by the time the multiplier is asked for, the thumb has often just reached the
+    // flick's endpoint and sat still for a poll or two -- and anchoring the walk-back on the newest
+    // sample made the whole measurement a race: the identical flick read full speed when the query
+    // landed mid-motion and EXACTLY ZERO when it landed a poll after the stop (field log: L0 on a
+    // third of one session's kickflips, each mapped to the minimum multiplier while the stick that
+    // merely drifted was picked instead). Skip trailing stillness first, bounded so a long-dead
+    // gesture can never be resurrected.
+    int end = M.n - 1;
+    while (end > first) {
+        const float dx = M.x[end] - M.x[end - 1], dy = M.y[end] - M.y[end - 1];
+        if (dx * dx + dy * dy >= kStillStep * kStillStep) break;
+        if (now - M.t[end - 1] > 0.15) break;                // stillness older than the bound: stop
+        end--;
+    }
+    int start = end;                                         // walk back over that movement
+    for (int i = end; i > first; i--) {
         const float dx = M.x[i] - M.x[i - 1], dy = M.y[i] - M.y[i - 1];
         if (dx * dx + dy * dy < kStillStep * kStillStep) break;   // the stick was at rest here
         start = i - 1;
     }
     float path = 0.0f;
-    for (int i = start + 1; i < M.n; i++) {
+    for (int i = start + 1; i <= end; i++) {
         const float dx = M.x[i] - M.x[i - 1], dy = M.y[i] - M.y[i - 1];
         path += sqrtf(dx * dx + dy * dy);
     }
-    const double span = M.t[M.n - 1] - M.t[start];
+    const double span = M.t[end] - M.t[start];
     if (span <= 0.0) return false;
     // A gesture has to have actually gone somewhere before its duration means anything. Below this
     // there is no measurement and the caller keeps the game's own value -- never the slowest setting.
@@ -281,8 +297,16 @@ static double g_rawT = 0.0;
 
 static void trackStick(void* handler) {
     const double t = nowSeconds();
-    const float lx = twkF(handler, IH_FRAME_RAW_LEFT),  ly = twkF(handler, IH_FRAME_RAW_LEFT + 4);
-    const float rx = twkF(handler, IH_FRAME_RAW_RIGHT), ry = twkF(handler, IH_FRAME_RAW_RIGHT + 4);
+    float lx, ly, rx, ry;
+    // While the pop scheme rewrites the pad, the input fields hold what the GAME is being shown,
+    // not what the player is doing -- and a flick tracker measuring the rewritten stick made flip
+    // speed swing with thumb depth (the trick flick reached the fields clamped). The pad hook
+    // publishes the pre-rewrite sticks; with the scheme off this returns false and the fields are
+    // the truth exactly as before.
+    if (!PopProbe_PhysSticks(&lx, &ly, &rx, &ry)) {
+        lx = twkF(handler, IH_FRAME_RAW_LEFT);  ly = twkF(handler, IH_FRAME_RAW_LEFT + 4);
+        rx = twkF(handler, IH_FRAME_RAW_RIGHT); ry = twkF(handler, IH_FRAME_RAW_RIGHT + 4);
+    }
     trackOne(g_trkL, lx, ly, t);
     trackOne(g_trkR, rx, ry, t);
     trackMag(g_magL, lx, ly, t);
@@ -291,6 +315,11 @@ static void trackStick(void* handler) {
     g_rawR[0] = rx; g_rawR[1] = ry;
     g_rawT = t;
 }
+
+// See the header note: the handler is only reachable from a hook that is handed it, and this
+// module's speed hook fires on every trick. Written from the game thread, read from the same pump.
+static void* g_lastFth = nullptr;
+void* ScoopSpeed_FlipHandler() { return g_lastFth; }
 
 bool ScoopSpeed_StickRaw(bool rightStick, float* x, float* y) {
     if (x) *x = 0.0f;
@@ -364,12 +393,21 @@ static void* hkInputTick(void* self, double a, double b, void* d) {
         __try { trackStick(self); }
         __except (EXCEPTION_EXECUTE_HANDLER) { g_useTracker = 0; }
     }
+    // The injection experiment's early write point: the physical sticks are already sampled above,
+    // so a rewrite here cannot pollute what the trackers saw. No-op unless its knob selects it.
+    PopProbe_TickEarly(self);
+    // Mode 4: `d` is the tick's stick buffer (see PopProbe_TickSticks) -- rewritten in place,
+    // within this call only, before the game derives anything from it.
+    PopProbe_TickSticks((float*)d);
     Tweaks_PumpFrame();                           // menu-registration retry etc. (shell)
-    __try { return ((InputTickFn)g_origTick)(self, a, b, d); }
+    void* ret = nullptr;
+    __try { ret = ((InputTickFn)g_origTick)(self, a, b, d); }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         if (InterlockedIncrement(&g_faults) == 1) TwkLog("[scoop] caught fatal in InputHandler::Tick -> recovered");
         return nullptr;
     }
+    PopProbe_TickLate(self);                      // ...and the late one, after the game's tick ran
+    return ret;
 }
 
 // Pure RETURN-VALUE substitution: the original always runs, no game state is written.
@@ -383,6 +421,7 @@ static float hkScoopSpeed(void* handler, uint64_t bArg, void* inputs, void* d) {
         if (InterlockedIncrement(&g_faults) == 1) TwkLog("[scoop] caught fatal in GetBoardRotationSpeedMultiplier -> recovered");
         return 1.0f;
     }
+    if (handler) g_lastFth = handler;             // publish for pop_probe (see ScoopSpeed_FlipHandler)
     if ((!g_scoopLog && !g_scoopFix) || !handler || !inputs) return stock;
 
     float out = stock;

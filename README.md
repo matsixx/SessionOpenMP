@@ -17,7 +17,10 @@ between the Epic and Steam builds.
 
 Every release also ships **SessionTweaks**, a companion mod with singleplayer gameplay fixes
 (stick-sweep scoop speed, a wider manual-catch window, a darkslide-aware catch fix, run-out on
-missed tricks). It is built from this repository and bundled in the same package — you get both.
+missed tricks, cloth physics on your clothes) and an optional **pop control scheme**: hold one
+stick to crouch to any depth you like — how deep you are is how high you pop — and flick the other
+to pop, in every stance. It is off until you switch it on under Pop control in the Session Tweaks
+menu. All of it is built from this repository and bundled in the same package — you get both.
 
 They are two separate DLLs rather than one because they do different jobs: SessionTweaks changes how
 *your own* skating feels and works with or without multiplayer, so it can be switched off on its own

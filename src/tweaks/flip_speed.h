@@ -21,6 +21,10 @@ void FlipSpeed_DrawMenu(const OmpMenuApi* api);   // RENDER THREAD (menu_ext con
 void FlipSpeed_ResetDefaults();
 bool FlipSpeed_Enabled();
 void FlipSpeed_SetEnabled(bool on);
+// The game's own stance answer for a skater -- this module resolved IsSkatingGoofy/IsSkatingSwitch
+// for its input normalisation, and the pop remap needs the same truth for its context gate. False =
+// the resolvers are unavailable (sig miss); outputs untouched then.
+bool FlipSpeed_Stance(void* skater, bool* goofy, bool* switchStance);
 // The flick-speed range, in stick-units/second x100 -- integers, so they read correctly on a
 // pause-menu slider (which prints "%d").
 float FlipSpeed_VelMin();  void FlipSpeed_SetVelMin(float v);

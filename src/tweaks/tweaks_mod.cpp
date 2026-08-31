@@ -50,11 +50,13 @@
 #include "foot_steer.h"
 #include "grind_pop.h"
 #include "camera_height.h"
+#include "pop_probe.h"
+#include "body_feel.h"
 #include "MinHook.h"
 #include "ue4ss_abi.h"
 #include "ui/menu_ext.h"
 
-#define TWEAKS_VERSION "3.19.19"
+#define TWEAKS_VERSION "3.19.199"
 #define TWK_WIDEN(x) STR(x)   // STR() prepends L before the macro expands; expand first
 
 // ------------------------------------------------------------------ log (own file, fresh per launch)
@@ -94,6 +96,8 @@ static void saveSettings() {
     FootPlace_SaveConfig(buf, sizeof(buf));
     FootSteer_SaveConfig(buf, sizeof(buf));
     GrindPop_SaveConfig(buf, sizeof(buf));
+    PopProbe_SaveConfig(buf, sizeof(buf));
+    BodyFeel_SaveConfig(buf, sizeof(buf));
     CameraHeight_SaveConfig(buf, sizeof(buf));
     f = fopen(g_iniPath, "w");
     if (!f) { TwkLog("[tweaks] settings save FAILED (cannot write %s)", g_iniPath); return; }
@@ -130,6 +134,8 @@ static void readConfig(const char* dir) {
     FootPlace_ReadConfig(buf);
     FootSteer_ReadConfig(buf);
     GrindPop_ReadConfig(buf);
+    PopProbe_ReadConfig(buf);
+    BodyFeel_ReadConfig(buf);
     CameraHeight_ReadConfig(buf);
     // No ini yet: write one holding the defaults just loaded. Without the multiplayer mod there is
     // no menu to change a setting through, so the file IS the interface -- and a file that lists
@@ -158,6 +164,8 @@ static void resetAllDefaults() {
     FootPlace_ResetDefaults();
     FootSteer_ResetDefaults();
     GrindPop_ResetDefaults();
+    PopProbe_ResetDefaults();
+    BodyFeel_ResetDefaults();
     CameraHeight_ResetDefaults();
     TwkLog("[tweaks] settings reset to defaults");
 }
@@ -186,6 +194,7 @@ static void drawSection(const OmpMenuApi* api, void*) {
     FootSteer_DrawMenu(api);
     api->Separator();
     GrindPop_DrawMenu(api);
+    PopProbe_DrawMenu(api);
     api->Separator();
     CameraHeight_DrawMenu(api);
     // The same reset the pause menu offers, so neither surface is the only way to get back.
@@ -217,6 +226,7 @@ static const char* const kTwkGSwingAmt = "TwkGrindSwingAmt";
 static const char* const kTwkPitch    = "TwkPitchRange";
 static const char* const kTwkPitchAmt = "TwkPitchSpread";
 static const char* const kTwkStopFlip = "TwkCatchStopsFlip";
+static const char* const kTwkClickCat = "TwkCatchClickToCatch";
 static const char* const kTwkAnyRev   = "TwkCatchAnyRevolution";
 static const char* const kTwkCloth     = "TwkCloth";
 static const char* const kTwkClothMove = "TwkClothMove";
@@ -241,6 +251,25 @@ static const char* const kTwkBone     = "TwkBoneScalePct";
 static const char* const kTwkBoneX    = "TwkBoneAddX";
 static const char* const kTwkBoneY    = "TwkBoneAddY";
 static const char* const kTwkBoneZ    = "TwkBoneAddZ";
+static const char* const kTwkBodyFeel  = "TwkBodyFeel";
+static const char* const kTwkBodyAmt   = "TwkBodyFeelAmount";
+static const char* const kTwkBrace     = "TwkBodyBrace";
+static const char* const kTwkArmPow    = "TwkBodyArmPct";
+static const char* const kTwkFallPow   = "TwkBodyFallPct";
+static const char* const kTwkReachPow  = "TwkBodyReachPct";
+static const char* const kTwkCarryPow  = "TwkBodyCarryPct";
+static const char* const kTwkFlailLen  = "TwkBodyFlailMs";
+static const char* const kTwkFlailDel  = "TwkBodyFlailDelayMs";
+static const char* const kTwkFlailPow  = "TwkBodyFlailPct";
+static const char* const kTwkGrabLen   = "TwkBodyGrabMs";
+static const char* const kTwkGrabDel   = "TwkBodyGrabDelayMs";
+static const char* const kTwkGrabPow   = "TwkBodyGrabPct";
+static const char* const kTwkPop       = "TwkPopControl";
+static const char* const kTwkPopWin    = "TwkPopWindow";
+static const char* const kTwkPopGate   = "TwkPopGate";
+static const char* const kTwkPopVisLo  = "TwkPopVisStart";
+static const char* const kTwkPopVisHi  = "TwkPopVisBottom";
+static const char* const kTwkPopVisSm  = "TwkPopVisSmooth";
 static const char* const kTwkReset    = "TwkResetDefaults";
 
 // An ACTION row on the page: pressed, not adjusted.
@@ -263,6 +292,7 @@ static void pageValue(const char* key, int iv, float fv, void*) {
     else if (!strcmp(key, kTwkSndVol))   CatchSound_SetVolumePct(fv);
     else if (!strcmp(key, kTwkLevel))    CatchLevel_SetEnabled(iv != 0);
     else if (!strcmp(key, kTwkStopFlip)) CatchTweaks_SetStopsFlip(iv != 0);
+    else if (!strcmp(key, kTwkClickCat)) CatchTweaks_SetClickToCatch(iv != 0);
     else if (!strcmp(key, kTwkAnyRev))   CatchTweaks_SetAnyRevolution(iv != 0);
     else if (!strcmp(key, kTwkFootLvl))  CatchTweaks_SetFootLevelsBoard(iv != 0);
     else if (!strcmp(key, kTwkGPitch))    GrindPop_SetPitchEnabled(iv != 0);
@@ -293,6 +323,25 @@ static void pageValue(const char* key, int iv, float fv, void*) {
     else if (!strcmp(key, kTwkCamFollow))    CameraHeight_SetFollowEnabled(iv != 0);
     else if (!strcmp(key, kTwkCamPitchDrop)) CameraHeight_SetPitchOnDropEnabled(iv != 0);
     else if (!strcmp(key, kTwkCamPitch))  CameraHeight_SetPitchDeg(fv);
+    else if (!strcmp(key, kTwkBodyFeel))  BodyFeel_SetEnabled(iv != 0);
+    else if (!strcmp(key, kTwkBodyAmt))   BodyFeel_SetAmountPct(fv);
+    else if (!strcmp(key, kTwkBrace))     BodyFeel_SetBraceEnabled(iv != 0);
+    else if (!strcmp(key, kTwkArmPow))    BodyFeel_SetArmPct(fv);
+    else if (!strcmp(key, kTwkFallPow))   BodyFeel_SetFallPct(fv);
+    else if (!strcmp(key, kTwkReachPow))  BodyFeel_SetReachPct(fv);
+    else if (!strcmp(key, kTwkCarryPow))  BodyFeel_SetCarryPct(fv);
+    else if (!strcmp(key, kTwkFlailLen))  BodyFeel_SetFlailMs(fv);
+    else if (!strcmp(key, kTwkFlailDel))  BodyFeel_SetFlailDelayMs(fv);
+    else if (!strcmp(key, kTwkFlailPow))  BodyFeel_SetFlailPct(fv);
+    else if (!strcmp(key, kTwkGrabLen))   BodyFeel_SetGrabMs(fv);
+    else if (!strcmp(key, kTwkGrabDel))   BodyFeel_SetGrabDelayMs(fv);
+    else if (!strcmp(key, kTwkGrabPow))   BodyFeel_SetGrabPct(fv);
+    else if (!strcmp(key, kTwkPop))       PopProbe_SetSchemeEnabled(iv != 0);
+    else if (!strcmp(key, kTwkPopWin))    PopProbe_SetTrickWindowMs(fv);
+    else if (!strcmp(key, kTwkPopGate))   PopProbe_SetCrouchGatePct(fv);
+    else if (!strcmp(key, kTwkPopVisLo))  PopProbe_SetCrankVisMinMs(fv);
+    else if (!strcmp(key, kTwkPopVisHi))  PopProbe_SetCrankVisTimeMs(fv);
+    else if (!strcmp(key, kTwkPopVisSm))  PopProbe_SetCrankVisSmoothMs(fv);
 }
 // ...and what it is set to RIGHT NOW, so a row opens showing the truth instead of a default.
 static int pageGet(const char* key, int* oi, float* of, void*) {
@@ -308,6 +357,7 @@ static int pageGet(const char* key, int* oi, float* of, void*) {
     else if (!strcmp(key, kTwkSndVol))   { *of = CatchSound_VolumePct();       return 1; }
     else if (!strcmp(key, kTwkLevel))    { *oi = CatchLevel_Enabled() ? 1 : 0; return 1; }
     else if (!strcmp(key, kTwkStopFlip)) { *oi = CatchTweaks_StopsFlip() ? 1 : 0; return 1; }
+    else if (!strcmp(key, kTwkClickCat)) { *oi = CatchTweaks_ClickToCatch() ? 1 : 0; return 1; }
     else if (!strcmp(key, kTwkAnyRev))   { *oi = CatchTweaks_AnyRevolution() ? 1 : 0; return 1; }
     else if (!strcmp(key, kTwkFootLvl))  { *oi = CatchTweaks_FootLevelsBoard() ? 1 : 0; return 1; }
     else if (!strcmp(key, kTwkGPitch))    { *oi = GrindPop_PitchEnabled() ? 1 : 0; return 1; }
@@ -338,6 +388,25 @@ static int pageGet(const char* key, int* oi, float* of, void*) {
     else if (!strcmp(key, kTwkBoneX))     { *of = CatchTweaks_BoneAdd(0);              return 1; }
     else if (!strcmp(key, kTwkBoneY))     { *of = CatchTweaks_BoneAdd(1);              return 1; }
     else if (!strcmp(key, kTwkBoneZ))     { *of = CatchTweaks_BoneAdd(2);              return 1; }
+    else if (!strcmp(key, kTwkBodyFeel))  { *oi = BodyFeel_Enabled() ? 1 : 0;          return 1; }
+    else if (!strcmp(key, kTwkBodyAmt))   { *of = BodyFeel_AmountPct();                return 1; }
+    else if (!strcmp(key, kTwkBrace))     { *oi = BodyFeel_BraceEnabled() ? 1 : 0;     return 1; }
+    else if (!strcmp(key, kTwkArmPow))    { *of = BodyFeel_ArmPct();                   return 1; }
+    else if (!strcmp(key, kTwkFallPow))   { *of = BodyFeel_FallPct();                  return 1; }
+    else if (!strcmp(key, kTwkReachPow))  { *of = BodyFeel_ReachPct();                 return 1; }
+    else if (!strcmp(key, kTwkCarryPow))  { *of = BodyFeel_CarryPct();                 return 1; }
+    else if (!strcmp(key, kTwkFlailLen))  { *of = BodyFeel_FlailMs();                  return 1; }
+    else if (!strcmp(key, kTwkFlailDel))  { *of = BodyFeel_FlailDelayMs();             return 1; }
+    else if (!strcmp(key, kTwkFlailPow))  { *of = BodyFeel_FlailPct();                 return 1; }
+    else if (!strcmp(key, kTwkGrabLen))   { *of = BodyFeel_GrabMs();                   return 1; }
+    else if (!strcmp(key, kTwkGrabDel))   { *of = BodyFeel_GrabDelayMs();              return 1; }
+    else if (!strcmp(key, kTwkGrabPow))   { *of = BodyFeel_GrabPct();                  return 1; }
+    else if (!strcmp(key, kTwkPop))       { *oi = PopProbe_SchemeEnabled()  ? 1 : 0;   return 1; }
+    else if (!strcmp(key, kTwkPopWin))    { *of = PopProbe_TrickWindowMs();            return 1; }
+    else if (!strcmp(key, kTwkPopGate))   { *of = PopProbe_CrouchGatePct();            return 1; }
+    else if (!strcmp(key, kTwkPopVisLo))  { *of = PopProbe_CrankVisMinMs();            return 1; }
+    else if (!strcmp(key, kTwkPopVisHi))  { *of = PopProbe_CrankVisTimeMs();           return 1; }
+    else if (!strcmp(key, kTwkPopVisSm))  { *of = PopProbe_CrankVisSmoothMs();         return 1; }
     return 0;
 }
 // Every slider's units are chosen so its INTEGER readout is meaningful -- the pause menu's progress
@@ -347,12 +416,14 @@ static int pageGet(const char* key, int* oi, float* of, void*) {
 // builder, so a list longer than its ~14-row window is simply cut off at the bottom. Categories cost
 // one registration each, keep every page readable at a glance, and grow indefinitely.
 static const OmpPageItem2 kTwkRootItems[] = {
+    { OMP_ITEM_PAGE, "Pop control",    "Pop control",     "Crouch to any depth and pop from it -- deeper means higher" },
     { OMP_ITEM_PAGE, "Board & tricks", "Board & tricks",  "Scoop and flip speed, board pitch control" },
     { OMP_ITEM_PAGE, "Catch & bail",   "Catch & bail",    "Catch window, catch sound, running out of a bail" },
     { OMP_ITEM_PAGE, "Grinds",         "Grinds",          "Pitch control and pop swing coming out of a grind" },
     { OMP_ITEM_PAGE, "Feet",           "Feet",            "Move your feet with the sticks while you are in the air" },
     { OMP_ITEM_PAGE, "Camera",         "Camera",          "Make the camera's height follow your skater everywhere" },
     { OMP_ITEM_PAGE, "Clothing",       "Clothing",        "Cloth physics on your shirt and trousers" },
+    { OMP_ITEM_PAGE, "Physical animation", "Physical animation", "The reactive body and ragdoll bails: bracing, grabbing what hurt, the landing flail" },
     // Kept on the front page deliberately: it resets EVERY Session Tweaks setting, not one category.
     { OMP_ITEM_ACTION, kTwkReset,  "Reset to defaults",   "Restore every Session Tweaks setting to its shipped value" },
 };
@@ -381,6 +452,7 @@ static const OmpPageItem2 kTwkCatchItems[] = {
       nullptr, nullptr, 100.0f, 400.0f, 25.0f },
     { OMP_ITEM_SLIDER, kTwkDsZone, "  Dark slide zone (deg)", "How far from grip-down a dark slide is still reserved",
       nullptr, nullptr, 10.0f, 170.0f, 10.0f },
+    { OMP_ITEM_TOGGLE, kTwkClickCat, "Click a stick to catch", "Press a stick instead of flicking; that foot catches. Only while you are on the board" },
     { OMP_ITEM_TOGGLE, kTwkStopFlip, "Catch ends the flip",   "A caught board stops at griptape-up instead of spinning another full flip" },
     { OMP_ITEM_TOGGLE, kTwkAnyRev,  "Foot always attaches",    "A caught board ends its flip flat under your foot, whatever revolution it was on" },
     { OMP_ITEM_TOGGLE, kTwkFootLvl, "  Foot levels the board", "The deck rolls flat in step with the foot coming down on it" },
@@ -431,6 +503,69 @@ static const OmpPageItem2 kTwkClothItems[] = {
     { OMP_ITEM_SLIDER, kTwkClothHemUp,"  Hem lift reach (%)", "How far up the shirt the lift reaches. Low only lifts the bottom edge; higher flares more of the garment",
       nullptr, nullptr, 10.0f, 80.0f, 5.0f },
 };
+static const OmpPageItem2 kTwkPhysItems[] = {
+    { OMP_ITEM_TOGGLE, kTwkBodyFeel, "Reactive body",
+      "The body braces at speed, loosens in the air, coils into the crouch and absorbs landings" },
+    { OMP_ITEM_SLIDER, kTwkBodyAmt,  "  Body reactivity (%)",
+      "Master strength for everything on this page; 0 = stock stiffness everywhere",
+      nullptr, nullptr, 0.0f, 200.0f, 10.0f },
+    { OMP_ITEM_SLIDER, kTwkArmPow,   "  Arm reactivity (%)",
+      "Balance arms while riding: swing wide in carves, spread in the air and on rails, absorb landings",
+      nullptr, nullptr, 0.0f, 300.0f, 10.0f },
+    { OMP_ITEM_TOGGLE, kTwkBrace,    "Bail reactions",
+      "Ragdolls brace the fall, grab what hurt and flail on landing instead of going limp" },
+    { OMP_ITEM_SLIDER, kTwkFallPow,  "  Fall weight (%)",
+      "Extra downward pull on the falling ragdoll; 0 = the game's own gravity only",
+      nullptr, nullptr, 0.0f, 300.0f, 10.0f },
+    { OMP_ITEM_SLIDER, kTwkReachPow, "  Mid-air reach (%)",
+      "Arms thrown toward the landing while still in the air",
+      nullptr, nullptr, 0.0f, 300.0f, 10.0f },
+    { OMP_ITEM_SLIDER, kTwkCarryPow, "  Momentum keep (%)",
+      "How much pre-bail speed the ragdoll holds through the fall; 0 leaves whatever the game gives",
+      nullptr, nullptr, 0.0f, 150.0f, 5.0f },
+    { OMP_ITEM_SLIDER, kTwkFlailDel, "  Flail delay (ms)",
+      "How long after the bail starts the legs begin kicking -- in the air, before landing",
+      nullptr, nullptr, 0.0f, 2000.0f, 50.0f },
+    { OMP_ITEM_SLIDER, kTwkFlailLen, "  Flail time (ms)",
+      "How long the legs pedal after touching down before settling into the curl",
+      nullptr, nullptr, 0.0f, 4000.0f, 100.0f },
+    { OMP_ITEM_SLIDER, kTwkFlailPow, "  Flail strength (%)",
+      "How hard the legs kick during the flail",
+      nullptr, nullptr, 0.0f, 300.0f, 10.0f },
+    { OMP_ITEM_SLIDER, kTwkGrabDel,  "  Reaction delay (ms)",
+      "Beat after touching down before the grab, curl and flail start -- room for the natural scorpion flop",
+      nullptr, nullptr, 0.0f, 2000.0f, 50.0f },
+    { OMP_ITEM_SLIDER, kTwkGrabLen,  "  Grab time (ms)",
+      "How long the hands keep clutching the part that hit the ground",
+      nullptr, nullptr, 500.0f, 9900.0f, 250.0f },
+    { OMP_ITEM_SLIDER, kTwkGrabPow,  "  Grab strength (%)",
+      "How hard the hands reach for the hurt",
+      nullptr, nullptr, 0.0f, 300.0f, 10.0f },
+};
+static const OmpPageItem2 kTwkPopItems[] = {
+    { OMP_ITEM_TOGGLE, kTwkPop,       "Pop control scheme",
+      "Crouch as deep as you like on one stick and pop with the other: how deep you are is how "
+      "high you pop. Mirrored for nollie, switch and fakie" },
+    { OMP_ITEM_SLIDER, kTwkPopWin,    "  Trick window (ms)",
+      "How long after the pop your trick flick may arrive. Longer is more forgiving; running out "
+      "pops a plain ollie",
+      nullptr, nullptr, 60.0f, 600.0f, 10.0f },
+    { OMP_ITEM_SLIDER, kTwkPopGate,   "  Crouch starts at (%)",
+      "How far the stick travels before you start crouching. Everything past this point is pop height",
+      nullptr, nullptr, 20.0f, 80.0f, 1.0f },
+    { OMP_ITEM_SLIDER, kTwkPopVisLo,  "  Shallowest crouch",
+      "How low the character sits the moment the crouch takes hold. Raise it if a light pull only "
+      "shuffles the back foot",
+      nullptr, nullptr, 0.0f, 800.0f, 25.0f },
+    { OMP_ITEM_SLIDER, kTwkPopVisHi,  "  Deepest crouch",
+      "How low a fully pulled stick sits. Lower it if you bottom out early, raise it if full stick "
+      "never reaches a full crouch",
+      nullptr, nullptr, 300.0f, 1500.0f, 25.0f },
+    { OMP_ITEM_SLIDER, kTwkPopVisSm,  "  Crouch smoothing (ms)",
+      "How heavily the body follows the stick. Higher is lazier and smoother, 0 tracks your thumb "
+      "exactly",
+      nullptr, nullptr, 0.0f, 400.0f, 10.0f },
+};
 static const OmpPageItem2 kTwkCameraItems[] = {
     { OMP_ITEM_TOGGLE, kTwkCamFollow, "Camera always follows height",
       "The camera tracks your height on every air, not just onto obstacles higher than you" },
@@ -450,7 +585,9 @@ static_assert(sizeof(kTwkRootItems)  / sizeof(kTwkRootItems[0])  <= 13 &&
               sizeof(kTwkGrindItems) / sizeof(kTwkGrindItems[0]) <= 13 &&
               sizeof(kTwkFeetItems)  / sizeof(kTwkFeetItems[0])  <= 13 &&
               sizeof(kTwkCameraItems) / sizeof(kTwkCameraItems[0]) <= 13 &&
-              sizeof(kTwkClothItems)  / sizeof(kTwkClothItems[0])  <= 13,
+              sizeof(kTwkClothItems)  / sizeof(kTwkClothItems[0])  <= 13 &&
+              sizeof(kTwkPopItems)    / sizeof(kTwkPopItems[0])    <= 13 &&
+              sizeof(kTwkPhysItems)   / sizeof(kTwkPhysItems[0])   <= 13,
               "A Session Tweaks page exceeds the engine's visible-row window (14 incl. the Back row "
               "the host appends). Split it into another category page rather than raising this.");
 
@@ -480,24 +617,28 @@ static bool tryRegisterMenu() {
         // this, and losing the in-game page must never cost the F1 section (or vice versa).
         if (!g_pageRegistered) {
             auto regp = (OmpMenuRegisterPage2Fn)GetProcAddress(mods[i], "OmpMenu_RegisterPage2");
-            // The CATEGORY pages go in first: the front page's rows name them by title, and a name
-            // that resolves to nothing leaves its row inert. Only the front page carries the seam's
-            // success flag -- it is the one the pause menu lists.
+            // The FRONT page registers FIRST. Child pages are claimed by TITLE at draw time,
+            // so order never affects the hierarchy -- but the host's page table has a cap, and
+            // if anything is refused it must be a category (one inert row), never the front
+            // page: an unclaimed category spills into the pause-menu root (field-hit when the
+            // 8th category pushed the front page past the old cap of 8).
             if (regp) {
+                if (regp("Session Tweaks", kTwkRootItems,
+                         (int)(sizeof(kTwkRootItems) / sizeof(kTwkRootItems[0])),
+                         &pageSelect, &pageValue, &pageGet, nullptr, nullptr)) {
+                    g_pageRegistered = true;
+                    TwkLog("[tweaks] registered the pause-menu page (the front page + 8 category pages)");
+                }
                 #define TWK_SUBPAGE(title, arr)                     regp(title, arr, (int)(sizeof(arr) / sizeof(arr[0])),                          &pageSelect, &pageValue, &pageGet, nullptr, nullptr)
+                TWK_SUBPAGE("Pop control",    kTwkPopItems);
                 TWK_SUBPAGE("Board & tricks", kTwkBoardItems);
                 TWK_SUBPAGE("Catch & bail",   kTwkCatchItems);
                 TWK_SUBPAGE("Grinds",         kTwkGrindItems);
                 TWK_SUBPAGE("Feet",           kTwkFeetItems);
                 TWK_SUBPAGE("Camera",         kTwkCameraItems);
                 TWK_SUBPAGE("Clothing",       kTwkClothItems);
+                TWK_SUBPAGE("Physical animation", kTwkPhysItems);
                 #undef TWK_SUBPAGE
-                if (regp("Session Tweaks", kTwkRootItems,
-                         (int)(sizeof(kTwkRootItems) / sizeof(kTwkRootItems[0])),
-                         &pageSelect, &pageValue, &pageGet, nullptr, nullptr)) {
-                    g_pageRegistered = true;
-                    TwkLog("[tweaks] registered the pause-menu page (5 category pages + the front page)");
-                }
             }
         }
         if (g_menuRegistered && g_pageRegistered) return true;
@@ -514,6 +655,8 @@ void Tweaks_PumpFrame() {
     FootPlace_PumpFrame();
     FootSteer_PumpFrame();           // liveness only: it applies from inside foot_place's hook
     GrindPop_PumpFrame();            // grind-exit pop records: names resolved and logged out here
+    PopProbe_PumpFrame();            // AFTER grind_pop: its drain feeds PopProbe_OnJump first
+    BodyFeel_PumpFrame();            // breathes the physical-animation stiffness (after pop_probe: reads its crouch depth)
     if (g_dirty && (LONGLONG)GetTickCount64() - g_dirtyMs > 2000) {
         InterlockedExchange(&g_dirty, 0);
         saveSettings();
@@ -567,6 +710,7 @@ public:
         GrindPop_Install();
         CameraHeight_Install();
         RunOut_Install();
+        PopProbe_Install();
         // Registration is attempted once now (host usually loaded already; mods.txt order) and
         // re-offered from the frame pump until the host appears, or forever if it never does:
         // without SessionOpenMP this mod still works fully, configured by the ini alone.

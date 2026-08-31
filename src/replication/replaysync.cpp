@@ -98,6 +98,14 @@ static const int kChunkData  = 900;                  // + 13 B header stays unde
 static const int kOutMax     = 4;                    // concurrent requesters (same-session peers)
 static const int kResendCap  = 512;
 struct OutXfer {
+    // ADAPTIVE WINDOW. Tuning::windowChunks is the floor and the starting point; each time the
+    // requester's reported count crosses another full window with no NAK in between, the window
+    // grows half again (cap 128 = ~116 KB in flight); a NAK or a stall halves it back toward the
+    // floor. Self-clocked throughout -- in-flight bytes stay bounded, so the open-loop flooding the
+    // fixed window was built against cannot return; the fixed window's cost was the OTHER direction,
+    // measured at 42 KB/s over EOS with the sender mostly idle waiting for permission.
+    int      dynWindow = 0;      // 0 = take the floor from Tuning on first use
+    uint32_t grewAt = 0;         // ackedGot when the window last changed
     uint32_t tickBlocked = 0;    // ticks with chunks left but the window shut (waiting on an ACK)
     uint32_t tickSent = 0;       // ticks that actually pushed at least one chunk
     uint64_t firstSendUs = 0;
@@ -133,10 +141,11 @@ static void outFree(OutXfer& x) {
         char m[220];
         snprintf(m, sizeof(m),
                  "[sync] sent %u/%u chunk(s) in %.1f s (%.0f KB/s) -- ticks: %u sending, %u"
-                 " window-blocked (%.0f%% waiting on ACKs)",
+                 " window-blocked (%.0f%% waiting on ACKs), window ended at %d",
                  x.swept, x.chunkCount, secs, secs > 0.01 ? kb / secs : 0.0,
                  x.tickSent, x.tickBlocked,
-                 (x.tickSent + x.tickBlocked) ? 100.0 * x.tickBlocked / (x.tickSent + x.tickBlocked) : 0.0);
+                 (x.tickSent + x.tickBlocked) ? 100.0 * x.tickBlocked / (x.tickSent + x.tickBlocked) : 0.0,
+                 x.dynWindow);
         g_outLog(m);
     }
     delete[] x.buf; x = OutXfer{};
@@ -370,6 +379,14 @@ void OnPacket(int peerIdx, const uint8_t* d, int len, uint64_t nowUs, void (*log
                 if (idx < o.chunkCount) { o.resendQ[(o.rHead + o.rCount) % kResendCap] = idx; o.rCount++; }
             }
             o.lastActUs = nowUs; o.heardBack = true;   // they have the header: NAKs name chunks
+            // Loss on the path: half the window back toward the floor. The resends themselves bypass
+            // the window (the receiver asked, so it has room), but the SWEEP slows until the path
+            // proves itself clean for another full window.
+            if (o.dynWindow > g_tun.windowChunks) {
+                o.dynWindow /= 2;
+                if (o.dynWindow < g_tun.windowChunks) o.dynWindow = g_tun.windowChunks;
+                o.grewAt = o.ackedGot;
+            }
         }
         break;
     }
@@ -452,12 +469,18 @@ void Tick(uint64_t nowUs, void (*logf)(const char*)) {
         // window would ratchet shut on every recovered loss. SIGNED and clamped: a quiet-period NAK
         // names every missing chunk including not-yet-swept ones, so resends can push `got` PAST
         // `swept` -- unsigned math would wrap that into a permanently shut window.
+        if (o.dynWindow <= 0) { o.dynWindow = g_tun.windowChunks; o.grewAt = o.ackedGot; }
+        if (o.ackedGot >= o.grewAt + (uint32_t)o.dynWindow && o.dynWindow < 128) {
+            o.dynWindow = o.dynWindow * 3 / 2;
+            if (o.dynWindow > 128) o.dynWindow = 128;
+            o.grewAt = o.ackedGot;
+        }
         const uint32_t sentBefore = o.swept;
         bool blocked = false;
         while (budget > 0 && o.sweep < o.chunkCount) {
             int outstanding = (int)o.swept - (int)o.ackedGot;
             if (outstanding < 0) outstanding = 0;
-            if (outstanding >= g_tun.windowChunks) { blocked = true; break; }
+            if (outstanding >= o.dynWindow) { blocked = true; break; }
             sendChunk(o, (uint16_t)o.sweep++); o.swept++; budget--;
         }
         if (o.swept != sentBefore) { o.tickSent++; if (!o.firstSendUs) o.firstSendUs = nowUs; }

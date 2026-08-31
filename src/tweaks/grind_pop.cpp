@@ -53,6 +53,7 @@
 #include "grind_pop.h"
 #include "catch_tweaks.h"    // CatchTweaks_Skater() -- remote players keep vanilla
 #include "tweaks_mod.h"
+#include "pop_probe.h"      // PopProbe_OnJump -- fed from this module's drain
 #include <cmath>
 #include <cctype>
 #include "MinHook.h"
@@ -263,6 +264,9 @@ static bool NameOfFName(const void* fnamePtr, char* out, int cap) {
         return k > 0;
     } __except (EXCEPTION_EXECUTE_HANDLER) { out[0] = 0; return false; }
 }
+bool GrindPop_FNameToString(const void* fname, char* out, int cap) {
+    return NameOfFName(fname, out, cap);
+}
 // A UObject's own name, for the trick definition asset.
 static bool NameOfObject(const void* obj, char* out, int cap) {
     out[0] = 0;
@@ -318,7 +322,13 @@ enum { MC_OWNER_SKATER_GP = 0x340 };
 static bool grindPopIsOurs(void* p) {
     void* const mine = CatchTweaks_Skater();
     if (!mine || !p) return true;
-    return (p == mine) || (twkP(p, MC_OWNER_SKATER_GP) == mine);
+    // Three identities, because the two hooks are handed different objects: the skater itself, the
+    // pitch sub-object (skater at +0x340), and the MOVEMENT COMPONENT -- whose skater is at
+    // MC_SKATER (+0xb28), the offset this file already documents as measured. The +0x340 read alone
+    // rejected every JumpForTrick call, so that hook's ring recorded NOTHING, ever: no GRIND EXIT or
+    // flat/other line has appeared in any session. Everything this probe reported to date came from
+    // the pitch records; the delay/height half was silently dark.
+    return (p == mine) || (twkP(p, MC_OWNER_SKATER_GP) == mine) || (twkP(p, MC_SKATER) == mine);
 }
 
 static char hkJumpForTrick(void* mc, double a2, double a3, double a4) {
@@ -544,6 +554,9 @@ void GrindPop_PumpFrame() {
                                                          : "other";
         TwkLog("[gpop] pitch mode %d state %d (%s%s)  extra=%.2f target=%.2f",
                p->mode, p->state, what, grind ? " -- ON A GRIND" : "", p->extra, p->target);
+        // The probe's second feed: mode START fires exactly once per trick, so the crank correlation
+        // still gets its per-trick line even if the JumpForTrick ring is not recording.
+        if (p->mode == PITCH_MODE_START) PopProbe_OnArm(p->trickPopRatio);
         if (p->added != 0.0f)
             TwkLog("[gpop]    added %.2f deg of your input to the grind-exit target", p->added);
         if (p->swingApplied)
@@ -584,6 +597,11 @@ void GrindPop_PumpFrame() {
             RememberGrind(r->grindDef, grind);
 
             const bool onGrind = (r->grindDef != nullptr);
+            // The pop probe correlates every jump with its stick/crank history. Fed from here --
+            // names resolved, values read, outside the game's callstack -- and BEFORE the flat-log
+            // gate below, which only decides whether THIS module prints its own flat lines.
+            PopProbe_OnJump(trick, onGrind ? 1 : 0, r->argHeight, r->argPopRatio, r->outGrindRatio,
+                            r->trickPopRatio);
             if (!onGrind && !g_flat) continue;
 
             if (onGrind) {
@@ -621,8 +639,9 @@ void GrindPop_PumpFrame() {
                 // The baseline. A flat pop should show delay 0 (the jump values are set immediately)
                 // and a live popRatio -- the two things a grind exit does not get.
                 TwkLog("[gpop] flat/other  trick='%s'  popRatio=%.3f  TrickPopRatio=%.3f  popHeight=%.1f  "
-                       "delay=%.4fs  grindRatio=%.3f",
-                       trick, r->argPopRatio, r->trickPopRatio, r->argHeight, r->outDelay, r->outGrindRatio);
+                       "delay=%.4fs  grindRatio=%.3f  crankMin=%.3fs",
+                       trick, r->argPopRatio, r->trickPopRatio, r->argHeight, r->outDelay,
+                       r->outGrindRatio, r->crankMin);
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             if (InterlockedIncrement(&g_faults) == 1) TwkLog("[gpop] caught fatal formatting a record -> probe off");

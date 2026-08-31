@@ -56,6 +56,7 @@
 #include "foot_steer.h"       // shares this hook: only one detour may exist on UpdateFootAnchors
 #include "catch_tweaks.h"     // CatchTweaks_Skater() -- the live skater, without a hook of our own
 #include "catch_level.h"      // CatchLevel_PostPhysAssert() -- the post-physics level re-assert
+#include "body_feel.h"       // BodyFeel_PostPhysApply() -- per-body blend-weight scaling
 #include <cmath>
 #include "MinHook.h"
 
@@ -144,6 +145,7 @@ static void hkUpdateFootAnchors(void* self, double dt, void* a, void* b) {
     // update, after the physics pass -- the one phase where a pitch write beats the game's per-frame
     // trajectory re-arm to the renderer. Our skater only; the function gates itself further.
     if (mine) CatchLevel_PostPhysAssert();
+    if (mine) BodyFeel_PostPhysApply();     // per-body physics-blend scaling (same surviving write point)
     unsigned char savedAA = 0;
     bool suppressed = false;
     if (mine && g_ok && g_on && self && SuppressWanted(self)) {

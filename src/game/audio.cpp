@@ -63,6 +63,7 @@ struct Live {
     uint8_t    nParam = 0;
     AudioParam param[kAudioMaxParams];
     uint64_t   touchUs = 0;
+    uint64_t   namedUs = 0;    // when this loop last travelled WITH its names (see Gather)
 };
 static const int kLive = 8;
 static Live      g_live[kLive];
@@ -554,6 +555,8 @@ bool Install(void (*logf)(const char*)) {
 // =====================================================================================================
 // publish
 // =====================================================================================================
+void ForceNames() { for (auto& l : g_live) l.namedUs = 0; }
+
 void Gather(State& s, uint64_t now) {
     s.nLoops = 0; s.nEvents = 0;
     if (!g_tun.enabled) return;
@@ -570,6 +573,12 @@ void Gather(State& s, uint64_t now) {
         AudioLoop& w = s.loops[s.nLoops++];
         w = AudioLoop{};
         w.slot = l.slot; w.attach = l.attach; w.nParam = l.nParam;
+        // Names ride the FIRST publish of a loop and a ~1 s refresh; every packet between carries
+        // values only (the receiver's cache supplies the strings). The refresh is what makes the
+        // scheme loss-proof and joiner-proof: worst case a loop is silent for under a second.
+        if (!l.namedUs || (now > l.namedUs && now - l.namedUs > 1000000ull)) {
+            w.sendNames = 1; l.namedUs = now;
+        } else w.sendNames = 0;
         strncpy_s(w.cue, l.cue, _TRUNCATE);
         for (int c = 0; c < 3; c++) w.rel[c] = l.rel[c];
         w.vol = l.vol; w.pitch = l.pitch;

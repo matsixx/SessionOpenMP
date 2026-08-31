@@ -35,6 +35,12 @@ bool ScoopSpeed_FlickMeasure(bool rightStick, float windowSec, float* outSpeed, 
 // not running or the read came back implausible -- a consumer turning this into a position must be
 // able to tell "centred" from "unknown".
 bool ScoopSpeed_StickRaw(bool rightStick, float* x, float* y);
+// The FlipTricksHandler, as last seen by this module's GetBoardRotationSpeedMultiplier hook -- which
+// runs for every trick, plain ollies included, and whose `this` IS the handler. Cached because the
+// handler is an embedded sub-object rather than a pointer the skater carries: a scan of the skater's
+// pointer slots cannot find it, and this hook already holds it in hand. Null until the first trick
+// of a session; consumers must re-verify identity (its +0x08 back-points to the skater) before use.
+void* ScoopSpeed_FlipHandler();
 // Log the raw magnitude samples behind the last `windowSec`.
 void ScoopSpeed_DumpFlick(bool rightStick, float windowSec);
 

@@ -474,3 +474,12 @@ void FlipSpeed_DrawMenu(const OmpMenuApi* api) {
     if (api->Checkbox("Log every flip", &lg)) { g_log = lg ? 1 : 0; TwkMarkDirty(); }
     api->Unindent();
 }
+// See the header note. SEH-guarded: the resolvers are game code handed a game pointer.
+bool FlipSpeed_Stance(void* skater, bool* goofy, bool* switchStance) {
+    if (!skater || !g_isGoofy || !g_isSwitch) return false;
+    __try {
+        if (goofy)        *goofy        = g_isGoofy(skater);
+        if (switchStance) *switchStance = g_isSwitch(skater);
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}

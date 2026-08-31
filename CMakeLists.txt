@@ -226,6 +226,8 @@ if(EXISTS "${UE4SS_LIB}")
             src/tweaks/foot_place.cpp
             src/tweaks/foot_steer.cpp
             src/tweaks/grind_pop.cpp
+            src/tweaks/pop_probe.cpp
+            src/tweaks/body_feel.cpp
             src/tweaks/camera_height.cpp
             ${MINHOOK_SRC}/src/buffer.c
             ${MINHOOK_SRC}/src/hook.c

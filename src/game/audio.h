@@ -101,6 +101,10 @@ void SetLocalParts(void* pawn, void* board);
 // Fill the publish snapshot's audio section: the loops still playing, plus any one-shots fired since
 // the last call (repeated across the next few packets by the redundancy window).
 void Gather(repl::State& s, uint64_t nowUs);
+// Make every live loop carry its NAMES on the next Gather. Called when a peer joins or reconnects:
+// the interning refresh timer is per-loop and per-process, so a new receiver could otherwise wait up
+// to a second -- or, mid-trick, resolve against a cache that was never taught.
+void ForceNames();
 
 // ---- receiver side ----------------------------------------------------------------------------------
 // Every playback runs with an "this is a replay" flag set, so our own capture hooks ignore the sounds

@@ -170,7 +170,10 @@ struct GuestPage {
 };
 // 8: splitting a long page into categories costs one registration per category, and the parent
 // counts too. The pause menu only ever lists the pages nothing else opens.
-static const int kMaxGuestPages = 8;
+// 16: SessionTweaks alone registers 9 (8 category pages + its front page). A refused
+// registration is worse than it looks -- an unregistered FRONT page leaves every category
+// page unclaimed, and they all spill into the pause-menu root as loose rows.
+static const int kMaxGuestPages = 16;
 static GuestPage g_guests[kMaxGuestPages];
 static int       g_nGuests = 0;
 #ifdef _WIN32

@@ -32,3 +32,6 @@ float GrindPop_SwingBlend();       void GrindPop_SetSwingBlend(float pct);
 // only one module may resolve it). `fnamePtr` points AT the FName field, not at the owning object.
 // False if the resolver is unavailable or the read failed -- callers must have a fallback.
 bool GrindPop_NameOfFName(const void* fnamePtr, char* out, int cap);
+// FName -> ascii, cached; the module's proven resolver, exported for body_feel's
+// bone-name classification. False when the name pool helper is unresolved.
+bool GrindPop_FNameToString(const void* fname, char* out, int cap);

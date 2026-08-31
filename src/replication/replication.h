@@ -57,6 +57,14 @@ struct AudioLoop {                     // a sound the sender still has playing
     uint8_t    slot   = 0;             // the sender's own handle id -- stable while the sound lives
     uint8_t    attach = kAudWorld;
     uint8_t    nParam = 0;
+    // NAME INTERNING. Cue and parameter names are the bulk of a loop's wire cost -- string data the
+    // receiver has already seen, resent 60 times a second for as long as the sound plays. The sender
+    // sets this on a loop's FIRST appearance, on any name change, and on a ~1 s refresh; every other
+    // packet carries values only and the receiver fills the names from its per-peer cache (see
+    // AudioNameCache). A cache miss -- a joiner mid-loop, or every packet since the named one lost --
+    // leaves the cue empty, and an empty cue is already the "skip this loop" signal downstream, so
+    // the sound is simply silent until the next refresh lands. Never wrong, at worst briefly quiet.
+    uint8_t    sendNames = 1;
     char       cue[kAudioCueLen] = {};
     float      rel[3] = {};
     float      vol = 1.f, pitch = 1.f;
@@ -143,6 +151,16 @@ struct State {
     // BreakBoard_Internal takes the value as its argument.
     uint8_t  brokenState = 0;
     uint16_t animLen = 0; uint8_t anim[320] = {};
+    // SessionTweaks' analog crouch: the CrankIn descent clock, in seconds, while the sender is
+    // scrubbing it to the stick (see the crouch-visual sync). Negative = not scrubbing -- either no
+    // SessionTweaks on the sender or a plain full-depth crank -- and the proxy plays the vanilla
+    // descent. Travels only while crankOn, as a u16 with a sentinel: two bytes, and only when cranked.
+    float crankClock = -1.f;
+    // Trick and grind names resend every frame for the length of the trick. The sender omits them on
+    // packets where the name is unchanged AND a recent packet carried it in full (every 4th packet
+    // refreshes, so a loss window is ~66 ms at 60 Hz); the wire marks the omission with a length
+    // sentinel and the receiver restores the name from its cache. 1 = this packet carries the name.
+    uint8_t trickNamed = 1, grindNamed = 1;
 
     // ==== AUDIO ======================================================================================
     // Captured at the game's own sound-spawn funnel, so every field here is already FULLY DETERMINED
@@ -306,6 +324,17 @@ bool IsChatPacket(const uint8_t* data, int len);
 struct SkelPrint {
     uint8_t  n = 0;
     uint32_t hash[kPoseMaxBones] = {};
+};
+// The receiver's per-peer name cache: fills in what an interned packet omitted. One per peer,
+// owned by the session; Resolve() runs right after Unpack, BEFORE the state is pushed anywhere, so
+// everything downstream still sees complete states and nothing else changes.
+struct AudioNameCache {
+    struct Ent { uint8_t slot = 0; uint8_t used = 0; char cue[kAudioCueLen] = {};
+                 uint8_t nParam = 0; char pname[kAudioMaxParams][kAudioParamLen] = {}; };
+    Ent  ent[8];                       // slots are sender handles, not indices -- keyed, not addressed
+    char trick[40] = {};               // the last full trick/grind names seen from this peer
+    char grind[40] = {};
+    void Resolve(State& s);            // fill omissions from the cache; learn from named entries
 };
 int  PackSkeleton(const SkelPrint& s, uint8_t* out, int cap);
 bool UnpackSkeleton(const uint8_t* data, int len, SkelPrint& out);

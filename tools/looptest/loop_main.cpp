@@ -66,20 +66,23 @@ static bool codecCheck() {
     s.bodyRotOk = 1; memcpy(s.bodyQuat, q2, 16);
     s.meshOk = 1;    memcpy(s.meshQuat, q3, 16);
     s.relOk = 1; s.relPos[0] = -12.5f; s.relPos[1] = 3.75f; s.relPos[2] = -91.0f;
+    // THE ORIGINAL TRAP, RESTORED AND VINDICATED: feet flagged world but carrying small,
+    // mesh-local-scale values. A rel-to-bodyPos encoding keyed off that flag shipped twice and broke
+    // legs in the field twice -- the flag does not tell the truth about the space. The encoding is
+    // now SELF-DESCRIBING (rel / abs-h16 / f32 chosen per frame from the measured values), and this
+    // data forces the abs-h16 mode: values far from bodyPos yet small, exactly what the anim
+    // instance actually produces.
     s.feetOk = 1; s.feetWorld = 1;
-    // The feet are deliberately NOWHERE NEAR bodyPos -- small, mesh-local-scale values. Feet placed
-    // next to the body would share the codec's world-space assumption, letting a rel-to-body encoding
-    // ship that clamps real (local) sockets and extends both legs 10 m. A gate must feed data that
-    // VIOLATES the codec's assumptions, not data shaped by them.
     for (int i = 0; i < 3; i++) {
         s.lFootPos[i] = 34.25f - 20.f * i;  s.rFootPos[i] = -12.5f + 15.f * i;
         s.lFootRot[i] = -179.5f + 10.f * i; s.rFootRot[i] = 44.25f * (i + 1);
     }
-    // Hand IK targets. Same trap as the feet: deliberately NOT near bodyPos, so a future "encode
-    // relative to the body" optimisation is caught by this gate instead of by a player's arms.
+    // Hands force the REL mode: genuinely world-scale values at limb range off bodyPos. Both h16
+    // modes are thereby exercised; the f32 escape is exercised by the fuzz below being unable to
+    // produce a mode > 2 (Unpack rejects it).
     s.handOk = 1; s.handWorld = 1;
     for (int i = 0; i < 3; i++) {
-        s.lHandPos[i] = -55.5f + 11.f * i;  s.rHandPos[i] = 27.75f - 9.f * i;
+        s.lHandPos[i] = s.bodyPos[i] - 55.5f + 11.f * i;  s.rHandPos[i] = s.bodyPos[i] + 27.75f - 9.f * i;
         s.lHandRot[i] = 91.25f - 40.f * i;  s.rHandRot[i] = -133.5f + 22.f * i;
     }
     s.onBoard = 1; s.grounded = 1; s.bailing = 0;
@@ -148,7 +151,11 @@ static bool codecCheck() {
     const int n = Pack(s, 123456789ull, pkt, sizeof(pkt));
     if (n <= 0) { printf("  codec: Pack failed\n"); return false; }
     State o; uint64_t su = 0;
-    if (!Unpack(pkt, n, o, &su) || su != 123456789ull) { printf("  codec: Unpack failed\n"); return false; }
+    if (!Unpack(pkt, n, o, &su)) { printf("  codec: Unpack failed\n"); return false; }
+    // The timestamp travels in 0.25 ms units; the promise is +/-250 us, far inside the ~16 ms
+    // snapshot spacing the playback clock interpolates across.
+    if (su > 123456789ull || 123456789ull - su > 250) {
+        printf("  codec: senderUs %llu not within 250us of sent\n", (unsigned long long)su); return false; }
     int bad = 0;
     auto near1 = [&](float a, float b, float tol, const char* what) {
         if (fabsf(a - b) > tol) { printf("  codec: %s %.6f != %.6f (tol %.4f)\n", what, a, b, tol); bad++; } };
@@ -159,12 +166,12 @@ static bool codecCheck() {
         near1(o.bodyPos[i], s.bodyPos[i], 0.0f, "bodyPos");                    // the anchor is exact
         near1(o.deckPos[i], s.deckPos[i], 0.15f, "deckPos");
         near1(o.relPos[i], s.relPos[i], 0.1f, "relPos");
-        near1(o.lFootPos[i], s.lFootPos[i], 0.0f, "lFootPos");    // absolute f32: EXACT, any space
-        near1(o.rFootPos[i], s.rFootPos[i], 0.0f, "rFootPos");
+        near1(o.lFootPos[i], s.lFootPos[i], 0.1f, "lFootPos");    // abs-h16 mode: small values as-is
+        near1(o.rFootPos[i], s.rFootPos[i], 0.1f, "rFootPos");
         near1(o.lFootRot[i], s.lFootRot[i], 0.25f, "lFootRot");
         near1(o.rFootRot[i], s.rFootRot[i], 0.25f, "rFootRot");
-        near1(o.lHandPos[i], s.lHandPos[i], 0.0f, "lHandPos");    // absolute f32: EXACT, any space
-        near1(o.rHandPos[i], s.rHandPos[i], 0.0f, "rHandPos");
+        near1(o.lHandPos[i], s.lHandPos[i], 0.15f, "lHandPos");   // rel mode: h16 offset off bodyPos
+        near1(o.rHandPos[i], s.rHandPos[i], 0.15f, "rHandPos");
         near1(o.lHandRot[i], s.lHandRot[i], 0.25f, "lHandRot");
         near1(o.rHandRot[i], s.rHandRot[i], 0.25f, "rHandRot");
     }
@@ -1346,6 +1353,70 @@ static bool skelPrintCheck() {
     return ok;
 }
 
+// ---- NAME INTERNING ----------------------------------------------------------------------------
+// Loop cue/param names and trick names now travel only on change + refresh; every packet between
+// relies on the receiver's AudioNameCache. A bug here is SILENT audio or a missing trick def in the
+// field, so the sequence is proven here: named packet teaches, nameless packet restores, and a
+// nameless packet with NO cache (the joiner) yields an empty cue -- the skip signal, never garbage.
+static bool internCheck() {
+    printf("\n-- name interning (loops + trick names across packets) --\n");
+    using namespace omp::repl;
+    bool ok = true;
+    auto mk = [](State& s, bool names) {
+        s = State{};
+        s.bodyPosOk = 1; s.bodyPos[0] = 100.f; s.bodyPos[1] = 200.f; s.bodyPos[2] = 50.f;
+        s.deckPos[0] = 110.f; s.deckPos[1] = 195.f; s.deckPos[2] = 40.f;
+        const float q[4] = { 0.f, 0.f, 0.f, 1.f };
+        memcpy(s.deckQuat, q, 16);
+        s.onBoard = 1; s.grounded = 1; s.pushSpeed = 1.f;
+        s.nLoops = 2;
+        for (int i = 0; i < 2; i++) {
+            AudioLoop& l = s.loops[i];
+            l.slot = (uint8_t)(40 + i); l.attach = 1; l.sendNames = names ? 1 : 0;
+            strcpy_s(l.cue, i ? "SCU_Onboard_WheelSpinning_Looping" : "SCU_IdleRolling");
+            l.vol = 0.5f + 0.25f * i; l.pitch = 1.f;
+            l.nParam = 1;
+            strcpy_s(l.param[0].name, "SurfaceTypeIndex");
+            l.param[0].value = (int16_t)(3 + i);
+        }
+        strcpy_s(s.trickName, "TRICK_RGS_Treflip");
+        s.trickNamed = names ? 1 : 0;
+    };
+    uint8_t p1[1024], p2[1024];
+    State a; mk(a, true);
+    State b; mk(b, false);
+    const int n1 = Pack(a, 1000ull, p1, sizeof(p1));
+    const int n2 = Pack(b, 2000ull, p2, sizeof(p2));
+    if (n1 <= 0 || n2 <= 0) { printf("  pack failed\n"); return false; }
+    printf("  named packet %d B, interned packet %d B (%d B saved per packet)\n", n1, n2, n1 - n2);
+    if (n2 >= n1) { printf("  interning saved nothing   FAIL\n"); ok = false; }
+
+    State ra, rb; uint64_t su = 0;
+    if (!Unpack(p1, n1, ra, &su) || !Unpack(p2, n2, rb, &su)) { printf("  unpack failed\n"); return false; }
+    AudioNameCache cache;
+    cache.Resolve(ra);                                   // teaches
+    cache.Resolve(rb);                                   // restores
+    bool good = true;
+    for (int i = 0; i < 2; i++) {
+        if (strcmp(rb.loops[i].cue, a.loops[i].cue)) good = false;
+        if (strcmp(rb.loops[i].param[0].name, a.loops[i].param[0].name)) good = false;
+        if (rb.loops[i].param[0].value != a.loops[i].param[0].value) good = false;
+    }
+    if (strcmp(rb.trickName, a.trickName)) good = false;
+    printf("  cache restore (cues, param names, values, trick)   %s\n", good ? "PASS" : "FAIL");
+    ok = ok && good;
+
+    // The joiner: nameless packet, empty cache. Cues must stay EMPTY (the skip signal), values intact.
+    State rj; AudioNameCache fresh;
+    if (!Unpack(p2, n2, rj, &su)) { printf("  unpack failed\n"); return false; }
+    fresh.Resolve(rj);
+    const bool joiner = (rj.loops[0].cue[0] == 0) && (rj.loops[1].cue[0] == 0) &&
+                        rj.loops[0].param[0].value == a.loops[0].param[0].value;
+    printf("  joiner with no cache: cues empty, values intact    %s\n", joiner ? "PASS" : "FAIL");
+    ok = ok && joiner;
+    return ok;
+}
+
 int main(int argc, char**) {
     const bool dbg = argc > 1;                      // any arg = per-second clock internals, clean profile
     printf("SessionOpenMP replication loop test\n");
@@ -1358,6 +1429,7 @@ int main(int argc, char**) {
     if (!dropSyncCheck()) { printf("\nDROP SYNC FAIL\n"); return 1; }
     if (!poseSliceCheck()) { printf("\nPOSE SLICE FAIL\n"); return 1; }
     if (!skelPrintCheck()) { printf("\nSKEL PRINT FAIL\n"); return 1; }
+    if (!internCheck()) { printf("\nINTERN FAIL\n"); return 1; }
     printf("%-13s %8s %8s %8s %6s %7s %7s %7s %7s\n",
            "profile", "outEwma", "outMax", "delay", "alpha", "starve", "resync", "extrap", "verdict");
     bool allPass = true;

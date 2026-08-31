@@ -129,6 +129,7 @@ bool CaptureFromPawn(void* pawn, repl::State& s);
 // could not be stored (no free slot), and the caller MUST retry rather than marking the peer fed:
 // a fingerprint normally arrives before this mesh has ever carried a pose.
 bool SetPeerSkeleton(void* mesh, const uint32_t* hashes, int n);
+void SetLogger(void (*logf)(const char*));   // for the throttled stale-pose line; optional
 void Note(void* mesh, const repl::State& s, uint64_t nowMs);
 void Forget(void* mesh);
 // Called from the FinalizeBoneTransform pre-hook for EVERY skeletal mesh in the game; cheap and

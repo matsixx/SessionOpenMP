@@ -46,6 +46,7 @@
 #include "catch_level.h"
 #include "foot_place.h"
 #include "foot_steer.h"      // the filtered steer, so a driven board agrees with the feet
+#include "grind_pop.h"       // FName -> string, to name the key a press arrived on
 #include <cmath>
 
 static bool CatchIsGoofy();   // defined with the catch-orient hook, used by the flick log above it
@@ -119,6 +120,7 @@ enum {
     MC_CATCH_TO_BOARD_DELAY = 0x554,   // _catchFeetToOnSkateboardDelay
     MC_BOARD_FLIP_TARGET    = 0x778,   // _boardFlipTargetAngle
     MC_BOARD_FLIP_CUR       = 0x77c,   // _boardFlipCurrentAngle
+    AN_ON_BOARD             = 0x300,   // USkaterAnimInstance::IsOnBoard -- riding, not walking
     AN_IS_SWITCH            = 0x303,   // USkaterAnimInstance::IsSkatingSwitch -- front foot swaps
     AN_IS_LANDING           = 0x5fd,   // USkaterAnimInstance::IsLanding -- "the board reaches the
                                        // ground", which is the release the second-foot hold wants
@@ -190,6 +192,79 @@ static int   g_catchDiag   = 0;       // log every catch decision (verbose; for 
 // hold). A catch orient is a single-stick gesture, so the game refuses it outright when both sticks
 // are deflected; this presents the held one as centred for the duration of the decision only.
 static int   g_catchTwoStick = 1;
+
+// ---- CLICK A STICK TO CATCH ----------------------------------------------------------------
+// Press a thumbstick to catch instead of flicking for it. The press does NOT reach into the catch
+// system: it stands in for the flick the game is already looking for, by presenting the mapped
+// stick as freshly deflected for the ONE call that decides. Everything downstream -- which foot
+// catches, the fresh-flick veto, the darkslide mask, the pre-catch angle window -- then behaves
+// exactly as it does for a real flick, and every other setting on this page still applies.
+//
+// The synthetic push is deliberately SMALL, just past the game's own deadzone: the orient's pitch
+// and yaw ratios come from how far the stick is pushed, so a gentle push reads as a level catch
+// rather than a steered one.
+//
+// The press is swallowed ONLY while on the board, and only when the catch path is actually hooked
+// -- blocking somebody's button without being able to deliver the catch it was blocked for is the
+// one outcome worth ruling out. Off the board it is handed straight to the game.
+static int   g_clickCatch   = 0;      // CatchClickToCatch -- opt-in: it rebinds a button
+static float g_clickMargin  = 0.15f;  // how far past the deadzone the synthetic push goes
+static float g_clickDirX    = 0.0f;   // the direction of that push, in stick space
+static float g_clickDirY    = -1.0f;
+static int   g_clickHoldMs  = 250;    // a press that finds no air this soon simply lapses
+static volatile long g_clickArmed = 0;   // 1 = left stick pressed, 2 = right
+static int   g_clickFrames  = 8;      // decisions a press holds the stick out for -- see below
+static int   g_clickHold    = 0;      // how many of those are left
+static int   g_clickWhich   = 0;      // and which stick they belong to
+// WHICH WAY THE GAME WANTS THE STICK PUSHED is not in the orient database -- those entries carry
+// the resulting pose (yaw, pitch, board offsets) and the state, not the input that selects them.
+// So the press SWEEPS: each held decision pushes a different compass direction at a near-full
+// deflection, with the edge tracker cleared each time so every one gets a fair test, and the
+// verdict is logged beside the direction that produced it. One press tries all eight. Once the
+// log names a direction that returns non-zero, this goes off and that direction becomes the push.
+static int   g_clickSweep   = 1;
+static float g_clickSweepMag = 0.9f;  // a real flick is a big movement, not a nudge
+static const float kClickDirs[8][2] = {
+    {  0.0f, -1.0f }, {  0.0f,  1.0f }, { -1.0f,  0.0f }, {  1.0f,  0.0f },
+    { -0.707f, -0.707f }, {  0.707f, -0.707f }, { -0.707f,  0.707f }, {  0.707f,  0.707f },
+};
+static float g_clickDirNow[2] = { 0.0f, 0.0f };   // what this decision is being handed
+static int   g_clickStepNow = -1;
+// FORCING THE ORIENT AT ITS SETTER -- the route the stick injection should have been all along.
+// Feeding a synthetic deflection into the decision could never be verified: the sweep proved the
+// value being read back was not a per-call verdict at all (all eight directions returned the same
+// number within one press, 0 or 2 -- it is the CURRENT catch state, not a decision). This module
+// already rewrites the catch state at ASkaterCharacterBase::SetCatchOrient for the flicked-foot
+// fix, which rides the game's own call and so cannot be lost to ordering. A press turns that call's
+// state 0 into a real catch state for a moment, and if the game does not call the setter at all
+// while idle, the pump drives it instead.
+static int      g_clickForce      = 1;      // CatchClickForceOrient
+static int      g_clickInject     = 0;      // CatchClickInject -- the old stick route, off
+static int      g_clickForceMs    = 250;    // how long a press keeps forcing
+static LONGLONG g_clickForceUntil = 0;
+static int      g_clickForceState = 0;      // 1 = left foot, 2 = right
+static long     g_clickSetterSeen = 0;      // did the game call the setter this frame
+static LONGLONG      g_clickQpc   = 0;
+static long          g_uiClickCatches = 0;
+// A SELF-LIMITING PROBE, live while the option is on and spent after this many lines. Which half
+// of the feature is failing is not guessable from outside: either the presses never reach the hook
+// (the game reads the pad somewhere else), or they reach it under names we do not match, or they
+// match and the board test rejects them, or the press arms and no air ever spends it. One line per
+// key event names all four.
+static long g_clickProbe = 0;         // CatchClickProbe -- lines to log, for naming a new pad
+// WHICH KEYS COUNT AS A STICK CLICK. Not a constant, because a pad can enumerate TWICE: the field
+// log shows every press arriving under BOTH a Gamepad_* name and a GenericUSBController_* one. Only
+// swallowing one of them would leave the other to fire the bound action anyway, so each stick gets
+// two name slots, and any pad can be named from the probe lines without a code change.
+static char g_clickKeyL [64] = "Gamepad_LeftThumbstick";
+// The pad's OTHER name for the same click. Correlated from the probe, same millisecond:
+// Gamepad_LeftThumbstick fires with GenericUSBController_Button11 and the right one with
+// Button12 -- the standard DirectInput ordering (1-4 face, 5-6 shoulders, 7-8 triggers, 9 select,
+// 10 start, 11 L3, 12 R3). Both copies have to be swallowed or the bound action still fires off
+// the one we let through. Any pad that disagrees can name its own in the ini.
+static char g_clickKeyL2[64] = "GenericUSBController_Button11";
+static char g_clickKeyR [64] = "Gamepad_RightThumbstick";
+static char g_clickKeyR2[64] = "GenericUSBController_Button12";
 // How many further calls the held stick stays masked once a catch verdict has been produced.
 // MEASURED WHY: with the mask on, the decision returns the RIGHT foot (out5=1, front) -- but
 // _Default only writes a verdict, and the dispatcher engages the catch after it returns. Restoring
@@ -293,6 +368,14 @@ static int   g_anyRevDeg    = 60;     // CatchAnyRevDeg -- how sideways a catch 
 // (forcing a CatchRatio kills the catch outright -- measured). Hands over to the game's align at
 // 0.9 with ~nothing left to do.
 static int   g_footLevel    = 1;      // CatchFootLevelsBoard
+// CatchPlantFix: bug repair, always on (menu policy: no row, ini kill-switch). A STOPPED board
+// must not owe rotation: each foot's CatchRatio is computed against _boardFlipTargetAngle, so
+// any path that halts the deck while the target still exceeds the current angle freezes the
+// ratio partway -- which IS a foot frozen partway down, hovering above the deck until landing
+// wedges it and CatchUnstick repairs it a second later (field: user screenshot, catch pose
+// with the foot just off the board for seconds). The AnyRev retarget prevents this INSIDE its
+// level-out window; this releases the ratio everywhere else, the moment the deck stops.
+static int   g_plantFix     = 1;
 // CatchUnstick: base-game bug repair. Catching with one foot and then flicking the OTHER stick
 // (and sometimes an ordinary catch) wedges the feet floating above the deck in the catch pose,
 // ride after ride, until a bail. Decoded: the only code that force-reseats the feet is a 0.2 s
@@ -328,7 +411,12 @@ static long  g_vetoLogged   = -1;     // trick serial the veto last logged for
 // This is NOT the reverted 2.62.2 guard. That one un-ended the flip AFTER the catch had registered, by
 // refusing to park _boardFlipTargetAngle; it treated the symptom and was pulled. This refuses the
 // engage itself, in the same place and the same way as the flick veto -- the mechanism that worked.
-// AUTO CATCH ONLY (AutoCatchActive) -- manual has the flick veto.
+// BOTH catch modes. It was auto-only until a field report killed that premise: the flick veto
+// does not cover manual's early engage, it only covers a stick HELD since before the pop. A
+// DELIBERATE fresh input arriving early -- a two-stick grind setup pressed straight after the
+// trick flick, e.g. kickflip into a smith -- is a fresh edge, so the veto admits it and the
+// board gets caught before it has flipped. "Has the deck actually turned?" is a question
+// neither catch mode can answer with a flick.
 static int   g_minSpinDeg   = 45;     // 0 = off
 // CatchMaxCutDeg: how much unfinished rotation "foot always attaches" may throw away. Past this the
 // flip is left alone to finish on its own. 0 = no limit (the old behaviour).
@@ -362,10 +450,11 @@ static volatile LONG g_uiDsHonored = 0;                         // grip-down str
 
 int CatchTweaks_ManualMode() { return g_manualMode; }
 
-// Both 3.18 guards below exist for AUTO catch only and are locked to it. Manual catch was already
-// right: the fresh-flick veto covers its early-engage case, and on manual an over-rotation is caught
-// deliberately -- the foot is supposed to attach and level the deck, which is exactly what
-// CatchMaxCutDeg was refusing to do (field: kickflip over-rotations stopped levelling out).
+// CatchMaxCutDeg is AUTO-ONLY and locked to it: on manual an over-rotation is caught deliberately
+// -- the foot is supposed to attach and level the deck, which is exactly what CatchMaxCutDeg was
+// refusing to do (field: kickflip over-rotations stopped levelling out). CatchMinSpinDeg used to
+// be locked the same way on the premise that the flick veto covered manual; it does not (see the
+// knob's comment), so the spin gate now runs in both modes and this helper no longer gates it.
 // `g_uiCatchMode` is the live menu setting, so switching modes in-game switches the guards with it.
 // Manual is only KNOWN once it has been learned (or set in the ini); until then assume auto, so a
 // player who never touches manual still gets the fix. The learn fires on the first manual-mode frame.
@@ -433,6 +522,20 @@ void CatchTweaks_ReadConfig(const char* buf) {
     g_catchBeatsDS = TwkIniInt(buf, "CatchBeatsDarkslide", 1);
     g_dsAngleDeg   = TwkIniInt(buf, "DarkslideZoneDeg", 60);
     g_catchDiag    = TwkIniInt(buf, "CatchDiag", 0);
+    g_clickCatch   = TwkIniInt(buf, "CatchClickToCatch", 0);
+    g_clickFrames  = TwkIniInt(buf, "CatchClickFrames", 8);
+    if (g_clickFrames < 1) g_clickFrames = 1; else if (g_clickFrames > 60) g_clickFrames = 60;
+    g_clickSweep   = TwkIniInt(buf, "CatchClickSweep", 0);
+    g_clickProbe   = TwkIniInt(buf, "CatchClickProbe", 0);
+    g_clickForce   = TwkIniInt(buf, "CatchClickForceOrient", 1);
+    g_clickInject  = TwkIniInt(buf, "CatchClickInject", 0);
+    g_clickForceMs = TwkIniInt(buf, "CatchClickForceMs", 250);
+    TwkIniStr(buf, "CatchClickKeyL",  g_clickKeyL,  sizeof(g_clickKeyL),  "Gamepad_LeftThumbstick");
+    TwkIniStr(buf, "CatchClickKeyL2", g_clickKeyL2, sizeof(g_clickKeyL2),
+              "GenericUSBController_Button11");
+    TwkIniStr(buf, "CatchClickKeyR",  g_clickKeyR,  sizeof(g_clickKeyR),  "Gamepad_RightThumbstick");
+    TwkIniStr(buf, "CatchClickKeyR2", g_clickKeyR2, sizeof(g_clickKeyR2),
+              "GenericUSBController_Button12");
     g_flickFoot      = TwkIniInt(buf, "CatchWithFlickedFoot", 1);
     g_flickInvert    = TwkIniInt(buf, "CatchFlickFootInvert", 0);
     // 150 = the other foot takes 1.5x the shipped 0.15 s to ATTACH. Deliberately mild: this gates
@@ -457,6 +560,7 @@ void CatchTweaks_ReadConfig(const char* buf) {
     g_anyRev       = TwkIniInt(buf, "CatchAnyRevolution", 1);
     g_anyRevDeg    = TwkIniInt(buf, "CatchAnyRevDeg", 60);
     g_footLevel    = TwkIniInt(buf, "CatchFootLevelsBoard", 1);
+    g_plantFix     = TwkIniInt(buf, "CatchPlantFix", 1);
     g_holdPose     = TwkIniInt(buf, "CatchHoldPose", 1);
     g_needFlick    = TwkIniInt(buf, "CatchNeedsFreshFlick", 1);
     g_unstick      = TwkIniInt(buf, "CatchUnstick", 1);
@@ -501,7 +605,19 @@ void CatchTweaks_SaveConfig(char* buf, size_t cap) {
     TwkIniSetInt(buf, cap, "CatchAnyRevolution",  g_anyRev);
     TwkIniSetInt(buf, cap, "CatchAnyRevDeg",      g_anyRevDeg);
     TwkIniSetInt(buf, cap, "CatchFootLevelsBoard", g_footLevel);
+    TwkIniSetInt(buf, cap, "CatchPlantFix",       g_plantFix);
     TwkIniSetInt(buf, cap, "CatchHoldPose",       g_holdPose);
+    TwkIniSetInt(buf, cap, "CatchClickToCatch",   g_clickCatch);
+    TwkIniSetInt(buf, cap, "CatchClickFrames",    g_clickFrames);
+    TwkIniSetInt(buf, cap, "CatchClickSweep",     g_clickSweep);
+    TwkIniSetInt(buf, cap, "CatchClickProbe",     (int)g_clickProbe);
+    TwkIniSetInt(buf, cap, "CatchClickForceOrient", g_clickForce);
+    TwkIniSetInt(buf, cap, "CatchClickInject",    g_clickInject);
+    TwkIniSetInt(buf, cap, "CatchClickForceMs",   g_clickForceMs);
+    TwkIniSetStr(buf, cap, "CatchClickKeyL",      g_clickKeyL);
+    TwkIniSetStr(buf, cap, "CatchClickKeyL2",     g_clickKeyL2);
+    TwkIniSetStr(buf, cap, "CatchClickKeyR",      g_clickKeyR);
+    TwkIniSetStr(buf, cap, "CatchClickKeyR2",     g_clickKeyR2);
     TwkIniSetInt(buf, cap, "CatchNeedsFreshFlick", g_needFlick);
     TwkIniSetInt(buf, cap, "CatchUnstick",        g_unstick);
     TwkIniSetInt(buf, cap, "CatchMinSpinDeg",     g_minSpinDeg);
@@ -867,6 +983,9 @@ static float BoardGripAxis(void* skater, int axis) {
 }
 static float BoardGrip(void* skater) { return BoardGripAxis(skater, g_flipAxis); }
 
+// Defined below, beside the rest of the stance rule; needed here for click-to-catch.
+static bool CatchStanceInverts();
+
 static void* hkCatchDefault(void* self, double dt, void* frontStick, void* backStick,
                             void* a5, void* a6, void* a7) {
     void* skater = self ? twkP(self, IAH_SKATER) : nullptr;
@@ -1041,6 +1160,79 @@ static void* hkCatchDefault(void* self, double dt, void* frontStick, void* backS
         } __except (EXCEPTION_EXECUTE_HANDLER) { maskedStick = nullptr; g_catchTwoStick = 0; }
     }
 
+    // ---- CLICK TO CATCH: present the mapped stick as flicked, and HOLD it there -------------
+    // A press used to be spent on ONE call, and that is not what a flick looks like. This function
+    // only writes a VERDICT -- the dispatcher engages the catch after it returns, re-deriving from
+    // the sticks as it goes, which is exactly why the two-stick mask has to hold its tracker for
+    // several calls. A real flick stays deflected for a hundred milliseconds or more, so a
+    // one-frame blip left the decision nothing to hold on to: the press was seen, the deflection
+    // was written, and no catch ever came of it. The press now holds the stick out across
+    // g_clickFrames consecutive decisions, the way a thumb does.
+    float clickSaved[2] = { 0.0f, 0.0f };
+    void* clickStick = nullptr; bool clickFirst = false;
+    if (g_clickInject && (g_clickArmed || g_clickHold > 0) && self) {
+        __try {
+            int which = 0;
+            if (g_clickHold > 0) which = g_clickWhich;
+            else {
+                LARGE_INTEGER t, f; QueryPerformanceCounter(&t); QueryPerformanceFrequency(&f);
+                const double ms = (double)(t.QuadPart - g_clickQpc) * 1000.0 / (double)f.QuadPart;
+                if (ms > (double)g_clickHoldMs) {
+                    if (g_catchDiag || g_clickProbe > 0)
+                        TwkLog("[catch] click lapsed unspent after %.0f ms (no decision ran)", ms);
+                    g_clickArmed = 0;      // pressed with no air to spend it on
+                } else {
+                    which = (int)g_clickArmed; g_clickWhich = which;
+                    g_clickHold = g_clickFrames; clickFirst = true; g_clickArmed = 0;
+                    InterlockedIncrement(&g_uiClickCatches);
+                }
+            }
+            if (which) {
+                // The game hands _Default its two sticks as front/back and swaps them by stance
+                // (CatchStanceInverts is that rule, disassembled). We key on the PHYSICAL stick,
+                // and the argument values cannot name it here the way the flick detector does --
+                // a press leaves both sticks centred, so the two arguments are identical.
+                const bool inv = CatchStanceInverts();
+                clickStick = ((which == 1) != inv) ? frontStick : backStick;
+                const float dzRead = twkF(twkP(self, IAH_CATCH_ORIENTS_DB), CODB_INPUT_DEADZONE);
+                const float dz = (dzRead > 0.0f && dzRead < 1.0f) ? dzRead : 0.2f;
+                float push = dz + g_clickMargin;
+                float dx = g_clickDirX, dy = g_clickDirY;
+                if (g_clickSweep) {
+                    // step 0 on the first held decision, then one direction per decision
+                    const int step = (g_clickFrames - g_clickHold) & 7;
+                    dx = kClickDirs[step][0]; dy = kClickDirs[step][1];
+                    push = g_clickSweepMag;
+                    g_clickStepNow = step;
+                    // Eligibility is an EDGE, so each swept direction needs its own: without this
+                    // only the first of the eight would ever be judged.
+                    const int hadOff2 = (clickStick == frontStick) ? IAH_HAD_FRONT_INPUT
+                                                                   : IAH_HAD_BACK_INPUT;
+                    *((uint8_t*)self + hadOff2) = 0;
+                } else g_clickStepNow = -1;
+                g_clickDirNow[0] = dx; g_clickDirNow[1] = dy;
+                clickSaved[0] = twkF(clickStick, 0); clickSaved[1] = twkF(clickStick, 4);
+                *(float*)clickStick       = dx * push;
+                *((float*)clickStick + 1) = dy * push;
+                if (clickFirst) {
+                    // Eligibility is an EDGE, so the first held decision has to clear the "was
+                    // pushed last frame" tracker. It is deliberately NOT restored afterwards: the
+                    // game's own epilogue then owns it, and the frames that follow are supposed to
+                    // look like a stick that is still being held.
+                    const int hadOff = (clickStick == frontStick) ? IAH_HAD_FRONT_INPUT
+                                                                  : IAH_HAD_BACK_INPUT;
+                    *((uint8_t*)self + hadOff) = 0;
+                    if (g_catchDiag || g_clickProbe > 0)
+                        TwkLog("[catch] click: %s stick -> %s arg, push %.2f (deadzone %.2f), "
+                               "held for %d decisions", which == 1 ? "LEFT" : "RIGHT",
+                               clickStick == frontStick ? "front" : "back", push, dz,
+                               g_clickFrames);
+                }
+                g_clickHold--;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) { clickStick = nullptr; g_clickCatch = 0; }
+    }
+
     void* r = nullptr;
     __try { r = ((CatchDefaultFn)g_origCatchDef)(self, dt, frontStick, backStick, a5, a6, a7); }
     __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -1054,7 +1246,33 @@ static void* hkCatchDefault(void* self, double dt, void* frontStick, void* backS
                 if (maskedHad >= 0) *((uint8_t*)self + maskedHad) = (uint8_t)savedHad;
             } __except (EXCEPTION_EXECUTE_HANDLER) {}
         }
+        if (clickStick) {
+            __try {
+                *(float*)clickStick = clickSaved[0];
+                *((float*)clickStick + 1) = clickSaved[1];
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
         return nullptr;
+    }
+    // The synthetic push is put straight back, exactly like the mask above: these are the caller's
+    // own temporaries and the next call gets fresh copies, so nothing may be held across it.
+    if (clickStick) {
+        __try {
+            // What the decision made of it. The press and the deflection were already visible in
+            // the log; this is the half that was not -- a5 is the catch state the dispatcher then
+            // engages, so a run of zeroes here means the deflection itself was refused, and
+            // non-zero means the decision was made and something after it dropped the catch.
+            if (g_catchDiag || g_clickProbe > 0) {
+                const int vd = a5 ? (int)twkB(a5, 0) : -1;
+                if (g_clickStepNow >= 0)
+                    TwkLog("[catch] click dir %d (%.2f, %.2f) -> verdict %d",
+                           g_clickStepNow, g_clickDirNow[0], g_clickDirNow[1], vd);
+                else if (clickFirst)
+                    TwkLog("[catch] click verdict = %d", vd);
+            }
+            *(float*)clickStick = clickSaved[0];
+            *((float*)clickStick + 1) = clickSaved[1];
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
     if (maskedStick) {                      // put the held stick and its tracker straight back
         __try {
@@ -1310,6 +1528,24 @@ static bool CatchHeldOverStale() {
 }
 
 static void hkSetCatchOrient(void* self, uint8_t state, float pitchRatio, float yawRatio) {
+    // ---- CLICK TO CATCH: turn an idle call into a catch, for as long as the press lasts -------
+    InterlockedExchange(&g_clickSetterSeen, 1);
+    if (g_clickCatch && g_clickForce && state == 0 && g_clickForceState) {
+        __try {
+            LARGE_INTEGER t; QueryPerformanceCounter(&t);
+            if (t.QuadPart < g_clickForceUntil) {
+                void* mineC = CatchTweaks_Skater();
+                if (!mineC || self == mineC) {
+                    state = (uint8_t)g_clickForceState;
+                    static LONGLONG loggedFor = 0;
+                    if ((g_catchDiag || g_clickProbe > 0) && loggedFor != g_clickForceUntil) {
+                        loggedFor = g_clickForceUntil;
+                        TwkLog("[catch] click forced orient state %d at the setter", (int)state);
+                    }
+                }
+            } else g_clickForceState = 0;
+        } __except (EXCEPTION_EXECUTE_HANDLER) { g_clickForce = 0; }
+    }
     uint8_t use = state;
     float usePitch = pitchRatio, useYaw = yawRatio;
     if (state == 0) {   // catch ended -- release the latch, the pose hold and the veto admission
@@ -1387,7 +1623,10 @@ static void hkSetCatchOrient(void* self, uint8_t state, float pitchRatio, float 
             // NOT gated on g_vetoAdmitted: that flag means "a fresh flick was seen", which says
             // nothing about whether the board has turned. Copying it from the veto meant that on any
             // trick the flick check admitted, the spin check never ran at all.
-            if (!vetoed && g_minSpinDeg > 0 && AutoCatchActive() && isMine &&
+            // BOTH modes (see g_minSpinDeg): manual's veto admits any fresh edge, including a
+            // grind-orient input pressed straight after the trick flick, so only this asks
+            // whether the deck has turned. Ollies never stamp a trick; darkslides stay exempt.
+            if (!vetoed && g_minSpinDeg > 0 && isMine &&
                 (oneFoot || twoFoot) && !(state >= 7 && state <= 9)) {
                 const int msTrick = FlipSpeed_MsSinceTrick();
                 if (msTrick >= 0 && msTrick <= 2000 && g_trickTravelDeg < (float)g_minSpinDeg) {
@@ -1506,6 +1745,101 @@ static void hkSetCatchOrient(void* self, uint8_t state, float pitchRatio, float 
 }
 
 // ------------------------------------------------------------------ install + menu
+// Riding, as opposed to walking around off the board. An unreadable state counts as NOT on the
+// board, so a bad read hands the press back to the game rather than eating it.
+static bool CatchOnBoard() {
+    __try {
+        void* a = FootPlace_AnimInstance();
+        return a && twkB(a, AN_ON_BOARD) > 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// Which thumbstick a key is, or 0. An FKey's first eight bytes are its FName, so both names are
+// resolved once and compared as plain words afterwards -- InputKey runs on every input event and
+// is no place for a string compare.
+static uint64_t g_fnClick[4] = { 0, 0, 0, 0 };        // L, L2, R, R2
+// ...and the keys already ruled OUT. The sticks' own axes arrive here every frame under names like
+// Gamepad_RightY, and without this every one of them would be resolved to a string forever.
+static uint64_t g_fnNot[24] = { 0 }; static int g_fnNotN = 0;
+static const char* ClickKeyName(int i) {
+    return (i == 0) ? g_clickKeyL : (i == 1) ? g_clickKeyL2
+         : (i == 2) ? g_clickKeyR : g_clickKeyR2;
+}
+static int ThumbClickWhich(const void* key) {
+    const uint64_t nm = *(const uint64_t*)key;
+    if (!nm) return 0;
+    for (int i = 0; i < 4; i++) if (g_fnClick[i] && nm == g_fnClick[i]) return (i < 2) ? 1 : 2;
+    for (int i = 0; i < g_fnNotN; i++) if (nm == g_fnNot[i]) return 0;
+    char nb[96];
+    if (!GrindPop_FNameToString(key, nb, sizeof(nb))) return 0;
+    for (int i = 0; i < 4; i++) {
+        const char* want = ClickKeyName(i);
+        if (want && want[0] && !strcmp(nb, want)) { g_fnClick[i] = nm; return (i < 2) ? 1 : 2; }
+    }
+    if (g_fnNotN < (int)(sizeof(g_fnNot) / sizeof(g_fnNot[0]))) g_fnNot[g_fnNotN++] = nm;
+    return 0;
+}
+
+// bool UPlayerInput::InputKey(FKey, EInputEvent, float, bool) -- MEASURED, not assumed: the FKey is
+// too big for a register, so it arrives as a POINTER in rdx (`mov rbx, [rdx]` reads its FName).
+static const char* SIG_PLAYER_INPUT_KEY =
+    "48 8B C4 53 57 41 56 48 83 EC 50 48 8B 1A 48 8B F9 48 89 68 08 8B CB 48 89 70 10 4C 8B F2 4C 89 60 18";
+typedef bool (*InputKeyFn)(void*, void*, int, float, bool);
+static InputKeyFn g_origInputKey  = nullptr;
+static void*      g_startInputKey = nullptr;
+
+static bool hkInputKey(void* self, void* key, int ev, float amt, bool pad) {
+    // IE_Pressed = 0, IE_Released = 1. The sticks' own axis events are the hot path here and are
+    // never ours, so the cheapest tests come first.
+    if (g_clickCatch && key && (ev == 0 || ev == 1)) {
+        int swallow = 0;
+        __try {
+            // PRESSES ONLY, AND NEVER AN AXIS. The first cut logged both edges of every key and
+            // the sticks' own axes come through here too -- 60 lines were spent in 25 seconds on
+            // face buttons and axis traffic, before a single stick was pressed.
+            if (g_clickProbe > 0 && ev == 0) {
+                char nb[96];
+                if (GrindPop_FNameToString(key, nb, sizeof(nb))) {
+                    const size_t ln = strlen(nb);
+                    const bool axis = strstr(nb, "Axis") || strstr(nb, "2D") ||
+                                      (ln && (nb[ln-1] == 'X' || nb[ln-1] == 'Y'));
+                    if (!axis) {
+                        InterlockedDecrement(&g_clickProbe);
+                        TwkLog("[catch] key '%s' pressed, onBoard=%d", nb,
+                               CatchOnBoard() ? 1 : 0);
+                    }
+                } else {
+                    InterlockedDecrement(&g_clickProbe);
+                    TwkLog("[catch] key press -- NAME UNREADABLE (FKey is not an FName here)");
+                }
+            }
+            const int which = ThumbClickWhich(key);
+            if (which && CatchOnBoard()) {
+                swallow = 1;
+                if (ev == 0) {
+                    LARGE_INTEGER t; QueryPerformanceCounter(&t);
+                    g_clickArmed = which; g_clickQpc = t.QuadPart;
+                    // The fresh-flick veto admits a catch only after a stick EDGE. This press IS
+                    // that edge -- without the stamp the veto would throw the catch away as a
+                    // held-over flick for the first two seconds of every trick.
+                    g_lastEdgeQpc = t.QuadPart;
+                    // and name the foot, the same way a real flick does
+                    if (g_flickFoot) { g_flickPhys = which; g_flickFresh = 60; g_flickLatch = 0; }
+                    // ...and hold the orient open at the setter for a moment
+                    LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
+                    g_clickForceState = (which == 1) ? 1 : 2;
+                    g_clickForceUntil = t.QuadPart +
+                                        (LONGLONG)(fq.QuadPart * g_clickForceMs / 1000);
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) { g_clickCatch = 0; swallow = 0; }
+        // Swallowed whole while riding -- press AND release -- so a bound action cannot fire on
+        // half a gesture.
+        if (swallow) return true;
+    }
+    return g_origInputKey(self, key, ev, amt, pad);
+}
+
 void CatchTweaks_Install() {
     g_startCanCatch = TwkScanExe(SIG_CAN_CATCH);
     if (!g_startCanCatch) { TwkLog("[catch] CanCatchOrient sig NOT FOUND -- catch window untouched (game updated?)"); g_catchFix = 0; }
@@ -1539,6 +1873,25 @@ void CatchTweaks_Install() {
     } else if (g_flickFoot) {
         TwkLog("[catch] flicked-foot fix needs CheckForCatchOrient_Default -- not installed");
         g_flickFoot = 0;
+    }
+
+    // Click to catch. Hooked whenever the signature resolves rather than only when the option is
+    // on, because the option is a live menu toggle -- until it is ticked this is a pass-through.
+    // It needs the decide hook to deliver the catch, and without that the press is NOT swallowed.
+    if (g_startCatchDef) {
+        g_startInputKey = TwkScanExe(SIG_PLAYER_INPUT_KEY);
+        if (!g_startInputKey) {
+            TwkLog("[catch] UPlayerInput::InputKey sig NOT FOUND -- click to catch off (game updated?)");
+            g_clickCatch = 0;
+        } else if (MH_CreateHook(g_startInputKey, (void*)&hkInputKey, (void**)&g_origInputKey) != MH_OK ||
+                   MH_EnableHook(g_startInputKey) != MH_OK) {
+            TwkLog("[catch] InputKey hook failed -- click to catch off");
+            g_startInputKey = nullptr; g_clickCatch = 0;
+        } else TwkLog("[catch] hooked UPlayerInput::InputKey @ %p -- a thumbstick press can catch",
+                      g_startInputKey);
+    } else if (g_clickCatch) {
+        TwkLog("[catch] click to catch needs CheckForCatchOrient_Default -- not installed");
+        g_clickCatch = 0;
     }
 }
 
@@ -1581,6 +1934,13 @@ void  CatchTweaks_SetBoneAdd(int axis, float v) {
     g_boneAdd[axis] = a; TwkMarkDirty();
 }
 float CatchTweaks_WindowMultPct() { return g_catchMult * 100.0f; }
+// The press-to-catch toggle. Reports FALSE when the input hook is not installed, so the pause-menu
+// row cannot offer a switch that would do nothing.
+bool  CatchTweaks_ClickToCatch() { return g_clickCatch != 0 && g_startInputKey != nullptr; }
+void  CatchTweaks_SetClickToCatch(bool on) {
+    g_clickCatch = (on && g_startInputKey) ? 1 : 0; TwkMarkDirty();
+}
+bool  CatchTweaks_ClickToCatchAvailable() { return g_startInputKey != nullptr; }
 bool  CatchTweaks_StopsFlip() { return g_stopFlip != 0; }
 void  CatchTweaks_SetStopsFlip(bool on) { g_stopFlip = on ? 1 : 0; TwkMarkDirty(); }
 bool  CatchTweaks_AnyRevolution() { return g_anyRev != 0; }
@@ -1621,6 +1981,18 @@ void CatchTweaks_DrawMenu(const OmpMenuApi* api) {
             if (api->Checkbox("Swap left/right", &inv)) { g_flickInvert = inv ? 1 : 0; TwkMarkDirty(); }
             api->SameLine(); api->TextDisabled("(tick this if it picks the opposite foot)");
             snprintf(b, sizeof(b), "orients corrected: %d", (int)g_uiFlickFixes);
+            api->TextDisabled(b);
+            api->Unindent();
+        }
+    }
+    if (g_startInputKey) {
+        bool cc = g_clickCatch != 0;
+        if (api->Checkbox("Click a stick to catch", &cc)) { g_clickCatch = cc ? 1 : 0; TwkMarkDirty(); }
+        api->SameLine(); api->TextDisabled("(press the stick instead of flicking; that foot catches)");
+        if (cc) {
+            api->Indent();
+            api->TextDisabled("only while you are on the board -- off it, the press does its usual job");
+            snprintf(b, sizeof(b), "catches from a press: %d", (int)g_uiClickCatches);
             api->TextDisabled(b);
             api->Unindent();
         }
@@ -1786,6 +2158,28 @@ static void TraceFeetCatch(void* skater, void* comp, float ang) {
 }
 
 void CatchTweaks_PumpFrame() {
+    // If the game does not call SetCatchOrient at all while there is no catch input, there is no
+    // call for the override above to ride -- so it is driven here instead. Which of the two paths
+    // did the work is in the log, because it decides where any further work belongs.
+    if (g_clickCatch && g_clickForce && g_clickForceState && g_origSetOrient) {
+        __try {
+            LARGE_INTEGER t; QueryPerformanceCounter(&t);
+            if (t.QuadPart < g_clickForceUntil) {
+                if (!InterlockedExchange(&g_clickSetterSeen, 0)) {
+                    void* sk = CatchTweaks_Skater();
+                    if (sk) {
+                        static LONGLONG droveFor = 0;
+                        if ((g_catchDiag || g_clickProbe > 0) && droveFor != g_clickForceUntil) {
+                            droveFor = g_clickForceUntil;
+                            TwkLog("[catch] click drove orient state %d from the pump "
+                                   "(the game never called the setter)", g_clickForceState);
+                        }
+                        hkSetCatchOrient(sk, (uint8_t)g_clickForceState, 0.0f, 0.0f);
+                    }
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) { g_clickForce = 0; }
+    }
     // The flicked-foot record ages out HERE, above every early-out -- it must decay on ordinary
     // frames or a stale flick would still be naming a foot minutes later.
     if (g_flickFresh > 0 && --g_flickFresh == 0) g_flickPhys = 0;
@@ -1946,6 +2340,31 @@ void CatchTweaks_PumpFrame() {
                         TwkLog("[catch] caught at %.0f deg -- aiming the flip at flat, %.0f deg away "
                                "(target %.0f -> %.0f, game wanted %.0f more)",
                                ang, toFlat, tgt, aim, owed);
+                    }
+                }
+            }
+            // ---- a stopped board must not owe rotation (CatchPlantFix) ----------------------
+            // Every catch path that halts the deck outside the AnyRev window -- StopFlip parking
+            // at grip-up, the MaxCut "let it finish" that then stalls, the attach window refusing
+            // -- leaves _boardFlipTargetAngle above the frozen current angle, and the per-foot
+            // CatchRatio (computed against the target) freezes with it: the foot hangs partway
+            // down. Rate ~0 with rotation still owed is that exact stuck state and can never
+            // resolve itself, so the target is brought to the deck: ratio completes, foot plants.
+            if (g_plantFix && comp && catchState != 0) {
+                const float pfTgt  = twkF(comp, MC_BOARD_FLIP_TARGET);
+                const float pfCur  = twkF(comp, MC_BOARD_FLIP_CUR);
+                const float pfRate = twkF(comp, MC_BOARD_FLIP_RATE);
+                const float pfOwed = fabsf(pfTgt) - fabsf(pfCur);
+                if (fabsf(pfRate) < 1.0f && pfOwed > 2.0f) {
+                    const float pfAim = (pfTgt < 0.0f) ? -fabsf(pfCur) : fabsf(pfCur);
+                    *(float*)((uint8_t*)comp + MC_BOARD_FLIP_TARGET) = pfAim;
+                    static long plantLogged = -1;
+                    const long pfSer = FlipSpeed_TrickSerial();
+                    if (plantLogged != pfSer) {
+                        plantLogged = pfSer;
+                        TwkLog("[catch] plant fix: deck stopped still owing %.0f deg (target %.0f, "
+                               "current %.0f) -- releasing the ratio so the foot lands", pfOwed,
+                               pfTgt, pfCur);
                     }
                 }
             }

@@ -65,6 +65,10 @@ bool  CatchTweaks_SecondFootHold(); void CatchTweaks_SetSecondFootHold(bool on);
 // byte (+0x63e) and nothing else -- USkaterAnimInstance::SetCatchOrient derives both foot flags
 // from it (left = state in {1,5,10,11}, right = {2,5,10,11}) -- so this corrects that byte at its
 // setter. Invert swaps the left/right parity if it reads backwards.
+// Press a thumbstick to catch instead of flicking for it (Skater XL style). Swallowed only while
+// on the board, and only while the input hook is installed -- the getter reports that.
+bool  CatchTweaks_ClickToCatch();   void CatchTweaks_SetClickToCatch(bool on);
+bool  CatchTweaks_ClickToCatchAvailable();
 bool  CatchTweaks_FlickFoot();   void CatchTweaks_SetFlickFoot(bool on);
 bool  CatchTweaks_FlickInvert(); void CatchTweaks_SetFlickInvert(bool on);
 // ASkaterCharacterBase::SetCatchOrient's start, or null. This module HOOKS that function, which

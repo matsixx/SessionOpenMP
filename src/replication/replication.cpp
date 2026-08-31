@@ -61,7 +61,12 @@ namespace omp { namespace repl {
 //   OMPI -> PushSpeedMultiplier (a peer on an older build animates every push at 1.0x, silently)
 //   OMPJ -> CLAIMED by the replay-sync transfer protocol (replaysync.cpp) -- never a snapshot value
 //   OMPK -> board brokenState byte (a peer's board break/repair renders on their proxy)
-static const uint32_t kMagic = 0x4B504D4Fu; // "OMPK"
+// "OMPR": the size batch. The timestamp shrank to a u32 (0.25 ms units), feet and hands travel
+// body-relative in h16, the crank fields ride only cranked frames, the anim escape mask covers only
+// the fields that can escape, and loop/trick names are interned (sent on change + refresh, cached on
+// the receiver). Every one of these changes the layout, so one letter covers the lot -- an older
+// build rejects the packet outright instead of misreading everything after the first moved byte.
+static const uint32_t kMagic = 0x52504D4Fu; // "OMPR"
 
 static bool finite3(const float* v, float lim) {
     for (int i = 0; i < 3; i++) if (!(v[i] > -lim && v[i] < lim)) return false;   // rejects NaN/Inf too
@@ -203,9 +208,10 @@ static bool audioReadStr(Rd& r, char* out, int cap) {
     return true;
 }
 static int audioLoopSize(const AudioLoop& l) {
-    int n = 3 + audioStrSize(l.cue, kAudioCueLen) + 3 * 2 + 2 + 2;   // slot, attach, nParam, cue, rel, vol, pitch
+    int n = 3 + 3 * 2 + 2 + 2;                    // slot, attach, flags|nParam, rel, vol, pitch
+    if (l.sendNames) n += audioStrSize(l.cue, kAudioCueLen);
     for (int i = 0; i < l.nParam && i < kAudioMaxParams; i++)
-        n += audioStrSize(l.param[i].name, kAudioParamLen) + 2;
+        n += 2 + (l.sendNames ? audioStrSize(l.param[i].name, kAudioParamLen) : 0);
     return n;
 }
 static int audioEventSize(const AudioEvent& e) {
@@ -213,11 +219,16 @@ static int audioEventSize(const AudioEvent& e) {
 }
 static void audioWriteLoop(Wr& w, const AudioLoop& l) {
     const uint8_t np = (uint8_t)(l.nParam < kAudioMaxParams ? l.nParam : kAudioMaxParams);
-    w.u8(l.slot); w.u8(l.attach); w.u8(np);
-    audioWriteStr(w, l.cue, kAudioCueLen);
+    // Bit 7 of the param-count byte = "names aboard". The values always travel; the strings only on
+    // first appearance / change / the ~1 s refresh -- the receiver's AudioNameCache fills the rest.
+    w.u8(l.slot); w.u8(l.attach); w.u8((uint8_t)(np | (l.sendNames ? 0x80 : 0)));
+    if (l.sendNames) audioWriteStr(w, l.cue, kAudioCueLen);
     for (int i = 0; i < 3; i++) w.h16(clampf(l.rel[i], 2000.f));
     w.h16(clampf(l.vol, 100.f)); w.h16(clampf(l.pitch, 100.f));
-    for (int i = 0; i < np; i++) { audioWriteStr(w, l.param[i].name, kAudioParamLen); w.u16((uint16_t)l.param[i].value); }
+    for (int i = 0; i < np; i++) {
+        if (l.sendNames) audioWriteStr(w, l.param[i].name, kAudioParamLen);
+        w.u16((uint16_t)l.param[i].value);
+    }
 }
 static void audioWriteEvent(Wr& w, const AudioEvent& e) {
     w.u16(e.id); w.u8(e.attach);
@@ -227,13 +238,50 @@ static void audioWriteEvent(Wr& w, const AudioEvent& e) {
     w.u16(e.ageMs);
 }
 
+// ---- LIMB POSITION ENCODING, SELF-DESCRIBING ---------------------------------------------------
+// A rel-to-bodyPos h16 encoding was shipped here TWICE on the assumption that the world flag means
+// the values are world coordinates near the body. Both times the field said otherwise (legs folded
+// on flat ground, the second time with the first attempt's own gate trap rewritten out of the way):
+// the anim-instance limb fields are not reliably in the space the flag claims, and an offset against
+// bodyPos then blows the clamp and aims the IK 20 m away. So the encoding ASSUMES NOTHING: each limb
+// pair picks its mode per frame from the measured values -- rel-to-body h16 when every offset fits,
+// as-is h16 when the raw values fit (the local-space case), and exact f32 when neither does. One
+// mode byte covers both pairs; the wrong-space failure is unrepresentable by construction.
+enum : uint8_t { kLimbRel = 0, kLimbAbs16 = 1, kLimbF32 = 2 };
+static uint8_t limbMode(const float* a, const float* b, const float* body) {
+    bool rel = true, abs16 = true;
+    for (int i = 0; i < 3; i++) {
+        if (fabsf(a[i] - body[i]) > 1900.f || fabsf(b[i] - body[i]) > 1900.f) rel = false;
+        if (fabsf(a[i]) > 1900.f || fabsf(b[i]) > 1900.f) abs16 = false;
+    }
+    // Prefer rel: at limb range its h16 error is smallest. abs16 covers local-space values.
+    return rel ? kLimbRel : (abs16 ? kLimbAbs16 : kLimbF32);
+}
+static void limbWrite(Wr& w, uint8_t mode, const float* p, const float* body) {
+    for (int i = 0; i < 3; i++) {
+        if (mode == kLimbRel)        w.h16(p[i] - body[i]);
+        else if (mode == kLimbAbs16) w.h16(p[i]);
+        else                         w.f32(p[i]);
+    }
+}
+static void limbRead(Rd& r, uint8_t mode, float* p, const float* body) {
+    for (int i = 0; i < 3; i++) {
+        if (mode == kLimbRel)        p[i] = r.h16() + body[i];
+        else if (mode == kLimbAbs16) p[i] = r.h16();
+        else                         p[i] = r.f32();
+    }
+}
+
 int Pack(const State& s, uint64_t senderUs, uint8_t* out, int cap, int* poseWrote) {
     if (poseWrote) *poseWrote = 0;
     // A packet without a valid board pose never ships; Unpack enforces the same gate on arrival.
     if (!out || !unitQuat(s.deckQuat) || !finite3(s.deckPos, 1e7f) || !finite3(s.bodyPos, 1e7f)) return 0;
     if (s.animLen > sizeof(s.anim)) return 0;
     Wr w{out, cap, 0, true};
-    w.u32(kMagic); w.u64(senderUs);
+    w.u32(kMagic);
+    // 0.25 ms units in a u32: 4 bytes saved per packet against the old u64 microseconds, with
+    // precision far inside the ~16 ms snapshot spacing the playback clock interpolates across.
+    w.u32((uint32_t)(senderUs / 250ull));
     const uint8_t trick = s.trickName[0] ? 1 : 0;
     const uint8_t grind = s.grindName[0] ? 1 : 0;
     const uint8_t f1 = (uint8_t)((s.bodyPosOk ? 1 : 0) | (s.bodyRotOk ? 2 : 0) | (s.meshOk ? 4 : 0)
@@ -248,7 +296,17 @@ int Pack(const State& s, uint64_t senderUs, uint8_t* out, int cap, int* poseWrot
     // PushSpeedMultiplier. h16 is plenty: it is a small animation-rate multiplier around 1.0, and the
     // clamp is what keeps a garbage read from driving the proxy's push animation to an absurd rate.
     w.h16(clampf(s.pushSpeed, 8.f));
+    // The crank DEF travels on EVERY frame -- it is a STANDING property, not a crank-time one: the
+    // game leaves it set between cranks and the receiver keeps the blend space populated from it, so
+    // making it conditional nulled the def between cranks and the proxy's LEGS posed from an empty
+    // blend space (field: legs ignoring the board on flat ground, fine on ramps -- ramps are where
+    // players crank, so the def travelled there). The pocket rides with it. Only the scrub CLOCK is
+    // crank-conditional; sentinel 0xFFFF = cranked but not scrubbed.
     w.u16(s.crankDefOff); w.h16(s.crankPocket);
+    if (s.crankOn)
+        w.u16(s.crankClock < 0.f ? 0xFFFFu
+                                 : (uint16_t)(s.crankClock * 10000.f + 0.5f > 65534.f
+                                              ? 65534u : (unsigned)(s.crankClock * 10000.f + 0.5f)));
     w.h16(clampf(s.grindPitch, 1000.f)); w.h16(clampf(s.grindYaw, 1000.f));
     for (int i = 0; i < 3; i++) w.f32(s.bodyPos[i]);             // the one absolute anchor
     w.u32(qPack(s.deckQuat));
@@ -260,27 +318,36 @@ int Pack(const State& s, uint64_t senderUs, uint8_t* out, int cap, int* poseWrot
     if (s.feetOk) {
         // positions ABSOLUTE f32 (see the space rule at the top); rotators are degrees, which are
         // space-free, so f16 stays.
-        for (int i = 0; i < 3; i++) w.f32(s.lFootPos[i]);
+        const uint8_t fm = limbMode(s.lFootPos, s.rFootPos, s.bodyPos);
+        w.u8(fm);
+        limbWrite(w, fm, s.lFootPos, s.bodyPos);
         for (int i = 0; i < 3; i++) w.h16(s.lFootRot[i]);
-        for (int i = 0; i < 3; i++) w.f32(s.rFootPos[i]);
+        limbWrite(w, fm, s.rFootPos, s.bodyPos);
         for (int i = 0; i < 3; i++) w.h16(s.rFootRot[i]);
     }
     if (s.handOk) {
         // Identical encoding to the feet, for the identical reason: a position whose coordinate SPACE
         // is not proven travels value-preserving/absolute, never relative to bodyPos. Rotators are
         // degrees -- space-free -- so f16 is safe there.
-        for (int i = 0; i < 3; i++) w.f32(s.lHandPos[i]);
+        const uint8_t hm = limbMode(s.lHandPos, s.rHandPos, s.bodyPos);
+        w.u8(hm);
+        limbWrite(w, hm, s.lHandPos, s.bodyPos);
         for (int i = 0; i < 3; i++) w.h16(s.lHandRot[i]);
-        for (int i = 0; i < 3; i++) w.f32(s.rHandPos[i]);
+        limbWrite(w, hm, s.rHandPos, s.bodyPos);
         for (int i = 0; i < 3; i++) w.h16(s.rHandRot[i]);
     }
+    // A trick's name repeats for its whole duration; the sender marks the repeats (trickNamed=0)
+    // and only every ~4th packet carries the string. 0xFE is the "unchanged" sentinel -- a real
+    // length can never reach it (the buffers are 40 bytes).
     if (trick) {
-        const uint8_t l = (uint8_t)strnlen(s.trickName, sizeof(s.trickName) - 1);
-        w.u8(l); w.b(s.trickName, l);
+        if (!s.trickNamed) w.u8(0xFE);
+        else { const uint8_t l = (uint8_t)strnlen(s.trickName, sizeof(s.trickName) - 1);
+               w.u8(l); w.b(s.trickName, l); }
     }
     if (grind) {
-        const uint8_t l = (uint8_t)strnlen(s.grindName, sizeof(s.grindName) - 1);
-        w.u8(l); w.b(s.grindName, l);
+        if (!s.grindNamed) w.u8(0xFE);
+        else { const uint8_t l = (uint8_t)strnlen(s.grindName, sizeof(s.grindName) - 1);
+               w.u8(l); w.b(s.grindName, l); }
     }
     // ---- the anim blob: walked BY THE FIELD TABLE (never by struct offsets). Only fields that fit
     // completely inside animLen travel; the count pins both ends to the same walk.
@@ -341,7 +408,12 @@ int Pack(const State& s, uint64_t senderUs, uint8_t* out, int cap, int* poseWrot
         // updates at 30 Hz instead of 60 -- which is what watching someone scrub can afford, and
         // infinitely better than not animating at all.
         const int total = (s.poseN > kPoseMaxBones) ? 0 : s.poseN;
-        const int room  = w.ok ? (cap - w.n - 3) : 0;      // -3 for total/first/count
+        // -3 for the slice's own total/first/count header, -2 for the AUDIO section's two count
+        // bytes, which are written UNCONDITIONALLY after this. Without that reservation a cap that
+        // lands exactly on a slice boundary packs the pose flush to the cap and the audio counts
+        // overflow by two -- the whole packet then fails. Found by probe: caps 502/512/522 (every
+        // extra bone) all returned 0 while their neighbours passed.
+        const int room  = w.ok ? (cap - w.n - 3 - 2) : 0;
         const int fit   = room > 0 ? room / (4 + 3 * 2) : 0;
         if (total > 0 && fit > 0) {
             const int first = (s.poseFirst < total) ? s.poseFirst : 0;
@@ -385,7 +457,7 @@ bool Unpack(const uint8_t* d, int len, State& out, uint64_t* senderUs) {
     if (!d || len < 4) return false;
     Rd r{d, len, 0, true};
     if (r.u32() != kMagic) return false;
-    const uint64_t su = r.u64();
+    const uint64_t su = (uint64_t)r.u32() * 250ull;   // 0.25 ms units back to microseconds
     const uint8_t f1 = r.u8(), f2 = r.u8();
     out = State{};
     out.bodyPosOk = (f1 & 1) ? 1 : 0;  out.bodyRotOk = (f1 & 2) ? 1 : 0;
@@ -406,6 +478,12 @@ bool Unpack(const uint8_t* d, int len, State& out, uint64_t* senderUs) {
     if (!(out.pushSpeed > 0.01f && out.pushSpeed < 8.f)) out.pushSpeed = 1.0f;
     out.crankDefOff = r.u16();
     { const float cp = r.h16(); out.crankPocket = (cp > -10.f && cp < 10.f) ? cp : 0; }
+    // Only the scrub clock is crank-conditional (see Pack).
+    out.crankClock = -1.f;
+    if (out.crankOn) {
+        const uint16_t cc = r.u16();
+        if (cc != 0xFFFFu) out.crankClock = (float)cc * 0.0001f;   // 0.1 ms units back to seconds
+    }
     { const float gp = r.h16(); out.grindPitch  = (gp > -1001.f && gp < 1001.f) ? gp : 0;
       const float gy = r.h16(); out.grindYaw    = (gy > -1001.f && gy < 1001.f) ? gy : 0; }
     for (int i = 0; i < 3; i++) out.bodyPos[i] = r.f32();
@@ -415,30 +493,42 @@ bool Unpack(const uint8_t* d, int len, State& out, uint64_t* senderUs) {
     if (out.meshOk)    qUnpack(r.u32(), out.meshQuat);
     if (out.relOk)     for (int i = 0; i < 3; i++) out.relPos[i] = r.h16();
     if (out.feetOk) {
-        for (int i = 0; i < 3; i++) out.lFootPos[i] = r.f32();
+        const uint8_t fm = r.u8();
+        if (fm > kLimbF32) return false;                 // a different build slipped past magic
+        limbRead(r, fm, out.lFootPos, out.bodyPos);      // bodyPos is parsed above this
         for (int i = 0; i < 3; i++) out.lFootRot[i] = r.h16();
-        for (int i = 0; i < 3; i++) out.rFootPos[i] = r.f32();
+        limbRead(r, fm, out.rFootPos, out.bodyPos);
         for (int i = 0; i < 3; i++) out.rFootRot[i] = r.h16();
     }
     if (out.handOk) {
-        for (int i = 0; i < 3; i++) out.lHandPos[i] = r.f32();
+        const uint8_t hm = r.u8();
+        if (hm > kLimbF32) return false;
+        limbRead(r, hm, out.lHandPos, out.bodyPos);
         for (int i = 0; i < 3; i++) out.lHandRot[i] = r.h16();
-        for (int i = 0; i < 3; i++) out.rHandPos[i] = r.f32();
+        limbRead(r, hm, out.rHandPos, out.bodyPos);
         for (int i = 0; i < 3; i++) out.rHandRot[i] = r.h16();
     }
     if (trick) {
         const uint8_t l = r.u8();
-        if (l >= sizeof(out.trickName)) return false;
-        if (!r.b(out.trickName, l)) return false;
-        out.trickName[l] = 0;                                    // untrusted input: force-terminate
-        sanitizeAscii(out.trickName, sizeof(out.trickName));     // ...and printable: both get logged
+        if (l == 0xFE) { out.trickNamed = 0; out.trickName[0] = 0; }   // cache fills it (Resolve)
+        else {
+            if (l >= sizeof(out.trickName)) return false;
+            if (!r.b(out.trickName, l)) return false;
+            out.trickName[l] = 0;                                  // untrusted input: force-terminate
+            sanitizeAscii(out.trickName, sizeof(out.trickName));   // ...and printable: both get logged
+            out.trickNamed = 1;
+        }
     }
     if (grind) {
         const uint8_t l = r.u8();
-        if (l >= sizeof(out.grindName)) return false;
-        if (!r.b(out.grindName, l)) return false;
-        out.grindName[l] = 0;
-        sanitizeAscii(out.grindName, sizeof(out.grindName));
+        if (l == 0xFE) { out.grindNamed = 0; out.grindName[0] = 0; }
+        else {
+            if (l >= sizeof(out.grindName)) return false;
+            if (!r.b(out.grindName, l)) return false;
+            out.grindName[l] = 0;
+            sanitizeAscii(out.grindName, sizeof(out.grindName));
+            out.grindNamed = 1;
+        }
     }
     const int nf = r.u8();
     if (nf > AnimFieldCount()) return false;                     // a different build slipped past magic
@@ -488,14 +578,18 @@ bool Unpack(const uint8_t* d, int len, State& out, uint64_t* senderUs) {
         for (int i = 0; i < nl; i++) {
             AudioLoop& l = out.loops[i];
             l.slot = r.u8(); l.attach = r.u8();
-            const uint8_t np = r.u8();
+            const uint8_t npf = r.u8();
+            const uint8_t np = npf & 0x7f;
+            l.sendNames = (npf & 0x80) ? 1 : 0;
             if (np > kAudioMaxParams) return false;
-            if (!audioReadStr(r, l.cue, kAudioCueLen)) return false;
+            if (l.sendNames) { if (!audioReadStr(r, l.cue, kAudioCueLen)) return false; }
+            else l.cue[0] = 0;                     // the cache fills it, or the loop sits out a beat
             for (int c = 0; c < 3; c++) l.rel[c] = r.h16();
             l.vol = r.h16(); l.pitch = r.h16();
             l.nParam = np;
             for (int p = 0; p < np; p++) {
-                if (!audioReadStr(r, l.param[p].name, kAudioParamLen)) return false;
+                if (l.sendNames) { if (!audioReadStr(r, l.param[p].name, kAudioParamLen)) return false; }
+                else l.param[p].name[0] = 0;
                 l.param[p].value = (int16_t)r.u16();
             }
             if (l.attach > kAudRoot) l.attach = kAudWorld;    // unknown placement degrades to a point
@@ -697,6 +791,39 @@ bool UnpackSkeleton(const uint8_t* d, int len, SkelPrint& out) {
     if (!r.ok || r.n != len) return false;
     out.n = (uint8_t)n;
     return true;
+}
+
+// ---- THE NAME CACHE (receiver side of the interning) -----------------------------------------
+// Runs once per received snapshot, before the state is pushed anywhere: named entries teach it,
+// nameless entries are filled from it. Downstream code then never sees the difference -- an entry
+// it cannot fill stays empty-cued, which was always the "skip this loop" signal.
+void AudioNameCache::Resolve(State& s) {
+    for (int i = 0; i < (int)s.nLoops && i < kAudioMaxLoops; i++) {
+        AudioLoop& l = s.loops[i];
+        if (l.sendNames && l.cue[0]) {
+            Ent* e = nullptr;
+            for (auto& c : ent) if (c.used && c.slot == l.slot) { e = &c; break; }
+            if (!e) for (auto& c : ent) if (!c.used) { e = &c; break; }
+            if (!e) e = &ent[l.slot & 7];          // full: evict deterministically, never fail
+            e->used = 1; e->slot = l.slot;
+            memcpy(e->cue, l.cue, sizeof(e->cue));
+            e->nParam = l.nParam;
+            for (int p = 0; p < (int)l.nParam && p < kAudioMaxParams; p++)
+                memcpy(e->pname[p], l.param[p].name, sizeof(e->pname[p]));
+        } else if (!l.sendNames) {
+            for (auto& c : ent) {
+                if (!c.used || c.slot != l.slot) continue;
+                memcpy(l.cue, c.cue, sizeof(l.cue));
+                for (int p = 0; p < (int)l.nParam && p < kAudioMaxParams; p++)
+                    memcpy(l.param[p].name, c.pname[p], sizeof(l.param[p].name));
+                break;
+            }
+        }
+    }
+    if (s.trickName[0] && s.trickNamed) memcpy(trick, s.trickName, sizeof(trick));
+    else if (!s.trickNamed && !s.trickName[0]) memcpy(s.trickName, trick, sizeof(s.trickName));
+    if (s.grindName[0] && s.grindNamed) memcpy(grind, s.grindName, sizeof(grind));
+    else if (!s.grindNamed && !s.grindName[0]) memcpy(s.grindName, grind, sizeof(s.grindName));
 }
 
 bool IsChatPacket(const uint8_t* d, int len) {
