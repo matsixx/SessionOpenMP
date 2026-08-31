@@ -610,12 +610,23 @@ void PopProbe_PumpFrame() {
             void* skater = CatchTweaks_Skater();
             void* mv = skater ? twkP(skater, SK_MOVE_COMP) : nullptr;
             const bool onBoard = mv && twkB(mv, MC_ON_BOARD) > 0;
-            bool sw = false;
-            if (onBoard) FlipSpeed_Stance(skater, nullptr, &sw);
-            g_padSw = sw ? 1 : 0;                 // the hook's mode table swaps sticks on this
-            // With stances on, switch riding is a supported mode (the hook mirrors the sticks);
-            // with them off, the original switch veto stands and the scheme goes vanilla there.
-            allow = (onBoard && (g_stances || !sw)) ? 1 : 0;
+            bool sw = false, goofy = false;
+            if (onBoard) FlipSpeed_Stance(skater, &goofy, &sw);
+            // WHICH PHYSICAL STICK IS THE BACK FOOT is a stance question and GOOFY WAS NEVER IN
+            // IT -- only the switch flag was read, so every mapping below was the regular-stance
+            // one and the whole scheme did nothing in goofy (field). The old reasoning, that
+            // "goofy only mirrors left/right", is about the X axis: mirroring X does not move the
+            // crouch onto the other stick.
+            // The goofy term is gated on the control-scheme option that binds sticks to LEFT/RIGHT
+            // feet -- with FRONT/BACK binding the sticks already follow the feet and stance swaps
+            // nothing -- and it is composed as a XOR ON TOP of the proven switch term, so regular
+            // and switch keep behaving exactly as they were tuned to.
+            const bool swapped = (sw != (goofy && CatchTweaks_LeftRightFootSkater()));
+            g_padSw = swapped ? 1 : 0;            // the hook's mode table swaps sticks on this
+            // With stances on, riding the other way round is a supported mode (the hook mirrors
+            // the sticks); with them off, the original veto stands and the scheme goes vanilla in
+            // any stance whose roles are swapped.
+            allow = (onBoard && (g_stances || !swapped)) ? 1 : 0;
         }
         g_padAllow = allow;
         g_padGrind = grinding ? 1 : 0;            // grinds/liptricks: total hands-off (see hook)
@@ -1232,9 +1243,12 @@ static const short kFlickPerPoll = 2500;
 //     regular nollie : crouch RS up   -> crank LS up
 //     switch  ollie  : crouch RS down -> crank LS down
 //     switch  nollie : crouch LS up   -> crank RS up
-// Fakie = regular inputs rolling backward (no mapping); goofy only mirrors left/right, which
-// passes through as raw angles. cIsRS picks the physical crouch stick, yFlip = -1 for the nollie
-// family (mode "down" = physical up). yFlip*yFlip = 1 and the stick swap is symmetric, so a
+// Fakie = regular inputs rolling backward (no mapping). GOOFY DOES swap the sticks: it decides
+// which foot is the back one, so it feeds the same swL the switch flag does (gated on the
+// left/right-foot binding -- see the stance sample). The earlier note here claimed goofy "only
+// mirrors left/right, which passes through as raw angles"; that is the X axis, and it is why the
+// scheme did nothing at all in goofy. cIsRS picks the physical crouch stick, yFlip = -1 for the
+// nollie family (mode "down" = physical up). yFlip*yFlip = 1 and the stick swap is symmetric, so a
 // pass-through emit reproduces the physical pad exactly.
 static short PadClampS(int v) { return (short)(v > 32767 ? 32767 : (v < -32767 ? -32767 : v)); }
 static void PadEmit(PadState* st, bool cIsRS, int yFlip, int tLx, int tLy, int kRx, int kRy) {

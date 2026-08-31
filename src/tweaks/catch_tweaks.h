@@ -67,6 +67,9 @@ bool  CatchTweaks_SecondFootHold(); void CatchTweaks_SetSecondFootHold(bool on);
 // setter. Invert swaps the left/right parity if it reads backwards.
 // Press a thumbstick to catch instead of flicking for it (Skater XL style). Swallowed only while
 // on the board, and only while the input hook is installed -- the getter reports that.
+// The control-scheme option binding sticks to LEFT/RIGHT feet instead of FRONT/BACK. Any module
+// mapping a PHYSICAL stick to a foot needs it: with front/back binding, stance swaps nothing.
+bool  CatchTweaks_LeftRightFootSkater();
 bool  CatchTweaks_ClickToCatch();   void CatchTweaks_SetClickToCatch(bool on);
 bool  CatchTweaks_ClickToCatchAvailable();
 bool  CatchTweaks_FlickFoot();   void CatchTweaks_SetFlickFoot(bool on);

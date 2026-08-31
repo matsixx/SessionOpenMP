@@ -1941,6 +1941,17 @@ void  CatchTweaks_SetClickToCatch(bool on) {
     g_clickCatch = (on && g_startInputKey) ? 1 : 0; TwkMarkDirty();
 }
 bool  CatchTweaks_ClickToCatchAvailable() { return g_startInputKey != nullptr; }
+// The control-scheme option that binds the sticks to LEFT/RIGHT feet rather than FRONT/BACK.
+// Exported because it is load-bearing for ANY physical-stick mapping, not just this module's: with
+// FRONT/BACK binding the sticks already follow the feet, so stance must not swap anything. An
+// unreadable setting falls back to the measured-true value, as CatchStanceInverts does.
+bool  CatchTweaks_LeftRightFootSkater() {
+    __try {
+        void* a = FootPlace_AnimInstance();
+        void* sk = a ? twkP(a, AN_SKATER) : nullptr;
+        return !sk || (twkB(sk, SK_STANCE_OPTS) & 1) != 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return true; }
+}
 bool  CatchTweaks_StopsFlip() { return g_stopFlip != 0; }
 void  CatchTweaks_SetStopsFlip(bool on) { g_stopFlip = on ? 1 : 0; TwkMarkDirty(); }
 bool  CatchTweaks_AnyRevolution() { return g_anyRev != 0; }
