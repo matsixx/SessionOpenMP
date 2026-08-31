@@ -1370,6 +1370,9 @@ static MenuCreateItemsFn o_CreateItems    = nullptr;
 static MenuSelConfirmFn  o_SelConfirm     = nullptr;
 static MenuSelConfirmFn  o_MultiChanged   = nullptr;   // same (page, params) shape as the confirm
 static MenuSelConfirmFn  o_ProgressChanged = nullptr;
+// UMenuPageContainer::HandlePageBackAction(UMenuPageContainer*, UMenuPageDefinition* activePage)
+typedef void (*MenuBackActionFn)(void*, void*);
+static MenuBackActionFn  o_PageBack       = nullptr;
 
 // UMenuPage::CreatePageItems -- the injection point (pre-hook: the rows must exist before the widgets
 // are made). Every deref is inside SEH; on any fault the feature dies quietly and the game's own menu
@@ -1580,6 +1583,72 @@ void PauseMenu_Pump() {
     g_pendingRefresh = false; g_pendingTitle[0] = 0; g_pendingTitleRoot = false;
 }
 
+// The menu's own "you went back" blip. Taking a step back in silence sounds like a dropped input, so
+// our Back plays the same sound the stock one does -- and reaches it the same way the stock code does,
+// through the container's vtable, because a byte signature CANNOT find this function: PlaySoundOnCancel,
+// PlaySoundOnClose and every other PlaySoundOn* in the family are byte-identical apart from the
+// RIP-relative displacements a signature has to wildcard. (Slot 0x510 is read straight off the
+// disassembly of HandlePageBackAction, which calls it two instructions before it pops the page stack.)
+//
+// A vtable index is a weaker thing to depend on than a signature, so the slot proves itself before it
+// is ever called: the family has a distinctive 23-byte prologue -- save, frame, load _audioSet from
+// this+0x368, null-test -- and anything that does not start with those exact bytes is not a
+// "play a UI sound from a field on this container" function and is left alone. Verified once and
+// remembered; a failed check costs the blip and nothing else.
+static void playCancelSound(void* container) {
+    static int state = 0;                                    // 0 unchecked, 1 usable, -1 refused
+    static void* fn  = nullptr;
+    if (state < 0) return;
+    __try {
+        if (!state) {
+            static const uint8_t kPrologue[] = {
+                0x48,0x89,0x5C,0x24,0x08,             // mov  [rsp+8], rbx
+                0x57,                                 // push rdi
+                0x48,0x83,0xEC,0x20,                  // sub  rsp, 0x20
+                0x48,0x8B,0xB9,0x68,0x03,0x00,0x00,   // mov  rdi, [rcx+0x368]   (_audioSet)
+                0x48,0x8B,0xD9,                       // mov  rbx, rcx
+                0x48,0x85,0xFF,                       // test rdi, rdi
+            };
+            void* cand = (*(void***)container)[0x510 / 8];
+            state = (cand && memcmp(cand, kPrologue, sizeof(kPrologue)) == 0) ? 1 : -1;
+            if (state > 0) fn = cand;
+            else log("[menu] the menu's cancel sound could not be identified -- Back will be silent");
+        }
+        if (state > 0) ((void (*)(void*))fn)(container);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        state = -1;                                          // cosmetic: never try again, never die
+    }
+}
+
+// ONE STEP BACK out of whichever page of ours is showing -- from the browser to Multiplayer, from a
+// guest sub-page to the page that opened it, from anywhere else to the pause menu proper. Two callers
+// reach it: the "Back" row, and the gamepad's own back button (hkPageBack). It is deliberately a
+// single function so the two can never disagree about where Back goes.
+// Returns false when there is nothing of ours to leave, which is the caller's cue to let the stock
+// behaviour happen -- for the button that means closing the menu, exactly as it does today.
+static bool navigateBack(void* page) {
+    if (g_page == PG_ROOT || !page) return false;
+    g_browsePolls = 0;
+    if (g_page >= PG_GUEST0) {
+        const int gi = g_page - PG_GUEST0;
+        const int up = (gi < g_nGuests) ? g_guests[gi].parent : -1;
+        if (up >= 0 && up < g_nGuests && !g_guests[up].dead) {
+            g_guests[gi].parent = -1;                  // one step per entry, never a stale chain
+            g_page = PG_GUEST0 + up;
+            queueSwap(page, g_guests[up].title, false, true);
+            return true;
+        }
+    }
+    if (g_page == PG_PLAYER)  { g_page = PG_PLAYERS; queueSwap(page, "Players", false, true); return true; }
+    // PG_NAMES now sits under PG_OTHER, so Back from it returns THERE, not to the MP page.
+    if (g_page == PG_NAMES) { g_page = PG_OTHER; queueSwap(page, "Other options", false, true); return true; }
+    const bool toMp = (g_page == PG_BROWSE || g_page == PG_PLAYERS || g_page == PG_OTHER);
+    g_page = toMp ? PG_MP : PG_ROOT;
+    if (toMp) g_lastSig = sessionSig();
+    queueSwap(page, toMp ? mpTitle() : nullptr, !toMp, true);
+    return true;
+}
+
 // UMenuPage::OnSelectionConfirmed -- the page-level funnel every confirm passes through. A row of ours
 // is handled here and the trampoline is NOT called, which suppresses the stock chain entirely; anything
 // else falls straight through untouched.
@@ -1630,29 +1699,9 @@ static bool handleConfirm(void* page, void* params) {
         }
     }
 
-    // "Back" is shared by every one of our pages -- from the browser it steps back to Multiplayer,
-    // from a sub-page to the page that opened it, from anywhere else to the pause menu proper.
-    if (itemKey == g_mpRowKeys[kMpRowCount - 1]) {
-        g_browsePolls = 0;
-        if (g_page >= PG_GUEST0) {
-            const int gi = g_page - PG_GUEST0;
-            const int up = (gi < g_nGuests) ? g_guests[gi].parent : -1;
-            if (up >= 0 && up < g_nGuests && !g_guests[up].dead) {
-                g_guests[gi].parent = -1;                  // one step per entry, never a stale chain
-                g_page = PG_GUEST0 + up;
-                queueSwap(page, g_guests[up].title, false, true);
-                return true;
-            }
-        }
-        if (g_page == PG_PLAYER)  { g_page = PG_PLAYERS; queueSwap(page, "Players", false, true); return true; }
-        // PG_NAMES now sits under PG_OTHER, so Back from it returns THERE, not to the MP page.
-        if (g_page == PG_NAMES) { g_page = PG_OTHER; queueSwap(page, "Other options", false, true); return true; }
-        const bool toMp = (g_page == PG_BROWSE || g_page == PG_PLAYERS || g_page == PG_OTHER);
-        g_page = toMp ? PG_MP : PG_ROOT;
-        if (toMp) g_lastSig = sessionSig();
-        queueSwap(page, toMp ? mpTitle() : nullptr, !toMp, true);
-        return true;
-    }
+    // "Back" is shared by every one of our pages -- and the B button reaches the same code, so the
+    // row and the button can never drift apart (see hkPageBack).
+    if (itemKey == g_mpRowKeys[kMpRowCount - 1]) { navigateBack(page); return true; }
     if (g_page == PG_MP && itemKey == g_browseOpenKey) {
         g_page = PG_BROWSE;
         post(OVA_BROWSE);                       // MpPump brings EOS up if needed, then searches
@@ -1791,6 +1840,41 @@ static void hkSelConfirm(void* page, void* params) {
     __try { handled = handleConfirm(page, params); }
     __except (EXCEPTION_EXECUTE_HANDLER) { die("faulted handling a confirm"); handled = false; }
     if (!handled) o_SelConfirm(page, params);
+}
+
+// UMenuPageContainer::HandlePageBackAction -- what the container runs for EKeys::Virtual_Back, the
+// platform's back button (B on a controller), one level above the page. The stock body pops the
+// container's own `_pageStack` (+0x308, count at +0x310) and CLOSES THE WHOLE MENU when that stack is
+// empty. Our sub-pages are never on it: they are row swaps performed on the one real page the
+// container already owns, so as far as the engine is concerned nothing was ever navigated and back
+// was always a close. That is why the "Back" ROW worked and the button did not.
+//
+// So: if a page of ours is showing, the button does exactly what that row does and the stock body
+// never runs. Everywhere else -- the pause root, the game's own sub-pages, any other menu in the game
+// -- the trampoline runs untouched and back keeps closing or popping as it always has.
+//
+// Two guards decide "a page of ours", and both must hold. The definition the container hands us must
+// be the pause page (its `_key`, the same FName the row injection keys off), which rules out every
+// other menu in the game; and `g_page` must not be the root. The key test is what makes this safe
+// after the menu is closed from one of our sub-pages by some other means: `g_page` still says
+// "Multiplayer" until the pause page is next built, and without the key check a back press in an
+// unrelated menu would be answered by swapping rows on a page that is no longer on screen.
+static void hkPageBack(void* container, void* pageDef) {
+    bool handled = false;
+    __try {
+        if (!g_dead && PauseMenu_Tuning().enabled && container && pageDef && g_page != PG_ROOT &&
+            *(const uint64_t*)((const uint8_t*)pageDef + off::kPageDefKey) == g_pauseKey) {
+            // The page the container is actually showing, rather than the one we last built: they are
+            // the same object in practice, and taking it from the container is what makes that true
+            // rather than assumed.
+            void* page = *(void**)((uint8_t*)container + off::kContainerPage);
+            if (page) {
+                handled = navigateBack(page);
+                if (handled) playCancelSound(container);
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { die("faulted handling the back button"); handled = false; }
+    if (!handled) o_PageBack(container, pageDef);
 }
 
 // ---- value changes (toggle / slider) ----------------------------------------------------------------
@@ -1973,6 +2057,13 @@ void PauseMenu_Install() {
         MH_EnableHook(S.MenuCreateItems) != MH_OK) { die("CreatePageItems hook failed"); return; }
     if (MH_CreateHook(S.MenuSelConfirmed, (void*)&hkSelConfirm, (void**)&o_SelConfirm) != MH_OK ||
         MH_EnableHook(S.MenuSelConfirmed) != MH_OK) { die("OnSelectionConfirmed hook failed"); return; }
+    // OPTIONAL, like the funnels below: without it the pages still work, the back button just closes
+    // the menu from one of ours instead of stepping back out of it -- which is the old behaviour.
+    bool backBtn = false;
+    if (S.MenuBackAction &&
+        MH_CreateHook(S.MenuBackAction, (void*)&hkPageBack, (void**)&o_PageBack) == MH_OK &&
+        MH_EnableHook(S.MenuBackAction) == MH_OK)
+        backBtn = true;
     // The two value-change funnels are OPTIONAL: without them a guest page still works, it just
     // cannot own toggles or sliders. Announce the loss rather than dying for it.
     bool values = false;
@@ -1982,9 +2073,11 @@ void PauseMenu_Install() {
         MH_CreateHook(S.MenuProgressChanged, (void*)&hkProgressChanged, (void**)&o_ProgressChanged) == MH_OK &&
         MH_EnableHook(S.MenuProgressChanged) == MH_OK)
         values = true;
-    char m[200];
-    snprintf(m, sizeof(m), "[menu] pause-menu integration armed (a 'Multiplayer' row joins the pause menu%s)",
-             values ? "; toggle/slider rows available to guest pages" : "; NO toggle/slider rows -- change funnels unresolved");
+    char m[260];
+    snprintf(m, sizeof(m), "[menu] pause-menu integration armed (a 'Multiplayer' row joins the pause menu%s%s)",
+             values ? "; toggle/slider rows available to guest pages" : "; NO toggle/slider rows -- change funnels unresolved",
+             backBtn ? "; the back button steps back through our pages"
+                     : "; NO back button -- HandlePageBackAction unresolved, B still closes the menu");
     log(m);
 }
 

@@ -159,6 +159,13 @@ static const SigEntry kSigs[] = {
     // (23 bytes covers all but the tail `jmp Broadcast` of a 32-byte function -- the two displacements
     // in it, _activePageDefinition +0x298 and the delegate +0x3b0, ARE its identity.)
     { "MenuSelConfirmed",     "F6 81 B0 02 00 00 01 ?? ?? 48 8B 81 98 02 00 00 48 81 C1 B0 03 00 00", false },
+    // UMenuPageContainer::HandlePageBackAction  Epic 0x1076df0 / Steam 0x1037170 -- the B button.
+    // 76 bytes because it has a BYTE TWIN: HandlePageResetSettingsAction (Epic 0x1077cb0) is the same
+    // "look this page up in the event-handler map, ask the handler, otherwise act" body and is
+    // identical for its first 72 bytes. The first real divergence is the `je` at +0x48, which this
+    // one encodes short (74) and the twin near (0F 84) -- so the sig has to reach that opcode, and
+    // shortening it makes the mod hook the reset-settings action instead.
+    { "MenuBackAction",       "48 89 5C 24 18 48 89 74 24 20 48 89 54 24 10 57 48 81 EC 00 01 00 00 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 84 24 F0 00 00 00 48 8B 5A 30 48 8B F9 8B 81 20 03 00 00 48 8B F3 48 C1 EE 20 48 89 5C 24 20 3B 81 4C 03 00 00 ?? ?? 8B CB", false },
     // UMenuPage::RefreshItemsPanel      Epic 0x1096b70 / Steam 0x1056ef0
     { "MenuRefreshItems",     "40 53 48 83 EC 20 48 8B D9 E8 ?? ?? ?? ?? 48 8B 8B D0 02 00 00 48 8B 01", false },
     // UMenuPage::SetTitle               Epic 0x109ab60 / Steam 0x105aee0
@@ -467,10 +474,15 @@ bool LocalMapName(void*, char* o, int c)    { if (o && c) o[0] = 0; return false
 
 #ifdef _WIN32
 // ---- pattern scan over the loaded image's executable sections ----------------------------------------
-struct Pat { uint8_t b[64]; bool wild[64]; int n; };
+// A pattern is capped at kPatMax bytes and SILENTLY TRUNCATED past it -- a truncated sig is a sig
+// that may no longer be unique, which is the one failure mode the sig table cannot detect at runtime.
+// 96 leaves room above the longest entry (MenuBackAction, 76 bytes, which needs every one of them:
+// it has a byte twin for its first 72). Raise this, not the entry, if a sig ever needs more.
+static const int kPatMax = 96;
+struct Pat { uint8_t b[kPatMax]; bool wild[kPatMax]; int n; };
 static bool parsePat(const char* sig, Pat& p) {
     p.n = 0;
-    for (const char* c = sig; *c && p.n < 64; ) {
+    for (const char* c = sig; *c && p.n < kPatMax; ) {
         if (*c == ' ') { c++; continue; }
         if (c[0] == '?') { p.wild[p.n] = true; p.b[p.n] = 0; p.n++; c += (c[1] == '?') ? 2 : 1; continue; }
         unsigned v = 0; int k = 0;
@@ -578,6 +590,7 @@ const Syms& Resolve(void (*logf)(const char*)) {
     g_syms.MeshFinalizeBones  =                     found[i++];   // hooked, never called directly
     g_syms.MenuCreateItems    =                     found[i++];   // hooked, never called directly
     g_syms.MenuSelConfirmed   =                     found[i++];   // hooked, never called directly
+    g_syms.MenuBackAction     =                     found[i++];   // hooked, never called directly
     g_syms.MenuRefreshItems   = (MenuRefreshFn)     found[i++];
     g_syms.MenuSetTitle       = (MenuSetTitleFn)    found[i++];
     g_syms.MenuSetSelIndex    = (MenuSetSelIdxFn)   found[i++];

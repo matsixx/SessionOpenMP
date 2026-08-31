@@ -359,6 +359,7 @@ struct Syms {
     // pause_menu.cpp enumerates these by name and announces what it is missing.
     void*            MenuCreateItems   = nullptr;   // UMenuPage::CreatePageItems -- HOOKED (inject rows)
     void*            MenuSelConfirmed  = nullptr;   // UMenuPage::OnSelectionConfirmed -- HOOKED (intercept)
+    void*            MenuBackAction    = nullptr;   // UMenuPageContainer::HandlePageBackAction -- HOOKED
     MenuRefreshFn    MenuRefreshItems  = nullptr;   // UMenuPage::RefreshItemsPanel -- called (rebuild)
     MenuSetTitleFn   MenuSetTitle      = nullptr;   // UMenuPage::SetTitle -- called (sub-page heading)
     MenuSetSelIdxFn  MenuSetSelIndex   = nullptr;   // UMenuPage::SetSelectedIndex -- called after a swap
@@ -658,6 +659,9 @@ namespace off {
     constexpr int kMapDataLabel       = 0x10;    //   ::MapLabel (FText, what Map Select displays)
     // ---- the pause menu. Every offset below is PDB-exact (pdbmembers) and each was re-confirmed
     // against the code that uses it, because a wrong one here is silent.
+    // UMenuPageContainer (the widget that OWNS the page and routes the gamepad):
+    constexpr int kContainerPage      = 0x2a0;   // _menuPage (UMenuPage*) -- the page the container is
+                                                 // showing, which is the page a back action applies to
     // UMenuPage:
     constexpr int kPageMaxVisible     = 0x290;   // _maxVisibleItems -- CreatePageItems creates rows
                                                  // [_itemsPanelHeaderIndex .. +_maxVisibleItems) only,

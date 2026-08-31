@@ -23,10 +23,15 @@
 
 using namespace omp::game;
 
-struct Pat { uint8_t b[64]; bool wild[64]; int n = 0; };
+// A pattern is capped at kPatMax bytes and SILENTLY TRUNCATED past it -- a truncated sig is a sig
+// that may no longer be unique, which is the one failure mode the sig table cannot detect at runtime.
+// 96 leaves room above the longest entry (MenuBackAction, 76 bytes, which needs every one of them:
+// it has a byte twin for its first 72). Raise this, not the entry, if a sig ever needs more.
+static const int kPatMax = 96;
+struct Pat { uint8_t b[kPatMax]; bool wild[kPatMax]; int n = 0; };
 static bool parsePat(const char* sig, Pat& p) {
     p.n = 0;
-    for (const char* c = sig; *c && p.n < 64; ) {
+    for (const char* c = sig; *c && p.n < kPatMax; ) {
         if (*c == ' ') { c++; continue; }
         if (c[0] == '?') { p.wild[p.n] = true; p.b[p.n++] = 0; c += (c[1] == '?') ? 2 : 1; continue; }
         unsigned v = 0; int k = 0;

@@ -82,6 +82,11 @@ The existing code injects into `PauseMenuPage` only, and wraps it in a page stat
 (`g_page`) for the Multiplayer sub-page. **You do not need any of that** to add one row to another
 page. Minimal path:
 
+> Worth knowing if you build a sub-page of your own: those pages are **row swaps on the one real
+> page**, so the container's `_pageStack` stays empty and the engine believes nothing was navigated.
+> The back button therefore reached "nothing to pop, close the menu" and had to be hooked
+> (`hkPageBack`) to step back through them; a "Back" row of your own goes through `navigateBack`.
+
 **a. Build the row once** (next to `buildRows()`), using the existing helpers:
 
 ```cpp
@@ -190,6 +195,7 @@ All resolved by byte signature, 1-hit in **both** the Epic and Steam exes, verif
 |---|---|---|---|
 | `MenuCreateItems` | `UMenuPage::CreatePageItems` | `0x1071150` | **hooked** — the injection point |
 | `MenuSelConfirmed` | `UMenuPage::OnSelectionConfirmed` | `0x1090c80` | **hooked** — confirm funnel (all pages) |
+| `MenuBackAction` | `UMenuPageContainer::HandlePageBackAction` | `0x1076df0` | **hooked** — the back button |
 | `MenuMultiChanged` | `::OnMultiOptionItemSelectionChanged` | `0x10822e0` | **hooked** — MultiOption changes |
 | `MenuProgressChanged` | `::OnProgressBarValueChanged` | `0x1090c50` | **hooked** — slider changes |
 | `MenuRefreshItems` | `UMenuPage::RefreshItemsPanel` | `0x1096b70` | rebuild the rows |
@@ -198,6 +204,17 @@ All resolved by byte signature, 1-hit in **both** the Epic and Steam exes, verif
 | `MenuProgressSetPct` | `UMenuPageItem::ProgressBarSetPercent` | `0x1096330` | slider value (**normalised 0..1**) |
 | `MenuMultiSetIndex` | `::MultiOptionSetSelectedItemIndex` | `0x1078e80` | toggle value (**broadcasts**) |
 | `MenuTextSite` | *a call site*, not a function | `0x108949b` | see below |
+
+⚠️ **Two of these have byte twins, and one of them cost a longer signature.**
+`HandlePageBackAction` and `HandlePageResetSettingsAction` are the same "look this page up in the
+event-handler map, ask the handler, otherwise act" body and are **identical for their first 72
+bytes** — the first real divergence is a `je` that one encodes short and the other near. Hence a
+76-byte signature, and hence `kPatMax` (the pattern parser's cap, in `game_syms.cpp` and
+`omp_symcheck`): a pattern past that cap is silently truncated, which is exactly how a unique
+signature quietly becomes an ambiguous one. Worse, the whole `PlaySoundOn*` family is identical
+apart from wildcarded displacements, so **no signature can ever name one of them** — the cancel
+sound is reached through the container's vtable instead, with the slot's target checked against the
+family's prologue before it is called.
 
 ⚠️ **`FText::FromName` cannot be signatured** — `FPackageName::GetShortName` is byte-for-byte
 identical, 2 hits at any length. We sig a unique **call site** and decode its trailing `E8 rel32`.
@@ -210,6 +227,8 @@ Key offsets (`off::` in `game_syms.h`, all PDB-exact):
 `kItemSize 0x90` · `kItemKey 0x00` · `kItemType 0x0d` · `kItemLabel 0x10` · `kItemShortDesc 0x28` ·
 `kItemLongDesc 0x40` · `kItemSubPage 0x58` · `kItemMultiTexts 0x68` · `kItemMultiStart 0x78` ·
 `kItemProgMin/Max/Increment 0x80/84/88` · `kPageActiveDef 0x298` · `kPageItemWidgets 0x2a0` ·
+`kContainerPage 0x2a0` (that is `UMenuPageContainer::_menuPage` — a different class that happens to
+share the number with `UMenuPage::_pageItemWidgets`; do not read one off the other) ·
 `kPageItemDefs 0x2e0` · `kPageDefKey 0x30` · `kMenuItemDef 0x2c0` ·
 change params: item key at `+0x08`, old/new at `+0x98`/`+0x9c`.
 

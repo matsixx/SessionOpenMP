@@ -112,7 +112,10 @@ static float g_curlDamp  = 90.0f;
 // as this joint allows, this way round", which is what the body reads as a real tuck.
 static float g_curlDeg   = 280.0f;   // spine/neck: how far each joint bends
 static int   g_curlAxis  = 2;        // 0 = X, 1 = Y, 2 = Z (sign of the angle flips it)
-static float g_hipDeg    = 280.0f;   // hips: the knees come up toward the chest
+static float g_hipDeg    = -50.0f;   // hips: the knees come up toward the chest. NEGATIVE is
+                                     // field-settled -- it flexes the thigh the way the knee
+                                     // folds the heel, and the positive value it replaced was
+                                     // only ever "as far as the joint allows, the other way"
 static int   g_hipAxis   = 2;
 static float g_kneeDeg   = 70.0f;    // knees: the heels fold in toward the butt
 static int   g_kneeAxis  = 0;
@@ -135,7 +138,7 @@ void BodyFeel_ReadConfig(const char* buf) {
     g_driveCurl  = TwkIniInt(buf, "BodyFeelDriveCurl", 1);
     g_curlDeg    = (float)TwkIniInt(buf, "BodyFeelCurlDeg", 280);
     g_curlAxis   = TwkIniInt(buf, "BodyFeelCurlAxis", 2);
-    g_hipDeg     = (float)TwkIniInt(buf, "BodyFeelHipDeg", 280);
+    g_hipDeg     = (float)TwkIniInt(buf, "BodyFeelHipDeg", -50);
     g_hipAxis    = TwkIniInt(buf, "BodyFeelHipAxis", 2);
     g_kneeDeg    = (float)TwkIniInt(buf, "BodyFeelKneeDeg", 70);
     g_kneeAxis   = TwkIniInt(buf, "BodyFeelKneeAxis", 0);
@@ -189,7 +192,7 @@ static float g_landMinGive = 0.15f;// even a curb hop shows a little give
 static int   g_tauMs     = 130;    // ease time constant
 static int   g_recoverMs = 340;    // how long a landing surge takes to breathe back in
 // the bail brace (live statics)
-static float g_bailAccel  = 2600.0f; // cm/s^2 pulled through the reaching bodies (~2.7 g)
+static float g_bailAccel  = 1560.0f; // cm/s^2 pulled through the reaching bodies (60% of base)
 static float g_tuckAccel  = 1100.0f; // FLIGHT: the head held off the ground (world-up)
 static int   g_bailMs     = 900;     // FLIGHT: ms over which the reach blends throw->down
 // the CLUTCH: from the instant of touchdown (detected off live body positions) the body
@@ -207,13 +210,13 @@ static int   g_grabDelayMs = 0;
 // (a static both-thigh pull barely moved the knees) and reads alive; then the fetal hold.
 static int   g_flailDelayMs = 0;      // the flail starts THIS long after the bail edge
                                       // (in the air), not at collision -- field ask
-static int   g_flailMs     = 1200;
+static int   g_flailMs     = 1800;
 static float g_flailHz     = 1.4f;    // slower alternation: each kick gets time to move the leg
 static float g_flailTorque = 120.0f;   // landing flail: alternating hip torque. Raised
                                        // hard twice: field reports the torque era reads
                                        // invisible -- if it STILL does at this level,
                                        // suspect the torque pathway, not the magnitude
-static float g_flailAccel  = 5200.0f;
+static float g_flailAccel  = 7280.0f;   // 140%
 static float g_clutchAccel = 2800.0f; // hands toward the impact part
 static float g_headHitMin  = 120.0f;  // ANY real knock to the head or neck counts -- you
                                       // clutch your head whether you cracked it or just
@@ -255,7 +258,7 @@ static float g_reachMax    = 100.0f;  // ...beyond this the hand simply does not
 // brakes) -- it cannot overshoot, sidetrack, or fight a body the engine already threw.
 // (v1 flung: its velocity sensor smoothed in from zero = fake deficit. The sensor stays
 // seeded with the pre-bail velocity at first sight.)
-static float g_carryFrac   = 0.8f;    // fraction of pre-bail speed the ragdoll keeps
+static float g_carryFrac   = 0.55f;   // fraction of pre-bail speed the ragdoll keeps
 static int   g_carryMs     = 250;
 static float g_carryGain   = 8.0f;    // accel = along-throw deficit * gain (1/s)
 static float g_carryMax    = 6000.0f; // cm/s^2 clamp per body
@@ -360,7 +363,7 @@ static float g_armKeepAccel  = 1400.0f; // arms held to the FRONT (force toward 
 // extra downward pull on every body while airborne in the ragdoll; ends at touchdown so
 // it never grinds the body into the floor. 100% = g_extraGrav on top of world gravity.
 static float g_extraGrav     = 750.0f;  // cm/s^2 at Fall weight 100%
-static int   g_fallAmt       = 50;      // Fall weight (%)
+static int   g_fallAmt       = 100;     // Fall weight (%)
 static float g_faceDownZ     = -0.45f;  // bellyZ below this = face-down
 static float g_rollDoneZ     = -0.15f;  // bellyZ above this = rolled off the belly
 // THE BREAK is OFF by default: two rounds of thresholds could not separate a bad slam
@@ -379,7 +382,7 @@ static float BraceClampPct(float v) {
     if (v < 0.0f) v = 0.0f; if (v > 400.0f) v = 400.0f; return v;
 }
 static void ReadBraceTuning(const char* buf) {
-    g_flailMs     = TwkIniInt(buf, "BodyFeelFlailMs", 1200);
+    g_flailMs     = TwkIniInt(buf, "BodyFeelFlailMs", 1800);
     if (g_flailMs < 0) g_flailMs = 0; if (g_flailMs > 10000) g_flailMs = 10000;
     g_flailDelayMs = TwkIniInt(buf, "BodyFeelFlailDelayMs", 0);
     if (g_flailDelayMs < 0) g_flailDelayMs = 0;
@@ -388,14 +391,14 @@ static void ReadBraceTuning(const char* buf) {
     if (g_clutchMs < 500) g_clutchMs = 500; if (g_clutchMs > 15000) g_clutchMs = 15000;
     g_grabDelayMs = TwkIniInt(buf, "BodyFeelGrabDelayMs", 0);
     if (g_grabDelayMs < 0) g_grabDelayMs = 0; if (g_grabDelayMs > 3000) g_grabDelayMs = 3000;
-    g_flailAccel  = kFlailBase  * BraceClampPct((float)TwkIniInt(buf, "BodyFeelFlailPct", 300)) / 100.0f;
+    g_flailAccel  = kFlailBase  * BraceClampPct((float)TwkIniInt(buf, "BodyFeelFlailPct", 140)) / 100.0f;
     g_clutchAccel = kClutchBase * BraceClampPct((float)TwkIniInt(buf, "BodyFeelGrabPct",  300)) / 100.0f;
-    g_bailAccel   = kReachBase  * BraceClampPct((float)TwkIniInt(buf, "BodyFeelReachPct", 100)) / 100.0f;
+    g_bailAccel   = kReachBase  * BraceClampPct((float)TwkIniInt(buf, "BodyFeelReachPct", 60)) / 100.0f;
     g_armAmt = TwkIniInt(buf, "BodyFeelArmPct", 170);
     if (g_armAmt < 0) g_armAmt = 0; if (g_armAmt > 300) g_armAmt = 300;
-    g_fallAmt = TwkIniInt(buf, "BodyFeelFallPct", 50);
+    g_fallAmt = TwkIniInt(buf, "BodyFeelFallPct", 100);
     if (g_fallAmt < 0) g_fallAmt = 0; if (g_fallAmt > 300) g_fallAmt = 300;
-    int cp = TwkIniInt(buf, "BodyFeelCarryPct", 80);
+    int cp = TwkIniInt(buf, "BodyFeelCarryPct", 55);
     if (cp < 0) cp = 0; if (cp > 150) cp = 150;
     g_carryFrac   = (float)cp / 100.0f;
 }
@@ -412,10 +415,10 @@ static void SaveBraceTuning(char* buf, size_t cap) {
     TwkIniSetInt(buf, cap, "BodyFeelFallPct", g_fallAmt);
 }
 static void ResetBraceTuning() {
-    g_flailMs = 1200; g_flailDelayMs = 0; g_clutchMs = 8250; g_grabDelayMs = 0;
-    g_flailAccel = kFlailBase * 3.0f; g_clutchAccel = kClutchBase * 3.0f;
-    g_bailAccel = kReachBase;
-    g_carryFrac = 0.8f; g_armAmt = 170; g_fallAmt = 50;
+    g_flailMs = 1800; g_flailDelayMs = 0; g_clutchMs = 8250; g_grabDelayMs = 0;
+    g_flailAccel = kFlailBase * 1.4f; g_clutchAccel = kClutchBase * 3.0f;
+    g_bailAccel = kReachBase * 0.6f;
+    g_carryFrac = 0.55f; g_armAmt = 170; g_fallAmt = 100;
 }
 bool  BodyFeel_BraceEnabled()          { return g_bail != 0; }
 void  BodyFeel_SetBraceEnabled(bool o) { g_bail = o ? 1 : 0; TwkMarkDirty(); }
@@ -553,6 +556,12 @@ static int    g_rollTries   = 0;       // ...and he only tries so many times
 // stiffness back to the rig and straighten out under their own weight (field).
 static int    g_limpLegs    = 1;       // off keeps the legs driven to the end
 static bool   g_legsLimp    = false;   // are they slack right now
+// THE PEDAL COMES BEFORE THE TUCK. The flail skipped every leg whenever the joint drives were on,
+// reasoning that a pedal underneath a commanded pose is just noise -- but the curl is driven from
+// the bail edge, so the legs were commanded for the whole ragdoll and the pedal never ran at all.
+// No slider could reach it. The legs are now left undriven while the flail is running and take up
+// the tuck when it finishes, which is the order a person does them in anyway.
+static bool   g_legsFlail   = false;
 static bool   g_rollLogged  = false;   // one force-report line per roll attempt
 static bool   g_legLogged   = false;   // one leg-geometry line per bail
 static double g_detectStart   = 0.0;   // touchdown gates count from here
@@ -736,7 +745,7 @@ static void DriveSpineCurl(uint8_t* mc, bool on) {
         else if (thighJ) { deg = g_hipDeg;  ax = g_hipAxis;  }
         // he has given up turning over: the whole leg goes slack, tone included, so it can
         // straighten out instead of staying tucked underneath him
-        if (on && g_legsLimp && (ankleJ || calfJ || thighJ)) {
+        if (on && (g_legsLimp || g_legsFlail) && (ankleJ || calfJ || thighJ)) {
             g_setOrientTarget(c, qI);
             g_setDriveParams(c, *(float*)(c + 0x8c + 0xc4 + 0x20),
                                 *(float*)(c + 0x8c + 0xc4 + 0x24), 0.0f);
@@ -1069,6 +1078,9 @@ void BodyFeel_PumpFrame() {
                 }
                 DriveSpineCurl((uint8_t*)g_mesh, true);
                 g_rollDone = false; g_rollTries = 0; g_legsLimp = false;
+                // the legs pedal first; the curl takes them over when the flail is spent
+                g_legsFlail = (g_bail && g_amount > 0 && g_flailMs > 0 &&
+                               g_flailAccel > 0.0f);
                 g_detectStart = t;
                 g_armBroken[0] = g_armBroken[1] = false; g_retargetUntil = 0.0;
                 for (int i = 0; i < kMaxBodies; i++) g_bOk[i] = false;
@@ -1269,9 +1281,6 @@ void BodyFeel_PumpFrame() {
                                                     (double)g_flailHz));
                             for (int i = 0; i < n2 && i < kMaxBodies; i++) {
                                 if (!g_legBody[i] || !g_bOk[i]) continue;
-                                // The drives own the legs while they are curling: a pedal
-                                // running underneath a commanded pose is just noise.
-                                if (g_driveCurl) continue;
                                 // The FEET never seek. They were being pulled toward the
                                 // chest at full strength like the rest of the leg, which
                                 // during the grab window reads as the feet trying to reach
@@ -1295,6 +1304,13 @@ void BodyFeel_PumpFrame() {
                                 g_addForce(bi, f4, true, true);
                             }
                         }
+                    }
+                    // The pedal is spent: the legs stop being free and take up the tuck.
+                    if (g_legsFlail && g_mesh && g_impactBody >= 0 &&
+                        (t - g_landT) >= (double)g_flailMs / 1000.0) {
+                        g_legsFlail = false;
+                        DriveSpineCurl((uint8_t*)g_mesh, true);
+                        TwkLogBail("[body] flail spent -- the legs take up the tuck");
                     }
                     // Invisible-surface telemetry, every 3s of ragdoll. The discriminator
                     // is motion: a body resting on real (even invisible) geometry keeps
