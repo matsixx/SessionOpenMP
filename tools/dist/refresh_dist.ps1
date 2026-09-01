@@ -51,7 +51,13 @@ $rootData = @(
     # Both files are plain text by design -- being readable is the whole trust argument for asking
     # someone to run a script that writes into their game folder.
     @{ From = Join-Path $Root "dist\update\update.ps1";  To = "update.ps1" },
-    @{ From = Join-Path $Root "dist\update\update.bat";  To = "update.bat" }
+    @{ From = Join-Path $Root "dist\update\update.bat";  To = "update.bat" },
+    # The RELAY SERVER and its instructions. It ships with the package because the feature is
+    # useless without it: "get someone to run a relay" is not advice anyone can act on if the
+    # relay is not in the download. It is a server, not part of the mod -- nothing loads it,
+    # nothing starts it, and a player who never opens it is unaffected by its presence.
+    @{ From = Join-Path $Root "build\Release\omp_relay.exe"; To = "relay\omp_relay.exe" },
+    @{ From = Join-Path $Root "tools\relay\README.md";       To = "relay\README.md" }
 )
 
 # Mods\ is an ALLOWLIST: only the folders in $mods survive, and inside each one only dlls\.
@@ -104,7 +110,12 @@ try {
 
     foreach ($d in $rootData) {
         if (-not (Test-Path $d.From)) { throw ("REFUSING to write the zip -- missing repo file: " + $d.From) }
-        Copy-Item $d.From (Join-Path $stage $d.To) -Force
+        # A destination may name a SUBFOLDER (the relay lives in one). Copy-Item does not create
+        # parents, so it would fail rather than nest -- make the folder first.
+        $dest = Join-Path $stage $d.To
+        $destDir = Split-Path $dest -Parent
+        if (-not (Test-Path $destDir)) { New-Item -ItemType Directory -Path $destDir -Force | Out-Null }
+        Copy-Item $d.From $dest -Force
         Write-Host ("  root: {0}" -f $d.To)
     }
 

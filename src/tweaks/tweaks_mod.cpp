@@ -56,7 +56,7 @@
 #include "ue4ss_abi.h"
 #include "ui/menu_ext.h"
 
-#define TWEAKS_VERSION "3.19.202"
+#define TWEAKS_VERSION "3.19.203"
 #define TWK_WIDEN(x) STR(x)   // STR() prepends L before the macro expands; expand first
 
 // ------------------------------------------------------------------ log (own file, fresh per launch)
@@ -170,33 +170,52 @@ static void resetAllDefaults() {
     TwkLog("[tweaks] settings reset to defaults");
 }
 
+// The F1 section, in the SAME categories as the pause-menu pages. It used to be all fourteen modules
+// one after another with separators between -- every module reasonable on its own, the whole thing a
+// screenful you had to read to navigate. The pause menu already had the right taxonomy; this is only
+// the F1 surface catching up to it, so a setting is in the same place whichever surface you opened.
+//
+// The groups need host API v3. An older host has no BeginGroup, so the flat layout stays as the
+// fallback rather than the section going missing: the seam's whole promise is that either side can be
+// older than the other.
 static void drawSection(const OmpMenuApi* api, void*) {
     if (!api || api->version < 1) return;
-    ScoopSpeed_DrawMenu(api);
-    FlipSpeed_DrawMenu(api);
-    api->Separator();
-    CatchTweaks_DrawMenu(api);
-    api->Separator();
-    RunOut_DrawMenu(api);
-    api->Separator();
-    CatchLevel_DrawMenu(api);
-    api->Separator();
-    CatchSound_DrawMenu(api);
-    api->Separator();
-    ClothMerge_DrawMenu(api);
-    ClothSim_DrawMenu(api);
-    api->Separator();
-    api->Separator();
-    PitchRange_DrawMenu(api);
-    api->Separator();
-    FootPlace_DrawMenu(api);
-    api->Separator();
-    FootSteer_DrawMenu(api);
-    api->Separator();
-    GrindPop_DrawMenu(api);
-    PopProbe_DrawMenu(api);
-    api->Separator();
-    CameraHeight_DrawMenu(api);
+
+    const bool grouped = (api->version >= 3 && api->BeginGroup && api->EndGroup);
+    // Open a category, draw its modules, close it. Written as a lambda over a small table rather than
+    // repeated eight times, so adding a module is one line in one place.
+    const auto group = [&](const char* title, void (*const* fns)(const OmpMenuApi*), int n) {
+        if (grouped) {
+            if (api->BeginGroup(title)) {
+                for (int i = 0; i < n; i++) { if (i) api->Separator(); fns[i](api); }
+            }
+            api->EndGroup();                       // once per BeginGroup, whatever it returned
+        } else {
+            api->Separator();
+            api->Text(title);
+            for (int i = 0; i < n; i++) fns[i](api);
+        }
+    };
+
+    typedef void (*DrawFn)(const OmpMenuApi*);
+    static DrawFn const kPop[]    = { PopProbe_DrawMenu };
+    static DrawFn const kBoard[]  = { FlipSpeed_DrawMenu, ScoopSpeed_DrawMenu, PitchRange_DrawMenu };
+    static DrawFn const kCatch[]  = { CatchTweaks_DrawMenu, CatchLevel_DrawMenu, CatchSound_DrawMenu,
+                                      RunOut_DrawMenu };
+    static DrawFn const kGrind[]  = { GrindPop_DrawMenu };
+    static DrawFn const kFeet[]   = { FootPlace_DrawMenu, FootSteer_DrawMenu };
+    static DrawFn const kCamera[] = { CameraHeight_DrawMenu };
+    static DrawFn const kCloth[]  = { ClothMerge_DrawMenu, ClothSim_DrawMenu };
+    #define TWK_GROUP(title, arr) group(title, arr, (int)(sizeof(arr) / sizeof(arr[0])))
+    TWK_GROUP("Pop control",    kPop);
+    TWK_GROUP("Board & tricks", kBoard);
+    TWK_GROUP("Catch & bail",   kCatch);
+    TWK_GROUP("Grinds",         kGrind);
+    TWK_GROUP("Feet",           kFeet);
+    TWK_GROUP("Camera",         kCamera);
+    TWK_GROUP("Clothing",       kCloth);
+    #undef TWK_GROUP
+
     // The same reset the pause menu offers, so neither surface is the only way to get back.
     if (api->version >= 2 && api->Button) {
         api->Separator();

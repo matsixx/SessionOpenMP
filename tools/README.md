@@ -1,7 +1,7 @@
 # tools
 
-Offline harnesses and build scripts. The five gates below run without the game, without a second
-player and without a network, and **all five must pass before a change ships**.
+Offline harnesses and build scripts. The six gates below run without the game, without a second
+player and without a network, and **all six must pass before a change ships**.
 
 Build them with the rest of the project (`cmake --build build --config Release`); they land in
 `build\Release\`. None of them takes arguments except `omp_symcheck`. `offcheck` is the exception
@@ -76,6 +76,17 @@ mismatch — including fields that were added to a struct but forgotten in the c
 ### `omp_sessiontest` — session lifecycle
 
 Headless test of peers arriving, going quiet, timing out and leaving, with the transport mocked out.
+
+### `omp_relaytest` — the relay, end to end
+
+Launches the REAL `omp_relay` server and **three** real clients on loopback, and asserts that every
+player sees both others and that reliable messages survive the trip. Three, not two, because a star
+and a mesh look identical at two players -- and "everyone sees everyone" is the entire reason the
+relay exists.
+
+It also proves the **amplification defence**: a short room-list request must be ignored and a padded
+one answered with no more bytes than were sent. That check protects other people's machines rather
+than ours, which is exactly why it is gated rather than trusted.
 
 ### `omp_shmtest` / `omp_udptest` — real two-process transport
 

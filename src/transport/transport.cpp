@@ -24,6 +24,27 @@
 
 namespace omp {
 
+// The RELAY backend. Everyone dials OUT to one server which forwards -- the only wire here that
+// works for 3+ players over the internet without anybody forwarding a port. See docs/relay-scope.md.
+namespace relayb {
+    bool Init(bool); void Shutdown(); void Deactivate();
+    const char* MyId(); int AddPeer(const char*); int PeerCount();
+    void Send(int, const void*, int, bool); void Tick(RecvFn, void*); bool GetStats(int, PeerStats*);
+    int  SendBudget();
+    bool LobbyHost(); bool LobbyJoin(); void LobbyLeave(); int LobbyStatus();
+    void SetLobbyAd(const char*, const char*);
+    void SetLobbyCode(const char*); const char* LobbyCode(); const char* MakeLobbyCode(char*, int);
+    bool LobbyJoinByCode(const char*);
+    bool LobbyBrowse(); int BrowseStatus(); int BrowseCount(); bool BrowseAt(int, LobbyInfo*);
+    bool LobbyJoinAt(int);
+    const char* PeerIdStr(int); bool LobbyIsHost(); bool LobbyKick(const char*);
+    const char* LobbyOwnerId(); int InitState();
+    TrustLevel PeerTrust(int); bool SessionOpen();
+    void SetRelayControl(bool); bool RelaysForced();
+    void SetLocalIdentity(const char*); void SetServer(const char*, int);
+    void Posture(char*, int);
+}
+
 namespace eosb {
     bool Init(bool forceRelays); void Shutdown(); void Deactivate();
     const char* MyId(); int AddPeer(const char*); int PeerCount();
@@ -76,6 +97,7 @@ bool Init(Backend which, const char* logPath, bool forceRelays) {
     if (which == BK_SHM)      { Log("=== transport: SHARED MEMORY (same-PC rig) ==="); ok = shmb::Init(forceRelays); }
     else if (which == BK_EOS) { Log("=== transport: EOS P2P ===");                      ok = eosb::Init(forceRelays); }
     else if (which == BK_UDP) { Log("=== transport: DIRECT UDP (no Epic) ===");         ok = udpb::Init(forceRelays); }
+    else if (which == BK_RELAY) { Log("=== transport: RELAY SERVER (no Epic) ===");     ok = relayb::Init(forceRelays); }
     if (ok) g_cur = which;
     else    Log("[transport] backend %d failed to initialize", (int)which);
     return ok;
@@ -86,6 +108,7 @@ int SendBudget() {
     case BK_SHM: return 32;    // = shm's kRelRing/2 (v3) -- keep in step with shm_transport.cpp
     case BK_EOS: return 64;
     case BK_UDP: return 32;
+    case BK_RELAY: return relayb::SendBudget();
     default:     return 8;
     }
 }
@@ -99,6 +122,7 @@ void Deactivate() {
     else if (g_cur == BK_EOS) { eosb::Deactivate(); Log("[transport] EOS deactivated (platform stays resident)"); }
     // UDP tears down fully like shm: a socket is cheap to rebuild and nothing about it is global.
     else if (g_cur == BK_UDP) { udpb::Deactivate(); Log("[transport] direct UDP deactivated"); }
+    else if (g_cur == BK_RELAY) { relayb::Deactivate(); Log("[transport] relay deactivated"); }
     g_cur = BK_NONE;
 }
 
@@ -106,6 +130,7 @@ void Shutdown() {
     if (g_cur == BK_SHM) shmb::Shutdown();
     else if (g_cur == BK_EOS) eosb::Shutdown();
     else if (g_cur == BK_UDP) udpb::Shutdown();
+    else if (g_cur == BK_RELAY) relayb::Shutdown();
     g_cur = BK_NONE;
     if (g_log) { fclose(g_log); g_log = nullptr; }
 }
@@ -115,29 +140,35 @@ void Shutdown() {
 // died must degrade to nothing happening.
 const char* MyId() {
     return (g_cur == BK_SHM) ? shmb::MyId() : (g_cur == BK_EOS) ? eosb::MyId()
-         : (g_cur == BK_UDP) ? udpb::MyId() : "";
+         : (g_cur == BK_UDP) ? udpb::MyId()
+         : (g_cur == BK_RELAY) ? relayb::MyId() : "";
 }
 int AddPeer(const char* id) {
     return (g_cur == BK_SHM) ? shmb::AddPeer(id) : (g_cur == BK_EOS) ? eosb::AddPeer(id)
-         : (g_cur == BK_UDP) ? udpb::AddPeer(id) : -1;
+         : (g_cur == BK_UDP) ? udpb::AddPeer(id)
+         : (g_cur == BK_RELAY) ? relayb::AddPeer(id) : -1;
 }
 int PeerCount() {
     return (g_cur == BK_SHM) ? shmb::PeerCount() : (g_cur == BK_EOS) ? eosb::PeerCount()
-         : (g_cur == BK_UDP) ? udpb::PeerCount() : 0;
+         : (g_cur == BK_UDP) ? udpb::PeerCount()
+         : (g_cur == BK_RELAY) ? relayb::PeerCount() : 0;
 }
 void Send(int i, const void* d, int n, bool rel) {
     if      (g_cur == BK_SHM) shmb::Send(i, d, n, rel);
     else if (g_cur == BK_EOS) eosb::Send(i, d, n, rel);
     else if (g_cur == BK_UDP) udpb::Send(i, d, n, rel);
+    else if (g_cur == BK_RELAY) relayb::Send(i, d, n, rel);
 }
 void Tick(RecvFn f, void* u) {
     if      (g_cur == BK_SHM) shmb::Tick(f, u);
     else if (g_cur == BK_EOS) eosb::Tick(f, u);
     else if (g_cur == BK_UDP) udpb::Tick(f, u);
+    else if (g_cur == BK_RELAY) relayb::Tick(f, u);
 }
 bool GetStats(int i, PeerStats* o) {
     return (g_cur == BK_SHM) ? shmb::GetStats(i, o) : (g_cur == BK_EOS) ? eosb::GetStats(i, o)
-         : (g_cur == BK_UDP) ? udpb::GetStats(i, o) : false;
+         : (g_cur == BK_UDP) ? udpb::GetStats(i, o)
+         : (g_cur == BK_RELAY) ? relayb::GetStats(i, o) : false;
 }
 // ---- direct-connect intent. NOT backend-gated, for the reason stated in the header: the caller sets
 // the address and THEN starts the transport, so at the moment of the call g_cur is BK_NONE and a gate
@@ -145,7 +176,8 @@ bool GetStats(int i, PeerStats* o) {
 void SetDirectEndpoint(const char* a, int port) { udpb::SetDirectEndpoint(a, port); }
 const char* DirectEndpoint() { return udpb::DirectEndpoint(); }
 const char* DirectBoundTo()  { return udpb::BoundDescription(); }
-void SetLocalIdentity(const char* id) { udpb::SetLocalIdentity(id); }
+void SetLocalIdentity(const char* id) { udpb::SetLocalIdentity(id); relayb::SetLocalIdentity(id); }
+void SetRelayServer(const char* a, int port) { relayb::SetServer(a, port); }
 // Route policy. Shared memory has no route to choose -- the "connection" is a page of RAM -- so this
 // is genuinely not applicable there rather than merely unimplemented, and RelaysForced() says false
 // so the posture line reports the truth instead of claiming a hidden address.
@@ -189,29 +221,35 @@ TrustLevel BackendTrust() {
 }
 TrustLevel PeerTrust(int i) {
     return (g_cur == BK_SHM) ? shmb::PeerTrust(i) : (g_cur == BK_EOS) ? eosb::PeerTrust(i)
-         : (g_cur == BK_UDP) ? udpb::PeerTrust(i) : TRUST_NONE;
+         : (g_cur == BK_UDP) ? udpb::PeerTrust(i)
+         : (g_cur == BK_RELAY) ? relayb::PeerTrust(i) : TRUST_NONE;
 }
 bool SessionOpen() {
     return (g_cur == BK_SHM) ? shmb::SessionOpen() : (g_cur == BK_EOS) ? eosb::SessionOpen()
-         : (g_cur == BK_UDP) ? udpb::SessionOpen() : false;
+         : (g_cur == BK_UDP) ? udpb::SessionOpen()
+         : (g_cur == BK_RELAY) ? relayb::SessionOpen() : false;
 }
 void AllowLearnWithoutSession(bool on) { eosb::AllowLearnWithoutSession(on); }
 bool LobbyHost() {
     return (g_cur == BK_SHM) ? shmb::LobbyHost() : (g_cur == BK_EOS) ? eosb::LobbyHost()
-         : (g_cur == BK_UDP) ? udpb::LobbyHost() : false;
+         : (g_cur == BK_UDP) ? udpb::LobbyHost()
+         : (g_cur == BK_RELAY) ? relayb::LobbyHost() : false;
 }
 bool LobbyJoin() {
     return (g_cur == BK_SHM) ? shmb::LobbyJoin() : (g_cur == BK_EOS) ? eosb::LobbyJoin()
-         : (g_cur == BK_UDP) ? udpb::LobbyJoin() : false;
+         : (g_cur == BK_UDP) ? udpb::LobbyJoin()
+         : (g_cur == BK_RELAY) ? relayb::LobbyJoin() : false;
 }
 void LobbyLeave() {
     if      (g_cur == BK_SHM) shmb::LobbyLeave();
     else if (g_cur == BK_EOS) eosb::LobbyLeave();
     else if (g_cur == BK_UDP) udpb::LobbyLeave();
+    else if (g_cur == BK_RELAY) relayb::LobbyLeave();
 }
 int LobbyStatus() {
     return (g_cur == BK_SHM) ? shmb::LobbyStatus() : (g_cur == BK_EOS) ? eosb::LobbyStatus()
-         : (g_cur == BK_UDP) ? udpb::LobbyStatus() : 0;
+         : (g_cur == BK_UDP) ? udpb::LobbyStatus()
+         : (g_cur == BK_RELAY) ? relayb::LobbyStatus() : 0;
 }
 // ---- the browser is EOS-only BY NATURE, not by omission: shared memory has no directory to search.
 // Claiming a mailbox slot IS joining, so "which lobby?" is not a question that exists on that wire.
@@ -221,23 +259,30 @@ int LobbyStatus() {
 // the only visible symptom being a code missing from the roster panel. They write static strings in
 // the EOS backend; nothing about that needs a live platform, and the values must already be sitting
 // there BEFORE the lobby is created for publishAd to find them.
-void SetLobbyAd(const char* h, const char* m) { eosb::SetLobbyAd(h, m); }
-bool LobbyBrowse(){ return (g_cur == BK_EOS) && eosb::LobbyBrowse(); }
-int  BrowseStatus(){ return (g_cur == BK_EOS) ? eosb::BrowseStatus() : 0; }
-int  BrowseCount(){ return (g_cur == BK_EOS) ? eosb::BrowseCount() : 0; }
-bool BrowseAt(int i, LobbyInfo* o){ return (g_cur == BK_EOS) && eosb::BrowseAt(i, o); }
-bool LobbyJoinAt(int i){ return (g_cur == BK_EOS) && eosb::LobbyJoinAt(i); }
+void SetLobbyAd(const char* h, const char* m) { eosb::SetLobbyAd(h, m); relayb::SetLobbyAd(h, m); }
+bool LobbyBrowse(){ return (g_cur == BK_EOS) ? eosb::LobbyBrowse()
+                         : (g_cur == BK_RELAY) ? relayb::LobbyBrowse() : false; }
+int  BrowseStatus(){ return (g_cur == BK_EOS) ? eosb::BrowseStatus()
+                          : (g_cur == BK_RELAY) ? relayb::BrowseStatus() : 0; }
+int  BrowseCount(){ return (g_cur == BK_EOS) ? eosb::BrowseCount()
+                         : (g_cur == BK_RELAY) ? relayb::BrowseCount() : 0; }
+bool BrowseAt(int i, LobbyInfo* o){ return (g_cur == BK_EOS) ? eosb::BrowseAt(i, o)
+                                        : (g_cur == BK_RELAY) ? relayb::BrowseAt(i, o) : false; }
+bool LobbyJoinAt(int i){ return (g_cur == BK_EOS) ? eosb::LobbyJoinAt(i)
+                              : (g_cur == BK_RELAY) ? relayb::LobbyJoinAt(i) : false; }
 // Private games are an EOS concept -- shared memory has one mailbox and no directory, so there is
 // nothing for a code to select between.
-void SetLobbyCode(const char* c){ eosb::SetLobbyCode(c); }
+void SetLobbyCode(const char* c){ eosb::SetLobbyCode(c); relayb::SetLobbyCode(c); }
 // The getter is safe to forward too: g_myCode is only ever non-empty while we are in a lobby that
 // HAS a code, which can only happen on the EOS wire in the first place.
 const char* LobbyCode(){ return eosb::LobbyCode(); }
 const char* MakeLobbyCode(char* o, int c){ return eosb::MakeLobbyCode(o, c); }
-bool LobbyJoinByCode(const char* c){ return (g_cur == BK_EOS) && eosb::LobbyJoinByCode(c); }
+bool LobbyJoinByCode(const char* c){ return (g_cur == BK_EOS) ? eosb::LobbyJoinByCode(c)
+                                         : (g_cur == BK_RELAY) ? relayb::LobbyJoinByCode(c) : false; }
 // Moderation is EOS-only: shared memory has no lobby, no owner and no membership to remove anyone
 // from -- claiming a mailbox slot IS joining.
-const char* PeerIdStr(int i){ return (g_cur == BK_EOS) ? eosb::PeerIdStr(i) : ""; }
+const char* PeerIdStr(int i){ return (g_cur == BK_EOS) ? eosb::PeerIdStr(i)
+                                   : (g_cur == BK_RELAY) ? relayb::PeerIdStr(i) : ""; }
 bool LobbyIsHost(){ return (g_cur == BK_EOS) && eosb::LobbyIsHost(); }
 // Only EOS has a lobby with an owner; the other backends have no such concept, so "" is the honest
 // answer rather than pretending somebody is in charge.

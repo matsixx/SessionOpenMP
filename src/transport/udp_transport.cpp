@@ -76,6 +76,7 @@ enum PktType : uint8_t {
     PT_ACK = 4,        // + seq(u32)
     PT_BYE = 5,        // a clean goodbye, so the peer does not wait out the timeout
     PT_PING = 6,       // keepalive: holds the NAT mapping open and proves liveness
+    PT_PEERS = 7,      // + count(u8) + N x { id[32], ipv4(u32), port(u16) }: "these are the others"
 };
 
 #pragma pack(push, 1)
@@ -99,6 +100,7 @@ static const int kPingMs         = 1000;
 static const int kPeerTimeoutMs  = 10000;
 static const int kHelloResendMs  = 300;
 static const int kHelloGiveUpMs  = 20000;
+static const int kGossipMs       = 3000;        // how often the roster is passed around (see Tick)
 
 // ---- state -------------------------------------------------------------------------------------------
 struct RelOut {
@@ -135,10 +137,24 @@ static volatile LONG g_status = 0;              // 0 idle, 1 connecting, 2 hosti
 static char        g_myId[kIdLen + 1] = {0};
 static char        g_joinAddr[128] = {0};       // what SetDirectEndpoint was told to join
 static int         g_listenPort = 0;
-static sockaddr_in g_joinTarget{};
-static bool        g_joining = false;
-static uint32_t    g_joinToken = 0;             // the token WE offer the host during our handshake
-static uint64_t    g_joinStartMs = 0, g_joinLastMs = 0;
+// ---- DIALS: every handshake we are currently attempting.
+// This used to be one target, because there used to be one: a joiner dialled the host and that was
+// the session. The LAN mesh dials everyone, so it has to be a table -- and NOT because one variable
+// was untidy. `peerByToken` finds a peer by the token WE issued, so two peers sharing a token would
+// route one of them's data to the other. Each dial therefore mints its OWN token, and the ACK adopts
+// the token belonging to the dial it answers.
+struct Dial {
+    sockaddr_in target{};
+    char        id[kIdLen + 1] = {0};   // who we EXPECT, when an introduction named them; "" if unknown
+    uint32_t    token = 0;              // what we advertised to this target, and nobody else
+    uint64_t    startMs = 0, lastMs = 0;
+    bool        active = false;
+    bool        primary = false;        // the player's own Join. Only its failure is worth a banner:
+                                        // an introduced peer that never answers is normal on the
+                                        // internet and says nothing about the session you are in.
+};
+static Dial        g_dials[kPeers];
+static bool        g_joining = false;   // is the PRIMARY dial still outstanding (drives LobbyStatus)
 static char        g_boundDesc[64] = {0};
 
 static const int kDefaultPort = 7777;
@@ -192,6 +208,39 @@ static int addPeer(const char* id, const sockaddr_in& from, uint32_t localToken)
     Log("[udp] peer #%d = %s at %s", g_nPeers, p.idStr, a);
     return g_nPeers++;
 }
+
+// Start (or refresh) a handshake attempt. Deduped on BOTH id and address: an introduction can name
+// somebody we are already talking to, and gossip repeats every few seconds.
+static bool startDial(const sockaddr_in& to, const char* id, bool primary) {
+    if (id && *id && !_stricmp(id, g_myId)) return false;          // ourselves
+    if (id && *id && peerById(id))          return false;          // already connected
+    for (int i = 0; i < kPeers; i++) {
+        const Dial& d = g_dials[i];
+        if (!d.active) continue;
+        if (sameAddr(d.target, to)) return false;                  // already dialling that endpoint
+        if (id && *id && d.id[0] && !_stricmp(d.id, id)) return false;
+    }
+    for (int i = 0; i < kPeers; i++) {
+        Dial& d = g_dials[i];
+        if (d.active) continue;
+        d = Dial{};
+        d.target = to;
+        if (id) strncpy_s(d.id, id, _TRUNCATE);
+        d.token = randU32();
+        d.startMs = GetTickCount64(); d.lastMs = 0;
+        d.active = true; d.primary = primary;
+        return true;
+    }
+    return false;                                                  // table full: nothing to do
+}
+// The token we promised THIS endpoint. An ACK is answered with the dial it belongs to, never with
+// "the token we happen to be using", which is what makes several dials at once safe.
+static Dial* dialFor(const sockaddr_in& from) {
+    for (int i = 0; i < kPeers; i++)
+        if (g_dials[i].active && sameAddr(g_dials[i].target, from)) return &g_dials[i];
+    return nullptr;
+}
+static void clearDials() { for (int i = 0; i < kPeers; i++) g_dials[i] = Dial{}; }
 
 // ---- raw send ----------------------------------------------------------------------------------------
 static void sendTo(const sockaddr_in& to, uint8_t type, uint32_t token,
@@ -350,17 +399,19 @@ bool LobbyHost() {
 bool LobbyJoin() {
     if (g_sock == INVALID_SOCKET) return false;
     if (g_inSession) return true;
-    if (!parseAddr(g_joinAddr, &g_joinTarget)) {
+    sockaddr_in target{};
+    if (!parseAddr(g_joinAddr, &target)) {
         Log("[udp] cannot join: '%s' is not an address I can resolve (want 1.2.3.4:7777)", g_joinAddr);
         InterlockedExchange(&g_status, -1);
         return false;
     }
     if (!bindSocket(0)) { InterlockedExchange(&g_status, -1); return false; }   // ephemeral: we dial out
-    g_inSession = true; g_joining = true;
-    g_joinToken = randU32();
-    g_joinStartMs = GetTickCount64(); g_joinLastMs = 0;
+    g_inSession = true;
+    clearDials();
+    startDial(target, nullptr, true);
+    g_joining = true;
     InterlockedExchange(&g_status, 1);
-    char a[64]; addrStr(g_joinTarget, a, sizeof(a));
+    char a[64]; addrStr(target, a, sizeof(a));
     Log("[udp] joining %s from %s ...", a, g_boundDesc);
     return true;
 }
@@ -372,6 +423,7 @@ void LobbyLeave() {
             g_peers[i].st.state = 5;
         }
     g_inSession = false; g_joining = false;
+    clearDials();
     InterlockedExchange(&g_status, 0);
     closeSocket();
     Log("[udp] session CLOSED");
@@ -454,7 +506,15 @@ static void onHello(const sockaddr_in& from, const uint8_t* body, int len, bool 
     if (!p) {
         // An ACK answers OUR hello, so this peer must keep the token we advertised in it. A plain
         // HELLO is someone dialling US, and they have not been told a token yet -- mint one.
-        const int i = addPeer(id, from, isAck ? g_joinToken : 0);
+        // An ACK answers ONE of our dials, and must adopt the token we promised THAT endpoint --
+        // see startDial. A plain HELLO is someone dialling us: mint one.
+        uint32_t adopt = 0;
+        if (isAck) {
+            const Dial* d = dialFor(from);
+            if (!d) return;                     // an ACK for a handshake we never started
+            adopt = d->token;
+        }
+        const int i = addPeer(id, from, adopt);
         if (i < 0) return;
         p = &g_peers[i];
     } else if (!sameAddr(p->addr, from)) {
@@ -471,9 +531,16 @@ static void onHello(const sockaddr_in& from, const uint8_t* body, int len, bool 
         // Always answer, including a repeat: our previous ACK may be the packet that was lost.
         sendHello(from, PT_HELLO_ACK, p->localToken);
     } else {
-        g_joining = false;
-        InterlockedExchange(&g_status, 3);
-        Log("[udp] JOINED -- connected to %s", p->idStr);
+        Dial* d = dialFor(from);
+        const bool wasPrimary = d && d->primary;
+        if (d) *d = Dial{};                     // answered: stop dialling this one
+        if (wasPrimary) {
+            g_joining = false;
+            InterlockedExchange(&g_status, 3);
+            Log("[udp] JOINED -- connected to %s", p->idStr);
+        } else {
+            Log("[udp] mesh: connected to %s (introduced)", p->idStr);
+        }
     }
 }
 
@@ -482,15 +549,26 @@ void Tick(RecvFn onRecv, void* user) {
     const uint64_t now = GetTickCount64();
 
     // ---- handshake retries. UDP has no connect(): "are you there" is a packet you repeat.
-    if (g_joining) {
-        if (now - g_joinLastMs >= (uint64_t)kHelloResendMs) {
-            g_joinLastMs = now;
-            sendHello(g_joinTarget, PT_HELLO, g_joinToken);
+    for (int di = 0; di < kPeers; di++) {
+        Dial& d = g_dials[di];
+        if (!d.active) continue;
+        if (now - d.lastMs >= (uint64_t)kHelloResendMs) {
+            d.lastMs = now;
+            sendHello(d.target, PT_HELLO, d.token);
         }
-        if (now - g_joinStartMs >= (uint64_t)kHelloGiveUpMs) {
+        if (now - d.startMs >= (uint64_t)kHelloGiveUpMs) {
+            char a[64]; addrStr(d.target, a, sizeof(a));
+            if (!d.primary) {
+                // An introduced peer that never answers is the NORMAL case off a LAN: two joiners
+                // behind different routers cannot reach each other without hole punching, which this
+                // backend does not do. It costs nothing and must not look like a fault.
+                Log("[udp] mesh: %s did not answer -- not reachable from here (normal off a LAN)", a);
+                d = Dial{};
+                continue;
+            }
+            d = Dial{};
             g_joining = false;
             InterlockedExchange(&g_status, -1);
-            char a[64]; addrStr(g_joinTarget, a, sizeof(a));
             Log("[udp] join FAILED -- no answer from %s after %d s. Wrong address, wrong port, "
                 "firewall, or the host is not listening.", a, kHelloGiveUpMs / 1000);
         }
@@ -559,9 +637,71 @@ void Tick(RecvFn onRecv, void* user) {
             p->st.state = 5;
             Log("[udp] peer %s said goodbye", p->idStr);
             break;
+        case PT_PEERS: {
+            // WHO ELSE IS HERE. Everyone gossips their own peer list, so the mesh converges no matter
+            // who joined first and no matter who anybody considers "the host" -- there is no host in
+            // the data model, only the peer somebody happened to dial.
+            if (bodyLen < 1) break;
+            const int cnt = body[0];
+            const int need = 1 + cnt * (kIdLen + 6);
+            if (cnt <= 0 || cnt > kPeers || bodyLen < need) break;
+            for (int e = 0; e < cnt; e++) {
+                const uint8_t* rec = body + 1 + e * (kIdLen + 6);
+                char eid[kIdLen + 1] = {0};
+                memcpy(eid, rec, kIdLen);
+                for (char& c : eid) if (c && (c < 0x20 || c > 0x7e)) c = '?';
+                uint32_t ip = 0; uint16_t port = 0;
+                memcpy(&ip, rec + kIdLen, 4);
+                memcpy(&port, rec + kIdLen + 4, 2);
+                if (!ip || !port) continue;
+                sockaddr_in a{};
+                a.sin_family = AF_INET;
+                a.sin_addr.s_addr = ip;
+                a.sin_port = port;
+                if (startDial(a, eid, false)) {
+                    char as[64]; addrStr(a, as, sizeof(as));
+                    Log("[udp] mesh: %s introduced %s at %s -- dialling", p->idStr, eid, as);
+                }
+            }
+            break;
+        }
         case PT_PING:
         default:
             break;
+        }
+    }
+
+    // ---- INTRODUCTIONS. Build the roster once per sweep and send it to everyone still live.
+    // Every few seconds rather than only on change: a datagram can be lost, and an introduction that
+    // was lost is a player who is simply never seen. Repeating is cheaper than acknowledging, and the
+    // receiver dedupes on identity, so a repeat costs nothing but the bytes.
+    //
+    // What this cannot do is make anyone REACHABLE. On a LAN every pair can already talk and the mesh
+    // completes; across the internet two joiners behind different routers still cannot reach each
+    // other, and those dials time out quietly. That limit is NAT, not addressing, and lifting it
+    // needs hole punching -- which needs a rendezvous server this backend deliberately does not have.
+    static uint64_t s_lastGossipMs = 0;
+    if (g_nPeers > 1 && now - s_lastGossipMs >= (uint64_t)kGossipMs) {
+        s_lastGossipMs = now;
+        uint8_t body[1 + kPeers * (kIdLen + 6)];
+        for (int i = 0; i < g_nPeers; i++) {
+            Peer& to = g_peers[i];
+            if (!to.used || to.st.state == 5 || !to.remoteToken) continue;
+            int cnt = 0, w = 1;
+            for (int j = 0; j < g_nPeers; j++) {
+                const Peer& about = g_peers[j];
+                // Never introduce a peer to themselves, and never pass on a corpse -- the receiver
+                // would dial a player who has already left and wait out the whole give-up window.
+                if (j == i || !about.used || about.st.state == 5) continue;
+                memcpy(body + w, about.idStr, kIdLen);              w += kIdLen;
+                memcpy(body + w, &about.addr.sin_addr.s_addr, 4);   w += 4;
+                memcpy(body + w, &about.addr.sin_port, 2);          w += 2;
+                cnt++;
+            }
+            if (!cnt) continue;
+            body[0] = (uint8_t)cnt;
+            sendTo(to.addr, PT_PEERS, to.remoteToken, body, w);
+            to.lastSendMs = now;
         }
     }
 

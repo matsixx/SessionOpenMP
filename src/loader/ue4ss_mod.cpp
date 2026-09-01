@@ -248,6 +248,21 @@ static void publishUi() {
             fontSettled = GameFont_Grab(logLine);
         }
     }
+    // Relay room list, if one was asked for. Cheap: these are reads of an array the backend
+    // already filled when the reply arrived.
+    g_ui.browseState = omp::BrowseStatus();
+    g_ui.browseCount = 0;
+    if (g_ui.browseState == 2 && omp::Current() == omp::BK_RELAY) {
+        const int n = omp::BrowseCount();
+        for (int i = 0; i < n && g_ui.browseCount < 8; i++) {
+            omp::LobbyInfo L{};
+            if (!omp::BrowseAt(i, &L)) continue;
+            MpUiState::RoomRow& r = g_ui.rooms[g_ui.browseCount++];
+            strncpy_s(r.code, L.id, _TRUNCATE);
+            strncpy_s(r.map, L.map, _TRUNCATE);
+            r.players = L.players;
+        }
+    }
     Overlay_Publish(&g_ui);
     PauseMenu_Publish(&g_ui);      // same snapshot, second surface
 }
@@ -316,6 +331,28 @@ static void MpPump() {
             Overlay_TakeDirect(addr, sizeof(addr), &port);
             omp::SetDirectEndpoint(addr, port);
             MpBegin(omp::BK_UDP, act == OVA_HOST_DIRECT, "menu");
+            break;
+        }
+        // A relay session. Host and Join are the same act -- the first player to name a room
+        // opens it -- so both arrive here and the flag only decides what the log says.
+        case OVA_HOST_RELAY:
+        case OVA_JOIN_RELAY: {
+            char addr[128] = {0}; char room[16] = {0}; int port = 0;
+            Overlay_TakeDirect(addr, sizeof(addr), &port);
+            Overlay_TakeRoom(room, sizeof(room));
+            omp::SetRelayServer(addr, port);
+            omp::SetLobbyCode(room);
+            MpBegin(omp::BK_RELAY, act == OVA_HOST_RELAY, "menu");
+            break;
+        }
+        // Asking a relay what rooms it has does NOT start a session: the backend opens its own
+        // socket for the question and the answer is polled from the menu.
+        case OVA_BROWSE_RELAY: {
+            char addr[128] = {0}; int port = 0;
+            Overlay_TakeDirect(addr, sizeof(addr), &port);
+            omp::SetRelayServer(addr, port);
+            if (omp::Current() != omp::BK_RELAY) omp::Init(omp::BK_RELAY, nullptr, false);
+            omp::LobbyBrowse();
             break;
         }
         case OVA_LEAVE:       leave = true; break;

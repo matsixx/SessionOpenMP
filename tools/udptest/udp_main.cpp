@@ -160,10 +160,81 @@ static int runSide(const char* label, bool host, float myTag, float theirTag) {
     return g_fails ? 1 : 0;
 }
 
+
+// ---- THE MESH, across THREE processes ------------------------------------------------------------
+// The pair test above proves two processes talk. It cannot prove the thing that actually decides
+// whether three people can play: a joiner only ever dials the ONE address it was given, so before
+// peer introduction the two joiners were invisible to each other and only the host saw everybody --
+// a session that looks connected and is half empty. No two-process test can see that.
+//
+// So: one host, TWO joiners, both dialling only the host. Each must end up with BOTH other players,
+// which can only happen if the introduction was sent AND acted on.
+static const int kMeshPort = kTestPort + 1;
+
+struct MeshCtx {
+    int recvFrom[4] = {0};      // snapshots received, indexed by the sender's tag
+    int bad = 0;
+};
+static void onMeshRecv(int peer, const uint8_t* d, int len, void* user) {
+    MeshCtx& c = *(MeshCtx*)user;
+    repl::State s; uint64_t su = 0;
+    if (!repl::Unpack(d, len, s, &su)) { c.bad++; return; }
+    const int tag = (int)(s.bodyPos[0] + 0.5f);
+    if (tag >= 1 && tag <= 3) c.recvFrom[tag]++;
+    else c.bad++;
+    (void)peer;
+}
+
+// role 1 = host, roles 2 and 3 = joiners. The role IS the tag, so a packet names its own sender.
+static int runMesh(const char* label, int role) {
+    char log[64]; snprintf(log, sizeof(log), "omp_udptest_mesh%d.log", role);
+    char id[33];
+    snprintf(id, sizeof(id), "mesh%d___________________________", role);
+    SetLocalIdentity(id);
+    char target[64]; snprintf(target, sizeof(target), "127.0.0.1:%d", kMeshPort);
+    SetDirectEndpoint(role == 1 ? "" : target, kMeshPort);
+    if (!Init(BK_UDP, log, false)) { printf("[%s] udp init FAILED\n", label); return 1; }
+
+    if (role == 1) { if (!LobbyHost()) { printf("[%s] host FAILED\n", label); return 1; } }
+    else           { if (!LobbyJoin()) { printf("[%s] join FAILED\n", label); return 1; } }
+
+    MeshCtx ctx;
+    int peak = 0;
+    // 15 s. The roster is gossiped every 3 s and a dial is answered in one loopback round trip, so
+    // this is several chances to converge rather than a photo finish.
+    for (int i = 0; i < 940; i++) {
+        const int n = PeerCount();
+        if (n > peak) peak = n;
+        repl::State s; makeState(s, (float)role, (uint32_t)i);
+        uint8_t pkt[900];
+        const int len = repl::Pack(s, (uint64_t)i * 16667, pkt, sizeof(pkt));
+        for (int p = 0; p < n; p++) Send(p, pkt, len, false);
+        Tick(onMeshRecv, &ctx);
+        Sleep(16);
+    }
+
+    printf("\n[%s] mesh results (role %d)\n", label, role);
+    char m[160];
+    snprintf(m, sizeof(m), "sees BOTH other players (peers=%d)", peak);
+    check(peak >= 2, m);
+    int heard = 0;
+    for (int t = 1; t <= 3; t++) if (t != role && ctx.recvFrom[t] > 50) heard++;
+    snprintf(m, sizeof(m), "receives a stream from BOTH (from role1=%d role2=%d role3=%d)",
+             ctx.recvFrom[1], ctx.recvFrom[2], ctx.recvFrom[3]);
+    check(heard == 2, m);
+    check(ctx.bad == 0, "every mesh packet unpacked cleanly");
+    LobbyLeave();
+    return g_fails ? 1 : 0;
+}
+
 int main(int argc, char** argv) {
     if (argc > 1 && !strcmp(argv[1], "child")) {
         Sleep(400);                       // give the parent a moment to bind; the retry covers the rest
         return runSide("child", false, 2.0f, 1.0f);
+    }
+    if (argc > 2 && !strcmp(argv[1], "mesh")) {
+        Sleep(500);                   // the joiners start after the host has bound
+        return runMesh(argv[2][0] == '2' ? "mesh-b" : "mesh-c", atoi(argv[2]));
     }
 
     printf("omp_udptest -- direct UDP backend across two processes (loopback :%d)\n\n", kTestPort);
@@ -180,7 +251,29 @@ int main(int argc, char** argv) {
     GetExitCodeProcess(pi.hProcess, &childRc);
     CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
     check(childRc == 0, "the child process also passed");
-    const bool pass = (rc == 0 && childRc == 0 && !g_fails);
+
+    // ---- phase 2: three processes, and the mesh.
+    printf("\n\nomp_udptest -- THREE processes, peer introduction (loopback :%d)\n", kMeshPort);
+    PROCESS_INFORMATION mp[2]{};
+    bool spawned = true;
+    for (int k = 0; k < 2; k++) {
+        char mc[MAX_PATH + 24];
+        snprintf(mc, sizeof(mc), "\"%s\" mesh %d", exe, k + 2);
+        STARTUPINFOA msi{}; msi.cb = sizeof(msi);
+        if (!CreateProcessA(nullptr, mc, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &msi, &mp[k])) {
+            printf("could not launch mesh joiner %d\n", k + 2); spawned = false; break;
+        }
+    }
+    int meshRc = 1; DWORD m1 = 1, m2 = 1;
+    if (spawned) {
+        meshRc = runMesh("mesh-a", 1);
+        WaitForSingleObject(mp[0].hProcess, 40000); GetExitCodeProcess(mp[0].hProcess, &m1);
+        WaitForSingleObject(mp[1].hProcess, 40000); GetExitCodeProcess(mp[1].hProcess, &m2);
+        for (int k = 0; k < 2; k++) { CloseHandle(mp[k].hThread); CloseHandle(mp[k].hProcess); }
+        check(m1 == 0 && m2 == 0, "both mesh joiners also passed");
+    }
+    const bool pass = (rc == 0 && childRc == 0 && spawned && meshRc == 0 &&
+                       m1 == 0 && m2 == 0 && !g_fails);
     printf("\n%s\n", pass ? "UDP TEST PASS" : "*** UDP TEST FAILURES ***");
     return pass ? 0 : 1;
 }

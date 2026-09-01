@@ -39,7 +39,11 @@ using RecvFn = void (*)(int peerIdx, const uint8_t* data, int len, void* user);
 //          cannot or will not use EOS. Not encrypted, not authenticated, and not hole-punched -- see
 //          udp_transport.cpp's header, and Posture(), which says so to the player.
 // One backend is active per session; the mode is chosen when the session starts.
-enum Backend { BK_NONE = 0, BK_EOS = 1, BK_SHM = 2, BK_UDP = 3 };
+//   Relay -- everyone dials OUT to one forwarding server. The only wire that works for 3+
+//            players over the internet without somebody forwarding a port, because a client
+//            never has to be reachable -- only the relay does. Not encrypted: whoever runs it
+//            sees the traffic, which Posture() says out loud. See docs/relay-scope.md.
+enum Backend { BK_NONE = 0, BK_EOS = 1, BK_SHM = 2, BK_UDP = 3, BK_RELAY = 4 };
 
 // CALL ON THE GAME THREAD, always: the EOS SDK is SHARED with the game's own EOSShared plugin, and a
 // second thread inside it takes down the game's tick (see eos_transport.cpp). Returns as soon as
@@ -167,6 +171,9 @@ const char* DirectBoundTo();                 // the local "ip:port" we actually 
 // This install's permanent identity, for backends that have no account system to borrow one from.
 // EOS ignores it (a ProductUserId already identifies you). Set it before Init.
 void        SetLocalIdentity(const char* id);
+// The relay server to dial. Same act as SetDirectEndpoint from the player's side -- type where
+// to connect -- so the UI sets both and the chosen backend decides which one matters.
+void        SetRelayServer(const char* addr, int port);
 
 void        SetLobbyCode(const char* code);  // "" = public. Call before LobbyHost().
 const char* LobbyCode();                     // the code of the lobby we are IN (host or guest), "" if public

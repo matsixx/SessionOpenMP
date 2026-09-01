@@ -118,6 +118,15 @@ void Overlay_TakeDirect(char* addrOut, int cap, int* portOut) {
     if (addrOut && cap > 0) strncpy_s(addrOut, (size_t)cap, g_directAddr, _TRUNCATE);
     if (portOut) *portOut = g_directPort;
 }
+static char g_roomBuf[16] = {0};
+static void roomPark(const char* r) {
+    std::lock_guard<std::mutex> lk(g_directMx);
+    strncpy_s(g_roomBuf, r ? r : "", _TRUNCATE);
+}
+void Overlay_TakeRoom(char* out, int cap) {
+    std::lock_guard<std::mutex> lk(g_directMx);
+    if (out && cap > 0) strncpy_s(out, (size_t)cap, g_roomBuf, _TRUNCATE);
+}
 
 bool Overlay_TakeCode(char* out, int cap) {
     if (!out || cap <= 0) return false;
@@ -208,13 +217,38 @@ static bool extSliderFloat(const char* l, float* v, float lo, float hi, const ch
 static void extIndent(void)                { ImGui::Indent(); }
 static void extUnindent(void)              { ImGui::Unindent(); }
 static bool extButton(const char* l)       { return l ? ImGui::Button(l) : false; }
+// A guest's collapsible group. The open/closed state is ImGui's own, keyed by the label, so it
+// persists for the session without the host storing anything.
+//
+// The depth counter is what makes the pair safe to hand to somebody else's code. EndGroup must be
+// callable once per BeginGroup whatever BeginGroup returned -- that is the shape guests will write,
+// because it is ImGui's own -- so the closed case has to be remembered rather than inferred. And a
+// nested BeginGroup is drawn FLAT instead of refused: losing one heading is a better failure than a
+// guest whose Indent/Unindent no longer balance for the rest of its section.
+static int  g_extGroupDepth = 0;
+static bool g_extGroupOpen  = false;     // was the OUTER group open? EndGroup needs it to un-indent
+static bool extBeginGroup(const char* l) {
+    if (!l) return false;
+    if (g_extGroupDepth++ > 0) return true;                  // nested: no header, body still drawn
+    g_extGroupOpen = ImGui::CollapsingHeader(l);
+    if (g_extGroupOpen) ImGui::Indent();
+    return g_extGroupOpen;
+}
+static void extEndGroup(void) {
+    if (g_extGroupDepth <= 0) return;                        // unbalanced guest: ignore, never fault
+    if (--g_extGroupDepth == 0 && g_extGroupOpen) {
+        ImGui::Unindent();
+        g_extGroupOpen = false;
+    }
+}
 // APPEND-ONLY, and the version number is the guest's only way to know what is safe to call: a
 // guest DLL built against v1 has a struct one pointer SHORTER, so new entries go at the END and the
 // version goes up with them. Never insert, never reorder.
 static const OmpMenuApi g_extApi = {
-    2, extText, extTextDisabled, extTextWrapped, extSeparator, extSameLine,
+    3, extText, extTextDisabled, extTextWrapped, extSeparator, extSameLine,
     extCheckbox, extSliderFloat, extIndent, extUnindent,
     extButton,
+    extBeginGroup, extEndGroup,
 };
 struct ExtSection { char title[48]; OmpMenuDrawFn draw; void* user; bool dead; };
 static ExtSection g_ext[8];
@@ -239,18 +273,29 @@ static bool extCallGuarded(OmpMenuDrawFn fn, void* user) {
     __try { fn(&g_extApi, user); return true; }
     __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
-static void drawExtSections() {
+// One TAB per registered guest, rather than a stack of headers under everything else. A guest with a
+// lot of settings used to be an extra screenful on the end of this window; now it is a word in the
+// tab bar, and what it costs the rest of the UI is nothing.
+//
+// A guest that faults mid-draw can leave its groups unclosed, and a leaked Indent would push every
+// widget drawn after it -- including ours, in other tabs -- permanently to the right. So the group
+// depth is unwound here rather than trusted: this is the same argument as the SEH around the call
+// itself, one level down.
+static void drawExtTabs() {
     std::lock_guard<std::mutex> lk(g_extMx);
     for (int i = 0; i < g_nExt; i++) {
         ExtSection& s = g_ext[i];
         if (s.dead) continue;
-        ImGui::Separator();
-        if (ImGui::CollapsingHeader(s.title, ImGuiTreeNodeFlags_DefaultOpen)) {
-            if (!extCallGuarded(s.draw, s.user)) {
-                s.dead = true;   // drawn never again; the game outlives the guest's bug
-                ovlogf("[overlay] menu extension \"%s\" FAULTED -- disabled for this run", s.title);
-            }
+        if (!ImGui::BeginTabItem(s.title)) continue;
+        ImGui::Spacing();
+        const bool ok = extCallGuarded(s.draw, s.user);
+        while (g_extGroupDepth > 0) extEndGroup();       // whatever the guest left open
+        g_extGroupDepth = 0; g_extGroupOpen = false;
+        if (!ok) {
+            s.dead = true;   // drawn never again; the game outlives the guest's bug
+            ovlogf("[overlay] menu extension \"%s\" FAULTED -- disabled for this run", s.title);
         }
+        ImGui::EndTabItem();
     }
 }
 
@@ -376,7 +421,23 @@ static void buildUI() {
         // this machine at, and with relays turned off that reaches an IP -- so putting it on screen
         // is a hazard for anyone streaming. It stays in the log, where sharing it is a deliberate act.
 
+        // Both are read by the Session tab AND the Dev tab, so they are computed once, above the
+        // tab bar, rather than by whichever tab happens to be drawing.
+        const bool busy = (st.tpState == 1);
+        const bool live = st.armed;
+
+        // ---- THE TABS. This window used to be one scroll: status, name, privacy, nameplates,
+        // online, direct connect, dev tools, and then every guest mod's settings on the end. Each
+        // piece was reasonable and the whole was a page you had to read to navigate.
+        //
+        // The status block above stays OUT of the tabs on purpose -- "is it working" is the question
+        // the window exists to answer, and it must never be one click away.
         ImGui::Separator();
+        if (ImGui::BeginTabBar("##omptabs", ImGuiTabBarFlags_None)) {
+
+        // ---- YOU: the things that are true of you whatever session you are in.
+        if (ImGui::BeginTabItem("You")) {
+        ImGui::Spacing();
         // ---- YOUR NAME. The one place in the mod you can actually type: the pause menu can show
         // this name but has no text-entry widget of its own (the game's editable-text widgets need
         // style assets that are not available). Applied through the filter, saved to disk, and
@@ -424,7 +485,7 @@ static void buildUI() {
         // preferences file, and a drag crosses a few hundred integer values. While the widget is
         // active the local copy is authoritative; the rest of the time it mirrors the store, so a
         // change made in the pause menu shows up here without any plumbing between them.
-        if (ImGui::CollapsingHeader("Player names")) {
+        if (ImGui::CollapsingHeader("Player names", ImGuiTreeNodeFlags_DefaultOpen)) {
             ImGui::Indent();
             int mode = MpPrefs_NameMode();
             ImGui::SetNextItemWidth(220.0f);
@@ -449,10 +510,12 @@ static void buildUI() {
             ImGui::Unindent();
         }
 
-        ImGui::Separator();
-        const bool busy = (st.tpState == 1);
-        const bool live = st.armed;
+        ImGui::EndTabItem();
+        }   // You
 
+        // ---- SESSION: the ways in and out of one.
+        if (ImGui::BeginTabItem("Session")) {
+        ImGui::Spacing();
         // ---- ONLINE. The only mode a player is expected to use, so it leads.
         ImGui::Text("Online (another player, another PC)");
         ImGui::TextDisabled("Signs in to Epic's relay. Both players load the same map, one Hosts.");
@@ -469,6 +532,69 @@ static void buildUI() {
         ImGui::EndDisabled();
         if (live) ImGui::TextDisabled("Leave first to switch between this-PC and online.");
 
+
+        ImGui::Separator();
+        // ---- RELAY. The only wire here that works for three or more players over the internet.
+        // Direct connect needs the host to forward a port and can never introduce two joiners behind
+        // different routers to each other; here everyone dials OUT to one server, which is what opens
+        // a return path through a home router. Collapsed by default only because it asks for an
+        // address -- for anyone who has one it is the easiest option in this window.
+        if (ImGui::CollapsingHeader("Relay server (no Epic account, works for 3+)")) {
+            ImGui::TextDisabled("Everyone connects out to one server, so nobody forwards a port and");
+            ImGui::TextDisabled("nobody sees anybody else's IP. Whoever runs the relay can see the");
+            ImGui::TextDisabled("traffic -- it is not encrypted. Run tools/relay to host one yourself.");
+            ImGui::Separator();
+            static char relayAddr[128] = {0};
+            static char roomBuf[16] = {0};
+            ImGui::Text("Relay address");
+            ImGui::SetNextItemWidth(240);
+            ImGui::InputTextWithHint("##omprelayaddr", "address or address:port", relayAddr, sizeof(relayAddr));
+            ImGui::Text("Room");
+            ImGui::SetNextItemWidth(140);
+            ImGui::InputTextWithHint("##omproom", "any name", roomBuf, sizeof(roomBuf),
+                                     ImGuiInputTextFlags_CharsUppercase | ImGuiInputTextFlags_CharsNoBlank);
+            ImGui::SameLine();
+            ImGui::TextDisabled("(the first person to use a name opens it)");
+            const bool ready = relayAddr[0] && roomBuf[0];
+            ImGui::BeginDisabled(busy || live || !ready);
+            if (ImGui::Button("  Open / join room  ")) {
+                directPark(relayAddr, 0);
+                roomPark(roomBuf);
+                post(OVA_JOIN_RELAY);
+            }
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::BeginDisabled(busy || live || !relayAddr[0]);
+            if (ImGui::Button("  See rooms  ")) {
+                directPark(relayAddr, 0);
+                roomPark("");
+                post(OVA_BROWSE_RELAY);
+            }
+            ImGui::EndDisabled();
+            if (!ready) ImGui::TextDisabled("An address and a room name are both needed.");
+            // Whatever the last browse found. The list is only ever this relay's own rooms: there is
+            // no directory, so without its address there is nothing to see.
+            if (st.browseState == 1) ImGui::TextDisabled("asking the relay...");
+            else if (st.browseState == -1) ImGui::TextDisabled("no answer -- is the address right, and is it running?");
+            else if (st.browseState == 2) {
+                if (!st.browseCount) ImGui::TextDisabled("no rooms open on that relay yet -- name one above.");
+                for (int i = 0; i < st.browseCount; i++) {
+                    const MpUiState::RoomRow& R = st.rooms[i];
+                    ImGui::PushID(i);
+                    ImGui::BeginDisabled(busy || live);
+                    if (ImGui::Button("Join")) {
+                        directPark(relayAddr, 0);
+                        roomPark(R.code);
+                        post(OVA_JOIN_RELAY);
+                    }
+                    ImGui::EndDisabled();
+                    ImGui::SameLine();
+                    ImGui::Text("%-8s %s  (%d player%s)", R.code, R.map[0] ? R.map : "?",
+                                R.players, R.players == 1 ? "" : "s");
+                    ImGui::PopID();
+                }
+            }
+        }
         ImGui::Separator();
         // ---- DIRECT CONNECT. No Epic at all: the host opens a port, the joiner is given an address.
         // THIS SECTION ONLY EXISTS IN F1, and it has to: joining needs a typed address and the
@@ -476,6 +602,10 @@ static void buildUI() {
         // because it is the harder path -- it works for LAN and for a host who can forward a port,
         // and it asks the player to know something about their network.
         if (ImGui::CollapsingHeader("Direct connect (no Epic account)")) {
+            ImGui::TextDisabled("More than two players works on a LAN: everyone is introduced to");
+            ImGui::TextDisabled("everyone. Over the internet only the host is reachable, so joiners");
+            ImGui::TextDisabled("see the host but not each other. Everyone here learns everyone's IP.");
+            ImGui::Separator();
             static char addrBuf[128] = {0};
             static int  portBuf = 7777;
 
@@ -513,11 +643,16 @@ static void buildUI() {
             ImGui::TextDisabled("Their address and port, e.g. 203.0.113.7:7777 (or 192.168.1.20:7777 on a LAN).");
         }
 
-        ImGui::Separator();
-        // ---- DEV TOOLS. The same-PC (shared memory) rig lives here and ONLY here: it is a
-        // development wire, not a way to play, and in the pause menu a player would reasonably try it
-        // and end up in a session with nobody. Collapsed by default.
-        if (ImGui::CollapsingHeader("Dev tools")) {
+        ImGui::EndTabItem();
+        }   // Session
+
+        drawExtTabs();       // a tab each for other mod DLLs (menu_ext.h) -- before Dev on purpose
+
+        // ---- DEV TOOLS, its own tab. The same-PC (shared memory) rig lives here and ONLY here: it
+        // is a development wire, not a way to play, and in the pause menu a player would reasonably
+        // try it and end up in a session with nobody.
+        if (ImGui::BeginTabItem("Dev")) {
+            ImGui::Spacing();
             ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "For testing on ONE PC. Not for playing with friends.");
             ImGui::TextDisabled("Two windows of the game talk through a shared-memory mailbox: no sign-in,");
             ImGui::TextDisabled("no network. Launch the game twice, load the SAME map in both, then press");
@@ -532,13 +667,16 @@ static void buildUI() {
                                "Restart the game before going online after using this.");
             ImGui::TextDisabled("Switching this-PC -> online inside one session can stall the Epic");
             ImGui::TextDisabled("sign-in. A fresh launch signs in normally.");
+            ImGui::EndTabItem();
+        }   // Dev
+
+        ImGui::EndTabBar();
         }
 
+        // Below the tabs, because it is true in all of them.
         ImGui::Separator();
         ImGui::TextDisabled("Keyboard: F8 host / F9 join (this PC), F6 leave, F1 this menu.");
         ImGui::TextDisabled("Everyone keeps playing their own game -- nobody is a server.");
-
-        drawExtSections();   // sections registered by other mod DLLs (menu_ext.h)
     }
     ImGui::End();
     Theme_Pop();

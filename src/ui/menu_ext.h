@@ -34,7 +34,7 @@
 #pragma once
 
 struct OmpMenuApi {
-    int  version;                                              // 2 (see Button, appended below)
+    int  version;                                              // 3 (see the appended blocks below)
     void (*Text)(const char* utf8);
     void (*TextDisabled)(const char* utf8);
     void (*TextWrapped)(const char* utf8);
@@ -47,12 +47,29 @@ struct OmpMenuApi {
     // ---- appended in version 2. Check `version >= 2` before calling. Returns true on the frame the
     // button is clicked -- for one-shot rows such as "Reset to defaults".
     bool (*Button)(const char* label);
+    // ---- appended in version 3. Check `version >= 3` before calling.
+    // A COLLAPSIBLE GROUP inside your section, so a guest with a lot of settings is a short list of
+    // categories rather than one long scroll. `BeginGroup` returns true when the group is OPEN, and
+    // ONLY THEN may its body be drawn; `EndGroup` is called exactly once per BeginGroup, whatever it
+    // returned -- the same shape as ImGui's own begin/end pairs, so a guest can nest them in RAII.
+    //
+    //   if (api->version >= 3 && api->BeginGroup) {
+    //       if (api->BeginGroup("Camera")) { ...rows... }
+    //       api->EndGroup();
+    //   } else { ...the flat fallback... }
+    //
+    // Groups do not nest: a BeginGroup inside another is drawn flat rather than refused, because a
+    // guest losing one heading is better than a guest losing its whole section.
+    bool (*BeginGroup)(const char* label);
+    void (*EndGroup)(void);
 };
 typedef void (*OmpMenuDrawFn)(const OmpMenuApi* api, void* user);
 
 // Exported by the host's main.dll. Returns 1 on success, 0 if the table is full or args are null.
-// `title` becomes a collapsing header in the F1 window; the callback draws the section body under
-// it. Registration is permanent for the process (C++ mods only unload at shutdown).
+// `title` becomes a TAB in the F1 window (it was a collapsing header on the end of the host's own
+// sections until the window gained tabs); the callback draws the tab's body. Keep it short -- it is
+// read in a tab bar beside the host's own. Registration is permanent for the process (C++ mods only
+// unload at shutdown).
 //   extern "C" __declspec(dllimport) int OmpMenu_Register(const char* title, OmpMenuDrawFn draw, void* user);
 
 // =====================================================================================================

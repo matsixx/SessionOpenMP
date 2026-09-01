@@ -39,9 +39,14 @@ add_library(omp_transport STATIC
     src/transport/transport.cpp          # the router (owns the log, dispatches the seam)
     src/transport/eos_transport.cpp      # between machines
     src/transport/shm_transport.cpp      # same PC -- the development rig
-    src/transport/udp_transport.cpp)     # between machines, without Epic
+    src/transport/udp_transport.cpp      # between machines, without Epic
+    src/transport/relay_transport.cpp)   # between machines via a forwarding server (tools/relay)
 target_include_directories(omp_transport PUBLIC src ${EOS_SDK}/Include)
 target_link_libraries(omp_transport PUBLIC ${EOS_SDK}/Lib/EOSSDK-Win64-Shipping.lib)
+
+# The relay server. Standalone by design: no game, no UE, no EOS -- it forwards opaque payloads and
+# is meant to be built and run on a machine that has none of those. See docs/relay-scope.md.
+add_executable(omp_relay tools/relay/relay_main.cpp)
 
 add_executable(omp_ping tools/ping/ping_main.cpp)
 target_link_libraries(omp_ping PRIVATE omp_transport)
@@ -90,6 +95,12 @@ target_link_libraries(omp_shmtest PRIVATE omp_transport omp_replication)
 add_executable(omp_udptest tools/udptest/udp_main.cpp)
 target_link_libraries(omp_udptest PRIVATE omp_transport omp_replication)
 
+# The relay, end to end: this test LAUNCHES omp_relay and three real clients, so it depends on that
+# binary existing beside it.
+add_executable(omp_relaytest tools/relaytest/relay_test_main.cpp)
+target_link_libraries(omp_relaytest PRIVATE omp_transport omp_replication)
+add_dependencies(omp_relaytest omp_relay)
+
 # =====================================================================================================
 # The UE4SS C++ mod  ->  <game>/SessionGame/Binaries/Win64/Mods/SessionOpenMP/dlls/main.dll
 # UE4SS uses the DYNAMIC CRT (its dll imports MSVCP140/VCRUNTIME140) and CppUserModBase's ctor is
@@ -110,6 +121,7 @@ if(EXISTS "${UE4SS_LIB}")
         src/transport/eos_transport.cpp
         src/transport/shm_transport.cpp
         src/transport/udp_transport.cpp
+        src/transport/relay_transport.cpp
         src/replication/replication.cpp
         src/replication/replaysync.cpp
         src/replication/dropsync.cpp

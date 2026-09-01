@@ -46,6 +46,12 @@ enum OvAction {
     // before the action is posted, so by the time the game thread acts on it the target is already in.
     OVA_HOST_DIRECT,
     OVA_JOIN_DIRECT,
+    // A RELAY session. The address is parked the same way the direct one is; the room name
+    // rides with it, because on a relay "which room" is as much a part of where you are going
+    // as the address itself.
+    OVA_HOST_RELAY,
+    OVA_JOIN_RELAY,
+    OVA_BROWSE_RELAY,
 };
 
 // What the menu displays. Plain data, copied under a lock -- no pointers into game state.
@@ -57,6 +63,14 @@ struct MpUiState {
     int   peers = 0, proxies = 0;
     float pubHz = 0;
     char  myMap[40] = {0};      // the local INTERNAL level name -- the roster resolves it to a label
+    // RELAY ROOMS, from the last "See rooms". They ride the SNAPSHOT rather than being read from
+    // the transport where they are drawn: this window runs on the render thread and deliberately
+    // does not know the transport exists (see the file header). Everything it shows arrives this
+    // way, and a browser is not the thing to make an exception for.
+    int   browseState = 0;      // omp::BrowseStatus(): 0 idle, 1 asking, 2 ready, -1 failed
+    int   browseCount = 0;
+    struct RoomRow { char code[16]; char map[40]; int players; };
+    RoomRow rooms[8] = {};
     char  bound[64] = {0};      // direct UDP: the local "ip:port" we are actually listening on, so a
                                 // host can read their own port back instead of trusting they typed it
 };
@@ -79,4 +93,6 @@ bool Overlay_TakeNameChanged();                  // game thread; true once per c
 // The address/port typed into the direct-connect section, parked when OVA_HOST_DIRECT/OVA_JOIN_DIRECT
 // was posted. Read on the GAME thread, which is the only place allowed to hand it to the transport.
 void Overlay_TakeDirect(char* addrOut, int cap, int* portOut);
+// The relay room typed alongside the address. Same parking rule and the same reason.
+void Overlay_TakeRoom(char* out, int cap);
 void OvLog(const char* msg);                     // implemented by the loader (writes SessionOpenMP.log)
