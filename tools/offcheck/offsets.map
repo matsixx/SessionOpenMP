@@ -1,0 +1,258 @@
+# offsets.map -- what each entry of the off:: namespace in src/game/game_syms.h IS.
+#
+#   <constant>            <Class::member>     the PDB must agree this member is at that offset
+#   <constant>            -                   deliberately NOT a struct offset: a stride, an enum
+#                                             value, an index, or a field of a type the PDB does not
+#                                             name. Recorded so it reads as decided, not forgotten.
+#
+# Lines here are DATA for omp_offcheck; the mod does not read this file and does not build against
+# it. Nothing in it can change how the mod behaves.
+#
+# An entry is only worth adding if the class is the one the CODE dereferences. A member that merely
+# happens to sit at the same offset will agree with the PDB today and keep agreeing after the field
+# it was supposed to be watching has moved -- which is worse than leaving the offset unmapped.
+# offcheck.py --discover only proposes what a comment already names, for exactly that reason.
+
+kActorRole                     AActor::Role
+kActorRootComp                 AActor::RootComponent
+kCapsuleHalfHeight             UCapsuleComponent::CapsuleHalfHeight
+kReplayMgrInputCtl             AReplayManager::_replayInputController
+kInputCtlCamera                AReplayInputController::_replayCamera
+kReplayCamLookAt               AReplayCamera::_lookAtTarget
+kSoundConcMaxCount             FSoundConcurrencySettings::MaxCount
+kCompQuat                      USceneComponent::ComponentToWorld
+kMeshSkeletalMesh              USkinnedMeshComponent::SkeletalMesh
+kSkaterTrickDef                ASkaterCharacterBase::_currentFlipTrickDef
+kBoardAudioData                ASkateboardEx::_audioData
+kPcTricksDb                    ASessionPlayerController::_tricksDatabase
+kDbCrankList                   UTricksDatabase::_crankList
+kObjNamePrivate                UObjectBase::NamePrivate
+kMeshAnimTickOption            USkinnedMeshComponent::VisibilityBasedAnimTickOption
+kObjClassPrivate               UObjectBase::ClassPrivate
+kStructSuperStruct             UStruct::SuperStruct
+kDbFlipTricks                  UTricksDatabase::_flipTricks
+kMapDataMaps                   UMapSelectDataAsset::_maps
+kContainerPage                 UMenuPageContainer::_menuPage
+kPageMaxVisible                UMenuPage::_maxVisibleItems
+kPageActiveDef                 UMenuPage::_activePageDefinition
+kPageHeaderIndex               UMenuPage::_itemsPanelHeaderIndex
+kPageSelectedIndex             UMenuPage::_selectedIndex
+kPageItemsPanel                UMenuPage::_itemsPanel
+kPageItemDefs                  UMenuPage::_pageItemDefinitions
+kPageDefKey                    UMenuPageDefinition::_key
+kPageDefItems                  UMenuPageDefinition::_menuItems
+kItemKey                       FMenuPageItemDefinition::_key
+kItemType                      FMenuPageItemDefinition::_itemType
+kItemLabel                     FMenuPageItemDefinition::_label
+kItemShortDesc                 FMenuPageItemDefinition::_shortDescription
+kItemLongDesc                  FMenuPageItemDefinition::_longDescription
+kItemSubPage                   FMenuPageItemDefinition::_subPageDefinition
+kItemMultiTexts                FMenuPageItemDefinition::_multiOptionTexts
+kItemMultiStart                FMenuPageItemDefinition::_multiOptionStartingIndex
+kItemProgMin                   FMenuPageItemDefinition::_progressDisplayValueMinimum
+kItemProgMax                   FMenuPageItemDefinition::_progressDisplayValueMaximum
+kItemProgIncrement             FMenuPageItemDefinition::_progressIncrement
+kCompOwner                     UActorComponent::OwnerPrivate
+kGiSkaterInstance              USessionGameInstance::_skaterInstance
+kSkInstName                    FSkaterInstance::SkaterName
+kSkaterVisualDef               ASkaterCharacterBase::_skaterDefinition
+kSkaterFollowCam               ASkaterCharacter::FollowCamera
+kGiDefaultVisualDef            USessionGameInstance::_defaultVisualsDefinition
+kItemMeshMaterials             FCustomizationItemMesh::ItemMaterials
+kItemDefAlphaMasks             UCustomizationItemDefinition::AlphaMasks
+kGiPlayerProfile               USessionGameInstance::_playerProfile
+kProfStance                    FCustomizationProfile::Stance
+kAnimIsGrounded                USkaterAnimInstance::IsGrounded
+kMeshAnimInstance              USkeletalMeshComponent::AnimScriptInstance
+kBoardFlipper                  ASkateboardEx::_flipper
+kBoardTruckBack                ASkateboardEx::_truckBack
+kBoardBrokenState              ASkateboardEx::_currentBrokenBoardState
+kBoardBreakRequested           ASkateboardEx::_breakBoardRequested
+kDropMgrDatabase               AObjectDropperManager::_objectsDatabase
+kDropDbCategories              UObjectDropperObjectsDatabase::_objectCategories
+kDropCatObjects                FObjectDropperObjectCategory::_objectList
+kCompMobility                  USceneComponent::Mobility
+kPickableIsPickable            UObjectDropperPickableObject::_isCurrentlyPickable
+
+# ---- replay ------------------------------------------------------------------------------------
+kReplayMgrCompData             AReplayManager::_replayRecorders
+kReplayMgrCompNum              AReplayManager::_replayRecorders.ArrayNum
+kReplayMgrInputCtl             AReplayManager::_replayInputController
+kReplayMgrActiveInst           AReplayManager::_activeInstanceData
+kInputCtlCamera                AReplayInputController::_replayCamera
+kReplayCamLookAt               AReplayCamera::_lookAtTarget
+kReplayCamActiveType           AReplayCamera::_activeCameraType
+kReplayCompManager             UReplayComponentBase::_replayManager
+kReplayCamOrbit                -      # RCT_Orbit, an enum VALUE rather than a field
+kReplayIfaceToComp             -      # interface sub-object -> component, read out of BeginPlay's own lea
+kReplayCompIface               -      # the mirror of the above; neither is a PDB member
+
+# ---- actor / component / engine ----------------------------------------------------------------
+kActorRole                     AActor::Role
+kActorRootComp                 AActor::RootComponent
+kActorTagsData                 AActor::Tags
+kActorTagsNum                  AActor::Tags.ArrayNum
+kCapsuleHalfHeight             UCapsuleComponent::CapsuleHalfHeight
+kCompPos                       USceneComponent::ComponentToWorld.Translation
+kMeshAnimTickOption            USkinnedMeshComponent::VisibilityBasedAnimTickOption
+kSkelMeshRefSkeleton           USkeletalMesh::RefSkeleton
+kRefSkelFinalBoneInfo          FReferenceSkeleton::FinalRefBoneInfo
+kMeshBoneSpaceData             USkeletalMeshComponent::BoneSpaceTransforms
+kObjNamePrivate                UObjectBase::NamePrivate
+kObjClassPrivate               UObjectBase::ClassPrivate
+kStructSuperStruct             UStruct::SuperStruct
+kMeshBoneInfoStride            -      # sizeof(FMeshBoneInfo), a stride
+kTransformRotOff               -      # offset of a rotation WITHIN an FTransform, used as a stride
+kColorRgbaOff                  -      # channel stride within an FLinearColor
+
+# ---- skater ------------------------------------------------------------------------------------
+kSkaterMoveComp                ASkaterCharacterBase::_movementComponent
+kSkaterBoard                   ASkaterCharacterBase::_skateboard
+kSkaterFlags710                ASkaterCharacterBase::_isRagDoll
+kSkaterCanBail                 ASkaterCharacterBase::_canBail
+kSkaterAnimParams              ASkaterCharacterBase::_skateboardingAnimParams
+kSkaterPushState               ASkaterCharacterBase::_skateboardingAnimParams.PushState
+kSkaterPushSpeedMul            ASkaterCharacterBase::_skateboardingAnimParams.PushSpeedMultiplier
+kSkaterBrake1                  ASkaterCharacterBase::_skateboardingAnimParams.IsBrakingFoot
+kSkaterBrake2                  ASkaterCharacterBase::_skateboardingAnimParams.IsBrakingTail
+kSkaterIsCranking              ASkaterCharacterBase::_isCranking
+kSkaterCrankDef                ASkaterCharacterBase::_currentCrankDef
+kSkaterCrankPocket             ASkaterCharacterBase::_crankPocketRatio
+kSkaterGrindDefTgt             ASkaterCharacterBase::_targetGrindDef
+kSkaterGrindDefCur             ASkaterCharacterBase::_currentGrindDef
+kSkaterGrindCache              ASkaterCharacterBase::_lastGrindName
+kSkaterGrindPitch              ASkaterCharacterBase::_grindPitchRatio
+kSkaterGrindYaw                ASkaterCharacterBase::_grindYawRatio
+
+# ---- board / movement / anim -------------------------------------------------------------------
+kBoardAudioData                ASkateboardEx::_audioData
+kMoveOnBoard                   USkaterMovementComponent::_isOnBoard
+kAnimLFootLoc                  USkaterAnimInstance::LeftFootSocketLocation
+kAnimIsGrounded                USkaterAnimInstance::IsGrounded
+kAnimCrankBS                   USkaterAnimInstance::CrankLoopBlendSpace
+kAnimFlipTrick                 USkaterAnimInstance::FlipTrick
+kAnimRevertBS                  USkaterAnimInstance::RevertBlendSpace
+kPcTricksDb                    ASessionPlayerController::_tricksDatabase
+kDbCrankList                   UTricksDatabase::_crankList
+
+# ---- NOT direct members; left unmapped ON PURPOSE, with the reason, so nobody re-guesses ---------
+# kSkaterMesh        0x280  the mesh is not at 0x280 in this PDB's ASkaterCharacterBase -- the value
+#                           is right (the mod uses it) but what names it is not yet established.
+# kBoardIface        0x280  an interface sub-object, not a reflected member.
+# kBoardMoveMode     0x188  reached as iface+0x50 via +0x138, NOT a member of the movement component:
+#                           _onEndBanking happens to sit at 0x188 and would agree for the wrong reason.
+# kSkaterToggleState 0xa38  derived in ApplyToggleOnBoard rather than read as a named field.
+# kSkaterReplayAttachA 0xa68 the anim-rate bitfield byte, not a named member.
+
+# ================================================================ src/tweaks constants
+# Same rules. These live as bare enums inside the module that uses them, several of them
+# declared in more than one module at once -- offcheck also checks those copies agree.
+ACTOR_ROOT                     AActor::RootComponent
+AN_AUTOADJUST                  USkaterAnimInstance::FootIKAutoAdjust
+AN_CATCH_L                     USkaterAnimInstance::HasLeftFootCatchOrient
+AN_CATCH_R                     USkaterAnimInstance::HasRightFootCatchOrient
+AN_CATCH_ST                    USkaterAnimInstance::CatchOrientState
+AN_CRANKIN_BS                  USkaterAnimInstance::CrankInBlendSpace
+AN_FLIPPING                    USkaterAnimInstance::IsBoardFlipping
+AN_GROUNDED                    USkaterAnimInstance::IsGrounded
+AN_GROUNDED_BF                 USkaterAnimInstance::IsGrounded
+AN_HAS_LFOOT_CATCH             USkaterAnimInstance::HasLeftFootCatchOrient
+AN_HAS_RFOOT_CATCH             USkaterAnimInstance::HasRightFootCatchOrient
+AN_IS_CRANKING                 USkaterAnimInstance::IsCranking
+AN_IS_GOOFY                    USkaterAnimInstance::IsSkatingGoofy
+AN_IS_GRINDING                 USkaterAnimInstance::IsGrinding
+AN_IS_GRINDING_BF              USkaterAnimInstance::IsGrinding
+AN_IS_LANDING                  USkaterAnimInstance::IsLanding
+AN_IS_SWITCH                   USkaterAnimInstance::IsSkatingSwitch
+AN_LAND_DROP                   USkaterAnimInstance::LandDropHeightRatio
+AN_L_ALPHA                     USkaterAnimInstance::LeftFootIKAlpha
+AN_L_AUTO_OFF                  USkaterAnimInstance::_lastLeftFootAutoOffset
+AN_L_SOCK_LOC                  USkaterAnimInstance::LeftFootSocketLocation
+AN_L_SOCK_ROT                  USkaterAnimInstance::LeftFootSocketRotation
+AN_L_TGT                       USkaterAnimInstance::_lastLeftFootTargetLocation
+AN_ON_BOARD                    USkaterAnimInstance::IsOnBoard
+AN_SKATER                      USkaterAnimInstance::_skater
+AN_SPEED_RATIO                 USkaterAnimInstance::SpeedRatio
+AN_TRICK_PENDING               USkaterAnimInstance::IsTrickPending
+BSP_BS                         FAnimNode_BlendSpacePlayer::BlendSpace
+BSP_LOOP                       FAnimNode_BlendSpacePlayer::bLoop
+BSP_PLAYRATE                   FAnimNode_BlendSpacePlayer::PlayRate
+BSP_X                          FAnimNode_BlendSpacePlayer::X
+COMP_CTW_QUAT                  USceneComponent::ComponentToWorld
+COMP_REL_ROT                   USceneComponent::RelativeRotation
+COMP_WORLD_QUAT                USceneComponent::ComponentToWorld
+LODRD_CLOTHVB                  FSkeletalMeshLODRenderData::ClothVertexBuffer
+LODRD_IDXCONT                  FSkeletalMeshLODRenderData::MultiSizeIndexContainer
+LODRD_POSVB                    FSkeletalMeshLODRenderData::StaticVertexBuffers.PositionVertexBuffer
+LODRD_SECTIONS                 FSkeletalMeshLODRenderData::RenderSections
+LODRD_SKINVB                   FSkeletalMeshLODRenderData::SkinWeightVertexBuffer
+MC_GRINDS_DB                   USkaterMovementComponent::_grindsDb
+MC_GRIND_CRANK_RATIO           USkaterMovementComponent::_grindCrankDurationRatio
+MC_IS_ON_BOARD                 USkaterMovementComponent::_isOnBoard
+MC_JUMP_DELAY                  USkaterMovementComponent::_setJumpForTrickDelay
+MC_SKATER                      USkaterMovementComponent::_skater
+MC_TRICKS_DB                   USkaterMovementComponent::_tricksDb
+MI_PARENT                      UMaterialInstance::Parent
+MI_PARENT_P                    UMaterialInstance::Parent
+MI_SCALARS                     UMaterialInstance::ScalarParameterValues
+MI_TEXTURES                    UMaterialInstance::TextureParameterValues
+MI_VECTORS                     UMaterialInstance::VectorParameterValues
+SEC_BASEIDX                    FSkelMeshRenderSection::BaseIndex
+SEC_BASEVERT                   FSkelMeshRenderSection::BaseVertexIndex
+SEC_BONEMAP                    FSkelMeshRenderSection::BoneMap
+SEC_CLOTHASSETID               FSkelMeshRenderSection::CorrespondClothAssetIndex
+SEC_CLOTHDATA                  FSkelMeshRenderSection::ClothingData
+SEC_CLOTHMAPPING               FSkelMeshRenderSection::ClothMappingData
+SEC_MATIDX                     FSkelMeshRenderSection::MaterialIndex
+SEC_NUMTRIS                    FSkelMeshRenderSection::NumTriangles
+SEC_NUMVERTS                   FSkelMeshRenderSection::NumVertices
+SK_ADV_FLIP                    ASkaterCharacterBase::_advancedSettings.FlipSpeedMultiplier
+SK_ADV_GRIND_POP               ASkaterCharacterBase::_advancedSettings.GrindsPopHeightMultiplier
+SK_AUDIO_DATA                  ASkaterCharacterBase::_audioData
+SK_BOARD                       ASkaterCharacterBase::_skateboard
+SK_CATCH_MODE                  ASkaterCharacterBase::_catchMode
+SK_CATCH_ORIENT_ST             ASkaterCharacterBase::_catchOrientState
+SK_CATCH_ORIENT_STATE          ASkaterCharacterBase::_catchOrientState
+SK_CURRENT_TRICK_DEF           ASkaterCharacterBase::_currentFlipTrickDef
+SK_CUR_FLIP_DEF                ASkaterCharacterBase::_currentFlipTrickDef
+SK_CUR_GRIND_DEF               ASkaterCharacterBase::_currentGrindDef
+SK_CUR_TRICK                   ASkaterCharacterBase::_currentFlipTrickDef
+SK_FLIP_MODE                   ASkaterCharacterBase::_boardFlipSpeedMode
+SK_MOVEMENT_COMP               ASkaterCharacterBase::_movementComponent
+SK_MOVE_COMP                   ASkaterCharacterBase::_movementComponent
+SK_THROWDOWN                   ASkaterCharacterBase::_isDoingThrowdown
+SK_TRICK_POP_HEIGHT            ASkaterCharacterBase::_trickPopHeight
+SK_TRICK_POP_RATIO             ASkaterCharacterBase::_skateboardingAnimParams.TrickPopRatio
+SMC_ANIMRATE                   USkeletalMeshComponent::GlobalAnimRateScale
+SMC_CLOTHFACTORY               USkeletalMeshComponent::ClothingSimulationFactory
+SMC_CLOTHSIM                   USkeletalMeshComponent::ClothingSimulation
+SMC_CLOTHTICK                  USkeletalMeshComponent::ClothTickFunction
+SMC_DISABLECLOTH               USkeletalMeshComponent::bDisableClothSimulation
+SMC_PAUSEANIMS                 USkeletalMeshComponent::bPauseAnims
+SMC_SIMDATA                    USkeletalMeshComponent::CurrentSimulationData
+SM_LODINFO                     USkeletalMesh::LODInfo
+SM_MATERIALS                   USkeletalMesh::Materials
+SM_MATS                        USkeletalMesh::Materials
+SM_MESHCLOTH                   USkeletalMesh::MeshClothingAssets
+SM_REFSKELETON                 USkeletalMesh::RefSkeleton
+SM_REFSKEL_M                   USkeletalMesh::RefSkeleton
+SM_RENDERDATA                  USkeletalMesh::SkeletalMeshRenderData
+SM_RENDERDATA_M                USkeletalMesh::SkeletalMeshRenderData
+SM_SKELETON_M                  USkeletalMesh::Skeleton
+
+# These name a BITFIELD BYTE, not the single flag the mod reads out of it. The member is an anchor:
+# if the byte moves, the check fires, which is the whole job. Do not read the member name as the
+# meaning of the constant -- the meaning is in the code that masks it.
+SK_FLAGS  ASkaterCharacterBase::_isRagDoll
+SK_STATE_BITS  ASkaterCharacterBase::_isRagDoll
+SK_PHYSANIM_ON  ASkaterCharacterBase::_isPumping
+SK_SYNC_FLAGS  ASkaterCharacterBase::_isPumping
+SK_STANCE_OPTS  ASkaterCharacterBase::_isLegacySkater
+
+# LEFT UNMAPPED ON PURPOSE -- the offset is right, the obvious class is not:
+#   ACTOR_CURLOD / ACTOR_CURNORM / ACTOR_LODDATA / ACTOR_SKINNORM / ACTOR_STRIDE
+#       named for the skin-cache/render-data structures they index, not for AActor. Prefix-matching
+#       lands them on ReplicatedMovement, Tags and RootComponent, which share the offsets and mean
+#       nothing like the same thing.
+#   SM_HASCLOTH
+#       shares an offset with USkeletalMesh::bHasVertexColors. Different flag, same byte.

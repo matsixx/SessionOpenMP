@@ -506,6 +506,23 @@ static void* scanRange(const uint8_t* base, size_t len, const Pat& p, int* hits)
     return first;
 }
 
+// ---- WHICH GAME BUILD IS THIS? ------------------------------------------------------------------
+// Every signature and every offset in this file was verified against two specific executables. When
+// the game updates, some of them stop being true -- and the ones that stop SILENTLY are the offsets:
+// the mod reads a neighbouring field and behaves oddly, or reads a pointer that is not one and dies
+// somewhere unrelated. Neither looks like "the game was patched" in a bug report.
+//
+// So the build is identified out of its own PE header (link timestamp + image size -- two fields,
+// already in memory, no symbols needed) and named in the log. A build nobody has verified against
+// still runs EXACTLY as before: this only writes a line. Disabling the mod on an unknown build would
+// turn a maybe-fine situation into a definitely-broken one, and the point here is to make the first
+// line of the log answer the first question anyone will ask.
+struct KnownBuild { uint32_t stamp; uint32_t image; const char* name; };
+static const KnownBuild kKnownBuilds[] = {
+    { 0x69ca6d05u, 0x054a1000u, "Epic"  },      // link 2026-03-30 12:31:01Z
+    { 0x69c6963du, 0x05457000u, "Steam" },      // link 2026-03-27 14:37:49Z
+};
+
 const Syms& Resolve(void (*logf)(const char*)) {
     // ONCE. The scan now runs from the mod CONSTRUCTOR -- the game's boot-time level load applies
     // the world-prop save ~7 s after process start, and the seams that must observe it used to
@@ -711,6 +728,34 @@ const Syms& Resolve(void (*logf)(const char*)) {
     snprintf(m, sizeof(m), "[sym] resolved %d/%d%s", g_syms.resolved, g_syms.total,
              missingRequired ? "  *** REQUIRED SYMBOLS MISSING -- overlay will not drive proxies" : "");
     say(m);
+
+    // Name the build, so an update never has to be inferred from the symptoms (see kKnownBuilds).
+    {
+        const uint8_t* mb = (const uint8_t*)GetModuleHandleA(nullptr);
+        const char* which = nullptr;
+        uint32_t stamp = 0, image = 0;
+        if (mb) {
+            const IMAGE_DOS_HEADER* dh = (const IMAGE_DOS_HEADER*)mb;
+            if (dh->e_magic == IMAGE_DOS_SIGNATURE) {
+                const IMAGE_NT_HEADERS64* nt = (const IMAGE_NT_HEADERS64*)(mb + dh->e_lfanew);
+                if (nt->Signature == IMAGE_NT_SIGNATURE) {
+                    stamp = nt->FileHeader.TimeDateStamp;
+                    image = nt->OptionalHeader.SizeOfImage;
+                    for (const KnownBuild& b : kKnownBuilds)
+                        if (b.stamp == stamp && b.image == image) { which = b.name; break; }
+                }
+            }
+        }
+        if (which)
+            snprintf(m, sizeof(m), "[sym] game build: %s, the one this mod was verified against", which);
+        else
+            snprintf(m, sizeof(m),
+                     "[sym] *** UNRECOGNISED GAME BUILD (stamp 0x%08x, image 0x%08x). This mod was"
+                     " built against a different one -- if the game has updated, expect trouble and"
+                     " see docs/game-update.md. Nothing is disabled; this is a warning.",
+                     stamp, image);
+        say(m);
+    }
 
     // A resolved COUNT cannot report a symbol that has no table entry at all, and a hand-picked
     // readiness triple can silently exclude one. Readiness is therefore derived from the FIELDS THE

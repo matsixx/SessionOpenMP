@@ -29,3 +29,13 @@ CHANGELOG.md
 src/transport/eos_creds.h
 # Local scratch: abandoned work kept as patches for reference, never part of the tree.
 backup/
+
+# offcheck is a Python tool; its bytecode cache is not source
+tools/offcheck/__pycache__/
+
+# Archived game binaries. The PDB alone is 859 MB and the exes are 85 MB each -- far past what
+# GitHub accepts, and they are not ours to redistribute. The ARCHIVE ITSELF IS THE POINT (Epic
+# overwrites the PDB on every update and it cannot be recovered afterwards), so it lives on disk
+# and only its MANIFEST -- what each set is, with hashes -- is tracked. See docs/game-update.md.
+exe&pdb backups/*
+!exe&pdb backups/MANIFEST.txt

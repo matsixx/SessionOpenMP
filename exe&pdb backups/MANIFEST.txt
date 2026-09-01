@@ -1,0 +1,36 @@
+SessionOpenMP -- archived game binaries
+=======================================
+
+WHY THIS EXISTS
+  Epic ships the game's full PDB next to the executable and OVERWRITES IT on every update. Once a
+  patch lands, the only way to map an old address to a symbol -- and therefore the only way to diff
+  the old build against the new one instead of re-deriving 89 signatures and 189 offsets by hand --
+  is a copy of the old pair. That copy cannot be made after the fact. This is it.
+
+  Steam ships no PDB at all and is a SEPARATE BUILD (see the link stamps below), which is why
+  sigbridge.py exists: it names a Steam address by finding the same function in the Epic exe.
+
+WHAT THIS IS
+  The exact binaries SessionOpenMP 1.0.0-rc3 / SessionTweaks 3.19.202 were built and verified
+  against. Every signature in src/game/game_syms.cpp resolves 1-hit in both executables below, and
+  omp_symcheck proves it offline.
+
+Epic   SessionGame-Win64-Shipping.exe        85819392 bytes  link 2026-03-30 12:31:01Z  SizeOfImage 0x54a1000
+       sha256 87e9e3f27373f3e509c588efa6850c52a1bfae6d8c01104ed9df87686f0aff28
+Epic   SessionGame-Win64-Shipping.pdb       859058176 bytes
+       sha256 8558c82e10168e55a5541bfcb185b3fff4b4300855bb15e8ffaf263967b8840b
+Steam  SessionGame-Win64-Shipping.exe        85514240 bytes  link 2026-03-27 14:37:49Z  SizeOfImage 0x5457000
+       sha256 872dce689d39b52c9e79cc6653b4d42a16dbf3b6aabfbf500350ec2749a83ddf
+
+USING IT AFTER AN UPDATE
+  1. Archive the NEW exe + pdb beside these, in a folder named for the new version. Do this FIRST,
+     before anything else -- the same overwrite problem applies to every future update.
+  2. Point omp_symcheck at the new executables. It names every signature that stopped resolving,
+     and separates "no match" from "more than one match" -- the second is the dangerous one.
+  3. Point omp_offcheck at the new PDB. It verifies every offset in the off:: namespace against the
+     symbols and names the ones that moved. Offsets are the silent failure: nothing else catches
+     them, and a wrong one is garbage reads in a player's game rather than a clean error.
+  4. Re-cut only what those two reported, with sigmake.py (dual-exe verified) and pdbmembers.py.
+     Anything they did not name is still correct and does not need looking at.
+
+  docs/game-update.md is the full runbook.

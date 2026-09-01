@@ -1,10 +1,15 @@
 # tools
 
-Offline harnesses and build scripts. The four gates below run without the game, without a second
-player and without a network, and **all four must pass before a change ships**.
+Offline harnesses and build scripts. The five gates below run without the game, without a second
+player and without a network, and **all five must pass before a change ships**.
 
 Build them with the rest of the project (`cmake --build build --config Release`); they land in
-`build\Release\`. None of them takes arguments except `omp_symcheck`.
+`build\Release\`. None of them takes arguments except `omp_symcheck`. `offcheck` is the exception
+to all of that: it is a Python tool, because it reads the game's PDB.
+
+Between them, `omp_symcheck` and `offcheck` cover the **entire** game contact surface -- 89
+signatures and ~490 offsets -- which is what makes a game update a short list of jobs instead of an
+audit. See [../docs/game-update.md](../docs/game-update.md).
 
 ## The gates
 
@@ -23,6 +28,31 @@ With no arguments it checks the default Epic and Steam install paths; an executa
 is reported as `SKIP` rather than failing. Run this after **any** change to `src/game/game_syms.cpp`
 — the signature table and its assignment block are positional, and this is the only thing that
 catches a misalignment.
+
+### `offcheck` — the other half of the contact surface
+
+```
+python tools\offcheck\offcheck.py              # verify
+python tools\offcheck\offcheck.py --discover   # propose new map entries
+python tools\offcheck\offcheck.py --pdb <exe>  # a different build
+```
+
+Verifies every **struct offset** against the game's shipped PDB: the 188 constants in the `off::`
+namespace and the ~305 bare enum constants scattered through `src/tweaks`. It also checks that a
+constant declared in more than one tweaks module (26 of them are) **agrees with itself** — a
+disagreement there is a live bug, not just an update risk.
+
+Why it exists: a broken signature is loud (the symbol table names it and the feature disables
+itself), but **a moved offset is silent** — the mod reads a neighbouring field, and the first anyone
+hears is a crash with nothing useful attached.
+
+It reads `game_syms.h` and never writes to it; the expected symbol for each constant lives in
+`offsets.map`, so none of this tooling can affect how the mod behaves. **Unmapped offsets are
+unchecked, not proven correct** — the number is there to grow. `--discover` is deliberately strict
+and only proposes what a comment already names and the PDB confirms: a map entry that agrees for the
+wrong reason is worse than no entry, because it keeps agreeing after the real field has moved.
+
+Not wired into the build: it needs the PDB, which only the Epic install ships.
 
 ### `omp_looptest` — replication core
 
