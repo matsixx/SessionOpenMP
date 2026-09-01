@@ -1,0 +1,18 @@
+# Signatures in src/tweaks that are KNOWN to match more than once, and are used anyway.
+#
+#   <name>   <hits>   # why this is safe
+#
+# A signature matching twice normally means "lengthen it": it still resolves, to whichever match the
+# scanner reached first, and that is a coin flip nobody documented. These are the exceptions, where
+# the ambiguity was measured and the first match is the wanted one.
+#
+# ORDER-DEPENDENT BY CONSTRUCTION. Every entry here is a bet that the twins keep their current
+# relative order in the binary. That is exactly the kind of thing a game update can flip without
+# changing a single byte of either function, and nothing would look wrong -- the mod would call the
+# other twin and misbehave in a way no log line explains. So after ANY game update, re-verify every
+# entry here by hand (pdbsym.py addr <rva> on each match) before trusting a green run.
+
+SIG_ADDFORCE  2   # FBodyInstance::AddForce and ::AddTorqueInRadians have byte-identical prologues
+                  # -- same shape, same four arguments, 0x4f bytes each. Verified against the Epic
+                  # PDB 2026-09-01: first match 0x2e47b50 = AddForce, second 0x2e47e40 =
+                  # AddTorqueInRadians. body_feel.cpp takes the first, which is the right one.

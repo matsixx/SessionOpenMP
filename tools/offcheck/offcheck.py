@@ -237,6 +237,112 @@ def parse_tweaks_offsets():
     return out
 
 
+def parse_tweaks_sigs():
+    """SessionTweaks' byte signatures.
+
+    omp_symcheck reads the kSigs table in game_syms.cpp and nothing else, so it has never seen these:
+    the tweaks modules keep their patterns as bare string literals next to the code that uses them,
+    several of them copied verbatim out of game_syms.cpp with a comment saying so. That is 85
+    signatures -- nearly as many as the checked table -- with no proof they resolve, or that they
+    resolve to only ONE place, in either executable.
+
+    Returns [(name, pattern, file, line)]. Adjacent string literals are concatenated the way the
+    compiler does, since a long pattern is usually split across lines."""
+    out = []
+    if not os.path.isdir(TWEAKS_DIR):
+        return out
+    lit = re.compile(r'"((?:[0-9A-Fa-f?]{2} +)*[0-9A-Fa-f?]{2} *)"')
+    for fn in sorted(os.listdir(TWEAKS_DIR)):
+        if not fn.endswith(('.cpp', '.h')):
+            continue
+        path = os.path.join(TWEAKS_DIR, fn)
+        lines = io.open(path, encoding='utf-8', errors='replace').read().split('\n')
+        i = 0
+        while i < len(lines):
+            parts = lit.findall(lines[i])
+            if not parts:
+                i += 1
+                continue
+            start = i
+            # the name is whatever identifier this statement assigns to, looking back a little
+            name = None
+            for b in range(i, max(-1, i - 3), -1):
+                m = re.search(r'(\w+)\s*(?:\[\s*\])?\s*=', lines[b])
+                if m:
+                    name = m.group(1)
+                    break
+            pat = ' '.join(p.strip() for p in parts)
+            # keep swallowing continuation lines that are nothing but another literal
+            j = i + 1
+            while j < len(lines):
+                more = lit.findall(lines[j])
+                if not more or not re.match(r'^\s*"', lines[j]):
+                    break
+                pat += ' ' + ' '.join(p.strip() for p in more)
+                j += 1
+            toks = pat.split()
+            if len(toks) >= 8:                 # a real signature, not a stray hex string
+                out.append((name or "<unnamed>", pat, fn, start + 1))
+            i = j
+    return out
+
+
+def scan_exe_for(pattern, images):
+    """Hits per executable. Same matcher omp_symcheck uses, over executable sections only."""
+    toks = pattern.split()
+    pat = [(None if t.startswith('?') else int(t, 16)) for t in toks]
+    n = len(pat)
+    counts = []
+    for name, secs in images:
+        hits = 0
+        for blob in secs:
+            L = len(blob)
+            first = pat[0]
+            start = 0
+            while True:
+                k = blob.find(bytes([first]), start) if first is not None else start
+                if k < 0 or k + n > L:
+                    break
+                ok = True
+                for a in range(1, n):
+                    if pat[a] is not None and blob[k + a] != pat[a]:
+                        ok = False
+                        break
+                if ok:
+                    hits += 1
+                start = k + 1
+                if start + n > L:
+                    break
+        counts.append((name, hits))
+    return counts
+
+
+def load_images(paths):
+    """(label, [executable section bytes]) per exe. A pattern can otherwise 'match' inside rdata."""
+    import struct
+    out = []
+    for p in paths:
+        if not os.path.exists(p):
+            continue
+        data = open(p, 'rb').read()
+        e_lfanew = struct.unpack_from('<I', data, 0x3c)[0]
+        nsec = struct.unpack_from('<H', data, e_lfanew + 6)[0]
+        opt = struct.unpack_from('<H', data, e_lfanew + 20)[0]
+        first = e_lfanew + 24 + opt
+        secs = []
+        for i in range(nsec):
+            o = first + i * 40
+            chars = struct.unpack_from('<I', data, o + 36)[0]
+            if not (chars & 0x20000000):            # IMAGE_SCN_MEM_EXECUTE
+                continue
+            raw = struct.unpack_from('<I', data, o + 20)[0]
+            sz = struct.unpack_from('<I', data, o + 16)[0]
+            secs.append(data[raw:raw + sz])
+        label = 'Epic' if 'Epic' in p else ('Steam' if 'Steam' in p else os.path.basename(p))
+        out.append((label, secs))
+    return out
+
+
 def parse_map():
     """kName<ws>Class::member    |    kName<ws>-    (deliberately not a struct offset)"""
     out = {}
@@ -372,6 +478,51 @@ def verify_tweaks(pdb, tw, mapped):
     return bad
 
 
+STEAM_EXE = r"F:\Steam\steamapps\common\Session\SessionGame\Binaries\Win64\SessionGame-Win64-Shipping.exe"
+
+
+def verify_tweaks_sigs():
+    """Every tweaks signature must resolve to EXACTLY ONE address in EVERY executable present.
+    Zero is a dead feature; more than one is worse, because it still resolves -- to whichever came
+    first. Needs no PDB, only the exes, so it runs even when the PDB is missing (Steam ships none)."""
+    sigs = parse_tweaks_sigs()
+    print("\n-- src/tweaks signatures --")
+    images = load_images([DEFAULT_EXE, STEAM_EXE])
+    if not images:
+        print("  no game executable found -- cannot check")
+        return 0
+    print("  %d signatures x %d exe(s): %s" % (len(sigs), len(images),
+                                               ", ".join(n for n, _ in images)))
+    expect = {}
+    ef = os.path.join(HERE, 'sigs.expect')
+    if os.path.exists(ef):
+        for ln in io.open(ef, encoding='utf-8'):
+            ln = ln.split('#')[0].strip()
+            p = ln.split()
+            if len(p) >= 2 and p[1].isdigit():
+                expect[p[0]] = int(p[1])
+    bad = ok = allowed = 0
+    for name, pat, fn, ln in sigs:
+        counts = scan_exe_for(pat, images)
+        want = expect.get(name, 1)
+        if all(c == want for _, c in counts):
+            if want == 1:
+                ok += 1
+            else:
+                allowed += 1
+            continue
+        bad += 1
+        detail = "  ".join("%s=%d" % (n, c) for n, c in counts)
+        why = "AMBIGUOUS" if any(c > want for _, c in counts) else "NOT FOUND"
+        print("  %-22s %-10s %s:%d   %s (expected %d)" % (name[:22], why, fn, ln, detail, want))
+    print("  %d resolve 1-hit everywhere, %d known-ambiguous (sigs.expect), %d WRONG   (of %d)"
+          % (ok, allowed, bad, len(sigs)))
+    if allowed:
+        print("  the known-ambiguous ones depend on which twin comes FIRST -- re-verify them by hand"
+              " after a game update")
+    return bad
+
+
 def main():
     exe = DEFAULT_EXE
     if '--pdb' in sys.argv:
@@ -380,8 +531,11 @@ def main():
     try:
         pdb = Pdb(exe)
     except Exception as e:
+        # The signature half needs only the executables, so a missing PDB costs the offset check
+        # and nothing else. Say which half ran rather than reporting a blanket failure.
         print("  cannot read the PDB: %s" % e)
-        return 1
+        print("  offsets NOT checked; running the signature check, which does not need it")
+        return 1 if verify_tweaks_sigs() else 1
     ents = parse_offsets()
     mapped = parse_map()
     tw = parse_tweaks_offsets()
@@ -392,6 +546,7 @@ def main():
         return 0
     bad = verify(pdb, ents, mapped)
     bad += verify_tweaks(pdb, tw, mapped)
+    bad += verify_tweaks_sigs()
     print("\nOFFCHECK %s" % ("PASS" if bad == 0 else "FAIL"))
     return 1 if bad else 0
 

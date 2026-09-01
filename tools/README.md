@@ -7,9 +7,9 @@ Build them with the rest of the project (`cmake --build build --config Release`)
 `build\Release\`. None of them takes arguments except `omp_symcheck`. `offcheck` is the exception
 to all of that: it is a Python tool, because it reads the game's PDB.
 
-Between them, `omp_symcheck` and `offcheck` cover the **entire** game contact surface -- 89
-signatures and ~490 offsets -- which is what makes a game update a short list of jobs instead of an
-audit. See [../docs/game-update.md](../docs/game-update.md).
+Between them, `omp_symcheck` and `offcheck` cover the **entire** game contact surface of **both
+mods** -- 158 signatures and ~490 offsets -- which is what makes a game update a short list of jobs
+instead of an audit. See [../docs/game-update.md](../docs/game-update.md).
 
 ## The gates
 
@@ -37,10 +37,18 @@ python tools\offcheck\offcheck.py --discover   # propose new map entries
 python tools\offcheck\offcheck.py --pdb <exe>  # a different build
 ```
 
-Verifies every **struct offset** against the game's shipped PDB: the 188 constants in the `off::`
-namespace and the ~305 bare enum constants scattered through `src/tweaks`. It also checks that a
-constant declared in more than one tweaks module (26 of them are) **agrees with itself** — a
-disagreement there is a live bug, not just an update risk.
+Covers everything `omp_symcheck` does not:
+
+- Every **struct offset** against the game's shipped PDB — the 188 constants in `off::` and the ~305
+  bare enum constants scattered through `src/tweaks`.
+- Whether a constant declared in more than one tweaks module (26 of them are) **agrees with itself**
+  — a disagreement there is a live bug, not just an update risk.
+- **SessionTweaks' own 69 byte signatures.** `omp_symcheck` reads the `kSigs` table in
+  `game_syms.cpp` and nothing else, so it has never seen these; the tweaks modules keep their
+  patterns as bare string literals next to the code that uses them. Each must resolve **1-hit in
+  every executable present**; `sigs.expect` records the ones deliberately used despite matching
+  twice, and those are order-dependent and need re-checking by hand after an update. This half needs
+  only the exes, so it runs even when the PDB is missing.
 
 Why it exists: a broken signature is loud (the symbol table names it and the feature disables
 itself), but **a moved offset is silent** — the mod reads a neighbouring field, and the first anyone

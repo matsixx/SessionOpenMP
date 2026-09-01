@@ -27,7 +27,7 @@ same function in the Epic exe.
 ## 1. Find out how bad it is, before touching any code
 
 Two commands. Neither needs the game running, and between them they cover the entire contact
-surface: **89 signatures and ~490 offsets.**
+surface: **158 signatures and ~490 offsets, across both mods.**
 
 ```
 build\Release\omp_symcheck.exe
@@ -39,8 +39,12 @@ dangerous one -- it will resolve, to the wrong function).
 ```
 python tools\offcheck\offcheck.py
 ```
-Every mapped offset, against the new PDB. Reports `MOVED` (the field is at a different offset now),
-`MEMBER GONE` (renamed or deleted) and `CLASS GONE`.
+Every mapped offset against the new PDB -- reporting `MOVED` (the field is at a different offset
+now), `MEMBER GONE` (renamed or deleted) and `CLASS GONE` -- **and SessionTweaks' own 69
+signatures**, which `omp_symcheck` never sees: it reads the `kSigs` table in `game_syms.cpp`, and
+the tweaks modules keep their patterns as bare string literals beside the code that uses them.
+
+The signature half needs only the executables, so it still runs when the PDB is missing.
 
 **What they do not name is still correct and does not need looking at.** That is the entire value of
 running them first: an update that moves six things becomes six jobs instead of an audit.
@@ -51,7 +55,8 @@ Both are offline and take seconds. Run them before forming any theory about what
 
 ## 2. The three failure modes, in the order they hurt
 
-**Signatures that no longer resolve** are the loudest and the least dangerous. The symbol table logs
+**Signatures that no longer resolve** are the loudest and the least dangerous (for OpenMP's table;
+SessionTweaks' copies mostly just go inert, each module logging its own miss). The symbol table logs
 each one by name at startup, and the feature that needed it disables itself
 (`*** PROXIES DISABLED -- spawn path needs: X`). Re-cut with:
 
@@ -75,6 +80,17 @@ both the header and `tools\offcheck\offsets.map`.
 still there and still called, but it now does something slightly different, or the event ordering
 around it moved. Nothing to do but test. The gates get you to the point where this is the only thing
 left, which is the best any static check can do.
+
+### Re-verify the known-ambiguous signatures BY HAND
+
+`tools/offcheck/sigs.expect` lists signatures that match more than once and are used anyway, because
+the first match was measured to be the wanted one. **Every entry is a bet on two twins keeping their
+relative order in the binary** -- something an update can flip without changing a byte of either
+function. Nothing would look wrong: the mod would simply call the other twin.
+
+Today that is `SIG_ADDFORCE`, where `FBodyInstance::AddForce` and `::AddTorqueInRadians` have
+byte-identical prologues. Re-check each entry with `pdbsym.py addr <rva>` on both matches before
+trusting a green run.
 
 ---
 
