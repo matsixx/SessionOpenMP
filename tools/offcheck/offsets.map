@@ -101,7 +101,7 @@ kMeshBoneSpaceData             USkeletalMeshComponent::BoneSpaceTransforms
 kObjNamePrivate                UObjectBase::NamePrivate
 kObjClassPrivate               UObjectBase::ClassPrivate
 kStructSuperStruct             UStruct::SuperStruct
-kMeshBoneInfoStride            -      # sizeof(FMeshBoneInfo), a stride
+kMeshBoneInfoStride            sizeof:FMeshBoneInfo
 kTransformRotOff               -      # offset of a rotation WITHIN an FTransform, used as a stride
 kColorRgbaOff                  -      # channel stride within an FLinearColor
 
@@ -256,3 +256,329 @@ SK_STANCE_OPTS  ASkaterCharacterBase::_isLegacySkater
 #       nothing like the same thing.
 #   SM_HASCLOTH
 #       shares an offset with USkeletalMesh::bHasVertexColors. Different flag, same byte.
+
+# ---- second pass: the rest of src/tweaks -------------------------------------------------
+ACTOR_CURLOD                   FClothingActorNv::CurrentLodIndex
+ACTOR_CURNORM                  FClothingActorNv::CurrentNormals
+ACTOR_LODDATA                  FClothingActorNv::LodData
+ACTOR_SKINNORM                 FClothingActorNv::SkinnedPhysicsMeshNormals
+BI_BLEND_WEIGHT                FBodyInstance::PhysicsBlendWeight
+BI_BONE_INDEX                  FBodyInstance::InstanceBoneIndex
+BI_LIN_DAMP                    FBodyInstance::LinearDamping
+BOARD_FLIPPER                  ASkateboardEx::_flipper
+CA_CONFIGS                     UClothingAssetCommon::ClothConfigs
+CA_LODDATA                     UClothingAssetCommon::LodData
+CA_LODMAP                      UClothingAssetCommon::LodMap
+CA_REFBONEIDX                  UClothingAssetCommon::ReferenceBoneIndex
+CA_USEDBONEIDX                 UClothingAssetCommon::UsedBoneIndices
+CFG_WINDDRAG                   UClothConfigNv::WindDragCoefficient
+CFG_WINDLIFT                   UClothConfigNv::WindLiftCoefficient
+CH_MESH                        ACharacter::Mesh
+CMP_BODIES                     USkeletalMeshComponent::Bodies
+CMP_CST_ARR                    USkinnedMeshComponent::ComponentSpaceTransformsArray
+CMP_CST_READIDX                USkinnedMeshComponent::CurrentReadComponentTransforms
+CMP_SKELMESH                   USkinnedMeshComponent::SkeletalMesh
+CTW_QUAT                       USceneComponent::ComponentToWorld
+CVB_DATA                       FSkeletalMeshVertexClothBuffer::Data
+CVB_IDXMAP                     FSkeletalMeshVertexClothBuffer::ClothIndexMapping
+CVB_NUMVERTS                   FSkeletalMeshVertexClothBuffer::NumVertices
+CVB_STRIDE                     FSkeletalMeshVertexClothBuffer::Stride
+CVB_VERTEXDATA                 FSkeletalMeshVertexClothBuffer::VertexData
+DB_FLIP_MAX                    UTricksDatabase::FlipSpeedMaxMultiplier
+DB_FLIP_MIN                    UTricksDatabase::FlipSpeedMinMultiplier
+DB_ROT_SPEED_MAX_MULT          UTricksDatabase::RotationSpeedMaxMultiplier
+DB_ROT_SPEED_MIN_MULT          UTricksDatabase::RotationSpeedMinMultiplier
+DEF_CATCH_ALIGN_SMOOTH         UFlipTrickDefinition::CatchPitchAlignSmoothing
+DEF_CATCH_TGT_PITCH            UFlipTrickDefinition::CatchTargetPitchAngle
+DEF_CATCH_TGT_ROLL             UFlipTrickDefinition::CatchTargetRollAngle
+DEF_FLIP_PRECATCH_ANGLE        UFlipTrickDefinition::BoardFlipPreCatchAngle
+DEF_OTHER_FOOT_TIME            UFlipTrickDefinition::OtherFootCatchTime
+DEF_ROT_PRECATCH_ANGLE         UFlipTrickDefinition::BoardRotationPreCatchAngle
+FTH_INPUT_HANDLER              FlipTricksHandler::_inputHandler
+FTH_SKATER                     FlipTricksHandler::_skater
+FTH_TRICKS_DB                  FlipTricksHandler::_tricksDb
+GDB_BASE_POP                   UGrindsDatabase::GrindBasePopHeight
+GDB_EXIT_POP                   UGrindsDatabase::GrindExitPopHeight
+GDB_MOM_POP_DELAY              UGrindsDatabase::AnimGrindMomentumPopPelvisDelay
+GDB_POP_DELAY                  UGrindsDatabase::AnimGrindPopPelvisDelay
+GD_ADD_POP                     UGrindOrSlideDefinition::AdditionalPopHeight
+GD_APPROACH                    UGrindOrSlideDefinition::ApproachType
+GD_END_ADDL                    UGrindOrSlideDefinition::AdditionalTrickGrindEndPitchData
+GD_END_ADDL_NUM                UGrindOrSlideDefinition::AdditionalTrickGrindEndPitchData.ArrayNum
+GD_END_PITCH                   UGrindOrSlideDefinition::TrickGrindEndPitchData
+GD_NAME                        UGrindOrSlideDefinition::Name
+GD_OVERRIDE_END                UGrindOrSlideDefinition::OverrideTrickEndPitch
+GD_OVERRIDE_START              UGrindOrSlideDefinition::OverrideTrickStartPitch
+GD_POPRATIO_MOD                UGrindOrSlideDefinition::AnimTrickPopRatioModifier
+NVSIM_ACTORS                   FClothingSimulationNv::Actors
+NVSIM_SIMTIME                  FClothingSimulationNv::SimulationTime
+PMD_BONEDATA                   FClothPhysicalMeshData::BoneData
+PMD_INDICES                    FClothPhysicalMeshData::Indices
+PMD_INVMASS                    FClothPhysicalMeshData::InverseMasses
+PMD_MAXBONEW                   FClothPhysicalMeshData::MaxBoneWeights
+PMD_NORMALS                    FClothPhysicalMeshData::Normals
+PMD_NUMFIXED                   FClothPhysicalMeshData::NumFixedVerts
+PMD_VERTS                      FClothPhysicalMeshData::Vertices
+PMD_WEIGHTMAPS                 FClothPhysicalMeshData::WeightMaps
+POSVB_CPUACCESS                FPositionVertexBuffer::bNeedsCPUAccess
+POSVB_DATA                     FPositionVertexBuffer::Data
+POSVB_NUMVERTS                 FPositionVertexBuffer::NumVertices
+POSVB_STRIDE                   FPositionVertexBuffer::Stride
+REFSK_BONEINFO                 FReferenceSkeleton::FinalRefBoneInfo
+REFSK_BONES                    FReferenceSkeleton::FinalRefBoneInfo
+SKATER_ROT_SPEED_MODE          ASkaterCharacterBase::_boardRotationSpeedMode
+SKATER_SCOOP_SPEED_MULT        ASkaterCharacterBase::_advancedSettings.ScoopSpeedMultiplier
+SKINVB_16BITBONE               FSkinWeightVertexBuffer::DataVertexBuffer.bUse16BitBoneIndex
+SKINVB_CPUACCESS               FSkinWeightVertexBuffer::DataVertexBuffer.bNeedsCPUAccess
+SKINVB_DATA                    FSkinWeightVertexBuffer::DataVertexBuffer.Data
+SKINVB_MAXINFL                 FSkinWeightVertexBuffer::DataVertexBuffer.MaxBoneInfluences
+SKINVB_NUMVERTS                FSkinWeightVertexBuffer::DataVertexBuffer.NumVertices
+SKINVB_VARBONES                FSkinWeightVertexBuffer::DataVertexBuffer.bVariableBonesPerVertex
+SLOD_SECTIONS                  FSkeletalMeshLODRenderData::RenderSections
+SMC_CSTA                       USkinnedMeshComponent::ComponentSpaceTransformsArray
+SMC_CST_EDIT                   USkinnedMeshComponent::CurrentEditableComponentTransforms
+SMC_CST_READ                   USkinnedMeshComponent::CurrentReadComponentTransforms
+SMC_MASTERBONEMAP              USkinnedMeshComponent::MasterBoneMap
+SMC_MASTERPOSE                 USkinnedMeshComponent::MasterPoseComponent
+SMC_PREDLOD                    USkinnedMeshComponent::PredictedLODLevel
+SMC_SKELMESH                   USkinnedMeshComponent::SkeletalMesh
+SMC_SKELMESH_M                 USkinnedMeshComponent::SkeletalMesh
+SMM_BUFFERACCESS               FSkeletalMeshMerge::MeshBufferAccess
+SMM_FORCESECMAP                FSkeletalMeshMerge::ForceSectionMapping
+SMM_MERGEMESH                  FSkeletalMeshMerge::MergeMesh
+SMM_SRCLIST                    FSkeletalMeshMerge::SrcMeshList
+SMM_STRIPTOPLOD                FSkeletalMeshMerge::StripTopLODs
+SRD_LODARRAY                   FSkeletalMeshRenderData::LODRenderData
+TDB_CRANK_GRIND_MIN            UTricksDatabase::CrankGrindAnimMinTime
+TDB_CRANK_MIN                  UTricksDatabase::CrankAnimMinTime
+TDB_FLIP_TRICKS                UTricksDatabase::_flipTricks
+TRICKDEF_NAME                  UFlipTrickDefinition::Name
+UOBJ_FLAGS                     UObjectBase::ObjectFlags
+WORLD_PHYSSCENE                UWorld::PhysicsScene
+
+ACTOR_STRIDE                   sizeof:FClothingActorNv
+
+# Bitfield BYTES -- the member is an anchor for the byte, not the flag the code masks out of it.
+WORLD_FLAGS  UWorld::bDropDetail
+
+# LEFT UNMAPPED, with the reason, so nobody re-guesses:
+#   SM_HASCLOTH        0x15f  shares its byte with USkeletalMesh::bHasVertexColors. Different flag.
+#   TD_MAX_CRANK_ON_GRIND / TD_ADD_POP_GRIND / TD_START_PITCH
+#       their comments name MaxCrankRatioOnGrinds / AdditionalPopHeightGrind, and NEITHER
+#       UTricksDatabase nor UGrindsDatabase has a member by those names at those offsets. Whatever
+#       class grind_pop.cpp is really walking has not been established -- so no entry, rather than
+#       an entry that would agree with the wrong thing.
+
+# ---- second pass: the rest of off:: ------------------------------------------------------------
+kSkaterMesh                    ACharacter::Mesh
+kBoardSkater                   ASkateboardEx::_skater
+kBoardMoveComp                 ASkateboardEx::_skateboardMovement
+kGrindDefCacheSrc              UGrindOrSlideDefinition::Name
+kGiMapSelectData               USessionGameInstance::_mapSelectDataAsset
+kGiSkaterDefs                  USessionGameInstance::_skaterDefinitions
+kMapDataName                   FMapSelectData::MapName
+kMapDataLabel                  FMapSelectData::MapLabel
+kPageItemWidgets               UMenuPage::_pageItemWidgets
+kMenuItemDef                   UMenuPageItem::_pageItemDefinition
+kChangeParamsOld               FOnMenuPageProgressBarValueChangedParams::OldPercent
+kChangeParamsNew               FOnMenuPageProgressBarValueChangedParams::NewPercent
+kSkInstVisualDef               FSkaterInstance::BaseVisualDefinition
+kSkInstProfile                 FSkaterInstance::CustomizationProfile
+kProfileInventory              UPlayerProfile::CustomizationInventory
+kProfCharItems                 FCustomizationProfile::CharacterItems
+kItemDefMeshes                 UCustomizationItemDefinition::ItemMeshes
+kItemDefAlphaMasks             UCustomizationItemDefinition::AlphaMasks
+kItemMeshMaterials             FCustomizationItemMesh::ItemMaterials
+kItemMatSoft                   FCustomizationItemMaterial::Material
+kItemMatVariants               FCustomizationItemMaterial::MaterialVariants
+kItemMatSoftAFXX               FCustomizationItemMaterial::Material_AFXX
+kMeshGlobalAnimRate            USkeletalMeshComponent::GlobalAnimRateScale
+
+# STRIDES AND SIZES. Checked with sizeof: rather than left unverifiable -- a struct that gains a
+# field changes its stride, and iterating an array with a stale one reads garbage from the second
+# element onward. That is a real update risk, and it used to go unwatched purely because the check
+# was expressed in terms of members.
+kItemSize                      sizeof:FMenuPageItemDefinition
+kCrankDefSize                  sizeof:FCrankDefinition
+kMapDataStride                 sizeof:FMapSelectData
+kItemMeshStride                sizeof:FCustomizationItemMesh
+kItemMatStride                 sizeof:FCustomizationItemMaterial
+kMarkerInfoSize                sizeof:FSessionPlayerMarkerInfo
+kSoftPtrSize                   sizeof:FSoftObjectPtr
+
+# Bitfield BYTES -- an anchor for the byte, not the flag the code masks out of it.
+kMeshAnimFlagsByte             USkeletalMeshComponent::bPauseAnims
+
+# NOT verifiable, with the reason:
+kSelParamsPageDef              -   # FOnMenuPageSelectionConfirmedParams is in the PDB with a SIZE
+kSelParamsItem                 -   # (152) and NO field layout -- a UScriptStruct. Its members
+kSelParamsFlag                 -   # cannot be checked; the offsets came from disassembly.
+kSoftPathInPtr                 -   # offset INSIDE a TSoftObjectPtr; the template has no entry
+kBoardMoveMode                 -   # reached as iface+0x50 via +0x138, not a member of anything
+kBoardModeInHand               -   # derived fallback, not a field
+kBoardIface                    -   # interface sub-object, not a reflected member
+kIVtblGetBoardMove             -   # vtable SLOT index
+kMVtblGetMoveMode              -   # vtable SLOT index
+kAcVtblStop                    -   # vtable SLOT index
+kAcVtblIsPlaying               -   # vtable SLOT index
+kNotifyPlaySoundLen            -   # byte LENGTH of a function, for a return-address range test
+kIntroUiLen                    -   # ditto
+kPauseInitLen                  -   # ditto
+kSkaterToggleState             -   # derived in ApplyToggleOnBoard, not read as a named field
+kSkaterDerivedPart             -   # where ASkaterCharacter's derived part begins; a boundary
+kReplayCompIface               -   # interface sub-object offset
+
+# LEFT UNMAPPED, deliberately:
+#   kReplayInstCurTime / kReplayInstTotalTime  0x8d4 / 0x8dc
+#       on the replay INSTANCE data, whose type the PDB does not name from _activeInstanceData.
+#   kSkaterReplayAttachA / kSkaterReplayAttachB  0xa68 / 0xa50
+#       skater-relative (the derived part starts at 0xa40), not USkeletalMeshComponent members --
+#       matching them there lands on ClothCollisionSources, which is meaningless here.
+
+# ---- third pass: the remainder of off:: --------------------------------------------------------
+kItemMatVariantsAF             FCustomizationItemMaterial::MaterialVariants_AFXX
+kItemMatVarSoft                FCustomizationItemMaterialVariant::Material
+kItemDefAlphaMaskAF            UCustomizationItemDefinition::AlphaMasks_AFXX
+kInstSockHeight                FCustomizationInventoryItemInstance::ItemAttributes.SockHeightIndex
+kInstColorOverrides            FCustomizationInventoryItemInstance::ItemAttributes.CustomColorAttribute.CustomColorOverrides
+kInstColorPatterns             FCustomizationInventoryItemInstance::ItemAttributes.CustomColorAttribute.CustomColorPatterns
+kInstVariantId                 FCustomizationInventoryItemInstance::VariantId
+kProfBoardItems                FCustomizationProfile::SkateboardItems
+kAnimLFootRot                  USkaterAnimInstance::LeftFootSocketRotation
+kAnimRFootLoc                  USkaterAnimInstance::RightFootSocketLocation
+kAnimRFootRot                  USkaterAnimInstance::RightFootSocketRotation
+kAnimLHandLoc                  USkaterAnimInstance::LeftHandIKLocation
+kAnimLHandRot                  USkaterAnimInstance::LeftHandIKRotation
+kAnimRHandLoc                  USkaterAnimInstance::RightHandIKLocation
+kAnimRHandRot                  USkaterAnimInstance::RightHandIKRotation
+kMeshBoneSpaceNum              USkeletalMeshComponent::BoneSpaceTransforms.ArrayNum
+kMeshCompSpaceArr              USkinnedMeshComponent::ComponentSpaceTransformsArray
+kMeshCompEditIdx               USkinnedMeshComponent::CurrentEditableComponentTransforms
+kMeshCompReadIdx               USkinnedMeshComponent::CurrentReadComponentTransforms
+kTransformPosOff               FTransform::Translation
+kDropMgrMode                   AObjectDropperManager::_currentMode
+kDropMgrAllObjects             AObjectDropperManager::_allObjects
+kDropMgrSelected               AObjectDropperManager::_selectedObjects
+kItemMatVarStride              sizeof:FCustomizationItemMaterialVariant
+kInvInstanceStride             sizeof:FCustomizationInventoryItemInstance
+kTransformStride               sizeof:FTransform
+kDropCatStride                 sizeof:FObjectDropperObjectCategory
+kDropInfoStride                sizeof:FObjectDropperObjectInformation
+
+kInvElemStride                 -   # TMap element stride, not a field
+kColorElemStride               -   # TMap element stride
+kColorValueOff                 -   # where the value starts inside a TMap element
+kColorEnabledOff               -   # a field inside that value; both come from the element layout
+kMeshCompSpaceStride           -   # the stride BETWEEN the two component-space arrays, not a field
+kDropInfoClassPath             -   # FSoftObjectPath inside a TSoftClassPtr; template, no PDB entry
+kVtblSetLinearVel              -   # vtable SLOT index
+kVtblSetAngularVel             -   # vtable SLOT index
+kVtblSetMobility               -   # vtable SLOT index
+kMobilityMovable               -   # EComponentMobility::Movable, an enum VALUE
+
+# LEFT UNMAPPED, deliberately:
+#   kInvItemsMap      0x10   FCustomizationInventory is not a type name in this PDB.
+#   kInvElemInstances 0x10   reads through a TMap element rather than off a named struct, so
+#                            matching it on FCustomizationInventoryItem lands on InstanceList's
+#                            ArrayNum -- the right number for the wrong reason.
+#   kMovePushFlags    0x7e8  no member there in USkaterMovementComponent; the byte was found by
+#                            disassembly and its owner has not been established.
+
+# ---- third pass: the remainder of src/tweaks ---------------------------------------------------
+ACTOR_GRAVOVR                  FClothingActorNv::GravityOverride
+ACTOR_USEGRAVOVR               FClothingActorNv::bUseGravityOverride
+CAM_DATA                       ASkaterCameraActor::_cameraData
+CD_BIGAIR_MINDROP              USessionCameraData::_minimumDropHeightForBigAir
+CD_BIGAIR_MINPOP               USessionCameraData::_minimumPopHeightForBigAir
+CD_DROP_DEBUG                  USessionCameraData::_enableDropDetectionDebug
+CD_DROP_DIST                   USessionCameraData::_dropDetectionDistance
+CD_DROP_ENABLE                 USessionCameraData::_enableDropDetection
+CD_DROP_MAXH                   USessionCameraData::_dropMaxHeight
+CD_DROP_MINH                   USessionCameraData::_dropMinHeight
+CD_FLATAIR_MAXLANDING          USessionCameraData::_maximumLandingHeightForFlatAir
+CD_FLATAIR_MAXPOP              USessionCameraData::_maximumPopHeightForFlatAir
+CFOA_MAXCHUNKS                 FChunkedFixedUObjectArray::MaxChunks
+CFOA_MAXELEMENTS               FChunkedFixedUObjectArray::MaxElements
+CFOA_OBJECTS                   FChunkedFixedUObjectArray::Objects
+CODB_INPUT_DEADZONE            UCatchOrientsDatabase::CatchOrientInputDeadZone
+CODB_ORIENTS                   UCatchOrientsDatabase::_catchOrients
+COS_OFF_L_RGS                  FCatchOrientSettings::LeftBoardRelativeOffset_RGS
+CO_BACK_SETTINGS               FCatchOrientDefinition::BackSideSettings
+CO_FRONT_SETTINGS              FCatchOrientDefinition::FrontSideSettings
+FCFI_RATIO                     FCatchFootInfo::CatchRatio
+IAH_CATCH_ORIENTS_DB           InAirHandler::_catchOrientsDb
+IAH_CATCH_ORIENT_INPUT         InAirHandler::_catchOrientInputMode
+IAH_DS_CANCEL                  InAirHandler::_shouldCancelSingleStickInputForDarkSlide
+IAH_DS_WINDOW                  InAirHandler::_isInDarkSlideWindow
+IAH_HAD_BACK_INPUT             InAirHandler::_hadCatchBackStickInput
+IAH_HAD_FRONT_INPUT            InAirHandler::_hadCatchFrontStickInput
+IAH_INPUT_HANDLER              InAirHandler::_inputHandler
+IAH_LAST_ORIENT_STATE          InAirHandler::_lastCatchOrientState
+IAH_SKATER                     InAirHandler::_skater
+IAH_TRICKS_DB                  InAirHandler::_tricksDb
+IH_FRAME_RAW_LEFT              InputHandler::_frameRawLeftInput
+IH_FRAME_RAW_RIGHT             InputHandler::_frameRawRightInput
+IH_RAW_LEFT                    InputHandler::_frameRawLeftInput
+IH_RAW_RIGHT                   InputHandler::_frameRawRightInput
+MM_BUF_ACCESS                  FSkeletalMeshMerge::MeshBufferAccess
+MM_MERGE_MESH                  FSkeletalMeshMerge::MergeMesh
+MM_SRC_LIST                    FSkeletalMeshMerge::SrcMeshList
+MM_STRIP_LODS                  FSkeletalMeshMerge::StripTopLODs
+NTF_SOUND                      UAnimNotify_PlaySound::Sound
+OBJ_CLASS                      UObjectBase::ClassPrivate
+OBJ_NAME                       UObjectBase::NamePrivate
+RD_LODARRAY                    FSkeletalMeshRenderData::LODRenderData
+SC_COMPLOCATION                USceneComponent::ComponentToWorld
+UOBJITEM_FLAGS                 UObjectBase::ObjectFlags
+CA_ASSETGUID                   UClothingAssetBase::AssetGuid
+COMP_CUSTOMPRIM_INT            UPrimitiveComponent::CustomPrimitiveDataInternal
+COMP_OWNER                     UActorComponent::OwnerPrivate
+COMP_WORLD                     UActorComponent::WorldPrivate
+MC_ANIM_ROLL                   USkateboardExMovementComponent::_localAnimationRotator.Roll
+MC_BOARD_FLIP_CUR              USkateboardExMovementComponent::_boardFlipCurrentAngle
+MC_BOARD_FLIP_RATE             USkateboardExMovementComponent::_boardFlipRate
+MC_BOARD_FLIP_TARGET           USkateboardExMovementComponent::_boardFlipTargetAngle
+MC_CATCH_FORCE_TIME            USkateboardExMovementComponent::_catchForceFeetCatchTime
+MC_CATCH_TOTAL_TIME            USkateboardExMovementComponent::_catchTotalTime
+MC_CATCH_TO_BOARD_DELAY        USkateboardExMovementComponent::_catchFeetToOnSkateboardDelay
+MC_CUSTOM_MODE                 UCharacterMovementComponent::CustomMovementMode
+MC_LFOOT_CATCH                 USkateboardExMovementComponent::_leftFootCatchInfo
+MC_MOVEMENT_MODE               UCharacterMovementComponent::MovementMode
+MC_PITCH_CUR_TIME              USkateboardExMovementComponent::_pitchCurrentTime
+MC_PITCH_EXTRA                 USkateboardExMovementComponent::_pitchExtraAngle
+MC_PITCH_MODE                  USkateboardExMovementComponent::_pitchCurrentMode
+MC_PITCH_NOW                   USkateboardExMovementComponent::_localAnimationRotator
+MC_PITCH_START                 USkateboardExMovementComponent::_pitchStartAngle
+MC_PITCH_TARGET                USkateboardExMovementComponent::_pitchTargetAngle
+MC_PITCH_TOTAL_TIME            USkateboardExMovementComponent::_pitchTotalTime
+MC_RFOOT_CATCH                 USkateboardExMovementComponent::_rightFootCatchInfo
+MC_VELOCITY                    UMovementComponent::Velocity
+SK_MESH                        ACharacter::Mesh
+SK_ROOT                        AActor::RootComponent
+SK_ROOT_COMP                   AActor::RootComponent
+SMC_WORLD                      UActorComponent::WorldPrivate
+ITEMMAT_STRIDE                 sizeof:FCustomizationItemMaterial
+
+# Bitfield BYTES -- an anchor for the byte, not the flag the code masks out of it.
+SMC_REGFLAGS                   UActorComponent::bRegistered
+MAT_USAGE1                     UMaterial::bBlockGI
+MAT_USAGE3                     UMaterial::bUsesDistortion
+
+VT_SHOULDRUNCLOTH              -   # vtable SLOT index
+FTH_SCAN_BYTES                 -   # a scan LENGTH, not an offset
+EXTRA_PITCH_SIZE               -   # allocation size for the mod's own side table
+CFGMAP_VALUE                   -   # value offset inside a TMap element
+BOARD_IFACE                    -   # interface sub-object, not a reflected member
+
+# LEFT UNMAPPED, with the reason, so nobody re-guesses:
+#   AD_NOCATCH_DATA / AD_NOCATCH_NUM  the board audio-data struct is not named in this PDB.
+#   APD_FOOT / APD_STRIDE             the mod's OWN per-foot table, not a game struct.
+#   FID_ANGLE / FID_INPUT             ditto -- the mod's own input record.
+#   IMS_AXIS_X_MAX_ANG                ditto.
+#   BSP_GROUP / BSP_TIME / BSP_WEIGHT relative to an FAnimNode base the PDB does not lay out here.
+#   CAM_COMPONENT / COMP_OVERRIDE_MATS / SMC_CLOTHTICK_ID / IDXBUF_* / LODRD_TANG*
+#                                     no member at those offsets in the obvious class; the owner
+#                                     has not been established, and a near-miss would be worse.
+#   PB_* (6)                          a sub-object embedded at component+0x138, self-verifying via
+#                                     its +0x208 back-pointer. The PDB does not name the type.
+#   TD_* (3) / SM_HASCLOTH            see the earlier notes.

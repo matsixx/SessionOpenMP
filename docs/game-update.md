@@ -27,7 +27,7 @@ same function in the Epic exe.
 ## 1. Find out how bad it is, before touching any code
 
 Two commands. Neither needs the game running, and between them they cover the entire contact
-surface: **158 signatures and ~490 offsets, across both mods.**
+surface: **158 signatures and 493 offsets, across both mods.**
 
 ```
 build\Release\omp_symcheck.exe
@@ -40,7 +40,8 @@ dangerous one -- it will resolve, to the wrong function).
 python tools\offcheck\offcheck.py
 ```
 Every mapped offset against the new PDB -- reporting `MOVED` (the field is at a different offset
-now), `MEMBER GONE` (renamed or deleted) and `CLASS GONE` -- **and SessionTweaks' own 69
+now), `MEMBER GONE`, `CLASS GONE` and `SIZE CHANGED` (a struct grew, so every stride derived from it
+is now wrong) -- **and SessionTweaks' own 69
 signatures**, which `omp_symcheck` never sees: it reads the `kSigs` table in `game_syms.cpp`, and
 the tweaks modules keep their patterns as bare string literals beside the code that uses them.
 
@@ -96,8 +97,9 @@ trusting a green run.
 
 ## 3. Growing the offset coverage
 
-`offcheck` reports how many offsets are mapped and how many are not. **An unmapped offset is
-unchecked, not proven correct** -- the count is a number to grow, not a gate to trip over.
+423 of the 493 are mapped and verified. 35 more are recorded as `-` -- a stride, an enum value, a
+vtable slot -- and the remaining 35 are unmapped **with the reason written into `offsets.map`**, so
+nobody re-derives the same dead end. **An unmapped offset is unchecked, not proven correct.**
 
 ```
 python tools\offcheck\offcheck.py --discover

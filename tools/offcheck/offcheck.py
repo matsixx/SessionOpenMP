@@ -112,6 +112,27 @@ class Pdb(object):
         self._cache[cls] = out
         return out
 
+    def exists(self, cls):
+        """Does the PDB know this type at all? NOT the same as 'has members' -- a UScriptStruct can
+        carry a size and no field layout (FOnMenuPageSelectionConfirmedParams is 152 bytes of
+        nothing). Without this distinction such a type reports as CLASS GONE, which is a lie."""
+        return self.find_type(cls) is not None
+
+    def type_size(self, cls):
+        """sizeof, for the stride and size constants.
+
+        Worth checking even when the members are not: a struct that gains a field changes its
+        stride, and iterating an array with a stale stride reads garbage from the second element
+        onward. Those constants used to be recorded as unverifiable, which left a real update risk
+        unwatched purely because the check was expressed in terms of members."""
+        tid = self.find_type(cls)
+        if tid is None:
+            return None
+        v = C.c_ulonglong(0)
+        if self.dbg.SymGetTypeInfo(self.h, self.base, tid, self.TI_GET_LENGTH, C.byref(v)):
+            return int(v.value)
+        return None
+
     def member_type(self, cls, member):
         """The type NAME of one member, so a path can step into a nested struct."""
         tid = self.find_type(cls)
@@ -344,7 +365,7 @@ def load_images(paths):
 
 
 def parse_map():
-    """kName<ws>Class::member    |    kName<ws>-    (deliberately not a struct offset)"""
+    """kName<ws>Class::member[.sub]   |   kName<ws>sizeof:Class   |   kName<ws>-"""
     out = {}
     if not os.path.exists(MAPFILE):
         return out
@@ -359,6 +380,33 @@ def parse_map():
 
 
 # ---------------------------------------------------------------- modes
+
+def check_one(pdb, name, val, exp):
+    """(ok, message). exp is 'Class::member[.sub]' or 'sizeof:Class'."""
+    if exp.startswith('sizeof:'):
+        cls = exp[7:]
+        if not pdb.exists(cls):
+            return False, "CLASS GONE    %s is not in this PDB" % cls
+        got = pdb.type_size(cls)
+        if got is None:
+            return False, "NO SIZE       the PDB gives no size for %s" % cls
+        if got != val:
+            return False, "SIZE CHANGED  sizeof(%s) is 0x%x, the source says 0x%x" % (cls, got, val)
+        return True, None
+    cls = exp.partition('::')[0]
+    if not pdb.exists(cls):
+        return False, "CLASS GONE    %s is not in this PDB" % cls
+    if not pdb.layout(cls):
+        # exists, but the PDB carries no field layout for it (a UScriptStruct, typically).
+        return False, "NO LAYOUT     %s has no member info in this PDB -- use sizeof: or '-'" % cls
+    got = pdb.resolve(exp)
+    if got is None:
+        return False, "MEMBER GONE   %s" % exp
+    if got != val:
+        return False, "MOVED         %s is 0x%x, the source says 0x%x" % (exp, got, val)
+    return True, None
+
+
 def discover(pdb, ents, mapped):
     """Propose map lines for unmapped offsets.
 
@@ -413,22 +461,12 @@ def verify(pdb, ents, mapped):
         if exp == '-':
             skipped += 1
             continue
-        cls, _, member = exp.partition('::')
-        if not pdb.layout(cls):
-            print("  %-28s CLASS GONE    %s is not in this PDB" % (name, cls))
-            bad += 1
-            continue
-        got = pdb.resolve(exp)
-        if got is None:
-            print("  %-28s MEMBER GONE   %s has no '%s'" % (name, cls, member))
-            bad += 1
-            continue
-        if got != val:
-            print("  %-28s MOVED         %s::%s is 0x%x, the header says 0x%x"
-                  % (name, cls, member, got, val))
-            bad += 1
-        else:
+        good, why = check_one(pdb, name, val, exp)
+        if good:
             ok += 1
+        else:
+            print("  %-28s %s" % (name, why))
+            bad += 1
     print("")
     print("  %d verified   %d not a struct offset   %d unmapped   %d WRONG   (of %d)"
           % (ok, skipped, unmapped, bad, len(ents)))
@@ -458,20 +496,12 @@ def verify_tweaks(pdb, tw, mapped):
         if exp == '-':
             skipped += 1
             continue
-        if not pdb.layout(exp.partition('::')[0]):
-            print("  %-28s CLASS GONE    %s is not in this PDB" % (name, exp.partition('::')[0]))
-            bad += 1
-            continue
-        got = pdb.resolve(exp)
-        if got is None:
-            print("  %-28s MEMBER GONE   %s" % (name, exp))
-            bad += 1
-        elif got != val:
-            print("  %-28s MOVED         %s is 0x%x, %s says 0x%x"
-                  % (name, exp, got, decls[0][1], val))
-            bad += 1
-        else:
+        good, why = check_one(pdb, name, val, exp)
+        if good:
             ok += 1
+        else:
+            print("  %-28s %s   (%s)" % (name, why, decls[0][1]))
+            bad += 1
     dup = sum(1 for n in tw if len(tw[n]) > 1)
     print("  %d verified   %d not a struct offset   %d unmapped   %d WRONG   (of %d, %d declared "
           "in more than one module)" % (ok, skipped, unmapped, bad, len(tw), dup))

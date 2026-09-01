@@ -39,8 +39,12 @@ python tools\offcheck\offcheck.py --pdb <exe>  # a different build
 
 Covers everything `omp_symcheck` does not:
 
-- Every **struct offset** against the game's shipped PDB — the 188 constants in `off::` and the ~305
-  bare enum constants scattered through `src/tweaks`.
+- Every **struct offset** against the game's shipped PDB — the 188 constants in `off::` and the 305
+  bare enum constants scattered through `src/tweaks`. **423 verified**, 35 recorded as `-` (a stride,
+  an enum value, a vtable slot — not a field), 35 left unmapped with the reason written down.
+- **Sizes and strides** via `sizeof:Class`. Worth checking even where members are not: a struct that
+  gains a field changes its stride, and iterating an array with a stale one reads garbage from the
+  second element onward.
 - Whether a constant declared in more than one tweaks module (26 of them are) **agrees with itself**
   — a disagreement there is a live bug, not just an update risk.
 - **SessionTweaks' own 69 byte signatures.** `omp_symcheck` reads the `kSigs` table in
