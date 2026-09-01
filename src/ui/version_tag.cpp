@@ -67,11 +67,29 @@ static void appendTag(void* outFString) {
     }
 }
 
+// THE GAME INSTANCE, and "we are on a menu", both for free.
+//
+// Everything else in the mod reaches the game instance through an ACTOR (AActor::GetGameInstance),
+// which is fine in a level and useless at the main menu, where there is no pawn. But this hook is a
+// METHOD ON THE GAME INSTANCE -- its `this` IS the pointer, handed over on a plate, at a moment the
+// menu is on screen. Nothing else has to be resolved, hooked or guessed.
+//
+// The caller filter does double duty too: a call from the intro UI means the MAIN MENU is drawing
+// its version line, which is exactly when a "you are out of date" popup should appear and exactly
+// when it is safe to show one.
+static void* g_gameInstance = nullptr;
+static volatile LONG g_onMenu = 0;
+void* VersionTag_GameInstance() { return g_gameInstance; }
+bool  VersionTag_SawMenu()      { return InterlockedExchange(&g_onMenu, 0) != 0; }
+
 static void* hkGameVersion(void* gameInstance, void* outFString) {
     void* r = o_GameVersion(gameInstance, outFString);
+    if (gameInstance) g_gameInstance = gameInstance;
     // _ReturnAddress() here is the address in the ORIGINAL caller: MinHook's trampoline leaves the
     // real return address in place, which is what makes the caller filter possible at all.
-    if (!g_dead && callerDisplays(_ReturnAddress())) appendTag(outFString);
+    const bool fromMenu = callerDisplays(_ReturnAddress());
+    if (fromMenu) InterlockedExchange(&g_onMenu, 1);
+    if (!g_dead && fromMenu) appendTag(outFString);
     return r;
 }
 

@@ -33,3 +33,10 @@
 #define OMP_VERSION_WIDE  OMP_VER_WIDEN(OMP_VERSION_STRING)
 
 void VersionTag_Install();   // game thread, from on_unreal_init (after MinHook is up)
+// The GAME INSTANCE, captured from the version hook's own `this`. Null until the game has asked for
+// its version at least once, which happens while the main menu is being built. This is the only
+// route to it that does not need an actor -- see the comment at the hook.
+void* VersionTag_GameInstance();
+// True ONCE per time the version line is drawn by a menu (intro or pause). Consumed by the reader,
+// so it answers "has the menu just been on screen" rather than "is it now".
+bool  VersionTag_SawMenu();

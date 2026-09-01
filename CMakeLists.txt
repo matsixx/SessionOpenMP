@@ -84,7 +84,9 @@ target_include_directories(omp_session PUBLIC src)
 target_link_libraries(omp_session PUBLIC omp_replication omp_game)
 
 # The session logic is game-free enough to test headless: peers arriving/going quiet/leaving.
-add_executable(omp_sessiontest tools/sessiontest/session_main.cpp)
+# update_check.cpp rides along for its version comparison: the popup's whole decision is "is theirs
+# newer than mine", and that is pure logic worth gating even though the HTTP around it is not.
+add_executable(omp_sessiontest tools/sessiontest/session_main.cpp src/ui/update_check.cpp)
 target_link_libraries(omp_sessiontest PRIVATE omp_session)
 
 # The same-PC rig must be verifiable by one person alone: two real processes, no game, no EOS.
@@ -177,6 +179,11 @@ if(EXISTS "${UE4SS_LIB}")
             # is compiled in by this block, and it hooks the engine's menu code the same way.
             src/ui/pause_menu.cpp
             src/ui/version_tag.cpp
+            # The GAME'S OWN popup, and the release check that uses it. Here rather than in the
+            # always-on list because the popup hooks nothing but reaches the game instance the
+            # version tag captured -- they are two halves of one thing.
+            src/ui/trx_popup.cpp
+            src/ui/update_check.cpp
             src/ui/mp_name.cpp
             # Chat (round 382). It IS an ImGui window, so it belongs to this block -- and so does the
             # font hunt, whose only consumer is the chat atlas.

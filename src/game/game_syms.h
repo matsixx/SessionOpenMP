@@ -175,7 +175,18 @@ using MenuProgSetPctFn  = void  (*)(void* menuPageItem, float pct01);
 // UMenuPageItem::MultiOptionSetSelectedItemIndex(this, int32) -- 2 args. Bounds checks against the
 // widget's own option count, then broadcasts the change like a user input would.
 using MenuMultiSetIdxFn = void  (*)(void* menuPageItem, int32_t index);
-using PauseShownFn      = bool  (*)(void* playerController);   // IsPauseMenuDisplayed
+using PauseShownFn      = bool  (*)(void* playerController);
+// FSubsystemCollectionBase::GetSubsystemInternal(collection, UClass*) -> the subsystem, or null.
+using GetSubsystemFn    = void* (*)(void* collection, void* ucls);
+// UTRXPopupManager::StaticClass() -> UClass*. Not signaturable on its own: every StaticClass in the
+// engine is byte-identical apart from the displacements a signature has to wildcard, so it is
+// DECODED from the call site inside the game's own disconnected-pad popup (the MenuTextSite trick).
+using StaticClassFn     = void* (*)();
+// UTRXPopupManager::CreatePopup(this, FTRXPopupCreationParameters*). The params are passed by
+// POINTER, so the callee copies what it keeps and the caller still owns -- and must destruct -- its
+// own struct. That is why the destructor below is needed too.
+using PopupCreateFn     = void* (*)(void* mgr, void* params);
+using PopupDtorFn       = void  (*)(void* params);   // IsPauseMenuDisplayed
 // USessionGameInstance::GetGameVersion(this, FString* out) -> out. Builds the "0.6.42 (48691)" line
 // from GGameIni. HOOKED to append the mod's own version -- but only for the two callers that DRAW it
 // (see version_tag.h: the third writes the player's profile).
@@ -368,6 +379,15 @@ struct Syms {
     MenuProgSetPctFn MenuProgressSetPct = nullptr;  // UMenuPageItem::ProgressBarSetPercent -- called
     MenuMultiSetIdxFn MenuMultiSetIndex = nullptr;  // UMenuPageItem::MultiOptionSetSelectedItemIndex
     PauseShownFn     PauseMenuShown    = nullptr;   // ASessionPlayerController::IsPauseMenuDisplayed
+    // ---- THE GAME'S OWN POPUP (the controller-disconnected dialog). All optional: without any of
+    // these the mod says what it has to say in the log and the F1 window instead.
+    // The route is the game's own, copied from UTRXDiscoPadManager::CreateDisconnectedPadPopup:
+    // the popup manager is a GAME INSTANCE SUBSYSTEM, so it is fetched with the engine's subsystem
+    // getter off UGameInstance::SubsystemCollection (+0xe0) using UTRXPopupManager's UClass.
+    GetSubsystemFn   GetSubsystem      = nullptr;   // FSubsystemCollectionBase::GetSubsystemInternal
+    void*            PopupMgrClass     = nullptr;   // UTRXPopupManager::StaticClass -- CALLED (returns UClass*)
+    PopupCreateFn    PopupCreate       = nullptr;   // UTRXPopupManager::CreatePopup(this, params)
+    PopupDtorFn      PopupParamsDtor   = nullptr;   // ~FTRXPopupCreationParameters -- see trx_popup.cpp
     // ---- the version tag. All optional: missing = the game's line is untouched.
     void*            GameVersion       = nullptr;   // HOOKED
     MemMallocFn      MemMalloc         = nullptr;

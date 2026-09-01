@@ -16,6 +16,7 @@
 // with peer count and does NOT rate-limit at one peer; and a full slot table drops the newcomer
 // instead of stealing an existing peer's slot.
 #include "../../src/session/session.h"
+#include "../../src/ui/update_check.h"
 #include "../../src/replication/replication.h"
 #include <cstdio>
 #include <cstring>
@@ -87,7 +88,56 @@ static void feed(int peer, uint64_t senderUs, uint64_t nowUs) {
     session::OnPacket(peer, pkt, n, nowUs);
 }
 
+// ---- VERSION COMPARISON -------------------------------------------------------------------------
+// The update popup's whole job is deciding "is theirs newer than mine", and getting that wrong is
+// worse than not asking: too eager and it nags people who are current, too shy and it stays silent
+// for the one person who needs telling. The rc-versus-release case is the one that bites -- a plain
+// string compare puts "1.0.0-rc4" AFTER "1.0.0", which is backwards and would leave every release
+// candidate user permanently un-warned.
+static bool versionCheck() {
+    printf("\n-- update check: version comparison --\n");
+    using omp::ui::UpdateCheck_CompareVersions;
+    struct Case { const char* a; const char* b; int want; const char* why; };
+    static const Case k[] = {
+        { "1.0.0",      "1.0.1",      -1, "patch bump" },
+        { "1.0.1",      "1.0.0",       1, "and the reverse" },
+        { "0.9.9b",     "1.0.0",      -1, "major bump past a lettered build" },
+        { "1.0.0",      "1.0.0",       0, "identical" },
+        { "v1.0.0",     "1.0.0",       0, "a leading v is not part of the number" },
+        { "1.0.0-rc4",  "1.0.0",      -1, "A RELEASE CANDIDATE IS OLDER THAN ITS RELEASE" },
+        { "1.0.0",      "1.0.0-rc4",   1, "and the reverse" },
+        { "1.0.0-rc2",  "1.0.0-rc4",  -1, "rc ordering" },
+        { "1.0.0-rc4",  "1.0.0-rc4",   0, "identical rc" },
+        { "1.2.0",      "1.10.0",     -1, "10 is NOT less than 2 -- numeric, not lexical" },
+        // The guarantee for junk is not a particular NUMBER, it is that we are never reported as
+        // BEHIND -- only a negative result shows a popup, so anything >= 0 is silence.
+        { "1.0.0",      "",            1, "an empty answer never says we are behind" },
+        { "1.0.0",      "garbage",     1, "nor does a nonsense one" },
+        { "",           "",            0, "and neither does nothing at all" },
+        // THE TAGS THIS PROJECT ACTUALLY PUBLISHES: v1.0.0rc3, v0.9.5b -- letters with NO separator.
+        // The first version of this comparison assumed "-rc4" and told rc4 it was behind rc3.
+        { "1.0.0-rc4",  "v1.0.0rc3",   1, "rc4 is NEWER than rc3, hyphen or not" },
+        { "1.0.0rc3",   "1.0.0-rc4",  -1, "and the reverse" },
+        { "1.0.0rc3",   "v1.0.0rc3",   0, "same rc, one tagged with a v" },
+        { "v0.9.5b",    "v1.0.0rc3",  -1, "an old beta is behind a release candidate" },
+        { "1.0.0rc3",   "1.0.0",      -1, "a release candidate is behind its release" },
+        { "1.0.0rc9",   "1.0.0rc10",  -1, "rc10 is after rc9 -- numeric, not lexical" },
+        { "0.9.0",      "v1.0.0rc3",  -1, "the test build vs what is published now" },
+    };
+    bool ok = true;
+    for (const Case& c : k) {
+        const int got = UpdateCheck_CompareVersions(c.a, c.b);
+        const bool pass = (got == c.want);
+        if (!pass) ok = false;
+        printf("  %-11s vs %-11s -> %2d (want %2d)  %-46s %s\n",
+               c.a[0] ? c.a : "\"\"", c.b[0] ? c.b : "\"\"", got, c.want, c.why,
+               pass ? "PASS" : "*** FAIL");
+    }
+    return ok;
+}
+
 int main() {
+    bool verOk = versionCheck();
     printf("omp_sessiontest -- session lifecycle\n\n");
     session::Init(logf_);
     session::Config cfg{};
@@ -183,6 +233,7 @@ int main() {
         check(g_mismatches == 2, "a DIFFERENT peer announces on its own");
     }
 
+    if (!verOk) g_fails++;      // the version comparison is part of the verdict
     printf("\n%s\n", g_fails ? "*** SESSION TEST FAILURES ***" : "SESSION TEST PASS");
     return g_fails ? 1 : 0;
 }

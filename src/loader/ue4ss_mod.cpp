@@ -39,6 +39,8 @@
 #include "ui/overlay.h"
 #include "ui/pause_menu.h"
 #include "ui/version_tag.h"
+#include "ui/trx_popup.h"
+#include "ui/update_check.h"
 #include "ui/mp_name.h"
 #include "ui/chat.h"
 #include "replication/replaysync.h"   // the sync-progress bubble below
@@ -261,6 +263,37 @@ static void publishUi() {
             strncpy_s(r.code, L.id, _TRUNCATE);
             strncpy_s(r.map, L.map, _TRUNCATE);
             r.players = L.players;
+        }
+    }
+    // ---- "YOUR COPY IS OLD", in the game's own popup.
+    //
+    // The timing is not a guess: VersionTag_SawMenu() is true only when the version line was just
+    // drawn BY A MENU, which is the moment the main menu exists, the game instance is reachable and
+    // nothing is being interrupted. Waiting for it also means this can never fire mid-run.
+    //
+    // Said ONCE per launch. A version warning that reappears is a version warning people learn to
+    // click past, and the one time it matters is the time they need to read it.
+    {
+        static bool told = false;
+        char latest[32] = {0};
+        if (!told && omp::ui::UpdateCheck_NewerAvailable(latest, sizeof(latest)) &&
+            VersionTag_SawMenu()) {
+            char body[320];
+            snprintf(body, sizeof(body),
+                     "You have %s. The latest is %s.\n\n"
+                     "Close the game and run update.bat in your Session folder to update.\n\n"
+                     "Players on different versions can join the same session and never see each "
+                     "other, so it is worth doing before you play together.",
+                     OMP_VERSION_STRING, latest);
+            if (omp::ui::TrxPopup_Show("SessionOpenMP update available", body, "OK", logLine)) {
+                told = true;
+                char m[128];
+                snprintf(m, sizeof(m), "[update] told the player about %s (running %s)",
+                         latest, OMP_VERSION_STRING);
+                logLine(m);
+            }
+            // Not shown yet? Leave `told` false and try on the next menu draw: the popup manager
+            // may simply not be up, and there is no value in a warning that was swallowed.
         }
     }
     Overlay_Publish(&g_ui);
@@ -1438,6 +1471,9 @@ public:
         PauseMenu_Install();
         // ...and put the mod's version beside the game's own, bottom-left.
         VersionTag_Install();
+        // Ask GitHub whether this build is the newest, once, off the game thread. The answer is
+        // shown at the main menu below if it says no -- see the pump.
+        omp::ui::UpdateCheck_Start();
         // The menu installs itself on its own thread: it waits for the game's swapchain and, on DX12,
         // for the game's command queue -- neither exists this early, and neither may be waited on here.
         Overlay_Install();

@@ -192,6 +192,23 @@ static const SigEntry kSigs[] = {
     // -- 2 args. It BROADCASTS _onMultiOptionItemSelectionChanged (+0x278), so calling it merely to
     // display a value re-enters the mod's own change hook; the caller must guard for that.
     { "MenuMultiSetIndex",    "85 D2 0F 88 ?? ?? ?? ?? 4C 8B DC 56 48 81 EC C0 00 00 00 8B 81 D0 03 00 00", false },
+    // --- THE GAME'S OWN POPUP. Session ships a TRX popup system and the controller-disconnected
+    // dialog is one of its clients, so a mod message can look like the game's own rather than like
+    // a mod's. UTRXPopupManager::CreatePopup  Epic 0xa80710 / Steam 0xa3ed00
+    { "PopupCreate",          "48 89 5C 24 18 48 89 7C 24 20 41 56 48 83 EC 20 4C 8B 8A 88 00 00 00 33 FF 4C 8B F2 48 8B D9", false },
+    // FSubsystemCollectionBase::GetSubsystemInternal  Epic 0x302a5a0 / Steam 0x2fed110. The popup
+    // manager is a game-instance subsystem; this is how the game itself fetches it.
+    { "GetSubsystem",         "48 89 5C 24 10 48 89 74 24 18 57 48 83 EC 20 48 8B DA 48 8B F9 4C 8B C2 48 83 C1 10 48 8D 54 24 30", false },
+    // FTRXPopupCreationParameters::~FTRXPopupCreationParameters  Epic 0xa75870 / Steam 0xa33d80.
+    // The params hold four FTexts and four delegates; CreatePopup takes them by POINTER and copies,
+    // so the caller destructs its own. Leaking these would leak refcounted text every popup.
+    { "PopupParamsDtor",      "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 33 FF 48 8B D9 39 B9 C8 00 00 00 ?? ?? 48 8B 89 C0 00 00 00", false },
+    // CALL SITE, not a function (the MenuTextSite pattern): UTRXPopupManager::StaticClass cannot be
+    // signatured -- every StaticClass in the engine is byte-identical apart from wildcarded
+    // displacements. This is the head of UTRXDiscoPadManager::CreateDisconnectedPadPopup
+    // (Epic 0xa7fc40 / Steam 0xa3e230) ending exactly on its `call StaticClass`, and the address is
+    // decoded from that E8. The same function is the worked example the whole popup path came from.
+    { "PopupClassSite",       "48 89 5C 24 10 48 89 74 24 18 55 57 41 54 41 56 41 57 48 8D AC 24 50 FF FF FF 48 81 EC B0 01 00 00 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 85 A0 00 00 00 48 8B 01 48 8B F2 4C 8B F1 FF 90 ?? ?? ?? ?? 48 8B B8 80 01 00 00 E8 ?? ?? ?? ??", false },
     // --- THE VERSION TAG. See version_tag.h for why two of these are RANGE MARKERS.
     // USessionGameInstance::GetGameVersion             Epic 0x11807b0 / Steam 0x1140ed0 -- HOOKED
     { "GameVersion",          "40 53 48 83 EC 40 48 8B 0D ?? ?? ?? ?? 33 C0 48 89 44 24 30 48 8B DA 48 89 44 24 38", false },
@@ -616,6 +633,27 @@ const Syms& Resolve(void (*logf)(const char*)) {
     g_syms.MenuProgressSetPct = (MenuProgSetPctFn)  found[i++];
     g_syms.PauseMenuShown     = (PauseShownFn)      found[i++];
     g_syms.MenuMultiSetIndex  = (MenuMultiSetIdxFn) found[i++];
+    g_syms.PopupCreate        = (PopupCreateFn)     found[i++];
+    g_syms.GetSubsystem       = (GetSubsystemFn)    found[i++];
+    g_syms.PopupParamsDtor    = (PopupDtorFn)       found[i++];
+    // The popup manager's UClass, decoded from a call site exactly like FText::FromName below.
+    {
+        const int clsIdx = i;
+        const uint8_t* site = (const uint8_t*)found[i++];
+        Pat sp;
+        if (site && parsePat(kSigs[clsIdx].sig, sp) && sp.n >= 5) {
+            const uint8_t* call = site + sp.n - 5;
+            if (*call == 0xE8) {
+                int32_t rel = 0; memcpy(&rel, call + 1, 4);
+                g_syms.PopupMgrClass = (void*)(call + 5 + rel);
+            }
+        }
+        char m[160];
+        snprintf(m, sizeof(m), "[sym] %-22s %s exe+%p (decoded from PopupClassSite)",
+                 "UTRXPopupManager class", g_syms.PopupMgrClass ? "->" : "!! NOT DECODED",
+                 g_syms.PopupMgrClass ? (void*)((uint8_t*)g_syms.PopupMgrClass - base) : nullptr);
+        say(m);
+    }
     g_syms.GameVersion        =                     found[i++];   // hooked, never called directly
     g_syms.IntroUiRange       =                     found[i++];   // range marker, never called
     g_syms.PauseInitRange     =                     found[i++];   // range marker, never called
