@@ -38,11 +38,24 @@
 //
 // Linux build, with no project and no dependencies:   g++ -O2 -o omp_relay relay_main.cpp
 // See README.md beside this file for a systemd unit.
+//
+// The include below resolves BOTH ways on purpose. In the repo the shared wire header lives in
+// src/transport/; in the release package the two files ship side by side, because a build
+// instruction you cannot follow from the download is not an instruction. Do not "tidy" this into
+// one path -- it would break whichever of the two arrangements it did not pick.
 #ifdef _WIN32
   #define _CRT_SECURE_NO_WARNINGS
   #define _CRT_RAND_S               // must precede <cstdlib>: it is what declares rand_s
 #endif
-#include "../../src/transport/relay_proto.h"
+#if defined(__has_include)
+#  if __has_include("relay_proto.h")
+#    include "relay_proto.h"                        // the release package: side by side
+#  else
+#    include "../../src/transport/relay_proto.h"    // the repo
+#  endif
+#else
+#  include "../../src/transport/relay_proto.h"
+#endif
 
 #include <cstdio>
 #include <cstring>

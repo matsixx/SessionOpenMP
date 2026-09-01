@@ -57,7 +57,14 @@ $rootData = @(
     # relay is not in the download. It is a server, not part of the mod -- nothing loads it,
     # nothing starts it, and a player who never opens it is unaffected by its presence.
     @{ From = Join-Path $Root "build\Release\omp_relay.exe"; To = "relay\omp_relay.exe" },
-    @{ From = Join-Path $Root "tools\relay\README.md";       To = "relay\README.md" }
+    @{ From = Join-Path $Root "tools\relay\README.md";       To = "relay\README.md" },
+    # AND ITS SOURCE, because the relay is the one part of this package that is expected to run
+    # somewhere the .exe cannot: a Linux VPS is the natural home for a service that runs all
+    # day. The README says to build it with one g++ command, and that instruction is useless
+    # if the two files it needs are not in the download. They are tiny and they are GPL --
+    # shipping them costs nothing and makes the documented path actually walkable.
+    @{ From = Join-Path $Root "tools\relay\relay_main.cpp";            To = "relay\src\relay_main.cpp" },
+    @{ From = Join-Path $Root "src\transport\relay_proto.h";           To = "relay\src\relay_proto.h" }
 )
 
 # Mods\ is an ALLOWLIST: only the folders in $mods survive, and inside each one only dlls\.

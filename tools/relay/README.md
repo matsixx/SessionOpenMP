@@ -11,14 +11,20 @@ The first person to use a name opens that room; it closes when the last player l
 
 ## Build
 
-**Linux** — no project, no dependencies, nothing to install beyond a compiler:
+**Linux** — the source ships in `src/` beside this file. No project, no dependencies,
+nothing to install beyond a compiler:
 
 ```
-g++ -O2 -o omp_relay relay_main.cpp
+cd src && g++ -O2 -o ../omp_relay relay_main.cpp
 ```
 
-It needs `relay_proto.h` from `src/transport/` at the path the `#include` expects, so copy the two
-files keeping that layout, or just clone the repo and build in place.
+That is the whole build. Those two files are all it needs, and the `#include` resolves whether
+they sit side by side (as they do here) or in the repo's own layout.
+
+**The shipped `omp_relay.exe` is the WINDOWS build; there is no prebuilt Linux one.** It has
+never been compiled on Linux, because the machine this was written on has no Linux compiler.
+The command above is the verification, and it takes about two seconds — if it does not
+build, that is a bug worth reporting rather than something to work around.
 
 **Windows** — it is a normal target of the main project:
 
