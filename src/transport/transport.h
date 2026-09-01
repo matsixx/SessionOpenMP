@@ -21,6 +21,10 @@ namespace omp {
 
 struct PeerStats {
     uint64_t sent = 0, recv = 0;
+    // Sends the WIRE REFUSED. Not the same as a packet lost in flight, which is normal and expected
+    // on a datagram wire: this one never left, so nothing will retry it and nothing will notice --
+    // which is exactly why it is counted rather than left to be inferred from a symptom.
+    uint64_t sendFailed = 0;
     int      state = 0;          // 0 none/connecting, 1 established DIRECT, 2 established RELAY,
                                  // 3 interrupted, 4 closed, 5 DEPARTED (left the lobby: sends muted,
                                  // index stays valid -- indices are handed out once, never reused)

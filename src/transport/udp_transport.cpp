@@ -463,6 +463,7 @@ void Send(int idx, const void* data, int len, bool reliable) {
         // is the one worth having. Logged, because a drop on the reliable lane must never be silent.
         RelOut* oldest = &p.out[0];
         for (auto& o : p.out) if (o.firstMs < oldest->firstMs) oldest = &o;
+        p.st.sendFailed++;       // a send that never left -- see PeerStats::sendFailed
         Log("[udp] peer #%d: reliable window full -- dropping seq %u unacknowledged", idx, oldest->seq);
         slot = oldest;
     }

@@ -344,7 +344,13 @@ void Send(int idx, const void* data, int len, bool reliable) {
     }
     RelOut* slot = nullptr;
     for (auto& o : p.out) if (!o.live) { slot = &o; break; }
-    if (!slot) { Log("[relay] peer #%d: reliable window full -- message dropped", idx); return; }
+    if (!slot) {
+        // Counted, not just logged: this is a send that never left, exactly like an EOS refusal,
+        // and the heartbeat is where a caller notices it without reading the log.
+        p.st.sendFailed++;
+        Log("[relay] peer #%d: reliable window full -- message dropped", idx);
+        return;
+    }
     slot->seq = p.nextRelSeq++;
     slot->len = len;
     memcpy(slot->data, data, (size_t)len);

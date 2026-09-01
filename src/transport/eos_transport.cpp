@@ -49,12 +49,20 @@ static bool                 g_loginDone = false, g_loginOk = false;
 // SDK's own default so a process that never calls SetRelayControl still reports the truth.
 static bool                 g_relaysForced = false;
 
+static const int kSendFailQuietMs = 5000;   // see Peer::sendFailSpoken
+
 struct Peer {
     EOS_ProductUserId puid = nullptr;
     char              idStr[64] = {0};
     PeerStats         st{};
     uint64_t          lastRecvMs = 0;
     uint64_t          closedUntilMs = 0;   // send cooldown after a remote close
+    // Send-failure reporting: the first refusal is named in full, then at most one summary line per
+    // kSendFailQuietMs. A refused send can repeat at the publish rate, so an unthrottled line would
+    // bury the log it is meant to make readable.
+    bool              sendFailSpoken = false;
+    uint64_t          sendFailLastMs = 0;
+    uint64_t          sendFailAtLast = 0;
     // ---- PROVENANCE. How we came to know this peer, which is a different question from whether they
     // are reachable. Set ONLY by the two roster paths -- rosterAddAll at join and the LOBBY_MEMBER
     // JOINED notification -- so it means "EOS says this human is in our session", never "this human
@@ -1327,7 +1335,36 @@ void Send(int idx, const void* data, int len, bool reliable) {
     o.Reliability = reliable ? EOS_EPacketReliability::EOS_PR_ReliableOrdered
                              : EOS_EPacketReliability::EOS_PR_UnreliableUnordered;
     o.bDisableAutoAcceptConnection = EOS_FALSE;
-    if (EOS_P2P_SendPacket(g_p2p, &o) == EOS_EResult::EOS_Success) p.st.sent++;
+    const EOS_EResult sr = EOS_P2P_SendPacket(g_p2p, &o);
+    if (sr == EOS_EResult::EOS_Success) { p.st.sent++; return; }
+
+    // A REFUSED SEND IS A LOST PACKET, AND IT USED TO BE SILENT.
+    //
+    // The old line counted successes and did nothing whatever with a failure -- no counter, no log,
+    // no trace. On the unreliable lane that is a dropped frame nobody misses. On the RELIABLE lane
+    // it is a replay chunk or a cosmetics update that will never arrive and will never be retried,
+    // because the retry belongs to EOS and EOS never accepted the packet. The symptom is a transfer
+    // that stalls for no visible reason -- which is precisely the shape of bug that took an
+    // afternoon to find on the relay, where the drop was equally silent.
+    //
+    // bAllowDelayedDelivery is set, so the ordinary "busy right now" case is QUEUED rather than
+    // refused and never reaches here. That is what makes this worth logging at all: if it does
+    // happen, something is actually wrong, and the result code says what.
+    p.st.sendFailed++;
+    const uint64_t now = GetTickCount64();
+    if (!p.sendFailSpoken) {
+        p.sendFailSpoken = true;
+        p.sendFailLastMs = now;
+        p.sendFailAtLast = p.st.sendFailed;
+        Log("[eos] peer %d: EOS refused a %s send (%s). It is gone -- nothing retries a packet the "
+            "SDK never took.", idx, reliable ? "RELIABLE" : "snapshot", EOS_EResult_ToString(sr));
+    } else if (now - p.sendFailLastMs >= (uint64_t)kSendFailQuietMs) {
+        Log("[eos] peer %d: %llu more refused sends in the last %d s (%s)", idx,
+            (unsigned long long)(p.st.sendFailed - p.sendFailAtLast),
+            kSendFailQuietMs / 1000, EOS_EResult_ToString(sr));
+        p.sendFailLastMs = now;
+        p.sendFailAtLast = p.st.sendFailed;
+    }
 }
 
 void Tick(RecvFn onRecv, void* user) {

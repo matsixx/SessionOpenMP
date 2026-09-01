@@ -861,8 +861,19 @@ static void GameThreadFrame() {
             // silently lost its tail -- the world counters this feature is diagnosed by never
             // printed at all, and a truncated diagnostic reads exactly like a working one.
             char m[420];
-            snprintf(m, sizeof(m), "[mod] peers=%d proxies=%d pubHz=%.0f published=%u received=%u applied=%u pawn=%p",
-                     st.peers, st.proxiesAlive, st.publishHz, st.published, st.received, st.appliedFrames, g_ownPawn);
+            // Sends the WIRE REFUSED, across every peer. Absent from the line when it is zero,
+            // which is the normal case -- a counter that is always there stops being read,
+            // and this one is only interesting when it is not zero. Non-zero means packets
+            // never left: not lost in flight, never sent, and nothing will retry them.
+            unsigned long long refused = 0;
+            for (int pi = 0; pi < omp::PeerCount(); pi++) {
+                omp::PeerStats ps{};
+                if (omp::GetStats(pi, &ps)) refused += ps.sendFailed;
+            }
+            char refusedTxt[64] = {0};
+            if (refused) snprintf(refusedTxt, sizeof(refusedTxt), " REFUSED-SENDS=%llu", refused);
+            snprintf(m, sizeof(m), "[mod] peers=%d proxies=%d pubHz=%.0f published=%u received=%u applied=%u pawn=%p%s",
+                     st.peers, st.proxiesAlive, st.publishHz, st.published, st.received, st.appliedFrames, g_ownPawn, refusedTxt);
             logLine(m);
             // Audio, both directions on one line. SEND: what the funnel captured, how much of it was
             // ours, how many loops are live. RECV: what was played for peers and what could not be

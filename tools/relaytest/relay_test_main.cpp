@@ -145,6 +145,17 @@ static int runClient(int role) {
         check(ctx.bulk == kBurstCount, m);
     }
     check(ctx.bad == 0, "every packet unpacked cleanly");
+    // REFUSED SENDS, which are packets that never left and which nothing retries. Zero is the only
+    // acceptable number in a healthy run: a non-zero here means the reliable window was outrun,
+    // which is exactly the bug the burst above exists to catch -- and it also proves the counter
+    // itself is wired, since a stat nobody asserts on is a stat that can quietly stop working.
+    unsigned long long refused = 0;
+    for (int p = 0; p < PeerCount(); p++) {
+        PeerStats ps{};
+        if (GetStats(p, &ps)) refused += ps.sendFailed;
+    }
+    snprintf(m, sizeof(m), "no sends were REFUSED by the wire (%llu)", refused);
+    check(refused == 0, m);
     LobbyLeave();
     Shutdown();
     return g_fails ? 1 : 0;
