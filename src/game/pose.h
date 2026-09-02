@@ -45,6 +45,30 @@ struct Tuning {
     // Capture only while the local player is in replay PLAYBACK. Gating this tightly is the whole
     // point: live skating keeps the cheap driver path, its notifies and its extrapolation.
     uint8_t captureMode = 2;
+    // ALSO capture while the local player is RAGDOLLING. A bail is the second instance of this
+    // module's one failure mode: the pose is produced by the physics asset, not by drivers, so a
+    // receiver deriving it from an anim graph cannot reproduce it -- every machine simulated its own
+    // ragdoll from its own starting conditions and they diverged immediately. Costs nothing while
+    // upright; a bail is a few seconds.
+    bool captureBails = true;
+    // One-shot per distinct bone count: dump the merged skeleton's bone names and parents. This is
+    // how we find out what a 95-bone character carries that a 70-bone one does not, and therefore
+    // whether the extras need to ride the wire at all.
+    // Off for release: resolving bone names allocates an FString per bone that is deliberately
+    // leaked, and it writes a line per bone. One-shot per skeleton size, so turning it on costs
+    // almost nothing -- and it is the first thing to reach for if bone counts are ever in question
+    // again (it is what identified the 25 extras as inert terminators).
+    bool dumpBones = false;
+    // Do not transport trailing "*_end" terminator bones. This is what gets a 95-bone character to a
+    // whole skeleton per packet (30 Hz) instead of two (15 Hz, stitched from two moments): the 25
+    // extra bones such a character carries are ALL terminators. Off = send the whole array.
+    bool trimLeafBones = true;
+    // ALSO drop the merged board rig ("SKXX_SkateSkel_*": root, flipper, foot/hand anchors, trucks,
+    // wheels -- 12 bones). The deck is ALREADY transported as its own transform and a proxy's board is
+    // a separate actor placed from it, so sending these means sending the board twice. They form a
+    // contiguous run just below the terminators, so the same prefix trim reaches them.
+    // Watch a PEER's board if this is ever suspected: this is the flag that would show it.
+    bool trimBoardBones = true;
     uint32_t freshMs = 500;     // a pose older than this is ignored, so a quiet stream hands the
                                 // skeleton back to the proxy's own graph rather than freezing it
     // RETIRED (default false): re-stamp the last held pose over a proxy's skeleton during a local

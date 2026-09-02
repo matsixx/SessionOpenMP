@@ -31,6 +31,23 @@ void ClothMerge_SaveConfig(char* iniText, size_t cap);
 void ClothMerge_ResetDefaults();
 void ClothMerge_Install();
 void ClothMerge_PumpFrame();                     // GAME THREAD
+// The outfit the wardrobe last offered us, for the menu's include/exclude rows. Names only; whether
+// one counts as included is derived from the live tag/exclusion lists, never stored, so a row cannot
+// drift from the rule that decides. Setting one edits ClothGarmentTags / ClothExclude and marks the
+// settings dirty, exactly as typing them by hand would.
+int         ClothMerge_WornCount();
+const char* ClothMerge_WornName(int i);
+bool        ClothMerge_WornIsBody(int i);      // the body mesh: listed, never selectable
+bool        ClothMerge_WornIncluded(int i);
+bool        ClothMerge_SetWornIncluded(int i, bool on);   // false = refused, see the note below
+// Why the last include/exclude was refused, or null. Tags and exclusions are CAPPED lists, and a
+// tick that springs back without saying why reads as broken rather than as full.
+const char* ClothMerge_WornNote();
+// Clear the tag and exclusion lists back to the stock patterns. The ONLY thing that does -- they
+// survive Reset Defaults on purpose -- and it logs both lists first so it can be undone by hand.
+void        ClothMerge_ForgetClothingChoices();
+int         ClothMerge_TagsUsed();  int ClothMerge_TagsMax();
+int         ClothMerge_ExclUsed();  int ClothMerge_ExclMax();
 void ClothMerge_DrawMenu(const OmpMenuApi* api); // RENDER THREAD (menu_ext contract)
 // Shared with cloth_sim (phase B), so the object-construction symbols have ONE owner and one set of
 // signatures. Null until the un-merge has built a garment component.

@@ -888,6 +888,18 @@ static bool syncTransferCheck() {
         src.deckPos[0] = (float)i;
         src.bodyPos[0] = (float)i * 2;
         src.posePos[1][0] = (float)i * 3;    // a bone rides the index too: asserts the pose BLENDS
+        // ONE-SHOTS THE WAY THE SENDER REALLY EMITS THEM: one event, repeated across 4 CONSECUTIVE
+        // snapshots so a lost packet cannot lose a sound. A gate that files each sound once would
+        // agree with a receiver that plays it four times -- which is exactly the bug that shipped.
+        // A sound every 50 snapshots, id 900+k, riding snapshots [50k, 50k+4).
+        src.nEvents = 0;
+        if ((i % 50) < 4) {
+            src.events[0] = AudioEvent{};
+            src.events[0].id = (uint16_t)(900 + i / 50);
+            snprintf(src.events[0].cue, sizeof(src.events[0].cue), "GateOneShot_%d", i / 50);
+            src.events[0].vol = 1.f; src.events[0].pitch = 1.f;
+            src.nEvents = 1;
+        }
         const uint64_t us = 1000000ull + (uint64_t)i * 16667;
         const int n = Pack(src, us, pkt, sizeof(pkt));
         if (n <= 0) { printf("  sync: Pack failed at %d\n", i); return false; }
@@ -936,6 +948,48 @@ static bool syncTransferCheck() {
     if (!SampleAt(3, 0, out) || out.deckPos[0] != 0.f) {
         printf("  sync: pre-window clamp wrong (deckX %.3f, want 0)\n", (double)out.deckPos[0]);
         return false;
+    }
+    // ---- ONE-SHOTS ARE PLAYED EXACTLY ONCE WHILE SCRUBBING FORWARD.
+    // The recorded history holds four copies of every sound (see the ring above). Walking the whole
+    // window one scrub frame at a time must yield each id exactly once -- not four times, which is
+    // what "the synced replay audio doubles" sounded like.
+    {
+        AudioEvent ev[32];
+        int seen[16] = {};
+        int total = 0;
+        uint64_t cur = oldest;
+        const uint64_t step = 33333;                    // ~30 Hz of scrubbing
+        while (cur < newest) {
+            const uint64_t to = cur + step;
+            const int got = AudioEventsBetween(3, cur, to, ev, 32);
+            for (int i = 0; i < got; i++) {
+                const int k = (int)ev[i].id - 900;
+                if (k >= 0 && k < 16) seen[k]++;
+                total++;
+            }
+            cur = to;
+        }
+        int wrong = 0, delivered = 0;
+        for (int k = 0; k < (N + 49) / 50 && k < 16; k++) {
+            if (seen[k] == 1) delivered++;
+            else { wrong++;
+                   printf("  sync audio: id %d fired %d time(s), want exactly 1\n", 900 + k, seen[k]); }
+        }
+        if (wrong || delivered < 1) {
+            printf("  sync audio: %d of %d one-shots wrong (%d events total)\n",
+                   wrong, delivered + wrong, total);
+            return false;
+        }
+        // ---- REWINDING AND WATCHING IT AGAIN MUST PLAY IT AGAIN. The dedup is a repeat filter, not
+        // a play-once-per-session rule; a window far from where a sound already fired re-arms it.
+        const uint64_t back = oldest;
+        const int again = AudioEventsBetween(3, back, back + step * 6, ev, 32);
+        if (again < 1) {
+            printf("  sync audio: rewind replayed nothing -- the dedup outlived its window\n");
+            return false;
+        }
+        printf("  sync audio: %d one-shot(s) x4 recorded copies -> exactly once, rewind re-arms  PASS\n",
+               delivered);
     }
     DropAll();
     SetSendFn(nullptr);

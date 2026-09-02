@@ -65,6 +65,25 @@ struct Tuning {
     // UAnimNotify_PlaySurfaceTypeSound::PlaySound null-checks the result (`test rax,rax; je`) before
     // touching it, as any UE caller must, since SpawnSound* legitimately returns null.
     bool  suppressProxyNotify = true;
+    // Drop the published loop set when a bail starts. See Gather: the game abandons its skating loops
+    // at the ragdoll without stopping the components, so they were published forever.
+    bool  dropLoopsOnBail  = true;
+    // A PROXY MAY NOT MAKE ITS OWN SOUND. Its audio comes off the wire -- that is the whole design --
+    // but a proxy's board is a REAL simulating actor near you (so it can collide), and a rolling
+    // board runs the game's own board-audio block and spawns its own rolling and push sounds. You
+    // hear them only while that board is MOVING, which is why it shows up after a bail: the deck
+    // comes loose and rolls. Muting is the same proven mechanism the proxy's anim notifies use --
+    // return null from the spawn without calling the original, which every UE caller null-checks.
+    // Attached sounds only: a world spawn is judged by proximity, and muting one of those risks
+    // silencing the LOCAL player's own sound, which is far worse than hearing one of theirs.
+    bool  suppressProxyLocal = true;
+    // Say NOTHING at all while the local player is in their replay editor. Tried and reverted as a
+    // default: it does stop a scrub being broadcast, but it also means a peer watching you scrub
+    // hears silence, and the skating audio of a replay is worth hearing. The actual defect was the
+    // RETRIGGER (loops restarting constantly with fresh slot ids), which is now handled on the
+    // receiving side by adopting a loop that is already playing the same cue -- see Proxy::AudioApply.
+    // Left here as the fallback if that ever proves insufficient.
+    bool  muteWhileReplaying = false;
     // A sound spawned at a WORLD POINT carries no owner, so it is attributed by proximity to our own
     // board/skater. Generous on purpose: skate sounds spawn on the board, and in a solo game the only
     // simulating skater is us (proxies do not run the code that spawns these).
@@ -82,6 +101,7 @@ Tuning& Tune();
 
 struct Stats {
     uint32_t captured = 0, oneShots = 0, loopsStarted = 0, rejected = 0, notifySkipped = 0, notifyMuted = 0;
+    uint32_t localMuted = 0;       // sounds a proxy tried to make for itself, refused
     uint32_t played = 0, unresolved = 0, playStarted = 0, playStopped = 0;
     // Transported cue names that resolved to an object of the WRONG TYPE. Distinct from `unresolved`
     // on purpose: "you do not have this sound" is normal across installs, "that name is not a sound at
@@ -105,6 +125,11 @@ void Gather(repl::State& s, uint64_t nowUs);
 // the interning refresh timer is per-loop and per-process, so a new receiver could otherwise wait up
 // to a second -- or, mid-trick, resolve against a cache that was never taught.
 void ForceNames();
+// Tell the capture layer the local player is in their own replay editor, in which case it captures and
+// publishes NOTHING. Their replay is a private, local thing: the sounds it makes are an artifact of
+// scrubbing a timeline, not of a skater in the shared world. See the definition for what a peer heard
+// without this.
+void SetInLocalReplay(bool on);
 
 // ---- receiver side ----------------------------------------------------------------------------------
 // Every playback runs with an "this is a replay" flag set, so our own capture hooks ignore the sounds

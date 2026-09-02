@@ -20,6 +20,7 @@ kReplayMgrInputCtl             AReplayManager::_replayInputController
 kInputCtlCamera                AReplayInputController::_replayCamera
 kReplayCamLookAt               AReplayCamera::_lookAtTarget
 kSoundConcMaxCount             FSoundConcurrencySettings::MaxCount
+kSoundBaseDuration             USoundBase::Duration
 kCompQuat                      USceneComponent::ComponentToWorld
 kMeshSkeletalMesh              USkinnedMeshComponent::SkeletalMesh
 kSkaterTrickDef                ASkaterCharacterBase::_currentFlipTrickDef

@@ -1436,6 +1436,9 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
     {
         static uint8_t lastRm = 0;
         const uint8_t rm = game::LocalReplayMode();
+        // Every frame, not just on the edge: cheap, and it cannot be left stuck on by a missed
+        // transition. A scrub must not be broadcast as skating -- see game::audio::SetInLocalReplay.
+        game::audio::SetInLocalReplay(rm == 2);
         if (rm != lastRm) {
             if (rm == 2) g_playbackEnteredUs = nowUs;
             if (lastRm == 2) {
@@ -1850,6 +1853,15 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
             if (actor) {
                 if (!syncDriven && s.replayConcealedActor != actor) {
                     game::spectate::SetPeerShownInReplay(actor, false, g_logf);
+                    // A CONCEALED SKATER MUST BE SILENT. Their loops are reconciled by the SET they
+                    // publish, and that reconcile lives in Apply -- which is exactly what concealing
+                    // them skips. So whatever they had playing at the instant the editor opened had
+                    // no one left to stop it: enter replay while somebody is grinding and the grind
+                    // drones for the whole session. With more than one peer it also reads as the
+                    // replay "doubling", because a synced peer's recorded grind plays over the top
+                    // of another peer's stuck live one. Stop them here, at the moment they are
+                    // hidden; a peer who is revealed again is driven by Apply and starts over.
+                    s.proxy.AudioStopAll();
                     s.replayConcealedActor = actor;
                 } else if (syncDriven && s.replayConcealedActor == actor) {
                     game::spectate::SetPeerShownInReplay(actor, true, g_logf);

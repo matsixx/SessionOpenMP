@@ -704,7 +704,13 @@ static void publishNameplates() {
             // bubbles ignore the on/off-board fade, which is what makes this visible inside the
             // replay editor where the nameplates themselves are held down.
             int syncPct = 0;
-            const replaysync::SyncState ss = replaysync::PeerSyncState(s, &syncPct);
+            // peerId, NOT s. `s` is the SLOT -- where this peer happens to sit in the array -- while
+            // replaysync is keyed by the peer's IDENTITY, which is what PeerAt hands back as peerId.
+            // The two agree only until somebody leaves and rejoins, after which they drift apart, and
+            // the readout appeared over whoever occupied the slot numerically equal to the synced
+            // peer's index: "syncing replay" floating above the wrong character. Everything else in
+            // this loop already keys on peerId; this was the one line that did not.
+            const replaysync::SyncState ss = replaysync::PeerSyncState(peerId, &syncPct);
             const bool syncing = (ss == replaysync::SyncState::Transferring ||
                                   ss == replaysync::SyncState::Failed);
             if (inReplay && !syncing) { n--; continue; }   // in the editor, ONLY a sync shows
@@ -914,9 +920,10 @@ static void GameThreadFrame() {
             const game::audio::Stats a = game::audio::GetStats();
             snprintf(m, sizeof(m),
                      "[audio] sent: cap=%u loops=%u(live %u) shots=%u rej=%u nfySkip=%u | recv:"
-                     " played=%u started=%u stopped=%u nfyMuted=%u noCue=%u faults=%u",
+                     " played=%u started=%u stopped=%u nfyMuted=%u locMuted=%u noCue=%u faults=%u",
                      a.captured, a.loopsStarted, a.liveLoops, a.oneShots, a.rejected, a.notifySkipped,
-                     a.played, a.playStarted, a.playStopped, a.notifyMuted, a.unresolved, a.faults);
+                     a.played, a.playStarted, a.playStopped, a.notifyMuted, a.localMuted,
+                     a.unresolved, a.faults);
             logLine(m);
             // The floating names. `show` is the local on/off-board fade target; `plated` is how many
             // reached the render thread. plated=0 with peers alive says which step lost them:

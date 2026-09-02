@@ -403,6 +403,26 @@ static bool GarmentFitsBody(void* garment, void* body, int* gBones, int* bBones,
 // Once per NAME rather than once per dress: a wardrobe session re-dresses constantly and the useful
 // content (the name) is identical every time. Deliberately outside g_logBudget, which is shared with
 // the merge diagnostics and would be spent long before a player got to the wardrobe.
+// ---- WHAT THE WARDROBE OFFERED, so the menu can list the outfit ------------------------------
+// The log has always named the garments we SKIPPED -- that is how a player learned what to type
+// into ClothGarmentTags. The menu needs the other half too, the ones we took, so every offered
+// garment is recorded here as it goes past. Only the NAME is kept: whether it counts as included
+// is asked of GarmentSlot each time it is drawn, so a row can never disagree with the rule that
+// actually decides. The body is flagged rather than dropped, because a list missing an item you
+// can see on your character reads as a bug -- it is shown, and shown as untouchable.
+static char g_worn[24][64];
+static bool g_wornBody[24];
+static int  g_nWorn = 0;
+static void NoteWornGarment(const char* nm) {
+    if (!nm || !nm[0]) return;
+    for (int i = 0; i < g_nWorn; i++) if (!strcmp(g_worn[i], nm)) return;
+    if (g_nWorn >= (int)(sizeof(g_worn) / sizeof(g_worn[0]))) return;
+    strncpy(g_worn[g_nWorn], nm, sizeof(g_worn[0]) - 1);
+    g_worn[g_nWorn][sizeof(g_worn[0]) - 1] = 0;
+    g_wornBody[g_nWorn] = (strstr(nm, "FullBody") != nullptr);
+    g_nWorn++;
+}
+
 static char g_saidName[24][64];
 static int  g_nSaid = 0;
 static void ReportUnmatchedGarment(const char* nm) {
@@ -481,13 +501,163 @@ void ClothMerge_ReadConfig(const char* buf) {
     if (g_nTags <= 0) { strcpy(g_tags[0], "_UB_"); g_nTags = 1; }
     TwkLog("[cloth] config: tags='%s' (%d) exclude='%s' (%d)", tags, g_nTags, excl, g_nExcl);
 }
+// Why a row can be REFUSED, in the words the menu shows. A tag is a SLOT -- one of twelve, two of
+// them spent on the stock _UB_/_LB_ patterns -- and exclusions have their own twelve. Running out
+// used to mean the tick simply sprang back with no reason given, which is a control that lies.
+static char g_wornNote[128] = {};
+const char* ClothMerge_WornNote() { return g_wornNote[0] ? g_wornNote : nullptr; }
+int  ClothMerge_TagsUsed()  { return g_nTags; }
+int  ClothMerge_TagsMax()   { return kMaxGarments; }
+int  ClothMerge_ExclUsed()  { return g_nExcl; }
+int  ClothMerge_ExclMax()   { return kMaxExcl; }
+
+// Does this pattern also catch a DIFFERENT garment in the outfit we know about?
+static bool TagCatchesOther(const char* tag, int selfIdx) {
+    if (!tag || !tag[0]) return false;
+    for (int i = 0; i < g_nWorn; i++)
+        if (i != selfIdx && strstr(g_worn[i], tag)) return true;
+    return false;
+}
+// Choose the pattern that stands for one garment, within the room a tag has.
+//
+// A tag is matched with strstr, and only cap-1 characters of it fit. Truncating from the FRONT is
+// the wrong end: garment variants differ in their TAIL (..._01, ..._B, ..._Red), so a head-cut tag
+// catches every sibling -- tick one shirt, get three. The tail is taken first and then CHECKED
+// against the rest of the outfit; if it also catches something else the head is tried, and if both
+// collide the caller is told rather than the player quietly getting more than they asked for.
+static bool PickPattern(const char* nm, int idx, char* out, int cap) {
+    const size_t len = strlen(nm);
+    if (len < (size_t)cap) { strcpy(out, nm); return !TagCatchesOther(out, idx); }
+    strncpy(out, nm + (len - (cap - 1)), cap - 1); out[cap - 1] = 0;
+    if (!TagCatchesOther(out, idx)) return true;
+    char head[80];
+    const int hc = (cap - 1 < (int)sizeof(head)) ? cap - 1 : (int)sizeof(head) - 1;
+    strncpy(head, nm, hc); head[hc] = 0;
+    if (!TagCatchesOther(head, idx)) { strcpy(out, head); return true; }
+    return false;                       // nothing that fits names this garment alone
+}
+
+// Start over. The tag and exclusion lists deliberately survive Reset Defaults -- they are names a
+// player found by reading the log, and nothing can regenerate them -- so this is the one place that
+// clears them, asked for explicitly and never as a side effect. Both lists are logged first, so a
+// clear is recoverable from the log by anyone who did it by mistake.
+void ClothMerge_ForgetClothingChoices() {
+    char tags[kMaxGarments * (kTagLen + 1) + 1] = {};
+    char excl[kMaxExcl * (sizeof(g_excl[0]) + 1) + 1] = {};
+    size_t tn = 0, xn = 0;
+    for (int i = 0; i < g_nTags; i++)
+        tn += snprintf(tags + tn, sizeof(tags) - tn, "%s%s", tn ? "," : "", g_tags[i]);
+    for (int i = 0; i < g_nExcl; i++)
+        xn += snprintf(excl + xn, sizeof(excl) - xn, "%s%s", xn ? "," : "", g_excl[i]);
+    TwkLog("[cloth] clothing choices cleared. They were: tags='%s' exclude='%s' -- paste either back "
+           "into SessionTweaks.ini to undo this", tags, excl);
+    memset(g_tags, 0, sizeof(g_tags));
+    memset(g_excl, 0, sizeof(g_excl));
+    strcpy(g_tags[0], "_UB_"); strcpy(g_tags[1], "_LB_"); g_nTags = 2; g_nExcl = 0;
+    snprintf(g_wornNote, sizeof(g_wornNote),
+             "cleared -- back to the stock tops and bottoms (the old lists are in the log)");
+    TwkMarkDirty();
+}
+
+int  ClothMerge_WornCount() { return g_nWorn; }
+const char* ClothMerge_WornName(int i) {
+    return (i >= 0 && i < g_nWorn) ? g_worn[i] : nullptr;
+}
+bool ClothMerge_WornIsBody(int i) { return (i >= 0 && i < g_nWorn) && g_wornBody[i]; }
+// Asked fresh every draw rather than cached -- this IS the rule the strip loop runs.
+bool ClothMerge_WornIncluded(int i) {
+    return (i >= 0 && i < g_nWorn) && GarmentSlot(g_worn[i]) >= 0;
+}
+// Include or exclude one garment BY NAME, which is what the menu row means.
+//
+// Exclusion wins over tags in GarmentSlot, so it is the lever in both directions: turning a garment
+// ON has to clear whatever exclusion was catching it, and turning one OFF only has to add one. The
+// full name is used as the key because a TAG may be a broad pattern shared with other garments
+// (_UB_ catches every stock top) -- removing the tag to drop one item would take the others with
+// it, whereas an exclusion names exactly this garment.
+bool ClothMerge_SetWornIncluded(int i, bool on) {
+    g_wornNote[0] = 0;
+    if (i < 0 || i >= g_nWorn || g_wornBody[i]) return false;
+    const char* nm = g_worn[i];
+    for (int e = 0; e < g_nExcl; ) {          // drop every exclusion that catches it, either way
+        if (g_excl[e][0] && strstr(nm, g_excl[e])) {
+            for (int k = e; k < g_nExcl - 1; k++) strcpy(g_excl[k], g_excl[k + 1]);
+            g_excl[--g_nExcl][0] = 0;
+        } else e++;
+    }
+    if (on) {
+        bool matched = false;
+        for (int t = 0; t < g_nTags; t++)
+            if (g_tags[t][0] && strstr(nm, g_tags[t])) { matched = true; break; }
+        if (!matched) {
+            if (g_nTags >= kMaxGarments) {
+                snprintf(g_wornNote, sizeof(g_wornNote),
+                         "all %d cloth slots are in use -- untick another garment first",
+                         kMaxGarments);
+                TwkLog("[cloth] cannot include '%s': %s", nm, g_wornNote);
+                TwkMarkDirty();
+                return false;
+            }
+            char pat[kTagLen];
+            const bool alone = PickPattern(nm, i, pat, kTagLen);
+            strcpy(g_tags[g_nTags], pat);
+            g_nTags++;
+            if (!alone)
+                snprintf(g_wornNote, sizeof(g_wornNote),
+                         "'%s' is too long to name on its own -- it may pull in a similar item",
+                         nm);
+        }
+    } else {
+        // UNDO THE TICK IF THAT IS WHAT THIS IS. Every untick used to add an EXCLUSION, so ticking
+        // and unticking the same garment grew both lists by one each time -- twelve slots would
+        // fill from fiddling rather than from wearing twelve things. If a tag matches this garment
+        // and nothing else in the outfit, and it is long enough to be a name fragment rather than
+        // one of the short stock patterns, then it is the tag a tick added for this garment: taking
+        // it away is the clean undo and leaves no residue at all. A garment carried by a BROAD tag
+        // (_UB_ catches every stock top) still needs the exclusion -- that tag is not ours to
+        // remove, and removing it would drop everything else it carries.
+        for (int t = 0; t < g_nTags; t++) {
+            if (!g_tags[t][0] || !strstr(nm, g_tags[t])) continue;
+            if (strlen(g_tags[t]) < 8 || TagCatchesOther(g_tags[t], i)) continue;
+            for (int k = t; k < g_nTags - 1; k++) strcpy(g_tags[k], g_tags[k + 1]);
+            g_tags[--g_nTags][0] = 0;
+            TwkMarkDirty();
+            return true;
+        }
+        if (g_nExcl >= kMaxExcl) {
+            snprintf(g_wornNote, sizeof(g_wornNote),
+                     "all %d exclusions are in use -- retick another garment first", kMaxExcl);
+            TwkLog("[cloth] cannot exclude '%s': %s", nm, g_wornNote);
+            TwkMarkDirty();
+            return false;
+        }
+        char pat[sizeof(g_excl[0])];
+        const bool alone = PickPattern(nm, i, pat, (int)sizeof(g_excl[0]));
+        strcpy(g_excl[g_nExcl], pat);
+        g_nExcl++;
+        if (!alone)
+            snprintf(g_wornNote, sizeof(g_wornNote),
+                     "'%s' is too long to name on its own -- it may drop a similar item too", nm);
+    }
+    TwkMarkDirty();
+    return true;
+}
+
 void ClothMerge_SaveConfig(char* buf, size_t cap) {
     // Only what is still configurable -- the garment tag lists and the tint rules. See the note on
     // ClothMerge_ReadConfig for why the rest is code now.
     {
-        char tags[128] = {}, excl[512] = {};
-        for (int i = 0; i < g_nTags; i++) { if (i) strcat(tags, ","); strcat(tags, g_tags[i]); }
-        for (int i = 0; i < g_nExcl; i++) { if (i) strcat(excl, ","); strcat(excl, g_excl[i]); }
+        // Sized from the lists themselves. The old 128 bytes could not hold a full tag list --
+        // every tag may be kTagLen long -- and the menu's include rows make long tags ordinary
+        // rather than rare, so an unbounded strcat here was a buffer overrun waiting for a player
+        // with a lot of custom gear.
+        char tags[kMaxGarments * (kTagLen + 1) + 1] = {};
+        char excl[kMaxExcl * (sizeof(g_excl[0]) + 1) + 1] = {};
+        size_t tn = 0, xn = 0;
+        for (int i = 0; i < g_nTags; i++)
+            tn += snprintf(tags + tn, sizeof(tags) - tn, "%s%s", tn ? "," : "", g_tags[i]);
+        for (int i = 0; i < g_nExcl; i++)
+            xn += snprintf(excl + xn, sizeof(excl) - xn, "%s%s", xn ? "," : "", g_excl[i]);
         TwkIniSetStr(buf, cap, "ClothGarmentTags", tags);
         TwkIniSetStr(buf, cap, "ClothExclude",     excl);
     }
@@ -592,7 +762,7 @@ static void hkDoMerge(void* self, void* refPose) {
                 void* mesh = twkP(data, i * 8);
                 int slot = -1;
                 const bool named = (mesh && CatchSound_ObjName(mesh, nm, sizeof(nm)));
-                if (named) slot = GarmentSlot(nm);
+                if (named) { NoteWornGarment(nm); slot = GarmentSlot(nm); }
                 if (slot < 0) ReportUnmatchedGarment(named ? nm : nullptr);
                 if (slot < 0 || slot >= kMaxGarments || excludedGarment[slot]) { i++; continue; }
                 // A garment whose rig does not match the body must stay merged -- separating it hands
@@ -2343,6 +2513,34 @@ void* ClothMerge_FindClass(const wchar_t* name) { return FindClassByName(name, "
 void ClothMerge_DrawMenu(const OmpMenuApi* api) {
     char b[128];
     if (!g_start) { api->TextDisabled("Cloth (phase A): merge hook not installed"); return; }
+    // ---- YOUR OUTFIT, one row per garment. The tag and exclusion lists are still the ini's, and
+    // still the thing being edited -- this only spares you reading a name out of the log and typing
+    // a fragment of it in by hand, which is how custom gear had to be enabled until now.
+    api->Text("Clothes you are wearing");
+    if (g_nWorn <= 0) {
+        api->TextDisabled("nothing seen yet -- change an item in the wardrobe and they list here");
+    } else {
+        snprintf(b, sizeof(b), "ticked = given cloth physics, next time the outfit loads "
+                 "(%d of %d slots used)", g_nTags, kMaxGarments);
+        api->TextDisabled(b);
+        api->Indent();
+        for (int i = 0; i < g_nWorn; i++) {
+            if (g_wornBody[i]) {                       // never simulated, never offered as a choice
+                snprintf(b, sizeof(b), "%s  (your body -- not clothing)", g_worn[i]);
+                api->TextDisabled(b);
+                continue;
+            }
+            bool inc = ClothMerge_WornIncluded(i);
+            if (api->Checkbox(g_worn[i], &inc)) ClothMerge_SetWornIncluded(i, inc);
+        }
+        api->Unindent();
+        // A refusal has to SAY so: the tick springs back on its own, and a control that changes its
+        // mind without a reason reads as broken rather than as full.
+        if (g_wornNote[0]) { api->TextWrapped(g_wornNote); }
+        if (api->version >= 2 && api->Button && api->Button("Forget my clothing choices"))
+            ClothMerge_ForgetClothingChoices();
+    }
+    api->Separator();
     bool on = g_unmerge != 0;
     if (api->Checkbox("Un-merge the shirt (cloth phase A)", &on)) { g_unmerge = on ? 1 : 0; TwkMarkDirty(); }
     api->SameLine(); api->TextDisabled(g_okBuild ? "(looks identical; the platform cloth lands on)"

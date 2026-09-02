@@ -96,7 +96,26 @@ static bool captureInto(void* mesh, State& s) {
     // anchor), so the published pose is the correct one to copy.
     uint8_t* cs = compSpace(mesh, /*editable*/ false, &num);
     if (!cs) return false;
-    const int n = num < kPoseMaxBones ? num : kPoseMaxBones;
+    int n = num < kPoseMaxBones ? num : kPoseMaxBones;
+    // Drop the trailing terminator bones. Cached per mesh because resolving names allocates; the
+    // answer only changes when the character is re-dressed, which also changes the bone count.
+    if (g_tun.trimLeafBones) {
+        static void* cachedMesh = nullptr; static int cachedFor = 0, cachedTo = 0;
+        if (mesh != cachedMesh || cachedFor != num) {
+            cachedMesh = mesh; cachedFor = num;
+            cachedTo = SkeletonTransportBoneCount(mesh, g_tun.trimBoardBones);
+            if (cachedTo > 0 && cachedTo < num && g_logf) {
+                char m[180];
+                snprintf(m, sizeof(m), "[pose] transporting %d of %d bone(s) -- %d trailing bone(s)"
+                                       " carry no motion a receiver needs (terminators%s)",
+                         cachedTo, num, num - cachedTo,
+                         g_tun.trimBoardBones ? " + the board rig, which travels as its own transform"
+                                              : "");
+                g_logf(m);
+            }
+        }
+        if (cachedTo > 0 && cachedTo < n) n = cachedTo;
+    }
     __try {
         for (int b = 0; b < n; b++) {
             const uint8_t* t = cs + (size_t)b * off::kTransformStride;
@@ -120,6 +139,17 @@ static bool captureInto(void* mesh, State& s) {
 #endif
 }
 
+// One dump per distinct skeleton size, ever. Names allocate, so this can never become periodic.
+static void maybeDumpBones(void* mesh) {
+    if (!g_tun.dumpBones || !mesh) return;
+    static int dumped[4] = {0, 0, 0, 0};
+    const int n = SkeletonBoneCount(mesh);
+    if (n <= 0) return;
+    for (int i = 0; i < 4; i++) if (dumped[i] == n) return;
+    for (int i = 0; i < 4; i++) if (!dumped[i]) { dumped[i] = n; break; }
+    DumpSkeletonBones(mesh, g_logf);
+}
+
 bool Capture(void* mesh, State& s) {
     s.poseN = 0;
     if (!g_tun.enabled || !mesh) return false;
@@ -132,7 +162,13 @@ bool Capture(void* mesh, State& s) {
     // with no foot IK and no extrapolation, and any packet hiccup rendered as a driverless anim
     // graph instead of a clean freeze. The session now builds a SEPARATE results packet and unicasts
     // it to the scrubbing peers alone (CaptureFromPawn below); everyone else keeps drivers.
-    if (LocalReplayMode() != g_tun.captureMode) return false;
+    // ...or while RAGDOLLING, which has the same shape: no drivers, so nothing to derive from. The
+    // caller has already filled s.bailing this frame (gather sets it long before it gets here).
+    // BEFORE the gate on purpose: this is a fact about the SKELETON, not about posing, so it must not
+    // wait for a bail or a scrub to be discoverable. Capture runs every gather, the dump is one-shot
+    // per distinct bone count, so it costs one integer compare per frame after it has fired.
+    maybeDumpBones(mesh);
+    if (LocalReplayMode() != g_tun.captureMode && !(g_tun.captureBails && s.bailing)) return false;
     return captureInto(mesh, s);
 }
 

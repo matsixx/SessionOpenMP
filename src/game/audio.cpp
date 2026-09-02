@@ -34,6 +34,9 @@ Stats   GetStats() { return g_st; }
 static void* g_pawn  = nullptr;      // the local skater actor
 static void* g_board = nullptr;      // the local board actor
 static void (*g_logf)(const char*) = nullptr;
+// True while the local player is in replay playback -- capture and publish are both off. See
+// SetInLocalReplay.
+static bool g_inLocalReplay = false;
 void SetLocalParts(void* pawn, void* board) { g_pawn = pawn; g_board = board; }
 
 // ---- reentrancy flags. Both are thread_local because the funnel runs on the game thread but nothing
@@ -328,10 +331,23 @@ static bool fromAnimNotify(void* ret) {
 // both happen would double every catch and footfall. Called BEFORE the original, so the sound is
 // never spawned at all -- safe because the notify callers null-check the spawn result.
 static bool muteProxyNotify(void* attachTo, const float* loc, void* ret) {
-    if (!g_tun.enabled || !g_tun.suppressProxyNotify || g_inReplay) return false;
-    if (!fromAnimNotify(ret)) return false;
-    const bool mute = attachTo ? proxyOwns(attachTo) : nearerAProxy(loc);
-    if (mute) g_st.notifyMuted++;
+    // g_inReplay guards OUR OWN re-issues: PlayLoop/PlayOneShot raise it while spawning a peer's
+    // transported sound onto their proxy, and muting those would silence the very thing we came to
+    // play. Everything below is therefore a sound the PROXY started for itself.
+    if (!g_tun.enabled || g_inReplay) return false;
+    if (fromAnimNotify(ret)) {
+        if (!g_tun.suppressProxyNotify) return false;
+        const bool mute = attachTo ? proxyOwns(attachTo) : nearerAProxy(loc);
+        if (mute) g_st.notifyMuted++;
+        return mute;
+    }
+    // Not a notify: the proxy's own board or mesh spawning gameplay audio locally. Its board really
+    // is simulating (that is what makes it collidable), so the game's board-audio block runs on it and
+    // produces rolling/push sound that nobody asked for and that the owner is already sending us.
+    // ATTACHED ONLY -- see the note on suppressProxyLocal for why a world spawn is left alone.
+    if (!g_tun.suppressProxyLocal || !attachTo) return false;
+    const bool mute = proxyOwns(attachTo);
+    if (mute) g_st.localMuted++;
     return mute;
 }
 #else
@@ -341,9 +357,23 @@ static bool muteProxyNotify(void*, const float*, void*) { return false; }
 #endif
 
 // ---- the one place a captured spawn is turned into wire data ----------------------------------------
+// DOES THIS CUE END BY ITSELF? UE stamps INDEFINITELY_LOOPING_DURATION (1e6 s) on a looping sound,
+// so the cue answers for itself rather than us inferring it from the caller's intent.
+static bool cueLoops(void* sound) {
+    if (!sound) return false;
+#ifdef _WIN32
+    __try {
+        const float d = *(const float*)((const uint8_t*)sound + off::kSoundBaseDuration);
+        return d > 1.0e5f;                    // the sentinel is 1e6; no real clip is near it
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+#else
+    return false;
+#endif
+}
+
 static void onSpawn(void* comp, void* sound, void* attachTo, const float* loc,
                     float vol, float pitch, float start, bool autoDestroy, void* ret) {
-    if (!g_tun.enabled || g_inReplay || !g_pawn) return;
+    if (!g_tun.enabled || g_inReplay || (g_tun.muteWhileReplaying && g_inLocalReplay) || !g_pawn) return;
     // `sound` here came from the GAME's own spawn call, so it is a genuine USoundBase by construction,
     // which makes it the proof of the receiver's cue gate. If the gate rejects this, "SoundBase" is the
     // wrong expectation and the gate disables itself rather than silencing every peer sound.
@@ -376,7 +406,9 @@ static void onSpawn(void* comp, void* sound, void* attachTo, const float* loc,
         char m[200];
         snprintf(m, sizeof(m), "[audio] cue '%s' (%s, %s%s)", cue,
                  attachTo ? (attach == kAudBoard ? "board" : attach == kAudMesh ? "mesh" : "root") : "world",
-                 autoDestroy ? "one-shot" : "loop", notify ? ", notify" : "");
+                 (autoDestroy && !cueLoops(sound)) ? "one-shot"
+                     : (autoDestroy ? "loop (cue never ends; spawned as a one-shot)" : "loop"),
+                 notify ? ", notify" : "");
         g_logf(m);
     }
 
@@ -384,7 +416,18 @@ static void onSpawn(void* comp, void* sound, void* attachTo, const float* loc,
     // ASkateboardEx::SpawnGrindLoopingAudio stages `mov byte [rsp+0x60], 0` for its looping grind
     // sound, and UAnimNotify_PlaySoundRecorded::PlaySound stages 1 for its fire-and-forget hit.
     // A sound the game intends to stop later is a sound the game keeps the component for.
-    if (autoDestroy) {
+    // ...BUT bAutoDestroy IS THE CALLER'S INTENT, NOT THE SOUND'S NATURE, and the two disagree.
+    // Session spawns SCU_PushRolling -- an internally LOOPING cue -- with bAutoDestroy set. On the
+    // owner that is harmless: auto-destroy on a sound that never finishes simply never fires, and the
+    // game drops the component when it feels like it. Re-issued on a PROXY as a fire-and-forget
+    // one-shot it is unstoppable: we keep no handle, it never ends by itself, and nothing in the
+    // loop reconcile can reach it. Field report: "the pushing sound plays over and over on the
+    // proxy's skateboard after they bail" -- it had been playing since before the bail; the bail is
+    // just when everything else went quiet.
+    // So a cue that never ends is tracked as a LOOP whatever the caller asked for. It then travels as
+    // loop STATE, the receiver owns the component, and it stops the moment it leaves the published
+    // set -- which is also what finally makes the bail teardown reach it.
+    if (autoDestroy && !cueLoops(sound)) {
         if (g_nPend >= kPendMax) return;                 // a burst beyond this is already inaudible
         Pending& p = g_pend[g_nPend++];
         p.e = AudioEvent{};
@@ -449,10 +492,15 @@ static SpawnSndAttFn   o_SndAtt   = nullptr, o_GsAtt   = nullptr;
 static AcSetIntFn      o_SetInt   = nullptr;
 static AcSetFloatFn    o_SetPitch = nullptr, o_SetVol = nullptr;
 
+// Defined below, next to the rest of the concurrency reasoning. Declared here because the widening
+// has to happen BEFORE the spawn it belongs to -- see the note on that definition.
+static void widenConcurrency(void* cue);
+
 static void* hkSndAtLoc(void* wc, void* sound, const float* loc, const float* rot,
                         float vol, float pitch, float start, void* att, void* conc, bool autoDestroy) {
     void* ret = _ReturnAddress();
     if (muteProxyNotify(nullptr, loc, ret)) return nullptr;   // a proxy's own notify: the wire has it
+    if (g_tun.enabled) widenConcurrency(sound);          // BEFORE the spawn -- see widenConcurrency
     g_inFunnel++;
     void* r = o_SndAtLoc(wc, sound, loc, rot, vol, pitch, start, att, conc, autoDestroy);
     g_inFunnel--;
@@ -464,6 +512,7 @@ static void* hkSndAtt(void* sound, void* attachTo, uint64_t point, const float* 
                       void* att, void* conc, bool autoDestroy) {
     void* ret = _ReturnAddress();
     if (muteProxyNotify(attachTo, loc, ret)) return nullptr;
+    if (g_tun.enabled) widenConcurrency(sound);          // BEFORE the spawn -- see widenConcurrency
     g_inFunnel++;
     void* r = o_SndAtt(sound, attachTo, point, loc, rot, locType, stopDetach, vol, pitch, start,
                        att, conc, autoDestroy);
@@ -557,9 +606,50 @@ bool Install(void (*logf)(const char*)) {
 // =====================================================================================================
 void ForceNames() { for (auto& l : g_live) l.namedUs = 0; }
 
+// SCRUBBING IS NOT SKATING, AND PEERS MUST NOT HEAR IT.
+// While the local player sits in their replay editor, the game re-spawns their recorded sounds through
+// the very funnel this module captures -- that is what UReplayAudioManager is FOR. So a scrub was
+// captured and broadcast as if the skater were making those sounds live, and because scrubbing starts
+// and stops loops constantly (a fresh slot each time), the receiving end faithfully reproduced every
+// start and stop: measured at 14-28 loop starts per second, with starts and stops in lockstep. That is
+// the "rolling sound spams while another skater scrubs" report, heard by everyone EXCEPT the person
+// scrubbing -- which is why it took so long to notice.
+// The pose lane deliberately does the opposite (a scrubbing peer still animates on your screen, round
+// 370). That is a considered difference, not an inconsistency: a replayed POSE is a coherent motion at
+// any scrub speed, while replayed AUDIO at scrub speed is a machine-gun that cannot be made to sound
+// like anything. Silence is the honest rendering of it.
+// Entering clears the live table rather than letting it drain: those components belong to the replay
+// system now, and the entries would otherwise be published as "still playing" -- the same drone bug
+// the receive side had when a concealed peer's loops were left running.
+static void clearLive() {
+    for (auto& l : g_live) l = Live{};
+    for (int i = 0; i < g_nPend; i++) g_pend[i].left = 0;   // one-shots mid-repeat: stop resending
+    g_nPend = 0;
+}
+void SetInLocalReplay(bool on) {
+    if (on == g_inLocalReplay) return;
+    g_inLocalReplay = on;
+    if (on) clearLive();          // no deref: the entries are dropped, never inspected
+}
+
 void Gather(State& s, uint64_t now) {
     s.nLoops = 0; s.nEvents = 0;
-    if (!g_tun.enabled) return;
+    if (!g_tun.enabled || (g_tun.muteWhileReplaying && g_inLocalReplay)) return;
+    // A BAIL ABANDONS THE SKATING LOOPS, AND THE GAME NEVER TELLS US.
+    // A loop only leaves the published set when it is BOTH stale (untouched for loopTtlMs) and
+    // reports !IsPlaying. When the ragdoll starts, the board's audio block stops running -- so the
+    // push/rolling loop stops being touched, but its component still answers IsPlaying = true, and
+    // it was therefore published forever. Field-measured: the sender sat at "live 1" for 13 s across
+    // three bails while the observer sat at started=15 stopped=14, one loop stuck open, which is the
+    // push sound looping through a bail.
+    // Dropping the set on the rising edge is the honest signal: whatever was rolling a moment ago is
+    // not rolling now, because the skater is a heap on the floor. It stops our PUBLISHING only -- the
+    // owner's own components are untouched, so nothing here can affect what the local player hears.
+    if (g_tun.dropLoopsOnBail) {
+        static uint8_t lastBail = 0;
+        if (s.bailing && !lastBail) clearLive();
+        lastBail = s.bailing;
+    }
     // Live loops. A loop the game has stopped simply stops being published, and the receiver stops its
     // copy -- which is why loops are STATE and not start/stop events: there is no stop funnel to hook,
     // so "still here" is the only signal that exists, and it is loss-proof.
@@ -622,9 +712,20 @@ static void* attachOn(uint8_t kind, void* actor, void* board) {
 // MaxCount is raised on whatever concurrency the cue actually uses, once per cue, via the game's OWN
 // resolver: `GetConcurrencyHandles` returns the override struct, or every ConcurrencySet entry, or the
 // project default -- so no case is missed and no TSet layout has to be assumed.
-// A live FConcurrencyGroup holds a COPY of these settings, so a group already playing keeps its old
-// limit until it empties. Rolling loops stop and restart constantly, so this self-heals in about a
-// second; there is no need to go hunting the audio device's live group map.
+// THE TIMING IS THE WHOLE FIX, and getting it wrong is why this looked built but did not work.
+// `FConcurrencyGroup::Settings` is an FSoundConcurrencySettings BY VALUE (+0x18 of the group, 40 B,
+// measured in the PDB -- not a pointer). A group therefore keeps the MaxCount it was BORN with, and
+// re-reads the asset never. It dies only when it empties.
+// The first cut widened only from resolveCue -- the RECEIVE path -- so the sequence was:
+//   local player rolls  ->  group created with the stock MaxCount of 1
+//   a peer's rolling arrives  ->  asset widened, but the live group still holds its copy of 1
+//   ... and with three people somebody is always rolling, so that group never empties and never
+//       gets rebuilt. The limit of 1 outlives the widening for the whole session.
+// That is the reported symptom exactly: rolling cutting in and out, "fighting" other players,
+// intermittent because it depends on whether the group ever happens to drain.
+// So the widening also runs on the game's own skate-audio funnel BEFORE the spawn is forwarded,
+// which means the group is BORN wide -- from the local player's very first roll, before any peer
+// exists. The funnel is Session's skate audio specifically, so this stays off unrelated sound.
 static const int kWidenTo   = 32;
 static const int kConcCache = 32;
 static const void* g_widened[kConcCache];

@@ -245,6 +245,23 @@ struct ReadyBuf {
     Entry*   idx = nullptr;
     uint32_t count = 0;
     uint64_t newestUs = 0, oldestUs = 0;
+    // ONE-SHOTS ARE RECORDED MORE THAN ONCE ON PURPOSE. A one-shot rides kRepeatPkts (4) consecutive
+    // packets so a dropped packet cannot lose a sound -- the live receiver throws the repeats away by
+    // id (Stream::audioSeen). A recorded history keeps all four copies, in four consecutive snapshots,
+    // so replaying an interval fired every sound up to four times: that is the "synced replay audio
+    // doubles" report, and it needs no second peer, which is why the concealment fix did not touch it.
+    // Deduped by id for the length of one FORWARD PASS over the timeline. The key cannot be recorded
+    // time: rewinding to watch a moment again lands on the very same timestamps as the repeats do, so
+    // proximity in the recording cannot tell the two apart (the gate caught exactly that). What does
+    // tell them apart is the CURSOR: repeats arrive while it advances, a rewind moves it backward.
+    // So the memory is cleared whenever the caller asks for a window that starts before the last one
+    // ended -- each pass over a section plays its sounds once, and watching it again plays them again.
+    // Ids are unique per event on the sender, so this can never silence two genuinely different sounds.
+    static const int kSeen = 64;
+    uint16_t seenId[kSeen] = {};
+    uint8_t  seenOk[kSeen] = {};
+    uint8_t  seenHead = 0;
+    uint64_t lastToUs = 0;             // where the previous window ended; a step back = a new pass
 };
 static const int kReadyMax = 8;
 static ReadyBuf g_ready[kReadyMax];
@@ -578,12 +595,28 @@ int AudioEventsBetween(int peerIdx, uint64_t fromUs, uint64_t toUs, repl::AudioE
         const uint32_t mid = (lo + hi) / 2;
         if (r->idx[mid].us <= fromUs) lo = mid + 1; else hi = mid;
     }
+    // A window starting before the last one ended means the cursor went backward: a new pass over the
+    // timeline, so everything is re-armed. (Session only asks while the scrub advances, so a rewind
+    // shows up here as precisely this step back.)
+    if (fromUs < r->lastToUs) for (int k = 0; k < ReadyBuf::kSeen; k++) r->seenOk[k] = 0;
+    r->lastToUs = toUs;
     int n = 0;
     for (uint32_t i = lo; i < r->count && n < cap; i++) {
         if (r->idx[i].us > toUs) break;
         repl::State st; uint64_t su = 0;
         if (!repl::Unpack(r->blob + r->idx[i].off, r->idx[i].len, st, &su)) continue;
-        for (int e = 0; e < (int)st.nEvents && n < cap; e++) out[n++] = st.events[e];
+        for (int e = 0; e < (int)st.nEvents && n < cap; e++) {
+            const repl::AudioEvent& ev = st.events[e];
+            if (!ev.cue[0]) continue;
+            bool already = false;
+            for (int k = 0; k < ReadyBuf::kSeen; k++)
+                if (r->seenOk[k] && r->seenId[k] == ev.id) { already = true; break; }
+            if (already) continue;                          // a repeat of a sound already played
+            r->seenId[r->seenHead] = ev.id;
+            r->seenOk[r->seenHead] = 1;
+            r->seenHead = (uint8_t)((r->seenHead + 1) % ReadyBuf::kSeen);
+            out[n++] = ev;
+        }
     }
     return n;
 }

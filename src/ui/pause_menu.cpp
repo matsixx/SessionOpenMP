@@ -122,7 +122,15 @@ static bool makeText(const char* s, FTextBlob* out) {
 // Status strings change (peer counts), so they are cached by STRING -- an FText is only ever built for
 // a string we have not shown before. Bounded by construction: at most kTextCache distinct strings for
 // the life of the process, so the "never destructed" rule stays affordable.
-static const int kTextCache = 24;
+//
+// "Bounded by construction" is only true of the strings this table is FOR. It was not true of the
+// two that were quietly using it: player names, which arrive as people join, and page titles, one of
+// which IS a player name. A five-player session filled all 24 in under an hour, and the visible
+// symptom was the replay Look At list offering two people out of five -- the caller read a full
+// cache as "stop building the list". Both now own their text (see spectateOptText and setTitle);
+// what is left here really is a fixed set of literals. The headroom is for whatever gets added next
+// before somebody notices this comment.
+static const int kTextCache = 64;
 static struct { char s[112]; FTextBlob t; bool used; } g_textCache[kTextCache];
 static const FTextBlob* cachedText(const char* s) {
     if (!s || !*s) return nullptr;
@@ -138,7 +146,11 @@ static const FTextBlob* cachedText(const char* s) {
         return &g_textCache[i].t;
     }
     static bool warned = false;
-    if (!warned) { warned = true; log("[menu] text cache full -- status text will stop updating"); }
+    if (!warned) {
+        warned = true;
+        log("[menu] text cache full -- status text stops updating from here. If a LIST looks short,"
+            " this is why: something is putting per-player strings through a fixed table.");
+    }
     return nullptr;
 }
 
@@ -533,6 +545,35 @@ static int       g_spectatePeerIds[kSpecMax];       // -1 = "Me"
 static int       g_spectateCount = 1;               // always at least "Me"
 static int       g_spectateSel   = 0;               // row position, display only -- derived from the id
 static int       g_spectateSelPeer = -1;            // THE selection. -1 = your own skater.
+// THE NAMES OWN THEIR OWN FTexts, deliberately NOT the shared cachedText table -- the same reason
+// the roster panel does, and this list is what proved the reason. That cache is 24 entries for the
+// life of the process and never evicts, so a session where people come and go eventually fills it
+// with names; after that cachedText returns null forever. The old loop treated null as "stop here",
+// which silently TRUNCATED the list: a five-player session offered two names to look at, and the
+// only clue was one line in the log an hour earlier.
+//
+// Each slot owns one blob and rebuilds it ONLY when that slot's string actually changes, so the
+// cost is per NEW NAME rather than per page build, and status text can never crowd names out.
+static char      g_spectateOptStr[kSpecMax][64] = {};
+static FTextBlob g_spectateOptText[kSpecMax]{};
+static bool      g_spectateOptHave[kSpecMax] = {};
+static FTextBlob g_spectateFallback{};
+static bool      g_spectateFallbackHave = false;
+
+// One Look At name. Returns false only if this slot has no usable text at all, which is the one
+// case the caller must handle -- and it handles it by showing a placeholder, never by dropping the
+// player: somebody you cannot name is still somebody you should be able to watch.
+static bool spectateOptText(int i, const char* str) {
+    if (i < 0 || i >= kSpecMax || !str) return false;
+    if (g_spectateOptHave[i] && strcmp(g_spectateOptStr[i], str) == 0) return true;   // unchanged
+    FTextBlob t{};
+    if (!makeText(str, &t)) return g_spectateOptHave[i];      // keep last frame's rather than lose it
+    g_spectateOptText[i] = t;
+    strncpy_s(g_spectateOptStr[i], str, _TRUNCATE);
+    g_spectateOptHave[i] = true;
+    return true;
+}
+
 static const LONG kSpecNoPending = 0x7FFFFFFF;
 static volatile LONG g_spectatePending = kSpecNoPending;   // a PEER ID, posted by the menu callback
 // ---- the per-player "Sync Replay: Off / On" row. Applies to whoever the Look At row selects; ON
@@ -875,11 +916,43 @@ static const char* statusLine() {
     if (s.backend != 0) return "Ready - choose Host or Join";
     return "Not connected";
 }
-// Point a row's footer description at the current status. Writing an FText field is a plain 24-byte
-// copy of a cached blob -- no allocation unless the STRING itself is new (see cachedText).
+// Point a row's footer description at the current status, keyed by ROW rather than by string.
+//
+// Keying by string is what the shared cache does, and it is the wrong axis here: statusLine() alone
+// spells out both a player count and a skater count, which is dozens of distinct strings over a long
+// session, and a row's status is the most-rewritten text in the menu. Keyed by row it is bounded by
+// something that genuinely cannot grow -- there are at most kRowCap rows -- and each row rebuilds
+// its text only when its own status actually changes, which is the same rule the roster panel and
+// the Look At names follow.
+static struct RowStatus {
+    uint8_t*  row;
+    char      str[112];
+    FTextBlob text;
+} g_rowStatus[kRowCap];
+static int g_rowStatusN = 0;
+
 static void setRowStatus(uint8_t* row, const char* text) {
-    const FTextBlob* t = cachedText(text);
-    if (t) memcpy(row + off::kItemShortDesc, t, sizeof(*t));
+    if (!row || !text) return;
+    RowStatus* e = nullptr;
+    for (int i = 0; i < g_rowStatusN; i++) {
+        if (g_rowStatus[i].row == row) { e = &g_rowStatus[i]; break; }
+    }
+    if (e && strcmp(e->str, text) == 0) {                 // unchanged: just re-stamp the same blob
+        memcpy(row + off::kItemShortDesc, &e->text, sizeof(e->text));
+        return;
+    }
+    FTextBlob t{};
+    if (!makeText(text, &t)) return;                      // leave whatever the row already shows
+    if (!e) {
+        // Out of slots would mean more live rows than the menu can even build; fall back to stamping
+        // an unowned blob rather than dropping the status, and let the next rebuild try again.
+        if (g_rowStatusN >= kRowCap) { memcpy(row + off::kItemShortDesc, &t, sizeof(t)); return; }
+        e = &g_rowStatus[g_rowStatusN++];
+        e->row = row;
+    }
+    e->text = t;
+    strncpy_s(e->str, text, _TRUNCATE);
+    memcpy(row + off::kItemShortDesc, &e->text, sizeof(e->text));
 }
 
 // ---- one-time page dump -----------------------------------------------------------------------------
@@ -972,8 +1045,17 @@ static const TArrayHdr* chooseArray(void* page, const TArrayHdr* items, TArrayHd
             g_spectateCount++;
         }
         for (int o = 0; o < g_spectateCount; o++) {
-            const FTextBlob* t = cachedText(g_spectateNames[o]);
-            if (t) g_spectateOpts[o] = *t; else { g_spectateCount = o; break; }
+            if (spectateOptText(o, g_spectateNames[o])) {
+                g_spectateOpts[o] = g_spectateOptText[o];
+                continue;
+            }
+            // No text for this slot. Show a placeholder rather than shortening the list -- the row
+            // still carries the right peer id, so the camera goes to the right person even when the
+            // label is generic. Dropping them is what the old code did, and it is the worse answer.
+            if (!g_spectateFallbackHave) g_spectateFallbackHave = makeText("Player", &g_spectateFallback);
+            if (g_spectateFallbackHave) { g_spectateOpts[o] = g_spectateFallback; continue; }
+            g_spectateCount = o;                          // truly nothing to draw with
+            break;
         }
         if (g_spectateCount < 1) return items;
         // Re-derive the highlighted ROW from the remembered IDENTITY. Whoever you picked keeps being
@@ -1483,13 +1565,30 @@ static void passOwned(const void* src, FTextBlob* out) {
 
 // The fake sub-page never re-activates a definition, so the heading would still read "PAUSE MENU".
 // SetTitle is the game's own setter; passing null restores the root definition's own display name.
+// ONE title is on screen at a time, so one blob is all a title needs -- and it must NOT come from
+// the shared cache. A player's own name is used as a page title (the per-player page), so every
+// different person you opened burned a permanent cache slot; that table filling is what silently
+// truncated the replay Look At list. Rebuilt only when the string actually changes, like the roster
+// panel, so re-showing the same title costs nothing at all.
+static char      g_titleStr[112] = {0};
+static FTextBlob g_titleText{};
+static bool      g_titleHave = false;
+
 static void setTitle(void* page, const char* text) {
     const Syms& S = Get();
     if (!S.MenuSetTitle) return;
     __try {
         const void* src = nullptr;
         if (text) {
-            src = cachedText(text);
+            if (!g_titleHave || strcmp(g_titleStr, text) != 0) {
+                FTextBlob t{};
+                if (makeText(text, &t)) {
+                    g_titleText = t;
+                    strncpy_s(g_titleStr, text, _TRUNCATE);
+                    g_titleHave = true;
+                }
+            }
+            src = g_titleHave ? &g_titleText : nullptr;
         } else {
             void* def = *(void**)((uint8_t*)page + off::kPageActiveDef);
             if (def) src = (const uint8_t*)def + 0x38;                   // _displayName

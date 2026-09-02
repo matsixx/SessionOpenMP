@@ -482,6 +482,23 @@ bool ObjectName(const void* obj, char* out, int cap);
 // A skater's mesh component, and the bone count of the skeleton it is drawing.
 void* SkaterMeshOf(void* skaterActor);
 int   SkeletonBoneCount(void* meshComp);
+// ONE-SHOT DIAGNOSTIC: every bone of the merged skeleton, as "index name parent". Answers what the
+// difference between a 70-bone and a 95-bone character actually IS -- garments merge as a UNION of
+// bones, so the extras are whatever joints the worn items bring, and whether they are inert children
+// of body bones decides whether they have to be transported at all. Resolves names, which ALLOCATES
+// and leaks an FString per bone, so this is strictly one-shot and never per frame.
+void  DumpSkeletonBones(void* meshComp, void (*logf)(const char*));
+// How many bones of the merged skeleton are worth transporting: the count with trailing TERMINATOR
+// bones ("*_end") removed. They are childless tip markers a garment's skeleton contributes at merge
+// time -- nothing is skinned to them and nothing hangs off them, so they describe no motion at all.
+// Measured on a real character: a 95-bone rig is a 70-bone one plus 25 of these, contiguous at the
+// tail, which is the difference between a whole skeleton per packet and half of one. Resolves names,
+// so it is ONE-SHOT per skeleton and cached by the caller.
+// `alsoBoard` additionally drops a trailing run of the merged BOARD rig ("SKXX_*"). A proxy's board
+// is a separate actor placed from the transported deck transform, never drawn from these bones, so
+// they describe nothing a receiver needs. They sit immediately below the terminators, which is what
+// lets one prefix trim reach both.
+int   SkeletonTransportBoneCount(void* meshComp, bool alsoBoard);
 // The merged skeleton's bones as name hashes, in index order. A NAME is the only handle on a bone
 // that survives the trip between two players: a character is merged from body + garments and the
 // merge takes the UNION of their bones, so two people's skeletons agree on names and on nothing
@@ -542,6 +559,10 @@ namespace off {
     constexpr int kReplayCamActiveType= 0x878;   // _activeCameraType (EReplayCameraType, uint8)
     constexpr int kReplayCamOrbit     = 1;       // RCT_Orbit
     constexpr int kSoundConcMaxCount  = 0x00;    // FSoundConcurrencySettings::MaxCount
+    // USoundBase::Duration. UE stamps INDEFINITELY_LOOPING_DURATION (1e6 seconds) on a sound that
+    // never ends, which is the cue's own answer to "do you loop?" -- and the only answer available
+    // at spawn time that does not depend on how the caller happened to spawn it.
+    constexpr int kSoundBaseDuration  = 0x108;   // USoundBase::Duration (float)
 
     constexpr int kActorTagsData      = 0x170;
     constexpr int kActorTagsNum       = 0x178;

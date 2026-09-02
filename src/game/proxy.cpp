@@ -538,8 +538,18 @@ void Proxy::Apply(const repl::State& s, uint64_t nowMs, uint64_t nowUs, void (*l
     const bool historicalState = (LocalReplayMode() == 2);
     if (g_tun.bailSync && !historicalState && (s.bailing ? 1 : 0) != lastBailing_) {
         lastBailing_ = s.bailing ? 1 : 0;
+        // Does this bail arrive with the owner's skeleton attached? If so the wire IS the ragdoll and
+        // simulating a local one would only fight it -- two physics results over one mesh, with the
+        // transported pose stamped at FinalizeBoneTransform and the local sim writing the same bones.
+        // Leaving the mesh out of simulation also keeps it on the ordinary anim path, which is the one
+        // the pose lane is proven to land on (it is how a scrubbing peer animates).
+        const bool poseDriven = g_tun.bailPoseSync && s.poseN != 0;
         if (s.bailing) {
-            if (S.Bail && bd) {
+            if (poseDriven) {
+                bailedLocally_ = false;
+                if (logf) logf("[proxy] BAIL (owner ragdoll edge) -> driven from their transported skeleton");
+            } else if (S.Bail && bd) {
+                bailedLocally_ = true;
                 // FString layout {data,num,max}, num counts the terminator. Bail treats the reason as
                 // a const ref (in-game callers hand it a stack Printf string), so a static buffer is fine.
                 static wchar_t reasonChars[] = L"OMP transported bail";
@@ -558,7 +568,11 @@ void Proxy::Apply(const repl::State& s, uint64_t nowMs, uint64_t nowUs, void (*l
 #endif
             } else if (logf) logf("[proxy] owner bailed but no Bail sym/board link -- skipped");
         } else {
-            if (S.ResetRagDoll) {
+            // Only undo a ragdoll we actually started. A pose-driven bail never simulated, so there is
+            // nothing to reset -- the owner simply stops sending a skeleton and their own graph, which
+            // has been running underneath the whole time, takes the mesh back.
+            if (!bailedLocally_) { /* nothing to recover */ }
+            else if (S.ResetRagDoll) {
 #ifdef _WIN32
                 __try { S.ResetRagDoll(actor_); } __except (EXCEPTION_EXECUTE_HANDLER) {}
 #endif
@@ -1166,6 +1180,10 @@ void Proxy::CrankVisRelease() {
 
 void Proxy::AudioApply(const repl::State& s, void* bd) {
     if (!actor_) return;
+    // A SCRUBBING PEER IS AUDIBLE -- the defect was never that they made sound, it was that the
+    // sound RETRIGGERED. Silencing them outright was the first attempt and it cost too much: you
+    // could watch someone scrub and hear nothing at all. See the cue adoption below for what
+    // replaced it. audio::Tune().muteWhileReplaying brings the silence back if it is ever wanted.
     for (int i = 0; i < 3; i++) lastBodyPos_[i] = s.bodyPos[i];
     // Tell the capture layer this actor is a proxy, so its OWN anim-notify sounds are muted: their
     // audio arrives on the wire, and letting the local graph fire them too would double every catch.
@@ -1180,9 +1198,33 @@ void Proxy::AudioApply(const repl::State& s, void* bd) {
     for (int w = 0; w < s.nLoops && w < repl::kAudioMaxLoops; w++) {
         const repl::AudioLoop& L = s.loops[w];
         if (!L.cue[0]) continue;
+        // Match on slot AND CUE. The slot is the sender's own handle id, which is a byte off a
+        // monotonic counter -- so it wraps every 256 loops, and a long session reaches that easily.
+        // On slot alone a wrapped id lands on a component still playing something else and takes the
+        // UpdateLoop path, which sets volume/pitch/surface but CANNOT change the cue: the result is
+        // one sound stuck playing forever while the wire believes it is a different one. Requiring
+        // the cue to agree turns that into an ordinary restart -- the mismatched entry simply fails
+        // to be kept below and is stopped, and the new loop takes a free slot.
         int found = -1;
         for (int i = 0; i < repl::kAudioMaxLoops; i++)
-            if (audioLoops_[i].comp && audioLoops_[i].slot == L.slot) { found = i; break; }
+            if (audioLoops_[i].comp && audioLoops_[i].slot == L.slot &&
+                strncmp(audioLoops_[i].cue, L.cue, repl::kAudioCueLen) == 0) { found = i; break; }
+        // WHILE THEY SCRUB, ADOPT BY CUE. Replaying a recording restarts its loops constantly, each
+        // taking a fresh slot id from the sender's counter, so slot matching saw an endless parade of
+        // "new" loops and dutifully stopped and restarted the sound underneath: measured at 14-28
+        // starts per second with starts and stops in lockstep, which is the machine-gun rolling
+        // sound. A loop already playing this exact cue is the same sound continuing, so take it over
+        // and let it play on. Scoped to `replaying` -- during live skating a new slot really is a new
+        // sound, and collapsing two of the same cue there would silence one of them.
+        if (found < 0 && s.replaying) {
+            for (int i = 0; i < repl::kAudioMaxLoops; i++)
+                if (audioLoops_[i].comp && !keep[i] &&
+                    strncmp(audioLoops_[i].cue, L.cue, repl::kAudioCueLen) == 0) {
+                    audioLoops_[i].slot = L.slot;         // adopt: same sound, new handle
+                    found = i;
+                    break;
+                }
+        }
         if (found < 0) {
             for (int i = 0; i < repl::kAudioMaxLoops; i++) if (!audioLoops_[i].comp) { found = i; break; }
             if (found < 0) continue;                       // no free slot: the newest loop waits a frame
@@ -1190,6 +1232,7 @@ void Proxy::AudioApply(const repl::State& s, void* bd) {
             if (!c) continue;                              // cue missing on this install -- counted there
             audioLoops_[found].slot = L.slot;
             audioLoops_[found].comp = c;
+            strncpy_s(audioLoops_[found].cue, L.cue, _TRUNCATE);
         } else {
             audio::UpdateLoop(audioLoops_[found].comp, L);  // volume/pitch/surface, every frame
         }
@@ -1198,7 +1241,7 @@ void Proxy::AudioApply(const repl::State& s, void* bd) {
     for (int i = 0; i < repl::kAudioMaxLoops; i++) {
         if (audioLoops_[i].comp && !keep[i]) {              // gone from the wire = the sender stopped it
             audio::StopSound(audioLoops_[i].comp);
-            audioLoops_[i].comp = nullptr; audioLoops_[i].slot = 0;
+            audioLoops_[i].comp = nullptr; audioLoops_[i].slot = 0; audioLoops_[i].cue[0] = 0;
         }
     }
 }
@@ -1212,7 +1255,7 @@ void Proxy::PlayAudioEvents(const repl::AudioEvent* e, int n) {
 void Proxy::AudioStopAll() {
     for (auto& l : audioLoops_) {
         if (l.comp) audio::StopSound(l.comp);
-        l.comp = nullptr; l.slot = 0;
+        l.comp = nullptr; l.slot = 0; l.cue[0] = 0;
     }
 }
 

@@ -372,6 +372,57 @@ int SkeletonBoneCount(void* meshComp) {
         return a.num;
     } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
 }
+int SkeletonTransportBoneCount(void* meshComp, bool alsoBoard) {
+    const int total = SkeletonBoneCount(meshComp);
+    if (total <= 0) return 0;
+    __try {
+        void* skelMesh = *(void**)((uint8_t*)meshComp + off::kMeshSkeletalMesh);
+        if (!skelMesh) return total;
+        const uint8_t* refSkel = (const uint8_t*)skelMesh + off::kSkelMeshRefSkeleton;
+        struct TArr { const uint8_t* data; int32_t num; int32_t max; } a{};
+        memcpy(&a, refSkel + off::kRefSkelFinalBoneInfo, sizeof(a));
+        if (!a.data || a.num != total) return total;
+        // Walk BACK from the end while the bone is a terminator. Trailing-only on purpose: the pose
+        // travels as a PREFIX of the skeleton, so trimming the tail needs no index remapping and no
+        // change to the name fingerprint -- a shorter prefix simply leaves the rest to the receiver's
+        // own graph, which is already what it does for a bone the sender does not have. An
+        // interleaved terminator is therefore not skipped; that costs a few bytes, never correctness.
+        int n = total;
+        while (n > 0) {
+            const uint8_t* bi = a.data + (size_t)(n - 1) * off::kMeshBoneInfoStride;
+            char nm[128];
+            if (!fnameToAscii(bi, nm, sizeof(nm))) break;
+            const size_t len = strlen(nm);
+            const bool terminator = (len >= 4 && strcmp(nm + len - 4, "_end") == 0);
+            const bool boardRig   = (alsoBoard && strncmp(nm, "SKXX_", 5) == 0);
+            if (!terminator && !boardRig) break;
+            n--;
+        }
+        return n > 0 ? n : total;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return total; }
+}
+void DumpSkeletonBones(void* meshComp, void (*logf)(const char*)) {
+    if (!meshComp || !logf) return;
+    __try {
+        void* skelMesh = *(void**)((uint8_t*)meshComp + off::kMeshSkeletalMesh);
+        if (!skelMesh) return;
+        const uint8_t* refSkel = (const uint8_t*)skelMesh + off::kSkelMeshRefSkeleton;
+        struct TArr { const uint8_t* data; int32_t num; int32_t max; } a{};
+        memcpy(&a, refSkel + off::kRefSkelFinalBoneInfo, sizeof(a));
+        if (!a.data || a.num <= 0 || a.num > 4096 || a.max < a.num) return;
+        char m[220];
+        snprintf(m, sizeof(m), "[bones] merged skeleton: %d bone(s) -- index, name, parent", (int)a.num);
+        logf(m);
+        for (int i = 0; i < a.num; i++) {
+            const uint8_t* bi = a.data + (size_t)i * off::kMeshBoneInfoStride;
+            char nm[128];
+            if (!fnameToAscii(bi, nm, sizeof(nm))) snprintf(nm, sizeof(nm), "?");
+            const int32_t parent = *(const int32_t*)(bi + 8);      // FMeshBoneInfo { FName; int32 }
+            snprintf(m, sizeof(m), "[bones] %3d  %-48s parent=%d", i, nm, (int)parent);
+            logf(m);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
 bool LocalSkaterName(void* pawn, char* out, int cap) {
     if (out && cap) out[0] = 0;
     if (!pawn || !g_syms.GetGameInstance || !out) return false;

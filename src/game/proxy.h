@@ -48,6 +48,13 @@ struct ProxyTuning {
                                           // query-collidable board at the dismount point.
     bool  bailSync        = true;         // owner's ragdoll edge -> execute Bail locally on the proxy,
                                           // and ResetRagDoll on the falling edge to recover
+    // FULL RAGDOLL SYNC. With this on, a bail whose packet also carries the owner's SKELETON is
+    // driven from that skeleton instead of by simulating a local ragdoll: everyone sees the same
+    // flop, because they are all watching the owner's actual one rather than their own re-run of it.
+    // SELF-SELECTING: the decision reads s.poseN on the bailing edge, and only a sender that captures
+    // bail poses sets it. A peer on a build without that keeps the old local ragdoll, so a mixed
+    // lobby degrades to exactly today's behaviour instead of to a skater who does not fall over.
+    bool  bailPoseSync    = true;
     bool  vetoBreak       = true;         // a proxy board must not DECIDE to break (hold
                                           // _breakBoardRequested, which CanBreakBoard fails on)
     bool  breakSync       = true;         // owner's brokenState byte -> BreakBoardInternal /
@@ -212,7 +219,10 @@ private:
     uint8_t    lastCrankOn_ = 0;          // def-idx line prints even when the wire says none/0xffff)
     // The peer's live sounds, keyed by THEIR slot id -- stable for as long as the sound lives on
     // their machine, which a name would not be (two grind loops can share a cue).
-    struct LoopSlot { uint8_t slot = 0; void* comp = nullptr; };
+    // The cue is stored, not just the slot id, because the slot is a BYTE off the sender's counter
+    // and wraps every 256 loops -- see AudioApply for what matching on it alone would do.
+    bool       bailedLocally_ = false;    // we called Bail ourselves, so recovery must call Reset
+    struct LoopSlot { uint8_t slot = 0; void* comp = nullptr; char cue[repl::kAudioCueLen] = {}; };
     LoopSlot   audioLoops_[repl::kAudioMaxLoops];
     float      lastBodyPos_[3] = {};      // where to place a world-anchored sound this frame
     ProxyStats st_;

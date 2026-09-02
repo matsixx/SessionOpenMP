@@ -80,6 +80,14 @@ enum { kMaxBodies = 64 };
 
 // ------------------------------------------------------------------ config
 static int g_on     = 1;      // BodyFeel -- live toggle; off restores every authored weight
+// A FAULT IS NOT THE USER'S SETTING. The two fault handlers used to clear g_on, which IS the saved
+// BodyFeel toggle -- so a fault switched the feature off in the menu and, on the next settings
+// write, in the ini as well. A map change tears the skater and its meshes down while our tick is
+// still reading them, which is exactly when a fault is likeliest: the reported symptom was
+// "reactive body resets to off whenever I change maps", and it was this.
+// Health lives in its own flag, is never read from or written to the ini, and CLEARS when a new
+// mesh is picked up -- a fault taken during a teardown says nothing about the next map.
+static int g_fault  = 0;
 static int g_amount = 100;    // BodyFeelAmount -- percent of the tuned character (0 = stock)
 static int g_log    = 0;      // BodyFeelLog -- 1 Hz state line
 
@@ -981,7 +989,11 @@ static void ResolveAddForce() {
     }
 }
 
-static void ForgetMesh() { g_mesh = nullptr; g_nBodies = 0; g_feel = 1.0f; g_pulse = 0.0f; }
+static void ForgetMesh() {
+    g_mesh = nullptr; g_nBodies = 0; g_feel = 1.0f; g_pulse = 0.0f;
+    // A new character on a new map deserves the benefit of the doubt.
+    if (g_fault) { g_fault = 0; TwkLog("[body] new character -- reactive body armed again"); }
+}
 
 // Restore every body we steered to its authored weight. Guarded; shared by every stand-down.
 static void RestoreAll() {
@@ -1052,7 +1064,7 @@ void BodyFeel_PumpFrame() {
                 if (m > 100.0f) { for (int a = 0; a < 3; a++) g_throw[a] = g_vel[a] / m; }
                 else { g_throw[0] = 0; g_throw[1] = 0; g_throw[2] = -1.0f; }
                 ResolveAddForce();
-                if (g_bail && g_on && g_nReachers && g_addForce)
+                if (g_bail && g_on && !g_fault && g_nReachers && g_addForce)
                     TwkLogBail("[body] brace: reaching along (%.2f, %.2f, %.2f) with %d bodies",
                            g_throw[0], g_throw[1], g_throw[2], g_nReachers);
                 g_throwVel[0] = g_vel[0]; g_throwVel[1] = g_vel[1];
@@ -1086,7 +1098,7 @@ void BodyFeel_PumpFrame() {
                 for (int i = 0; i < kMaxBodies; i++) g_bOk[i] = false;
             }
             const double el = t - g_braceStart;
-            if (g_bail && g_on && g_amount > 0 && g_addForce && g_nReachers &&
+            if (g_bail && g_on && !g_fault && g_amount > 0 && g_addForce && g_nReachers &&
                 g_mesh && el < 30.0) {
                 uint8_t* arr2 = *(uint8_t**)((uint8_t*)g_mesh + CMP_BODIES);
                 const int n2 = *(int*)((uint8_t*)g_mesh + CMP_BODIES + 8);
@@ -2480,7 +2492,7 @@ void BodyFeel_PumpFrame() {
             ForgetMesh();
             return;
         }
-        if (!g_on || g_amount == 0 || !physOn) {
+        if (!g_on || g_fault || g_amount == 0 || !physOn) {
             if (g_mesh) RestoreAll();  // pickups, replays, the toggle -- restore and hand back
             return;
         }
@@ -2693,8 +2705,9 @@ void BodyFeel_PumpFrame() {
             }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        g_on = 0;
-        TwkLog("[body] faulted -- body feel off for this session");
+        g_fault = 1;
+        TwkLog("[body] faulted -- reactive body paused until the next character loads "
+               "(your setting is untouched)");
     }
 }
 
@@ -2753,7 +2766,8 @@ void BodyFeel_PostPhysApply() {
             }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        g_on = 0;
-        TwkLog("[body] post-phys apply faulted -- body feel off for this session");
+        g_fault = 1;
+        TwkLog("[body] post-phys apply faulted -- reactive body paused until the next character "
+               "loads (your setting is untouched)");
     }
 }
