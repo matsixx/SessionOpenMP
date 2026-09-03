@@ -146,6 +146,7 @@ static void hkUpdateFootAnchors(void* self, double dt, void* a, void* b) {
     // trajectory re-arm to the renderer. Our skater only; the function gates itself further.
     if (mine) CatchLevel_PostPhysAssert();
     if (mine) BodyFeel_PostPhysApply();     // per-body physics-blend scaling (same surviving write point)
+    if (mine) CatchTweaks_PostPhysHold();   // the scoop-foot hold (same surviving write point)
     unsigned char savedAA = 0;
     bool suppressed = false;
     if (mine && g_ok && g_on && self && SuppressWanted(self)) {

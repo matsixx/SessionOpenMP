@@ -80,7 +80,8 @@ enum {
 static int g_on       = 1;     // CatchSound          -- kill-switch, ini only (bug-fix policy: no menu row)
 static int g_volPct   = 100;   // CatchSoundVolumePct -- OUR sound's volume; 100 = the cue's authored level
 static int g_delayMs  = 40;    // CatchSoundSelfDelayMs -- edge -> sound; small, so it lands with the pose
-static int g_diag     = 1;     // CatchSoundDiag      -- one log line per catch
+static int g_diag     = 0;     // CatchSoundDiag      -- one log line per catch; OFF by default
+                               // (release logging: diagnostics stay quiet unless asked for)
 // The cue name. The catch sound observed firing in-game is 'SCU_FootOnBoard'. It is not referenced
 // from any data asset -- neither USkateboardAudioDataAsset nor USkaterAudioData holds a catch cue --
 // so this name is the only handle on it that does not require a notify to fire first.
@@ -96,7 +97,7 @@ void CatchSound_ReadConfig(const char* buf) {
     g_on      = TwkIniInt(buf, "CatchSound", 1);
     g_volPct  = TwkIniInt(buf, "CatchSoundVolumePct", 100);
     g_delayMs = TwkIniInt(buf, "CatchSoundSelfDelayMs", 40);
-    g_diag    = TwkIniInt(buf, "CatchSoundDiag", 1);
+    g_diag    = TwkIniInt(buf, "CatchSoundDiag", 0);
     if (g_volPct  < 25) g_volPct  = 25;   if (g_volPct  > 300) g_volPct  = 300;
     if (g_delayMs < 0)  g_delayMs = 0;    if (g_delayMs > 250) g_delayMs = 250;
     TwkLog("[csnd] config: CatchSound=%d VolumePct=%d DelayMs=%d Diag=%d",
@@ -109,7 +110,7 @@ void CatchSound_SaveConfig(char* buf, size_t cap) {
     TwkIniSetInt(buf, cap, "CatchSoundDiag",        g_diag);
 }
 void CatchSound_ResetDefaults() {
-    g_on = 1; g_volPct = 100; g_delayMs = 40; g_diag = 1;
+    g_on = 1; g_volPct = 100; g_delayMs = 40; g_diag = 0;
     g_okEdge = g_okSelfPlay = 1;   // re-arm; a past fault is not a preference
 }
 bool  CatchSound_Enabled()           { return g_on != 0; }

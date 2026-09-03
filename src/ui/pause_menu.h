@@ -63,6 +63,9 @@ void PauseMenu_Install();                   // game thread, from on_unreal_init 
 // is a use-after-free plus an out-of-bounds index. One frame later is safe.
 void PauseMenu_Pump();
 void PauseMenu_Publish(const MpUiState* s); // game thread -> what the injected rows display
+// Is the pause page this code last built still realised on screen? Read off the widget's own Slate
+// handle -- the game's IsPauseMenuDisplayed is always false with world pausing disabled.
+bool PauseMenu_IsShown();
 int  PauseMenu_TakeAction();                // game thread; returns OvAction and clears it
 int  PauseMenu_TakeJoinIndex();             // the browse index that OVA_JOIN_INDEX refers to
 // Who OVA_KICK / OVA_BAN refer to. An IDENTITY, never a row position: the roster rebuilds live, so an

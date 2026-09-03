@@ -17,11 +17,23 @@ param(
 $ErrorActionPreference = "Stop"
 
 if ([string]::IsNullOrEmpty($Zip)) {
-    # Matches both the old SessionOpenMP-Test-<date> naming and versioned releases like
-    # SessionOpenMP-0.5.0b. Deliberately anchored on "SessionOpenMP-" so it cannot pick up the
-    # unrelated OpenMP-PingTest.zip that also lives in dist\.
-    $Zip = Get-ChildItem (Join-Path $Root "dist\SessionOpenMP-*.zip") |
-           Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
+    # The zip is NAMED FROM THE SOURCE OF TRUTH: OMP_VERSION_STRING in version_tag.h. It used to be
+    # named after whichever SessionOpenMP-*.zip was newest, which quietly produced a second "rc4"
+    # for what was actually rc5 -- the name and the build inside it disagreed. If no zip for this
+    # version exists yet it is SEEDED from the newest one (the script refreshes an existing package
+    # rather than assembling from scratch -- see the header), then rebuilt in place under its name.
+    $verFile = Join-Path $Root "src\ui\version_tag.h"
+    $ver = (Select-String -Path $verFile -Pattern 'OMP_VERSION_STRING\s+"([^"]+)"').Matches[0].Groups[1].Value
+    if ([string]::IsNullOrEmpty($ver)) { throw "could not read OMP_VERSION_STRING from $verFile" }
+    $Zip = Join-Path $Root ("dist\SessionOpenMP-{0}.zip" -f $ver)
+    if (-not (Test-Path $Zip)) {
+        # Anchored on "SessionOpenMP-" so it cannot pick up the unrelated OpenMP-PingTest.zip.
+        $seed = Get-ChildItem (Join-Path $Root "dist\SessionOpenMP-*.zip") |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
+        if ([string]::IsNullOrEmpty($seed)) { throw "no package zip to seed $Zip from" }
+        Copy-Item $seed $Zip
+        Write-Host ("seeded {0} from {1}" -f (Split-Path $Zip -Leaf), (Split-Path $seed -Leaf))
+    }
 }
 if ([string]::IsNullOrEmpty($Zip) -or -not (Test-Path $Zip)) {
     throw "no package zip found (looked for dist\SessionOpenMP-*.zip) -- pass -Zip explicitly"

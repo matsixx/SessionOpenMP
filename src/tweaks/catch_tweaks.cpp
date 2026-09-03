@@ -47,6 +47,7 @@
 #include "foot_place.h"
 #include "foot_steer.h"      // the filtered steer, so a driven board agrees with the feet
 #include "grind_pop.h"       // FName -> string, to name the key a press arrived on
+#include "pop_probe.h"       // PopProbe_SkaterManualBits -- the skater's manual latch, for the probe
 #include <cmath>
 
 static bool CatchIsGoofy();   // defined with the catch-orient hook, used by the flick log above it
@@ -122,8 +123,12 @@ enum {
     MC_BOARD_FLIP_CUR       = 0x77c,   // _boardFlipCurrentAngle
     AN_ON_BOARD             = 0x300,   // USkaterAnimInstance::IsOnBoard -- riding, not walking
     AN_IS_SWITCH            = 0x303,   // USkaterAnimInstance::IsSkatingSwitch -- front foot swaps
-    AN_IS_LANDING           = 0x5fd,   // USkaterAnimInstance::IsLanding -- "the board reaches the
-                                       // ground", which is the release the second-foot hold wants
+    AN_IS_LANDING           = 0x5fd,   // USkaterAnimInstance::IsLanding -- the landing PHASE, true
+                                       // from the catch onward while still airborne (measured: the
+                                       // scoop hold released on it 0 frames after arming, eight
+                                       // times in 50 ms). NOT touchdown. Its neighbours are
+                                       // IsFalling 0x5fc / IsJustLanded 0x5fe; touchdown is
+                                       // IsGrounded 0x5fa. Nothing should release on this.
     AN_HAS_LFOOT_CATCH      = 0x313,   // USkaterAnimInstance::HasLeftFootCatchOrient
     AN_HAS_RFOOT_CATCH      = 0x314,   //   "                  HasRightFootCatchOrient
     MC_BOARD_FLIP_RATE      = 0x774,   // USkateboardExMovementComponent::_boardFlipRate. Reached
@@ -192,6 +197,108 @@ static int   g_catchDiag   = 0;       // log every catch decision (verbose; for 
 // hold). A catch orient is a single-stick gesture, so the game refuses it outright when both sticks
 // are deflected; this presents the held one as centred for the duration of the decision only.
 static int   g_catchTwoStick = 1;
+// How flat the deck has to be before a held catch pose counts as WEDGED. It is the cosine of the
+// deck's tilt: 1.0 is perfectly flat either way up, 0.0 is standing on its edge. Below this the
+// board is on its side -- a primo -- where holding a catch pose is the trick, not a fault.
+static float g_unstickFlat = 0.60f;
+// How close together two sticks have to START deflecting to count as ONE deliberate gesture.
+// Thumbs never land on the same frame, so a two-stick input always begins as a one-stick one --
+// which is why both of the narrowing features below could not see it.
+static int   g_twoStickMs  = 250;   // CatchTwoStickMs
+// KEEP THE POSE RATIOS WHEN NARROWING A TWO-STICK ORIENT. Narrowing hands the game state 1 or 2
+// with pitch and yaw of ZERO, i.e. a neutral catch pose -- and a mid-scoop catch, which is the case
+// that narrows, comes out with the catching foot in what reads as a MANUAL foot position (field).
+// Turning the narrowing off proves where the pose comes from: the game's own two-foot orient (11)
+// places the feet correctly, so it is the state forcing, and most likely its zeroed ratios, that
+// spoils it -- but the narrowing is also what lets ONE foot catch while the scoop stays held out,
+// which is the whole feature, so it cannot simply be dropped.
+// The zeroing is not gratuitous: forwarding the ratios of a two-stick orient onto a one-foot pose
+// once read as the board PITCHING NOSE-DOWN on an otherwise perfect catch, because those numbers
+// encode the held scoop stick's deflection. So this is a switch, defaulted to the shipped
+// behaviour, and the round that flips it should watch for that pitch as much as for the foot.
+static int   g_narrowKeepRatios = 0;   // CatchNarrowKeepRatios
+// HOLD THE SCOOP-SIDE FOOT OFF A TWO-FOOT CATCH, instead of narrowing the catch to one foot.
+// Catching with one foot while a scoop is held used to NARROW the game's two-foot orient (11) to
+// the flicked foot. That gives the one-footed catch the feature is for -- but state 1's orient
+// definition places the board differently from state 11's, and the catching foot comes down on the
+// NOSE instead of over the bolts (field, screenshots). With the narrowing off, state 11 places both
+// feet correctly and the scoop foot comes down too. Neither ratios nor foot choice are the cause:
+// keeping the ratios changed nothing, and inverting the foot made the SCOOP foot catch, which then
+// had nothing holding the other one out.
+// So: keep state 11 -- the game's own placement, proven right -- and hold the scoop-side foot off
+// the deck by clearing its catch TYPE each frame until the board lands. That is the write the
+// SecondFootHold note described and nobody ever implemented (its counters were never incremented).
+// Written in the animation-phase detour, AFTER UpdateFeetCatchInfo has recomputed the type in the
+// physics pass, so it follows the game rather than fighting it. Opt-in until the write is proven:
+// the release line reports frames, writes and the held foot's peak ratio, and a ratio that stays at
+// zero IS the proof.
+static int      g_scoopHold       = 1;      // CatchScoopFootHold -- ON: mode 4 below is the fix for
+                                            // the nose/tail foot on a mid-scoop catch, a shipped feature
+// WHICH FIELD IS THE LEVER for keeping a foot off. CatchScoopHoldMode:
+//   0 = write nothing -- state 11 goes through untouched and the probe below records what every
+//       candidate field does across the catch (a measurement round);
+//   1 = clear the scoop foot's HasXFootCatchOrient flag on the anim instance each frame -- the
+//       per-foot flag SetCatchOrient derives from the state, and the last untested candidate;
+//   2 = clear the foot's catch TYPE byte on the movement component (MEASURED NOT to hold: 44
+//       writes, ratio still ramped to 1.00; kept only as the A/B reference).
+static int      g_scoopHoldMode   = 4;
+static int      g_scoopHoldZeros  = 0;      // consecutive state-0 reads -- a flicker is not an end
+//   3 = BORROW THE BOARD OFFSETS. Both hold levers are measured dead (type byte: 44 writes, ratio
+//       ramped to 1.00; anim flag: stayed cleared all catch, ratio ramped anyway), and the probe
+//       shows the game itself settling on state 1 for a mid-scoop catch (5 -> 11 -> 3 -> 1 by
+//       frame 18) with none of our converters firing. So the one-foot catch is the game's own
+//       outcome, and the remaining difference between it and the correctly-placed two-foot catch
+//       is WHICH ORIENT DEFINITION the state selects: each FCatchOrientDefinition carries four
+//       BoardRelativeOffset vectors that seat the deck under the skater. Mode 3 narrows as before
+//       (one foot, proven) and, for the catch, copies the from-state's offsets into every def of
+//       the narrowed state -- restored on release. The arm line prints BOTH sets of offsets, so if
+//       they turn out identical the hypothesis is dead on the spot, no headset needed.
+static int      g_scoopBorrowFrom = 11;     // CatchScoopBorrowFrom -- whose offsets to borrow
+// THE HELD SCOOP STICK IS ALSO THE MANUAL INPUT. Every lever on the catch side is measured dead
+// -- type byte, anim flag, and now the orient definition's board offsets (they differed, were
+// written, and the foot still went to the nose). What the field actually reports is the skater's
+// BODY shifting to ready a nose manual, and the probe's one constant signature is the catching
+// foot's type going 1 -> 4 at frame 12 of every scoop catch, where a normal catch stays at 1. A
+// stick held past the manual threshold IS Session's manual request, and our two-stick mask only
+// hides it from the CATCH decision, one call deep. So this gate hides it from the MANUAL decision
+// too: while a scoop catch is live, ASessionPlayerController::Skate_CheckForManuals is skipped --
+// the same refusal pop_probe's manual gate already makes, in the same hook -- and for a short tail
+// after touchdown, because the game latches manuals at the landing.
+//   4 = GIVE THE CATCHING FOOT THE PLAIN FOOT TYPE once the orient has settled to one foot.
+//       CORRECTED after the DB dump: the one-stick orient states are AUTHORED as pitched catches
+//       (state 1 -> CF_Nose, state 2 -> CF_Tail; only 10/11 carry plain Left/RightFoot), and the
+//       game downgrades them to a plain foot only when _catchOrientPitchRatio points the other
+//       way (Nose kept while pitch >= 0, Tail kept while pitch <= 0). A pitch of exactly ZERO
+//       keeps both -- and zero is what the narrowing writes when it drops the two-stick ratios,
+//       which is the whole bug. The first cut of this mode recomputed the game's own answer and
+//       so wrote the Tail back. It now writes the DOWNGRADED value: the plain foot for the state,
+//       stance-remapped. Older reasoning kept below for the record:
+//       Disassembled
+//       (UpdateFeetCatchInfo, ConvertCatchFootToStance, GetCatchOrientCatchFootType): the foot type
+//       is the ORIENT DEFINITION's authored CatchFootType for the CURRENT state, stance-remapped
+//       (goofy ^ switch: 1<->2, 4<->5, 6<->7), and once nonzero it is PRESERVED frame to frame
+//       (`cmovne` keeps the previous value). A mid-scoop catch passes through transient two-stick
+//       states (5 / 11 / 3) that a normal catch never visits; the type is decided there as 4 and
+//       then preserved after the state settles to 1 -- which is exactly what the probe shows (1 ->
+//       4 at ~frame 12, state 1 thereafter). A normal catch decides 1 and keeps 1. So this mode
+//       recomputes the one-foot value the game would have chosen and writes it; the game's own
+//       preserve logic keeps it from there.
+static int      g_scoopDbDumped   = 0;      // the orient DB's state -> foot-type table, once
+static int      g_scoopNoManual   = 0;      // CatchScoopNoManual -- OFF: measured to fix nothing
+                                            // (man=0 throughout, type still 1 -> 4, foot still
+                                            // on the nose) and to BREAK mid-air foot control.
+                                            // Skate_CheckForManuals does more than latch manuals.
+static LONGLONG g_scoopLiveUntil  = 0;      // the post-landing tail
+static void*    g_codbCached      = nullptr;// the orient DB, cached from the decide hook
+static uint8_t* g_borrowSrc       = nullptr;// the def being borrowed from
+static uint8_t* g_borrowDst[8];             // the defs being written (one per matching state)
+static float    g_borrowSave[8][2][4][3];   // their originals: [def][side][vector][xyz]
+static int      g_nBorrow         = 0;
+static void     ApplyBorrow();              // defined below; re-applied from an earlier hook
+static int      g_scoopHoldFoot   = 0;      // 1 = left, 2 = right -- the foot being held off
+static int      g_scoopHoldFrames = 0, g_scoopHoldWrites = 0;
+static float    g_scoopHoldPeak   = 0.0f;   // the held foot's CatchRatio, worst case
+static LONGLONG g_scoopHoldQpc    = 0;
 
 // ---- CLICK A STICK TO CATCH ----------------------------------------------------------------
 // Press a thumbstick to catch instead of flicking for it. The press does NOT reach into the catch
@@ -222,7 +329,7 @@ static int   g_clickWhich   = 0;      // and which stick they belong to
 // deflection, with the edge tracker cleared each time so every one gets a fair test, and the
 // verdict is logged beside the direction that produced it. One press tries all eight. Once the
 // log names a direction that returns non-zero, this goes off and that direction becomes the push.
-static int   g_clickSweep   = 1;
+static int   g_clickSweep   = 0;   // a measurement mode; the ini default is 0 and so is this
 static float g_clickSweepMag = 0.9f;  // a real flick is a big movement, not a nudge
 static const float kClickDirs[8][2] = {
     {  0.0f, -1.0f }, {  0.0f,  1.0f }, { -1.0f,  0.0f }, {  1.0f,  0.0f },
@@ -522,6 +629,12 @@ void CatchTweaks_ReadConfig(const char* buf) {
     g_catchBeatsDS = TwkIniInt(buf, "CatchBeatsDarkslide", 1);
     g_dsAngleDeg   = TwkIniInt(buf, "DarkslideZoneDeg", 60);
     g_catchDiag    = TwkIniInt(buf, "CatchDiag", 0);
+    g_twoStickMs   = TwkIniInt(buf, "CatchTwoStickMs", 250);
+    g_narrowKeepRatios = TwkIniInt(buf, "CatchNarrowKeepRatios", 0);
+    g_scoopHold    = TwkIniInt(buf, "CatchScoopFootHold", 1);
+    g_scoopHoldMode = TwkIniInt(buf, "CatchScoopHoldMode", 4);
+    g_scoopBorrowFrom = TwkIniInt(buf, "CatchScoopBorrowFrom", 11);
+    g_scoopNoManual = TwkIniInt(buf, "CatchScoopNoManual", 0);
     g_clickCatch   = TwkIniInt(buf, "CatchClickToCatch", 0);
     g_clickFrames  = TwkIniInt(buf, "CatchClickFrames", 8);
     if (g_clickFrames < 1) g_clickFrames = 1; else if (g_clickFrames > 60) g_clickFrames = 60;
@@ -608,6 +721,12 @@ void CatchTweaks_SaveConfig(char* buf, size_t cap) {
     TwkIniSetInt(buf, cap, "CatchPlantFix",       g_plantFix);
     TwkIniSetInt(buf, cap, "CatchHoldPose",       g_holdPose);
     TwkIniSetInt(buf, cap, "CatchClickToCatch",   g_clickCatch);
+    TwkIniSetInt(buf, cap, "CatchTwoStickMs",     g_twoStickMs);
+    TwkIniSetInt(buf, cap, "CatchNarrowKeepRatios", g_narrowKeepRatios);
+    TwkIniSetInt(buf, cap, "CatchScoopFootHold",  g_scoopHold);
+    TwkIniSetInt(buf, cap, "CatchScoopHoldMode",  g_scoopHoldMode);
+    TwkIniSetInt(buf, cap, "CatchScoopBorrowFrom", g_scoopBorrowFrom);
+    TwkIniSetInt(buf, cap, "CatchScoopNoManual",  g_scoopNoManual);
     TwkIniSetInt(buf, cap, "CatchClickFrames",    g_clickFrames);
     TwkIniSetInt(buf, cap, "CatchClickSweep",     g_clickSweep);
     TwkIniSetInt(buf, cap, "CatchClickProbe",     (int)g_clickProbe);
@@ -908,7 +1027,9 @@ static bool hkCanCatchOrient(void* self, void* b, void* c, void* d) {
             }
             // The bone adjustment is independent of catch MODE -- it is authored data, not a manual
             // catch behaviour -- so it follows its own knobs only.
-            applyBoardOffsets(twkP(self, IAH_CATCH_ORIENTS_DB));
+            g_codbCached = twkP(self, IAH_CATCH_ORIENTS_DB);
+            applyBoardOffsets(g_codbCached);
+            if (g_nBorrow) ApplyBorrow();
         } __except (EXCEPTION_EXECUTE_HANDLER) {
             g_catchFix = 0;
             TwkLog("[catch] caught fatal in the widen gate -> window fix off");
@@ -982,6 +1103,117 @@ static float BoardGripAxis(void* skater, int axis) {
     return 180.0f - roll;                                   // 180 = flat, to match the old semantics
 }
 static float BoardGrip(void* skater) { return BoardGripAxis(skater, g_flipAxis); }
+
+// ---- the board-offset borrow (CatchScoopHoldMode 3; see the knob comment) -----------------
+// Copies the four BoardRelativeOffset vectors of BOTH settings blocks from the def of one catch
+// state into every def of another, saving the originals for an exact restore. Pointers into the
+// orient DB are stable for the session (it is a data asset), the same assumption the boned-ollie
+// writer already rests on.
+static void EndBorrow() {
+    for (int i = 0; i < g_nBorrow; i++) {
+        uint8_t* def = g_borrowDst[i]; if (!def) continue;
+        for (int h = 0; h < 2; h++) {
+            uint8_t* st = def + (h == 0 ? CO_BACK_SETTINGS : CO_FRONT_SETTINGS);
+            for (int q = 0; q < 4; q++)
+                for (int c = 0; c < 3; c++)
+                    *(float*)(st + kBoardOffsets[q] + c * 4) = g_borrowSave[i][h][q][c];
+        }
+    }
+    if (g_nBorrow) TwkLog("[catch] scoop borrow: %d def(s) restored", g_nBorrow);
+    g_nBorrow = 0; g_borrowSrc = nullptr;
+}
+static void ApplyBorrow() {
+    if (!g_borrowSrc) return;
+    for (int i = 0; i < g_nBorrow; i++) {
+        uint8_t* def = g_borrowDst[i]; if (!def) continue;
+        for (int h = 0; h < 2; h++) {
+            const uint8_t* ss = g_borrowSrc + (h == 0 ? CO_BACK_SETTINGS : CO_FRONT_SETTINGS);
+            uint8_t*       ds = def         + (h == 0 ? CO_BACK_SETTINGS : CO_FRONT_SETTINGS);
+            for (int q = 0; q < 4; q++)
+                for (int c = 0; c < 3; c++)
+                    *(float*)(ds + kBoardOffsets[q] + c * 4) = *(const float*)(ss + kBoardOffsets[q] + c * 4);
+        }
+    }
+}
+static void BeginBorrow(int fromState, int toState) {
+    EndBorrow();
+    if (!g_codbCached) { TwkLog("[catch] scoop borrow: no orient DB cached yet -- skipped"); return; }
+    uint8_t* arr = (uint8_t*)twkP(g_codbCached, CODB_ORIENTS);
+    const int n = twkI(g_codbCached, CODB_ORIENTS + 8);
+    if (!arr || n <= 0 || n > 128) { TwkLog("[catch] scoop borrow: orient DB unreadable (%d defs)", n); return; }
+    uint8_t* src = nullptr;
+    for (int i = 0; i < n && !src; i++)
+        if (arr[(size_t)i * CO_DEF_STRIDE] == (uint8_t)fromState) src = arr + (size_t)i * CO_DEF_STRIDE;
+    if (!src) { TwkLog("[catch] scoop borrow: no def carries state %d -- skipped", fromState); return; }
+    for (int i = 0; i < n && g_nBorrow < 8; i++) {
+        uint8_t* def = arr + (size_t)i * CO_DEF_STRIDE;
+        if (def[0] != (uint8_t)toState || def == src) continue;
+        for (int h = 0; h < 2; h++) {
+            const uint8_t* st = def + (h == 0 ? CO_BACK_SETTINGS : CO_FRONT_SETTINGS);
+            for (int q = 0; q < 4; q++)
+                for (int c = 0; c < 3; c++)
+                    g_borrowSave[g_nBorrow][h][q][c] = *(const float*)(st + kBoardOffsets[q] + c * 4);
+        }
+        g_borrowDst[g_nBorrow++] = def;
+    }
+    if (!g_nBorrow) { TwkLog("[catch] scoop borrow: no def carries state %d -- skipped", toState); return; }
+    g_borrowSrc = src;
+    // THE MEASUREMENT: both sets, front block, the two regular-stance vectors. If these are the
+    // same numbers the offsets are not what moves the foot, and this mode is dead without a run.
+    const float* sf = (const float*)(src + CO_FRONT_SETTINGS);
+    const float* df = (const float*)(g_borrowDst[0] + CO_FRONT_SETTINGS);
+    TwkLog("[catch] scoop borrow: state %d's offsets -> %d state-%d def(s). front block, "
+           "L_RGS/R_RGS: from (%.1f,%.1f,%.1f)/(%.1f,%.1f,%.1f)  was (%.1f,%.1f,%.1f)/(%.1f,%.1f,%.1f)",
+           fromState, g_nBorrow, toState,
+           sf[COS_OFF_L_RGS/4], sf[COS_OFF_L_RGS/4+1], sf[COS_OFF_L_RGS/4+2],
+           sf[COS_OFF_R_RGS/4], sf[COS_OFF_R_RGS/4+1], sf[COS_OFF_R_RGS/4+2],
+           df[COS_OFF_L_RGS/4], df[COS_OFF_L_RGS/4+1], df[COS_OFF_L_RGS/4+2],
+           df[COS_OFF_R_RGS/4], df[COS_OFF_R_RGS/4+1], df[COS_OFF_R_RGS/4+2]);
+    ApplyBorrow();
+}
+
+// UCatchOrientsDatabase::GetCatchOrientCatchFootType, from the disassembly: the authored
+// CatchFootType (def+1) of the FIRST definition whose CatchState (def+0) matches; 0 if none.
+static int OrientFootTypeFor(int state) {
+    if (!g_codbCached) return 0;
+    uint8_t* arr = (uint8_t*)twkP(g_codbCached, CODB_ORIENTS);
+    const int n = twkI(g_codbCached, CODB_ORIENTS + 8);
+    if (!arr || n <= 0 || n > 128) return 0;
+    for (int i = 0; i < n; i++) {
+        const uint8_t* def = arr + (size_t)i * CO_DEF_STRIDE;
+        if (def[0] == (uint8_t)state) return def[1];
+    }
+    return 0;
+}
+// USkateboardExMovementComponent::ConvertCatchFootToStance, from its jump table: identity when the
+// stance byte is 0; with it set, 1<->2, 4<->5, 6<->7, everything else unchanged. The stance byte
+// the game passes is IsSkatingGoofy() ^ IsSkatingSwitch().
+static int StanceFootType(int foot, bool stance) {
+    if (!stance) return foot;
+    switch (foot) { case 1: return 2; case 2: return 1; case 4: return 5; case 5: return 4;
+                    case 6: return 7; case 7: return 6; default: return foot; }
+}
+static bool GoofyXorSwitch() {
+    __try {
+        void* a = FootPlace_AnimInstance();
+        return a && ((twkB(a, AN_IS_GOOFY) > 0) != (twkB(a, AN_IS_SWITCH) > 0));
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+// Once: every orient definition's state -> authored foot type, so the transient state that carries
+// the 4 is named in the log rather than inferred.
+static void DumpOrientFootTypes() {
+    if (g_scoopDbDumped || !g_codbCached) return;
+    g_scoopDbDumped = 1;
+    uint8_t* arr = (uint8_t*)twkP(g_codbCached, CODB_ORIENTS);
+    const int n = twkI(g_codbCached, CODB_ORIENTS + 8);
+    if (!arr || n <= 0 || n > 128) return;
+    char line[512]; size_t k = 0;
+    for (int i = 0; i < n && k < sizeof(line) - 16; i++) {
+        const uint8_t* def = arr + (size_t)i * CO_DEF_STRIDE;
+        k += snprintf(line + k, sizeof(line) - k, "%s%d->%d", i ? "  " : "", def[0], def[1]);
+    }
+    TwkLog("[catch] orient DB (%d defs) state->footType: %s", n, line);
+}
 
 // Defined below, beside the rest of the stance rule; needed here for click-to-catch.
 static bool CatchStanceInverts();
@@ -1527,6 +1759,27 @@ static bool CatchHeldOverStale() {
     return true;                                // only held-over deflections are live
 }
 
+// BOTH STICKS PUSHED ON PURPOSE, as opposed to a second stick arriving late.
+//
+// A two-stick orient (5/10/11 -- the boardslide family) is REWRITTEN to one foot by two separate
+// features below, and neither could tell a deliberate gesture from an accident: the flicked-foot
+// narrowing was built for a catch taken while a scoop is HELD, and the pose hold for a second stick
+// moved later in the air. Both are real, and both were blocking the deliberate push -- pushing both
+// sticks inward for a boardslide did nothing, while a DARKSLIDE oriented fine because states 7-9
+// are exempt from both (field, longstanding).
+//
+// The tell is WHEN each deflection began, which is already tracked per stick. Thumbs land a few
+// frames apart, never on the same one, so a deliberate two-stick gesture has two deflections that
+// STARTED together; a held scoop, or a stick moved later in the air, has one that began long before
+// the other.
+static bool DeliberateTwoStick() {
+    const long long dl = g_deflStartL, dr = g_deflStartR;
+    if (dl <= 0 || dr <= 0) return false;              // only one stick is out: not a gesture
+    LARGE_INTEGER fq; QueryPerformanceFrequency(&fq);
+    const long long gap = (dl > dr) ? (dl - dr) : (dr - dl);
+    return (int)(gap * 1000 / fq.QuadPart) <= g_twoStickMs;
+}
+
 static void hkSetCatchOrient(void* self, uint8_t state, float pitchRatio, float yawRatio) {
     // ---- CLICK TO CATCH: turn an idle call into a catch, for as long as the press lasts -------
     InterlockedExchange(&g_clickSetterSeen, 1);
@@ -1671,7 +1924,47 @@ static void hkSetCatchOrient(void* self, uint8_t state, float pitchRatio, float 
                     if (g_flickInvert)        want = 3 - want;   // manual override, if parity reads backwards
                     g_flickLatch = want;
                 }
-                if (g_flickLatch != 0 && (uint8_t)g_flickLatch != state) {
+                // The latch was armed by the FIRST of the two sticks -- a two-stick push cannot
+                // help but look like a one-stick flick for a frame or two -- so narrowing on it
+                // would undo the gesture the player is in the middle of making.
+                const bool bothOnPurpose = twoFoot && DeliberateTwoStick();
+                if (bothOnPurpose && g_flickLatch != 0) {
+                    static long saidSerial = -1;
+                    const long serial9 = FlipSpeed_TrickSerial();
+                    if (saidSerial != serial9) {
+                        saidSerial = serial9;
+                        TwkLog("[catch] both sticks pushed together -- leaving the two-stick orient "
+                               "%d alone", (int)state);
+                    }
+                }
+                // The scoop hold takes this case away from the narrowing: the state goes through
+                // as the game chose it, and the foot on the scoop side is held off afterwards.
+                const bool scoopCase = g_scoopHold && twoFoot && g_flickLatch != 0 &&
+                                       (uint8_t)g_flickLatch != state && !bothOnPurpose;
+                // mode 3 lets the narrowing run -- the one-foot catch is proven, and is what the
+                // game settles on by itself anyway -- and fixes where the board sits instead
+                const bool scoopHeld = scoopCase && g_scoopHoldMode != 3 && g_scoopHoldMode != 4;
+                if (scoopCase && g_scoopHoldMode == 3 && g_scoopHoldFoot == 0) {
+                    g_scoopHoldFoot = 3 - g_flickLatch;         // release tracking only
+                    g_scoopHoldFrames = g_scoopHoldWrites = 0; g_scoopHoldPeak = 0.0f;
+                    LARGE_INTEGER tq; QueryPerformanceCounter(&tq); g_scoopHoldQpc = tq.QuadPart;
+                    BeginBorrow(g_scoopBorrowFrom, g_flickLatch);
+                }
+                if (scoopCase && g_scoopHoldMode == 4 && g_scoopHoldFoot == 0) {
+                    g_scoopHoldFoot = 3 - g_flickLatch;         // release tracking only
+                    g_scoopHoldFrames = g_scoopHoldWrites = 0; g_scoopHoldPeak = 0.0f;
+                    LARGE_INTEGER tq; QueryPerformanceCounter(&tq); g_scoopHoldQpc = tq.QuadPart;
+                    DumpOrientFootTypes();
+                }
+                if (scoopHeld && g_scoopHoldFoot == 0) {
+                    g_scoopHoldFoot = 3 - g_flickLatch;         // the foot that did NOT flick
+                    g_scoopHoldFrames = g_scoopHoldWrites = 0; g_scoopHoldPeak = 0.0f;
+                    LARGE_INTEGER tq; QueryPerformanceCounter(&tq); g_scoopHoldQpc = tq.QuadPart;
+                    TwkLog("[catch] scoop catch: keeping two-foot orient %d, holding the %s foot "
+                           "off the deck", (int)state, g_scoopHoldFoot == 1 ? "LEFT" : "RIGHT");
+                }
+                if (g_flickLatch != 0 && (uint8_t)g_flickLatch != state && !bothOnPurpose &&
+                    !scoopHeld) {
                     use = (uint8_t)g_flickLatch; InterlockedIncrement(&g_uiFlickFixes);
                     // The pitch/yaw pose ratios were computed by the caller FOR the state it
                     // decided on. Narrowing a TWO-STICK orient (the mid-scoop catch) to one foot
@@ -1685,11 +1978,12 @@ static void hkSetCatchOrient(void* self, uint8_t state, float pitchRatio, float 
                         const long serial = FlipSpeed_TrickSerial();
                         if (loggedSerial != serial && (fabsf(usePitch) > 0.05f || fabsf(useYaw) > 0.05f)) {
                             loggedSerial = serial;
-                            TwkLog("[catch] narrowed two-stick orient %d -> %d: dropped its pose "
-                                   "ratios (pitch %.2f yaw %.2f -> 0)", (int)state, (int)use,
+                            TwkLog("[catch] narrowed two-stick orient %d -> %d: %s pose ratios "
+                                   "(pitch %.2f yaw %.2f)", (int)state, (int)use,
+                                   g_narrowKeepRatios ? "KEPT its" : "dropped its",
                                    usePitch, useYaw);
                         }
-                        usePitch = 0.0f; useYaw = 0.0f;
+                        if (!g_narrowKeepRatios) { usePitch = 0.0f; useYaw = 0.0f; }
                     }
                 }
             }
@@ -1704,13 +1998,25 @@ static void hkSetCatchOrient(void* self, uint8_t state, float pitchRatio, float 
                     g_holdState = use;              // the catch engaged one-footed: hold this pose
                 } else if (g_holdState != 0) {
                     if (use == 5 || use == 10 || use == 11) {
-                        if (!g_holdLoggedState) {
-                            g_holdLoggedState = 1;
-                            TwkLog("[catch] second stick tried to flip the catch into two-stick "
-                                   "state %d -- held on foot %d", (int)use, g_holdState);
+                        // The scoop hold has claimed this catch: the two-foot state MUST reach the
+                        // game, or the hold is working on a pose that never happened. A mid-scoop
+                        // catch engages as state 1 and the 11 follows ~20 ms later, so this block
+                        // had latched on the 1 and was converting the 11 straight back -- the
+                        // round meant to test state 11 never ran it (log: both lines, same ms).
+                        if (DeliberateTwoStick() || g_scoopHoldFoot != 0) {
+                            // Both thumbs arrived together: the player is ASKING for the two-stick
+                            // pose. Treated exactly as a darkslide is -- passed through, and the
+                            // hold dropped, because they have deliberately changed the pose.
+                            g_holdState = 0; g_holdLoggedState = 0;
+                        } else {
+                            if (!g_holdLoggedState) {
+                                g_holdLoggedState = 1;
+                                TwkLog("[catch] second stick tried to flip the catch into two-stick "
+                                       "state %d -- held on foot %d", (int)use, g_holdState);
+                            }
+                            use = (uint8_t)g_holdState;
+                            InterlockedIncrement(&g_uiHoldFixes);
                         }
-                        use = (uint8_t)g_holdState;
-                        InterlockedIncrement(&g_uiHoldFixes);
                     }
                     // The pitch/yaw ratios are NOT pinned here, and must not be. Pinning them was
                     // added speculatively alongside the state-narrowing, and the round after measured
@@ -2095,6 +2401,16 @@ static void TraceFeetCatch(void* skater, void* comp, float ang) {
     static bool  inCatch = false;
     static bool  sawL = false, sawR = false;
     static float peakL = 0.0f, peakR = 0.0f;
+    static int   attL = -1, attR = -1;          // frame each foot's ratio first reached 0.99
+    // Our per-air latches as they stood on the LAST FRAME BEFORE the catch engaged. Sampled on the
+    // engage frame they read 1/1/1/1 on every catch -- the engaging setter call has already
+    // admitted the veto, latched the foot and marked the air by the time this trace sees the state
+    // flip -- so the first cut of this stamp said nothing. A latch that was already set while the
+    // state was still 0 is a STALE one carried in from a previous air, which is the thing worth
+    // seeing; only a pre-engage sample can show it.
+    static int   preVeto = 0, preHold = 0, preAir = 0, preFlick = 0;
+    if (state == 0) { preVeto = g_vetoAdmitted; preHold = g_holdState;
+                      preAir = g_airCaughtFoot; preFlick = g_flickLatch; }
     static float angAt = 0.0f, curAt = 0.0f, tgtAt = 0.0f;
     static int   frames = 0, quiet = 0;
 
@@ -2108,11 +2424,16 @@ static void TraceFeetCatch(void* skater, void* comp, float ang) {
 
     if (state != 0 && !inCatch) {
         inCatch = true; sawL = sawR = false; peakL = peakR = 0.0f; frames = 0; quiet = 0;
+        attL = attR = -1;
         // The engage LATENCY names the pop-time-catch bug directly: ~230 ms is the pop itself
         // (selection -> pop lag), anything close to that = the catch engaged AT the pop (the
         // held-stick ramp bug); a deliberate mid-flip catch reads hundreds of ms later.
-        TwkLog("[feet] catch engaged (state %d) +%d ms after trick '%s'",
-               state, FlipSpeed_MsSinceTrick(), FlipSpeed_LastTrickName());
+        // A hover catch that engages early with a nonzero latch here names a stale carry-over as
+        // the cause; all four should read 0 on a clean air.
+        TwkLog("[feet] catch engaged (state %d) +%d ms after trick '%s'   [stale latches before "
+               "engage: veto=%d hold=%d air=%d flick=%d]",
+               state, FlipSpeed_MsSinceTrick(), FlipSpeed_LastTrickName(),
+               preVeto, preHold, preAir, preFlick);
         angAt = ang;
         curAt = twkF(comp, MC_BOARD_FLIP_CUR);
         tgtAt = twkF(comp, MC_BOARD_FLIP_TARGET);
@@ -2125,6 +2446,30 @@ static void TraceFeetCatch(void* skater, void* comp, float ang) {
     if (!inCatch) return;
 
     ++frames;
+    // The ratio column was dead too -- peakL/peakR were reset and never assigned, so every catch
+    // printed 0.00 whether the foot planted or hovered, and the one question this trace exists to
+    // answer was unanswerable from it. Sampled here every frame from the same fields the scoop-hold
+    // probe reads, plus the frame at which each foot first arrived (a hover is a ratio that never
+    // gets there; a late plant is one that gets there late -- the two want different fixes).
+    if (comp) {
+        const float rl = twkF(comp, MC_LFOOT_CATCH + FCFI_RATIO);
+        const float rr = twkF(comp, MC_RFOOT_CATCH + FCFI_RATIO);
+        if (rl > peakL && rl < 10.0f) peakL = rl;
+        if (rr > peakR && rr < 10.0f) peakR = rr;
+        if (attL < 0 && rl >= 0.99f) attL = frames;
+        if (attR < 0 && rr >= 0.99f) attR = frames;
+    }
+    // The orient column was dead -- sawL/sawR were reset and never set, so every catch since this
+    // trace was written has printed "L orient=no R orient=no <-- NO FOOT CAUGHT", working ones
+    // included. They now read the anim instance's per-foot orient flags, which is what the column
+    // always claimed to be.
+    {
+        void* an2 = FootPlace_AnimInstance();
+        if (an2) {
+            if (twkB(an2, AN_HAS_LFOOT_CATCH)) sawL = true;
+            if (twkB(an2, AN_HAS_RFOOT_CATCH)) sawR = true;
+        }
+    }
     // ---- HOLD THE SECOND FOOT. The foot WITHOUT the catch orient is the one you did not catch
     // with; clearing its catch TYPE to CF_None leaves it nothing to do until the board lands.
     // Written every frame because the movement tick recomputes it (UpdateFeetCatchInfo runs in the
@@ -2149,11 +2494,12 @@ static void TraceFeetCatch(void* skater, void* comp, float ang) {
     // The timers are printed as CAPTURED (start of catch) and as they read NOW. If they are live
     // state the pair differs; if they never move and scaling them changes nothing on screen, the
     // fields are not consulted and holding the second foot needs a different lever entirely.
-    TwkLog("[feet] catch over %d frames: L orient=%s peak ratio %.2f | R orient=%s peak ratio %.2f "
+    TwkLog("[feet] catch over %d frames: L orient=%s peak ratio %.2f (plant f%d) | R orient=%s peak "
+           "ratio %.2f (plant f%d) "
            "| deck %.0f -> %.0f deg | flip angle %.0f -> %.0f (target %.0f)%s"
            " | footType L=%d R=%d -> %d/%d | timers total %.3f force %.3f delay %.3f"
            " -> %.3f/%.3f/%.3f%s",
-           frames, sawL ? "YES" : "no ", peakL, sawR ? "YES" : "no ", peakR,
+           frames, sawL ? "YES" : "no ", peakL, attL, sawR ? "YES" : "no ", peakR, attR,
            angAt, ang, curAt, twkF(comp, MC_BOARD_FLIP_CUR), tgtAt,
            (!sawL && !sawR) ? "   <-- NO FOOT CAUGHT" : "",
            typeLat, typeRat, twkB(comp, MC_LFOOT_CATCH), twkB(comp, MC_RFOOT_CATCH),
@@ -2166,6 +2512,104 @@ static void TraceFeetCatch(void* skater, void* comp, float ang) {
     if (g_secondFootHold)
         TwkLog("[feet]   second-foot hold: cleared on %d frames, rejected %d, already clear %d",
                heldFrames, heldRejected, heldAlready);
+}
+
+// Is a scoop catch live -- armed and not yet released, or within the post-landing tail? This is
+// what pop_probe's manual gate asks before letting Skate_CheckForManuals run.
+bool CatchTweaks_ScoopCatchLive() {
+    if (!g_scoopHold || !g_scoopNoManual) return false;
+    if (g_scoopHoldFoot != 0) return true;
+    LARGE_INTEGER t; QueryPerformanceCounter(&t);
+    return t.QuadPart < g_scoopLiveUntil;
+}
+
+// The hold itself. Runs from foot_place's UpdateFootAnchors detour -- inside the animation update,
+// after the physics pass has recomputed the foot's catch info -- which is the one phase where
+// clearing the type outlasts the game's own write. Released the moment the board is landing, the
+// catch ends, or a safety timeout passes.
+void CatchTweaks_PostPhysHold() {
+    if (!g_scoopHold || g_scoopHoldFoot == 0) return;
+    __try {
+        void* comp = CatchLevel_MovementComponent();
+        void* an   = FootPlace_AnimInstance();
+        void* sk   = CatchTweaks_Skater();
+        LARGE_INTEGER t, fq; QueryPerformanceCounter(&t); QueryPerformanceFrequency(&fq);
+        const int ms = (int)((t.QuadPart - g_scoopHoldQpc) * 1000 / fq.QuadPart);
+        // Release on TOUCHDOWN -- IsGrounded -- not IsLanding. IsLanding is the landing phase and
+        // is already true at the catch, so the first cut released before its first write, eight
+        // times in 50 ms, and the round measured nothing.
+        const bool grounded = an && twkB(an, AN_GROUNDED) != 0;
+        const int  st       = sk ? twkB(sk, SK_CATCH_ORIENT_STATE) : 0;
+        // the state can read 0 for a frame mid-catch; three in a row is the catch really ending
+        g_scoopHoldZeros = (st == 0) ? g_scoopHoldZeros + 1 : 0;
+        if (!comp || grounded || g_scoopHoldZeros >= 3 || ms > 2500) {
+            // The proof is in this line -- but only once it has actually written. A held foot whose
+            // ratio never left zero was held; one whose ratio climbed came down anyway, and the type
+            // byte is not the lever. Zero writes proves nothing either way.
+            TwkLog("[catch] scoop hold released (%s) after %d frames: %d writes, held foot's peak "
+                   "ratio %.2f -- %s", !comp ? "no component" : grounded ? "grounded"
+                   : st == 0 ? "catch ended" : "timeout", g_scoopHoldFrames, g_scoopHoldWrites,
+                   g_scoopHoldPeak,
+                   g_scoopHoldMode == 4 ? "catching foot's type re-decided (judge the foot)"
+                   : g_scoopHoldMode == 3 ? "board offsets borrowed (judge the foot, see arm line)"
+                   : g_scoopHoldMode == 0 ? "probe only, nothing written"
+                   : g_scoopHoldWrites == 0 ? "NEVER RAN (released before the first write)"
+                   : g_scoopHoldPeak < 0.05f ? "HELD" : "NOT HELD by this mode");
+            if (g_nBorrow) EndBorrow();
+            // manuals latch AT the landing: keep the gate up for a beat after touchdown
+            g_scoopLiveUntil = t.QuadPart + fq.QuadPart * 300 / 1000;
+            g_scoopHoldFoot = 0;
+            return;
+        }
+        uint8_t* info = (uint8_t*)comp + (g_scoopHoldFoot == 1 ? MC_LFOOT_CATCH : MC_RFOOT_CATCH);
+        ++g_scoopHoldFrames;
+        if (g_scoopHoldMode == 4) {
+            // Give the CATCHING foot the plain foot type -- the value the game's own Nose/Tail
+            // downgrade would have produced had the pitch ratio pointed the right way. The game
+            // does NOT preserve it on this path: UpdateFeetCatchInfo re-decides Nose every frame
+            // the orient reads state 1 (field: 16-37 writes per catch), so this is written every
+            // frame too, and wins because it lands in the animation phase after the physics-pass
+            // decision. Keyed on the NARROWED foot, not the state byte -- the state flickers
+            // through 3/5/11 mid-catch and a frame the correction sat out is a frame the anim
+            // could sample Nose. Only the wrong SHAPES are touched: BothFeet/Nose/Tail (3/4/5). A
+            // scoop catch is one-footed by definition, so none of those can be right for it.
+            const int catchFoot = 3 - g_scoopHoldFoot;                  // 1 = left, 2 = right
+            uint8_t* catching = (uint8_t*)comp + (catchFoot == 1 ? MC_LFOOT_CATCH : MC_RFOOT_CATCH);
+            const int want = StanceFootType(catchFoot, GoofyXorSwitch());
+            const int cur  = *catching;
+            if (want > 0 && cur != want && (cur == 3 || cur == 4 || cur == 5)) {
+                static int saidFrom = -1;
+                if (g_scoopHoldWrites == 0 || saidFrom != *catching) {
+                    saidFrom = *catching;
+                    TwkLog("[catch] scoop catch: %s foot type %d -> %d (state %d, stance %d, "
+                           "pitch %.2f)", catchFoot == 1 ? "LEFT" : "RIGHT", cur, want, st,
+                           GoofyXorSwitch() ? 1 : 0, sk ? twkF(sk, 0x640) : 0.0f);
+                }
+                *catching = (uint8_t)want; ++g_scoopHoldWrites;
+            }
+        } else if (g_scoopHoldMode == 2) {
+            if (*info != 0) { *info = 0; ++g_scoopHoldWrites; }     // the type byte (does not hold)
+        } else if (g_scoopHoldMode == 1 && an) {
+            uint8_t* fl = (uint8_t*)an + (g_scoopHoldFoot == 1 ? AN_HAS_LFOOT_CATCH
+                                                                : AN_HAS_RFOOT_CATCH);
+            if (*fl != 0) { *fl = 0; ++g_scoopHoldWrites; }          // the per-foot orient flag
+        }
+        const float r = *(float*)(info + FCFI_RATIO);
+        if (r > g_scoopHoldPeak && r < 10.0f) g_scoopHoldPeak = r;
+        // THE PROBE: every candidate field, a few times across the catch, so the round says which
+        // of them actually differs for a foot that stays off versus one that comes down. Read
+        // AFTER the write of the chosen mode, so a field that the game immediately re-asserts
+        // shows up as re-asserted.
+        if (g_scoopHoldFrames == 1 || (g_scoopHoldFrames % 6) == 0) {
+            const uint8_t* li = (const uint8_t*)comp + MC_LFOOT_CATCH;
+            const uint8_t* ri = (const uint8_t*)comp + MC_RFOOT_CATCH;
+            TwkLog("[catch]   hold f%d mode %d st=%d | hasL=%d hasR=%d | typeL=%d typeR=%d | "
+                   "ratioL=%.2f ratioR=%.2f | man=%d", g_scoopHoldFrames, g_scoopHoldMode, st,
+                   an ? twkB(an, AN_HAS_LFOOT_CATCH) : -1, an ? twkB(an, AN_HAS_RFOOT_CATCH) : -1,
+                   *li, *ri, *(const float*)(li + FCFI_RATIO), *(const float*)(ri + FCFI_RATIO),
+                   PopProbe_SkaterManualBits());
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { g_scoopHold = 0; g_scoopHoldFoot = 0; }
 }
 
 void CatchTweaks_PumpFrame() {
@@ -2196,9 +2640,10 @@ void CatchTweaks_PumpFrame() {
     if (g_flickFresh > 0 && --g_flickFresh == 0) g_flickPhys = 0;
     // Belt-and-braces latch release: the state==0 call is the normal end of a catch, but if the
     // setter simply STOPS being called instead, the latch would otherwise persist into the next one.
-    if ((g_flickLatch != 0 || g_holdState != 0) && ++g_latchIdle > 10) {
+    if ((g_flickLatch != 0 || g_holdState != 0 || g_vetoAdmitted != 0) && ++g_latchIdle > 10) {
         g_flickLatch = 0; g_latchIdle = 0;
         g_holdState = 0; g_holdLoggedState = 0;
+        g_vetoAdmitted = 0;                                 // same lifetime as the other two
         if (g_airCaughtFoot != 0) g_airCatchZeros = 99;   // setter went quiet = the catch ended
     }
     // THE "was this air a trick" LATCH IS MAINTAINED HERE, EVERY FRAME -- not only when
@@ -2214,6 +2659,16 @@ void CatchTweaks_PumpFrame() {
             else if (twkB(an, AN_GROUNDED) > 0) {
                 g_airWasTrick = 0;
                 g_airCaughtFoot = 0; g_airCatchZeros = 0; g_airSwallowLogged = 0;
+                // THE VETO ADMISSION TOO. It was cleared only by the setter's state-0 call, and a
+                // stick held through the landing keeps the orient state alive (the game's own
+                // post-landing hold-to-orient), so the setter never sent a 0 and the admission
+                // survived into the NEXT air. With it stale, the fresh-flick veto stood down and a
+                // held stick engaged the catch at the pop -- the pose with a full flip still owed,
+                // i.e. the catch animation with the foot hovering above the deck (field: user
+                // screenshot), persisting trick after trick until some later catch finally sent a
+                // 0. That is "stuck for a bit, then randomly fine". An admission is a fact about ONE
+                // catch; the ground ends it.
+                g_vetoAdmitted = 0;
             }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
@@ -2463,6 +2918,30 @@ void CatchTweaks_PumpFrame() {
 
         // ---- unstick a wedged catch pose (base-game bug; see the knob comment) ------------------
         if (g_unstick) {
+            // A DECK ON ITS EDGE IS NOT A WEDGE. In a primo the feet legitimately hold catch types
+            // while grounded, and the orient state reads 0 -- so the darkslide exemption, which
+            // tests the STATE, does not cover it. The pose looked stuck, and a second in this
+            // re-seated both feet onto the griptape and twisted them (field: "the feet look correct
+            // on the side of the board, after a few seconds they connect to the grip tape").
+            // This is the same mistake the grind round made, one level down: the types are a
+            // legitimate pose there too. The discriminator is the BOARD, not the feet -- a catch
+            // wedged after a landing has the deck flat, a primo has it on its edge -- and it is
+            // measured from the flipper's world quat, exactly as the darkslide zone is.
+            bool onEdge = false;
+            __try {
+                void* board7   = twkP(skater, SK_BOARD);
+                void* flipper7 = board7 ? twkP(board7, BOARD_FLIPPER) : nullptr;
+                if (flipper7) {
+                    const float qx7 = twkF(flipper7, COMP_CTW_QUAT);
+                    const float qy7 = twkF(flipper7, COMP_CTW_QUAT + 4);
+                    if (qx7 > -100000.0f && qy7 > -100000.0f) {
+                        float upZ7 = 1.0f - 2.0f * (qx7 * qx7 + qy7 * qy7);
+                        if (upZ7 < -1.0f) upZ7 = -1.0f; else if (upZ7 > 1.0f) upZ7 = 1.0f;
+                        // neither grip-up nor grip-down: the deck is standing on its edge
+                        onEdge = fabsf(upZ7) < g_unstickFlat;
+                    }
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) { onEdge = false; }  // unreadable: as before
             static double susSince = 0.0, lastFix = 0.0;
             void* comp = CatchLevel_MovementComponent();
             const int st  = twkB(skater, SK_CATCH_ORIENT_STATE);
@@ -2476,7 +2955,7 @@ void CatchTweaks_PumpFrame() {
             // grinds hold one deliberately (field round: firing on state alone re-seated the feet
             // mid-grind, the reported "feet move for a second in a grind"). Clean catches end with
             // both types back at 0, so types stuck in catch values are the broken pose.
-            const bool suspicious = FootPlace_Grounded() && !darkslide && catchTypes;
+            const bool suspicious = FootPlace_Grounded() && !darkslide && !onEdge && catchTypes;
             const double now = DsNow();
             if (!suspicious) susSince = 0.0;
             else if (susSince <= 0.0) susSince = now;

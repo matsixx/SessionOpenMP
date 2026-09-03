@@ -418,9 +418,22 @@ static uint64_t  g_browseOpenKey = 0, g_refreshKey = 0;
 static uint64_t  g_lobbyRowKeys[kMaxLobbyRows];
 static int       g_lobbyRowCount = 0;                         // rows built on the LAST page build
 static int       g_lobbyRowIdx[kMaxLobbyRows];                // row -> transport browse index
-static int       g_lastBrowseState = -99;                     // to notice "results arrived"
 static void*     g_lastPage = nullptr;                        // the pause page, as of the last build
-static int       g_browsePolls = 0;                           // rebuilds still owed to a live search
+// THE BROWSER FOLLOWS THE SEARCH LIVE, the way the multiplayer page follows the session: it re-renders
+// whenever what it DISPLAYS changes, for as long as it is on screen. The previous design owed the
+// page a fixed number of rebuilds and treated any state but "searching" as the last one it owed. On
+// a cold open the state is IDLE -- the search is deferred until Epic sign-in completes -- so the poll
+// recorded "idle", spent its budget, and stopped watching before the search had begun. The page then
+// said "Starting up..." until Refresh, which only worked because by then sign-in was done.
+static bool      g_browseLive = false;                        // watching the browse page
+static uint32_t  g_lastBrowseSig = 0xffffffffu;               // last search state the page showed
+// Trace the browse page's life in the log: what each build chose to show, each rebuild the poll
+// queued and why. Off for release now that the browser is confirmed to follow a search on its
+// own (field log: open -> signing in -> searching -> row, 2.1 s, hands off). The one-shot "poll
+// idle" line below is NOT behind this flag: it only speaks when the poll is armed and blocked,
+// which is the exact condition that hid this bug, and it costs nothing when things work.
+static bool      g_browseTrace = false;
+static uint8_t   g_browseIdleReported = 0;                    // per arm: the idle reason already logged
 static uint32_t  g_lastSig = 0xffffffffu;                     // last session state the page showed
 static volatile LONG g_pendingJoinIdx = -1;
 static uint64_t  g_guestRootKeys[kMaxGuestPages];
@@ -677,9 +690,8 @@ static void buildRows() {
         // on one having built.
         static const char* kDropOpts[3] = { "Off", "Live edits only", "Share one set" };
         if (!buildOptionRow(g_dropRow, "OmpDropMode", "Dropped objects",
-                            "Whether the rails and ramps you place with the object dropper are shared. "
-                            "Share one set shows everybody the same objects: your own are hidden for "
-                            "the session and come back when you leave -- nothing is ever deleted.",
+                            "Share the rails and ramps you drop. One set shows everyone "
+                            "the same objects; yours come back when you leave.",
                             kDropOpts, 3, &g_dropKey, g_dropOpts))
             g_dropKey = 0;
         static const char* kModeOpts[3] = { "Off", "Off board only", "Always" };
@@ -739,9 +751,8 @@ static void buildRows() {
         // The length row fails independently too: losing it must not cost the page its other rows.
         if (g_replayPageKey &&
             buildRow(g_syncLenRow, "OmpSyncLen", "Synced replay length",
-                     "How far back Sync Replay fetches, newest first. Shorter is a much faster "
-                     "sync -- 15 s covers a trick, where the whole history is mostly footage "
-                     "nobody scrubs back to. Your setting decides your own wait, not theirs.",
+                     "How far back Sync Replay fetches. Shorter syncs much faster; "
+                     "15 s covers a trick. Sets your wait, not theirs.",
                      &g_syncLenKey)) {
             bool okAll = true;
             for (int i = 0; i < kSyncLenCount && okAll; i++) {
@@ -885,6 +896,41 @@ static const char* mpTitle() {
 }
 // One number that changes whenever anything the page displays changes. Cheaper and more honest than
 // comparing the rendered strings: if this is equal, nothing on screen could differ.
+// What the browse page shows that can change without the player touching anything: the search
+// state, the count of results, and how far along the wire is (which decides the footer while the
+// list is empty). A field that is rendered but not signed is a field that goes stale silently --
+// the same rule sessionSig follows for the multiplayer page.
+// IS THE PAGE WE WOULD REFRESH STILL ON SCREEN? The pump touches a page pointer handed over on an
+// earlier frame, so it needs a real answer. The game's IsPauseMenuDisplayed was used for this and is
+// ALWAYS false here: it tests the controller's _activePauseMenuPageContainer, which the game leaves
+// null when the world is not paused -- and this mod disables pausing. Field-logged with the browser
+// visibly open: "browse poll idle: PauseMenuOpen() is false", on every frame, every Refresh. So the
+// browse page never re-rendered on its own, and the multiplayer page's "live" refresh never ran
+// either; its safety comment was true only in the sense that a poll which never fires cannot crash.
+// The page is a UWidget, and its Slate handle is valid precisely while it is realised: released when
+// the menu tears down, which is the "long gone" case that had to be caught. Hidden/Collapsed counts
+// as off screen too. Any doubt -- unreadable, no handle, no controller -- answers "no".
+static bool pageOnScreen(void* page) {
+    if (!page) return false;
+    __try {
+        const uint8_t* p = (const uint8_t*)page;
+        const uint8_t vis = p[off::kWidgetVisibility];
+        if (vis == 1 || vis == 2) return false;             // ESlateVisibility::Collapsed / Hidden
+        void* obj = *(void* const*)(p + off::kWidgetMyWidget);
+        const uint8_t* ctl = *(const uint8_t* const*)(p + off::kWidgetMyWidget + 8);
+        if (!obj || !ctl) return false;
+        return *(const int32_t*)(ctl + off::kRefCtlSharedCount) > 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+bool PauseMenu_IsShown() { return g_lastPage && pageOnScreen(g_lastPage); }
+
+static uint32_t browseSig() {
+    const int st = omp::BrowseStatus();
+    const int n  = (st == 2) ? omp::BrowseCount() : 0;
+    return (uint32_t)((st + 2) & 7) | ((uint32_t)(g_state.tpState & 3) << 3)
+         | ((uint32_t)(n & 0xff) << 5);
+}
+
 static uint32_t sessionSig() {
     const MpUiState& s = g_state;
     // The join code is part of what the page DISPLAYS, so it has to be part of what decides a
@@ -1101,7 +1147,7 @@ static const TArrayHdr* chooseArray(void* page, const TArrayHdr* items, TArrayHd
     g_lastPage = page;                                   // only ever used by the bounded browse poll
     // A rebuild of the root page that this code did not ask for means the game re-activated it (the
     // menu was opened, or navigation returned here) -- so the fake sub-page is no longer on screen.
-    if (!g_selfRefresh && g_page != PG_ROOT) { g_page = PG_ROOT; g_browsePolls = 0; }
+    if (!g_selfRefresh && g_page != PG_ROOT) { g_page = PG_ROOT; g_browseLive = false; }
     if (!PauseMenu_Tuning().injectRow) return items;
 
     // Capture the stock row template BEFORE we build anything, so even the very first injected row
@@ -1260,10 +1306,38 @@ static const TArrayHdr* chooseArray(void* page, const TArrayHdr* items, TArrayHd
         add(g_banRow, true);
         add(g_mpRows + (size_t)(kMpRowCount - 1) * off::kItemSize, true);   // Back
     } else if (g_page == PG_BROWSE) {
-        add(g_refreshRow, true);
         g_lobbyRowCount = 0;
         const int st = omp::BrowseStatus();
         const int n  = (st == 2) ? omp::BrowseCount() : 0;
+        // The footer is decided and stamped BEFORE the row is copied into the page. add() takes a
+        // copy, so anything written to g_refreshRow after it is on screen one build late -- which is
+        // how a freshly opened browser showed the row's template text, and a Refresh showed the text
+        // computed on the build before it.
+        if (n == 0) {
+            // Search state first (it is the later, more specific fact), then the wire underneath it.
+            // The search is deferred until sign-in completes, so "idle" here almost always means
+            // "signing in" -- and a sign-in that FAILED must say so, or it reads as still starting.
+            const char* why = (st == 1) ? "Searching for sessions..."
+                            : (st == -1) ? "Search failed - press Refresh to try again"
+                            : (st == 2) ? "No sessions found - press Refresh, or Host online yourself"
+                            : (g_state.tpState == 1) ? "Signing in to Epic Online Services..."
+                            : (g_state.tpState == 3) ? "Could not reach Epic Online Services - press Refresh to retry"
+                            : (g_state.tpState == 2) ? "Searching for sessions..."
+                            : "Starting up...";
+            setRowStatus(g_refreshRow, why);
+            if (omp::debug::Get().menuPages || g_browseTrace) {
+                char m[200];
+                snprintf(m, sizeof(m), "[menu] browse build: st=%d tp=%d n=%d -> footer '%s'",
+                         st, (int)g_state.tpState, n, why);
+                log(m);
+            }
+        } else if (omp::debug::Get().menuPages || g_browseTrace) {
+            char m[120];
+            snprintf(m, sizeof(m), "[menu] browse build: st=%d tp=%d n=%d -> %d row(s)",
+                     st, (int)g_state.tpState, n, n);
+            log(m);
+        }
+        add(g_refreshRow, true);
         for (int i = 0; i < n && g_lobbyRowCount < kMaxLobbyRows; i++) {
             omp::LobbyInfo L{};
             if (!omp::BrowseAt(i, &L)) continue;
@@ -1303,16 +1377,6 @@ static const TArrayHdr* chooseArray(void* page, const TArrayHdr* items, TArrayHd
             g_lobbyRowIdx[r] = i;
             g_lobbyRowCount++;
             add(row, true);
-        }
-        // Nothing to show yet: say WHICH nothing. A browser that is merely empty while it is still
-        // signing in reads as broken.
-        if (n == 0) {
-            const char* why = (st == 1) ? "Searching for sessions..."
-                            : (st == -1) ? "Search failed - press Refresh to try again"
-                            : (g_state.tpState == 1) ? "Signing in to Epic Online Services..."
-                            : (st == 2) ? "No sessions found - press Refresh, or Host online yourself"
-                            : "Starting up...";
-            setRowStatus(g_refreshRow, why);
         }
         add(g_mpRows + (size_t)(kMpRowCount - 1) * off::kItemSize, true);   // the shared "Back" row
     } else {
@@ -1514,9 +1578,18 @@ static void hkCreateItems(void* page, void* itemsArray, bool flag) {
 // BEFORE the engine's, and Slate (hence NativeTick -> OnConfirmAction) runs inside the engine's, so
 // the confirm always completes on intact widgets and the rebuild happens before anything touches them
 // again. The general rule: do not mutate a structure the caller above you is still walking.
-static void refreshPage(void* page) {
+static void refreshPage(void* page, bool keepSel) {
     const Syms& S = Get();
     if (!S.MenuRefreshItems) return;
+    // Where the cursor was, read BEFORE the rebuild replaces the list. Only honoured for a live
+    // re-render of the same page; see queueSwap. The rebuilt page may have fewer rows (a peer left,
+    // a lobby closed), so it is clamped against the widgets the page actually ends up with -- the
+    // one count that is true after MenuRefreshItems, whatever chooseArray decided.
+    int32_t prevSel = -1;
+    if (keepSel) {
+        __try { prevSel = *(int32_t*)((uint8_t*)page + off::kPageSelectedIndex); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { prevSel = -1; }
+    }
     g_selfRefresh = true;
     // Everything from here to the end of the stamp is the mod rebuilding the page. Any value-change
     // event that arrives in that window -- the mod's own OR the engine's DeserializePage restoring a
@@ -1530,7 +1603,13 @@ static void refreshPage(void* page) {
         // SetSelectedIndex's deselect-the-old-row branch is skipped, then select the top row properly
         // -- through the game's own setter, so the footer/description broadcast happens as normal.
         *(int32_t*)((uint8_t*)page + off::kPageSelectedIndex) = -1;
-        if (S.MenuSetSelIndex) S.MenuSetSelIndex(page, 0, false);
+        int32_t sel = 0;
+        if (prevSel > 0) {
+            const TArrayHdr* pw = (const TArrayHdr*)((uint8_t*)page + off::kPageItemWidgets);
+            const int32_t built = (pw && pw->data) ? pw->num : 0;
+            sel = (prevSel < built) ? prevSel : (built > 0 ? built - 1 : 0);
+        }
+        if (S.MenuSetSelIndex) S.MenuSetSelIndex(page, sel, false);
         // ...and only NOW are the row values safe to write: MenuRefreshItems has finished, which
         // means DeserializePage (which drives these same setters) is behind us.
         stampValues(page);
@@ -1601,9 +1680,14 @@ static void setTitle(void* page, const char* text) {
 }
 
 // Queue a swap/title change for the next frame instead of doing it under the engine's feet.
-static void queueSwap(void* page, const char* title, bool rootTitle, bool refresh) {
+// `keepSel`: this is the SAME page re-rendering because something it shows changed (a peer joined,
+// a search finished), not a step to another page -- so the row the player is on stays the row they
+// are on. Navigation leaves it false and lands on the top row, as it always has.
+static bool g_pendingKeepSel = false;
+static void queueSwap(void* page, const char* title, bool rootTitle, bool refresh, bool keepSel = false) {
     g_pendingPage      = page;
     g_pendingRefresh   = refresh;
+    g_pendingKeepSel   = keepSel;
     g_pendingTitleRoot = rootTitle;
     if (title) strncpy_s(g_pendingTitle, title, _TRUNCATE); else g_pendingTitle[0] = 0;
 }
@@ -1657,26 +1741,48 @@ void PauseMenu_Pump() {
     // heading, footer status AND the roster panel, so "connecting..." actually resolves and the other
     // skater is visibly seen to arrive. It is safe because `IsPauseMenuDisplayed` gates it: the widget
     // cannot be gone while the game says its menu is on screen.
-    if (g_page == PG_MP && !g_pendingPage && g_lastPage && PauseMenuOpen()) {
+    if (g_page == PG_MP && !g_pendingPage && g_lastPage && pageOnScreen(g_lastPage)) {
         const uint32_t sig = sessionSig();
         if (sig != g_lastSig) {
             g_lastSig = sig;
-            queueSwap(g_lastPage, mpTitle(), false, true);
+            queueSwap(g_lastPage, mpTitle(), false, true, /*keepSel*/ true);
         }
     }
-    if (g_page == PG_BROWSE && !g_pendingPage && g_lastPage && g_browsePolls > 0) {
-        const int st = omp::BrowseStatus();
-        if (st != g_lastBrowseState) {
-            g_lastBrowseState = st;
-            if (st != 1) g_browsePolls = 0;             // terminal: this is the last rebuild we owe
-            else         g_browsePolls--;
-            queueSwap(g_lastPage, "Online sessions", false, true);
+    if (g_page == PG_BROWSE && g_browseLive) {
+        // Which condition, if any, is keeping the poll from running? Reported once per arm so the
+        // log names the blocker without repeating it every frame.
+        uint8_t idle = 0;
+        if (g_pendingPage)        idle = 1;             // a swap is already queued: normal, transient
+        else if (!g_lastPage)     idle = 2;             // no page pointer from any build yet
+        else if (!pageOnScreen(g_lastPage)) idle = 3;   // the page's Slate widget is gone or hidden
+        if (idle) {
+            if (idle != 1 && g_browseIdleReported != idle) {
+                g_browseIdleReported = idle;
+                char m[160];
+                snprintf(m, sizeof(m), "[menu] browse poll idle: %s", idle == 2 ? "no page pointer yet"
+                                                                    : "page is not on screen");
+                log(m);
+            }
+        } else {
+            const uint32_t sig = browseSig();
+            if (sig != g_lastBrowseSig) {
+                g_lastBrowseSig = sig;
+                if (g_browseTrace) {
+                    char m[160];
+                    snprintf(m, sizeof(m), "[menu] browse poll: st=%d tp=%d n=%d -> rebuild",
+                             omp::BrowseStatus(), (int)g_state.tpState,
+                             omp::BrowseStatus() == 2 ? omp::BrowseCount() : 0);
+                    log(m);
+                }
+                queueSwap(g_lastPage, "Online sessions", false, true, /*keepSel*/ true);
+            }
         }
     }
     if (!g_pendingPage) return;
     void* page = g_pendingPage;
     g_pendingPage = nullptr;                    // one shot, whatever happens below
-    if (g_pendingRefresh) refreshPage(page);
+    if (g_pendingRefresh) refreshPage(page, g_pendingKeepSel);
+    g_pendingKeepSel = false;
     if (g_pendingTitleRoot)   setTitle(page, nullptr);
     else if (g_pendingTitle[0]) setTitle(page, g_pendingTitle);
     g_pendingRefresh = false; g_pendingTitle[0] = 0; g_pendingTitleRoot = false;
@@ -1727,7 +1833,7 @@ static void playCancelSound(void* container) {
 // behaviour happen -- for the button that means closing the menu, exactly as it does today.
 static bool navigateBack(void* page) {
     if (g_page == PG_ROOT || !page) return false;
-    g_browsePolls = 0;
+    g_browseLive = false;
     if (g_page >= PG_GUEST0) {
         const int gi = g_page - PG_GUEST0;
         const int up = (gi < g_nGuests) ? g_guests[gi].parent : -1;
@@ -1804,8 +1910,9 @@ static bool handleConfirm(void* page, void* params) {
     if (g_page == PG_MP && itemKey == g_browseOpenKey) {
         g_page = PG_BROWSE;
         post(OVA_BROWSE);                       // MpPump brings EOS up if needed, then searches
-        g_lastBrowseState = -99;                // force the next poll to notice whatever happens
-        g_browsePolls = 8;                      // bounded: sign-in -> searching -> results
+        g_browseLive = true;
+        g_browseIdleReported = 0;
+        g_lastBrowseSig = 0xffffffffu;          // unequal to anything: the first poll re-renders
         queueSwap(page, "Online sessions", false, true);
         log("[menu] pause: opened the lobby browser");
         return true;
@@ -1867,14 +1974,15 @@ static bool handleConfirm(void* page, void* params) {
     if (g_page == PG_BROWSE) {
         if (itemKey == g_refreshKey) {
             post(OVA_BROWSE);
-            g_lastBrowseState = -99;
-            g_browsePolls = 8;
+            g_browseLive = true;
+            g_browseIdleReported = 0;
+            g_lastBrowseSig = 0xffffffffu;
             queueSwap(page, "Online sessions", false, true);
             return true;
         }
         for (int r = 0; r < g_lobbyRowCount; r++) {
             if (itemKey != g_lobbyRowKeys[r]) continue;
-            g_browsePolls = 0;                  // leaving the list; stop rebuilding it
+            g_browseLive = false;               // leaving the list; stop rebuilding it
             InterlockedExchange(&g_pendingJoinIdx, g_lobbyRowIdx[r]);
             post(OVA_JOIN_INDEX);
             // HAND OFF TO THE MULTIPLAYER PAGE rather than sitting on the browser saying "Joining...".

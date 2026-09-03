@@ -46,6 +46,14 @@ float CatchTweaks_RecentMaxZ();
 bool CatchTweaks_TravelVel(float* vx, float* vy, float* vz);
 // Per-frame board-rotation watch (the flip trace). GAME THREAD.
 void CatchTweaks_PumpFrame();
+// The scoop-foot hold's per-frame write. Called from foot_place's UpdateFootAnchors detour -- the
+// animation-phase point after the physics pass -- because that is the only phase where clearing a
+// foot's catch type outlasts the game's own recompute. GAME THREAD, our skater only.
+void CatchTweaks_PostPhysHold();
+// True while a mid-scoop catch is live (armed, or within a short tail after touchdown). pop_probe's
+// manual gate skips Skate_CheckForManuals while this holds: the held scoop stick is also the manual
+// input, and it must not read as a manual request.
+bool CatchTweaks_ScoopCatchLive();
 // A registered catch ends the flip at griptape-up instead of letting it spin another revolution.
 bool CatchTweaks_StopsFlip();  void CatchTweaks_SetStopsFlip(bool on);
 bool CatchTweaks_AnyRevolution();  void CatchTweaks_SetAnyRevolution(bool on);

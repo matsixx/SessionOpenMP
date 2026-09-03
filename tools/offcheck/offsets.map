@@ -21,6 +21,9 @@ kInputCtlCamera                AReplayInputController::_replayCamera
 kReplayCamLookAt               AReplayCamera::_lookAtTarget
 kSoundConcMaxCount             FSoundConcurrencySettings::MaxCount
 kSoundBaseDuration             USoundBase::Duration
+kWidgetMyWidget                UWidget::MyWidget
+kWidgetVisibility              UWidget::Visibility
+kRefCtlSharedCount             SharedPointerInternals::FReferenceControllerBase::SharedReferenceCount
 kCompQuat                      USceneComponent::ComponentToWorld
 kMeshSkeletalMesh              USkinnedMeshComponent::SkeletalMesh
 kSkaterTrickDef                ASkaterCharacterBase::_currentFlipTrickDef

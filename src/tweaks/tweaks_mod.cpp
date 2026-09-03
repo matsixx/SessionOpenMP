@@ -56,7 +56,7 @@
 #include "ue4ss_abi.h"
 #include "ui/menu_ext.h"
 
-#define TWEAKS_VERSION "3.19.207"
+#define TWEAKS_VERSION "3.19.222"
 #define TWK_WIDEN(x) STR(x)   // STR() prepends L before the macro expands; expand first
 
 // ------------------------------------------------------------------ log (own file, fresh per launch)
@@ -563,8 +563,8 @@ static const OmpPageItem2 kTwkPhysItems[] = {
 };
 static const OmpPageItem2 kTwkPopItems[] = {
     { OMP_ITEM_TOGGLE, kTwkPop,       "Pop control scheme",
-      "Crouch as deep as you like on one stick and pop with the other: how deep you are is how "
-      "high you pop. Mirrored for nollie, switch and fakie" },
+      "Crouch on one stick and pop with the other: how deep you "
+      "go is how high you pop. Mirrored for nollie and switch." },
     { OMP_ITEM_SLIDER, kTwkPopWin,    "  Trick window (ms)",
       "How long after the pop your trick flick may arrive. Longer is more forgiving; running out "
       "pops a plain ollie",

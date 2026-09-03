@@ -321,7 +321,11 @@ static void MpPump() {
     {
         static bool enterHeld = false;
         const bool edge = keyEdge(VK_RETURN, &enterHeld);
-        if (edge && g_armed && !Chat_IsOpen() && !Overlay_Visible() && !game::PauseMenuOpen())
+        // game::PauseMenuOpen() is always false in this mod (world pausing is off, and it tests the
+        // paused-menu container) -- so PauseMenu_IsShown, read off the page widget itself, is what
+        // actually keeps a hotkey from firing underneath an open menu.
+        if (edge && g_armed && !Chat_IsOpen() && !Overlay_Visible() && !game::PauseMenuOpen() &&
+            !PauseMenu_IsShown())
             Chat_SetOpen(true);
     }
     // Anything the player typed goes out RELIABLE to every live peer, and is echoed locally at the

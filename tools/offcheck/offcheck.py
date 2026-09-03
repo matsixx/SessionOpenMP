@@ -163,7 +163,10 @@ class Pdb(object):
         holds those as one offset from the skater. Without a path they could only be recorded as
         unverifiable, which is exactly the wrong answer for a field that moves whenever either the
         outer class OR the inner struct gains a member."""
-        cls, _, rest = path.partition('::')
+        # LAST '::' on purpose: a class may itself be namespaced (SharedPointerInternals::
+        # FReferenceControllerBase), and the member never contains '::'. Splitting on the first
+        # one reported such a class as GONE while its offset was right.
+        cls, _, rest = path.rpartition('::')
         if not rest:
             return None
         parts = rest.split('.')
@@ -393,7 +396,7 @@ def check_one(pdb, name, val, exp):
         if got != val:
             return False, "SIZE CHANGED  sizeof(%s) is 0x%x, the source says 0x%x" % (cls, got, val)
         return True, None
-    cls = exp.partition('::')[0]
+    cls = exp.rpartition('::')[0]           # last '::' -- see resolve(): the class may be namespaced
     if not pdb.exists(cls):
         return False, "CLASS GONE    %s is not in this PDB" % cls
     if not pdb.layout(cls):

@@ -56,6 +56,8 @@ bool PopProbe_PhysSticks(float* lx, float* ly, float* rx, float* ry);
 // The pop scheme's live crouch depth, 0..1 (0 when not crouched or the scheme is off).
 // Read-only, for modules that shape the body to the load (body_feel).
 float PopProbe_CrouchDepth01();
+// The skater's manual latch bits (masked), -1 if unreadable. For other modules' probes.
+int   PopProbe_SkaterManualBits();
 // The pause-menu page's accessors (GAME THREAD, menu_ext contract): plain int reads/writes,
 // every setter marks the ini dirty. "Scheme" = pad-level injection mode 3, the shipped scheme.
 bool  PopProbe_SchemeEnabled();      void PopProbe_SetSchemeEnabled(bool on);

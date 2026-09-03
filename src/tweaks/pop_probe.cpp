@@ -388,7 +388,27 @@ static void hkSetTrick(void* sk, void* def, float a3, float a4,
         ((SetTrickFn)g_origSetTrick)(sk, def, a3, a4, a5, a6, a7, a8);
 }
 
+// The skater's manual latch, for other modules' probes. -1 = unreadable.
+int PopProbe_SkaterManualBits() {
+    __try {
+        void* sk = CatchTweaks_Skater();
+        return sk ? (int)(twkB(sk, SK_MANUAL_BITS) & MANUAL_BITS_MASK) : -1;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return -1; }
+}
+
 static void hkCheckManuals(void* pc, float dt) {
+    // A MID-SCOOP CATCH IS NOT A MANUAL REQUEST. The scoop stick is still held through the catch
+    // and Session reads a held stick as a manual, so the game readies a nose manual -- body shifted,
+    // catching foot on the nose (field). While catch_tweaks says a scoop catch is live, the manual
+    // decision does not run at all, the same refusal the scheme's own gate makes below. Independent
+    // of the scheme: this is a catch feature's fix, and it must hold with the scheme off.
+    if (CatchTweaks_ScoopCatchLive()) {
+        static long skips = 0;
+        const long n = InterlockedIncrement(&skips);
+        if (n == 1 || (n % 40) == 0)
+            TwkLog("[pop] manual check skipped for a scoop catch (%ld so far)", n);
+        return;
+    }
     // The verdict must be FRESH -- a stale forbid (pump stopped: pause, load) falls back to
     // vanilla rather than sticking. Same 150 ms rule as the pad hook's stamp.
     if (g_forbidManual && g_manualGate) {

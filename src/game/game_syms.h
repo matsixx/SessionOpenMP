@@ -701,6 +701,15 @@ namespace off {
     // ---- the pause menu. Every offset below is PDB-exact (pdbmembers) and each was re-confirmed
     // against the code that uses it, because a wrong one here is silent.
     // UMenuPageContainer (the widget that OWNS the page and routes the gamepad):
+    // IS THIS WIDGET REALISED ON SCREEN? UWidget::MyWidget is the TWeakPtr<SWidget> to the page's
+    // Slate widget: {SWidget* Object; FReferenceController* ctl}, valid while ctl->SharedReferenceCount
+    // is above zero -- and the menu tearing down is exactly what releases it. This is the liveness
+    // signal the frame-pump refresh needs. The game's own IsPauseMenuDisplayed cannot serve: it tests
+    // ASessionPlayerController::_activePauseMenuPageContainer (+0x710), which stays NULL in this mod
+    // because world pausing is disabled (field-measured: false with the menu visibly open).
+    constexpr int kWidgetMyWidget     = 0xd8;    // UWidget::MyWidget (TWeakPtr<SWidget>, 16 B)
+    constexpr int kWidgetVisibility   = 0xc3;    // UWidget::Visibility (ESlateVisibility, 1 B)
+    constexpr int kRefCtlSharedCount  = 0x08;    // SharedPointerInternals::FReferenceControllerBase::SharedReferenceCount
     constexpr int kContainerPage      = 0x2a0;   // _menuPage (UMenuPage*) -- the page the container is
                                                  // showing, which is the page a back action applies to
     // UMenuPage:
