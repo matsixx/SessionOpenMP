@@ -111,8 +111,8 @@ static int g_ccd     = 1;
 // BodyFeelCollisionDump: one-shot at the first bail, BEFORE CCD is touched -- every body's CCD flag
 // and solver iteration counts (live and the asset's defaults), every joint's disable-collision flag,
 // and the physics asset's forbidden-pair table, all by bone name. Says which pairs can never touch
-// (a joint's flag, or the table) versus which merely tunnel.
-static int g_ccdDump = 1;
+// (a joint's flag, or the table) versus which merely tunnel. Opt-in, like every other diagnostic.
+static int g_ccdDump = 0;
 // BodyFeelArmTorso: let the UPPER ARMS collide with the torso. The rig's physics asset forbids both
 // upper arms against the pelvis and all three spine bodies (and against each other) in its
 // collision-disable table -- dumped from the field rig, 87 pairs -- so only the forearm ever stops
@@ -146,9 +146,11 @@ static int g_armTorsoGrab = 0;
 // cannot. The clutch's pull then takes the straight line THROUGH the torso, and the arm-torso
 // collision only decides whether that line is blocked (arm stops short) or not (arm passes through).
 // Written into the constraint's live profile and pushed to the physics joint; restored with the
-// drives when the ragdoll ends. 0 = the rig's own value.
-static float g_shoulderSwing = 90.0f;
-static float g_shoulderTwist = 45.0f;
+// drives when the ragdoll ends. 0 = the rig's own value. 40/20 = the field's own tuning: the rig's
+// 25/10 cannot reach across the body, and the 90/45 this shipped with first was loose enough to read
+// as floppy arms in the tumble.
+static float g_shoulderSwing = 40.0f;
+static float g_shoulderTwist = 20.0f;
 // MUSCLE TONE. This is the piece the research says everyone else has and we did not: an
 // active ragdoll drives EVERY joint toward a pose all the time, and behaviours bias a few
 // joints on top of that baseline. Only three joint groups were being driven here and every
@@ -194,13 +196,13 @@ void BodyFeel_ReadConfig(const char* buf) {
     g_log    = TwkIniInt(buf, "BodyFeelLog", 0);
     g_bail   = TwkIniInt(buf, "BodyFeelBrace", 1);
     g_ccd     = TwkIniInt(buf, "BodyFeelCCD", 1);
-    g_ccdDump = TwkIniInt(buf, "BodyFeelCollisionDump", 1);
+    g_ccdDump = TwkIniInt(buf, "BodyFeelCollisionDump", 0);
     g_armTorso = TwkIniInt(buf, "BodyFeelArmTorso", 1);
     if (g_armTorso < 0) g_armTorso = 0;
     if (g_armTorso > 3) g_armTorso = 3;
     g_armTorsoGrab = TwkIniInt(buf, "BodyFeelArmTorsoGrabFree", 0);
-    g_shoulderSwing = (float)TwkIniInt(buf, "BodyFeelShoulderSwingDeg", 90);
-    g_shoulderTwist = (float)TwkIniInt(buf, "BodyFeelShoulderTwistDeg", 45);
+    g_shoulderSwing = (float)TwkIniInt(buf, "BodyFeelShoulderSwingDeg", 40);
+    g_shoulderTwist = (float)TwkIniInt(buf, "BodyFeelShoulderTwistDeg", 20);
     if (g_shoulderSwing < 0.0f) g_shoulderSwing = 0.0f;
     if (g_shoulderSwing > 170.0f) g_shoulderSwing = 170.0f;
     if (g_shoulderTwist < 0.0f) g_shoulderTwist = 0.0f;
@@ -248,7 +250,7 @@ void BodyFeel_SaveConfig(char* buf, size_t cap) {
     TwkIniSetInt(buf, cap, "BodyFeelToneArmStiff", (int)g_toneArmStiff);
     SaveBraceTuning(buf, cap);
 }
-void BodyFeel_ResetDefaults() { g_on = 1; g_amount = 100; g_bail = 1; g_ccd = 1; g_armTorso = 1; g_armTorsoGrab = 0; g_shoulderSwing = 90.0f; g_shoulderTwist = 45.0f; ResetBraceTuning(); }
+void BodyFeel_ResetDefaults() { g_on = 1; g_amount = 100; g_bail = 1; g_ccd = 1; g_armTorso = 1; g_armTorsoGrab = 0; g_shoulderSwing = 40.0f; g_shoulderTwist = 20.0f; ResetBraceTuning(); }
 
 bool  BodyFeel_Enabled()          { return g_on != 0; }
 void  BodyFeel_SetEnabled(bool o) { g_on = o ? 1 : 0; TwkMarkDirty(); }

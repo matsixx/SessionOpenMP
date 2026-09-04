@@ -307,6 +307,42 @@ static void* hkBail(void* skater, void* reason, uint64_t b1, uint64_t b2) {
     }
 }
 
+// A bail delivered on request from OUTSIDE the game's bail callstack: catch_tweaks' over-rotation
+// limit (CatchOverBailDeg), decided on a catch's first frame. Same policy as the game's own mid-air
+// bad-catch verdict gets in hkBail -- on manual with run-out enabled the catch converts to a run-out
+// on the spot and the fall watch is armed; otherwise the game's own Bail. Counted like any Bail on
+// our skater, so the verdict probe's before/after count sees it.
+void RunOut_BailNow(void* skater) {
+    if (!skater || !g_origBail) return;
+    __try {
+        InterlockedIncrement(&g_bailCalls);
+        void* mc = twkP(skater, SK_MOVE_COMP);
+        const int  mm      = CatchTweaks_ManualMode();
+        const bool manual  = (mm >= 0) && (twkB(skater, SK_CATCH_MODE) == mm);
+        const int  onBoard = mc ? twkB(mc, MC_IS_ON_BOARD) : 0;
+        if (g_runOut && g_setOnFoot && manual && mc && onBoard > 0 && twkB(skater, SK_THROWDOWN) == 0) {
+            const float kept = doRunOut(skater, mc);
+            g_armSkater  = skater;
+            g_armZ       = TwkActorZ(skater);
+            g_armT       = GetTickCount64() / 1000.0;
+            g_armFalling = false;
+            InterlockedIncrement(&g_uiRunOuts);
+            TwkLog("[runout] RUN OUT at the over-rotated catch (kept %.0f cm/s) -- fall watch armed at z=%.0f",
+                   kept, g_armZ);
+            return;
+        }
+        static wchar_t overChars[] = L"SessionTweaks over-rotation";
+        static struct { wchar_t* d; int n; int max; } overStr =
+            { overChars, (int)(sizeof(overChars) / 2), (int)(sizeof(overChars) / 2) };
+        InterlockedIncrement(&g_uiRealBails);
+        TwkLog("[runout] real bail (over-rotated catch, onBoard=%d, manual=%d)", onBoard, manual ? 1 : 0);
+        ((BailFn)g_origBail)(skater, &overStr, 1, 1);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        if (InterlockedIncrement(&g_faults) == 1)
+            TwkLog("[runout] caught fatal delivering an over-rotation bail -> skipped");
+    }
+}
+
 // The fall watch + deferred facing, one poll per input tick (game thread).
 void RunOut_PumpFrame() {
     // ---- a MISSED early catch has landed (catch_tweaks refused the press; CatchEarlyMiss): this

@@ -22,6 +22,7 @@ void RunOut_DrawMenu(const OmpMenuApi* api);  // RENDER THREAD (menu_ext contrac
 // contract). Restore this module's shipped defaults:
 void RunOut_ResetDefaults();
 long RunOut_BailCalls();                      // Bail calls seen on our skater (any source)
+void RunOut_BailNow(void* skater);            // bail this skater now (run-out where the policy allows)
 bool RunOut_Enabled();
 void RunOut_SetEnabled(bool on);
 // In CENTIMETRES, not metres: the pause menu's slider row prints its value with %d, so a knob

@@ -29,6 +29,9 @@ void CatchTweaks_SetEnabled(bool on);
 // The manual catch window: how far from flat the deck may be at a manual press before the game's own
 // verdict bails it (CatchManualFlipAngleThreshold on every flip def; the defs ship 120). Degrees.
 float CatchTweaks_ManualTolDeg();       void CatchTweaks_SetManualTolDeg(float deg);
+float CatchTweaks_OverBailDeg();        void CatchTweaks_SetOverBailDeg(float deg);
+bool  CatchTweaks_ShoveStopHold();      // a shove stopped where it was caught, catch still live
+float CatchTweaks_ShoveBailBandDeg();   void CatchTweaks_SetShoveBailBandDeg(float deg);
 float CatchTweaks_DarkslideZoneDeg();   void CatchTweaks_SetDarkslideZoneDeg(float deg);
 int  CatchTweaks_ManualMode();                     // the ECatchMode value meaning MANUAL (-1 unknown)
 // The last ASkaterCharacterBase seen by the catch system, for modules that need to poll skater state

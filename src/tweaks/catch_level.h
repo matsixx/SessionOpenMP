@@ -37,3 +37,6 @@ void  CatchLevel_DrawMenu(const OmpMenuApi* api); // RENDER THREAD (menu_ext con
 // pause-menu accessors (GAME THREAD), same shape as the other modules
 bool  CatchLevel_Enabled();
 void  CatchLevel_SetEnabled(bool on);
+// The ease's time constant in ms (how fast the board eases flat), 20..200.
+float CatchLevel_ResponseMs();
+void  CatchLevel_SetResponseMs(float ms);

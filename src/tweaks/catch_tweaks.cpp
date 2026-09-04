@@ -124,6 +124,8 @@ enum {
     MC_BOARD_FLIP_CUR       = 0x77c,   // _boardFlipCurrentAngle
     MC_BOARD_ROT_TARGET     = 0x788,   // _boardRotationTargetAngle -- the shuv axis; UpdateFeetCatchInfo
     MC_BOARD_ROT_CUR        = 0x78c,   // _boardRotationCurrentAngle   runs the same ratio math on it
+    MC_BOARD_ROT_RATE       = 0x780,   // _boardRotationRate -- the shove axis's own rate (PDB layout:
+                                       // rate 0x780, target rate 0x784, target 0x788, current 0x78c)
     MC_BOARD_FLAGS          = 0x7e9,   // the _isBoard* bitfield byte. UpdateFeetCatchInfo applies the
                                        // flip window only while bit 0x08 is set and the rotation window
                                        // only while 0x20 is -- the two bits it clears once attached.
@@ -190,7 +192,8 @@ static float g_catchMult   = 1.0f;
 // lifetime: manual catch only, put back the moment it is not). 0 = the def's own value.
 // This IS the manual catch window, and the menu's "Catch window" slider drives it. The rotation half
 // (shove tricks) follows the flip half unless CatchManualRotTolDeg is set in the ini.
-static int   g_manualFlipTol = 90;
+static int   g_manualFlipTol = 120;   // the field's value (with the over-rotation bail at 70 and the
+                                      // shove sideways band at 10 carrying the "past flat" side)
 static int   g_manualRotTol  = 0;     // 0 = same as the flip tolerance
 // Which ECatchMode value means MANUAL. The default -1 means "unknown, never widen": the enumerator
 // names are not in the build, and a wrong guess would silently widen AUTO catch, which this module
@@ -493,14 +496,130 @@ static int   g_anyRev       = 1;      // CatchAnyRevolution
 static int   g_anyRevDeg    = 60;     // CatchAnyRevDeg -- how sideways a catch still gets levelled.
                                       // Bigger = more of a sideways catch is rolled flat under the
                                       // foot; smaller = only near-flat catches are touched.
-// CatchFootLevelsBoard: on a parked over-rotation catch, the deck's roll is driven toward level in
-// LOCKSTEP with the foot's own CatchRatio -- board angle becomes a function of foot descent, so the
-// level-out reads as the foot pressing the board flat instead of the board levelling by itself
-// afterwards. The game's own roll-align cannot do this: it only starts once a ratio passes 0.9,
-// i.e. after the foot has already landed on the tilted deck. Reads the ratios, never writes them
-// (forcing a CatchRatio kills the catch outright -- measured). Hands over to the game's align at
-// 0.9 with ~nothing left to do.
+// CatchFootLevelsBoard ("Over rotation leveling"): a board caught PAST flat is rolled BACK to flat
+// the short way, the foot coming down with it, so it never attaches to a tilted deck.
+//
+// THE BUG THIS REPLACES, found on the seventh look (3.19.244 log): BoardGrip is UNSIGNED -- 180 is
+// flat and it cannot tell 36 deg before flat from 36 deg past it -- but its direction of change can:
+// it RISES toward 180 before flat and FALLS away from it after. The snap reads that (that is what
+// its "remaining" is). The aim-at-flat did not: it aimed the flip FORWARD by (180 - angle) whatever
+// the direction, so a deck 36 past flat and falling was aimed 36 further on, the foot attached at 72
+// past flat, and the game's roll-align twisted the deck 74 deg back under the planted foot. Every
+// earlier attempt chased a mapping between the flip integrator and the rendered angle; there was
+// nothing to map -- the sign was sitting in `delta` all along.
+//
+// THE DRIVE, a mirror of the under-rotation snap: on a new engage with the deck heading AWAY from
+// flat, up to 180 -- the short way round -- the flip RATE is reversed (only the rate moves the
+// deck -- the integrator adds rate*dt and the rendered roll follows the same step) at the speed the
+// snap would use for the same distance, and every frame the flip TARGET is placed exactly one
+// "remaining" ahead of the current angle with the def's attach window written to the ORIGINAL
+// overshoot. Two things fall out of that one placement: the game's step clamp (|step| <= target -
+// current, live during a catch) lands the deck exactly on flat with no overshoot, and the game's
+// own foot ratio, 1 - owed/window, climbs from 0 at the engage to 1 as the deck comes level -- the
+// foot descends WITH the board, by the game's own formula, nothing forced (writing a ratio kills the
+// catch). At flat the rate is zeroed and the target brought to the deck (owed 0 = planted), then the
+// game's roll-align finishes the last degree. Ratios are only read. If the reversed rate ever moves
+// the deck the WRONG way (a stance mirror this cannot see from here), the drive aborts after three
+// widening frames, plants where it is and says so in the log.
+// Under-rotations keep the snap + descent they already had. Needs "Foot always attaches" on (it is
+// the same promise, one direction over). Both catch modes. The old lockstep roll write this knob
+// used to gate never stuck (the flip update re-stamped it every frame) and is gone.
 static int   g_footLevel    = 1;      // CatchFootLevelsBoard
+// (CatchOverMaxDeg is GONE. Past the cap the board was left to "flip on round to the next flat", and
+// that path failed every time it ran -- 14 of 14 in the 3.19.254 log: a double kickflip that never
+// finishes in the air, landing upside down with no plant. It was also the answer to "why does it
+// default to a double kickflip after a certain amount of over-rotation": a saved ini carried the old
+// 120 over the shipped 175. Below 180 the short way round is always the roll-back; past 180 the
+// nearest flat genuinely is the next revolution and the game's own target stands.)
+// CatchOverMs: the roll-back's OWN time budget. An over-rotated catch is late in the air by definition
+// -- field (3.19.250): 70-85 ms to touchdown, and at the snap's 90 ms budget the roll-back was cut off
+// with 20-70 deg still to go, every time. Short, and capped only by an absolute ceiling: the speed
+// here is bounded by the air left, not by how fast the trick was flipping.
+static int   g_overMs       = 40;
+// CatchAnyRevLegacyAim: the OLD aim-at-flat for under-rotations, which measured the distance to flat
+// off the rendered deck angle and so over-aimed by the render lag (30-50 deg past flat on every tre
+// flip in the 3.19.249 log; the game's align then twisted the deck level under the planted foot).
+// The counter-based aim replaces it: the nearest flat AHEAD of the counter is the target the game
+// already has unless it extended it, so for a plain under-rotation nothing is written and the flip
+// ends exactly level. Kept for one A/B round in case the old feel is missed. 0 = counter-based.
+static int   g_anyRevLegacy = 0;
+// CatchShoveSnap: the snap, on the SHOVE axis. The foot ratio is min(flip term, rotation term), and a
+// shove caught SHORT keeps turning at the game's own decaying rate with nothing hurrying it for the
+// catch -- base-game behaviour. Field (3.19.253, inward heel): caught with the shove 53 deg short at
+// 262 deg/s; the flip was flat in four frames, the shove was still 13 short at touchdown, the ratio
+// sat at 0.34 and the foot stayed in the trick pose all the way down. So: the rotation still owed is
+// finished within CatchSnapMs -- MAGNITUDE only, the game's own sign and target kept (the rotation
+// rate's sign does not follow the counter's direction: measured cur 127 -> 167 at rate -262) -- and
+// the descent opens the rotation window to the owed amount so the ratio climbs as the shove
+// completes. Pure shoves and shove+flips alike. An over-rotated shove is left alone: its term clamps
+// to 1 and is never the blocker. Absolute ceiling 1500 deg/s; a shove already fast enough is left at
+// its own speed and only gets the window.
+static int   g_shoveSnap    = 1;
+// CatchShoveSnapMaxRate: the snap's speed ceiling on the shove axis, deg/s. 720, not the 1500 it
+// shipped with: the board MESH trails the game's counter by ~85 ms, so a shove finished at 1500 had
+// the foot planting (on the counter) with the visible board still 60-100 deg short, which then spun
+// the rest of the way under the attached foot -- field: "the board mechanically connects to the foot
+// and magically finishes the rotation". The game's own shoves run 500-900 deg/s; at that speed the
+// mesh keeps up and the board arrives WITH the foot. A shove too far short to finish at this speed
+// seats on the landing instead, which is what a badly under-rotated shove does anyway.
+static int   g_shoveSnapMaxRate = 720;
+// CatchShoveFinishMaxDeg: a shove caught short by MORE than this is caught WHERE IT IS -- the rotation
+// stops and the target comes to the counter, so the foot lands on an under-rotated board (the
+// sketchy catch it is). Short by this much or less, the snap finishes it. Field (varial heel, shove
+// 84 short, snap at 720): the counter reached 180 with the foot planting on it, and the board mesh --
+// ~85 ms behind -- was still ~60 short and spun the rest of the way under the attached foot. No finish
+// speed fixes that: the mesh needs ~3 time constants after the counter stops, more air than a late
+// catch has, so any real deficit finished forward reads as "the board magically completes under the
+// foot". Catching it where it is puts the foot on the board the player actually sees. 0 = always
+// catch where it is, 180 = always finish (the old behaviour).
+static int   g_shoveFinishMaxDeg = 30;
+// CatchShoveRollBack ("shove stops where it is caught"): the game extends the shove target the moment
+// the shove runs past it uncaught, exactly as it extends the flip (field: hardflips authored at 160
+// engaging with the target at 320 and the counter at 182-225; tre flips 360 -> 540 at 368/388) --
+// that is "hold the shove and it does a 360", and it is why an over-rotated 180 finished the rotation
+// (the shove snap then hurried it there). The trick's AUTHORED shove is captured at the pop, before
+// the game can extend it, and a catch with the shove past that mark by less than half the extension
+// STOPS the rotation where it is and brings the target to the counter: owed 0, the foot takes the
+// board at that yaw. Past the halfway point the extended shove is finished forward, as before.
+// A ROLL-BACK was built first (3.19.258) and is not possible: the rotation rate's sign is not a
+// direction on this axis -- flipping it made the counter climb FASTER (10 deg/frame at -1260), ten of
+// ten catches -- so there is no lever to turn a shove back. The user's call, and the realistic one: a
+// shove caught past its mark is caught there.
+static int   g_shoveRollBack = 1;
+// CatchShoveBailBandDeg: a shove caught this close to SIDEWAYS -- 90 deg of yaw on the counter, mod 180
+// (270 on a 360 shove is the same place) -- is bailed on the spot. That band is where the game cannot
+// decide which end of the board each foot belongs to: the catching foot's socket wanders between the
+// two ends, and three rounds of holding or placing it (3.19.265-270) either missed it or broke normal
+// catches. The user's call: a catch there is a bail. Through run_out's mid-air policy (run-out where
+// enabled, else the game's own Bail), manual catch only like the other bails. 0 = off.
+static int   g_shoveBailBand = 10;    // the field's value: 30 bailed every hardflip (its shove sits ~16 from sideways)
+// (CatchShoveStopMaxDeg is GONE. It sent a shove caught more than 60 past its mark on to the NEXT
+// full mark -- for a 180 that is 360, the board turning back to face the way it started, which the
+// field saw as "over-rotations trying to straighten out". It existed for the nose/tail-flip theory,
+// which the type-flip counter disproved and the sideways socket hold now covers. Every over-rotated
+// shove stops where it is caught and lands like that.)
+static bool  g_shoveRbClaimed = false;   // this catch belongs to the stop: the snap stands down
+static bool  g_shoveSnapTried = false;   // the snap's one-decision-per-catch latch (reset by an abort)
+static int   g_overTrace    = 0;      // CatchOverTrace -- one line per frame of a roll-back / shove snap;
+                                      // proven in the field (3.19.252-272), opt-in like every diagnostic
+static bool  g_overActive   = false;  // a roll-back is running: the snap, aim-at-flat, plant fix and
+                                      // descent stand down for this catch
+// CatchOverBailDeg: the OVER-rotation side of the manual catch window, on its own. The game's verdict
+// (the "Catch window" slider) is symmetric: tightening it to refuse a deck caught far PAST flat also
+// refuses the same distance SHORT of flat, which is the early catch the player wants generous (field:
+// "decreasing the catch window sorta helps but makes early catches almost impossible"). Measured on
+// the catch's first frame off the RENDERED deck, past side only: the deck heading away from flat by
+// more than this is bailed on the spot -- run_out's mid-air bad-catch policy: run-out where enabled,
+// else the game's own Bail. 0 = off, the window rules both sides. Manual catch only, like the verdict.
+// WHY THE RENDERED DECK and not the counter the roll-back uses (3.19.255 field, two symptoms): the
+// counter runs 60-100 deg ahead of the render at flip speed, so a counter threshold fired on catches
+// that LOOKED early (counter 40 past, deck 44 short and rising -> bail at slider 5); and a double
+// kickflip is a single whose target the game extended to 720, so any "past the trick's flat" reading
+// puts a double caught near 720 hundreds of degrees over and bails it at every setting ("doubles
+// almost impossible"). The rendered deck is the frame the game's own verdict judges in and the one the
+// player's eye reads; a deck still rising toward flat is short, whatever the counter says, and a
+// double caught short of its second flat is short too.
+static int   g_overBailDeg  = 70;     // the field's value (0 = off)
 // CatchPlantFix: bug repair, always on (menu policy: no row, ini kill-switch). A STOPPED board
 // must not owe rotation: each foot's CatchRatio is computed against _boardFlipTargetAngle, so
 // any path that halts the deck while the target still exceeds the current angle freezes the
@@ -563,7 +682,8 @@ static int   g_earlyMiss    = 0;
 // def's CatchManualFlipAngleThreshold, or rotating and outside CatchManualRotationAngleThreshold.
 // The "is flipping / is rotating / pop pending" are the board interface's own virtuals (slots
 // 0x238 / 0x248 / 0x278 on the object its slot 0x108 returns), called exactly as the game calls them.
-static int   g_verdictProbe = 1;
+// Opt-in, like every other diagnostic in the mod.
+static int   g_verdictProbe = 0;
 static bool  g_airMissed    = false;   // this air had a missed press; every later engage is refused
 static bool  g_missPending  = false;   // the missed air has touched down; run_out delivers the bail
 static float g_deckRemaining = 0.0f;   // deck degrees to grip-up along its current direction, per frame
@@ -718,7 +838,7 @@ bool CatchTweaks_TravelVel(float* vx, float* vy, float* vz) {
 void CatchTweaks_ReadConfig(const char* buf) {
     g_catchFix     = TwkIniInt(buf, "CatchWindow", 1);
     g_catchMult    = (float)TwkIniInt(buf, "CatchWindowMult", 100) / 100.0f;
-    g_manualFlipTol = TwkIniInt(buf, "CatchManualFlipTolDeg", 90);
+    g_manualFlipTol = TwkIniInt(buf, "CatchManualFlipTolDeg", 120);
     g_manualRotTol  = TwkIniInt(buf, "CatchManualRotTolDeg", 0);
     if (g_manualFlipTol < 0) g_manualFlipTol = 0; if (g_manualFlipTol > 180) g_manualFlipTol = 180;
     if (g_manualRotTol  < 0) g_manualRotTol  = 0; if (g_manualRotTol  > 180) g_manualRotTol  = 180;
@@ -770,13 +890,27 @@ void CatchTweaks_ReadConfig(const char* buf) {
     g_anyRev       = TwkIniInt(buf, "CatchAnyRevolution", 1);
     g_anyRevDeg    = TwkIniInt(buf, "CatchAnyRevDeg", 60);
     g_footLevel    = TwkIniInt(buf, "CatchFootLevelsBoard", 1);
+    g_overTrace    = TwkIniInt(buf, "CatchOverTrace", 0);
+    g_overMs       = TwkIniInt(buf, "CatchOverMs", 40);
+    if (g_overMs < 10) g_overMs = 10; if (g_overMs > 300) g_overMs = 300;
+    g_anyRevLegacy = TwkIniInt(buf, "CatchAnyRevLegacyAim", 0);
+    g_shoveSnap    = TwkIniInt(buf, "CatchShoveSnap", 1);
+    g_shoveSnapMaxRate = TwkIniInt(buf, "CatchShoveSnapMaxRate", 720);
+    g_shoveFinishMaxDeg = TwkIniInt(buf, "CatchShoveFinishMaxDeg", 30);
+    if (g_shoveFinishMaxDeg < 0) g_shoveFinishMaxDeg = 0; if (g_shoveFinishMaxDeg > 180) g_shoveFinishMaxDeg = 180;
+    if (g_shoveSnapMaxRate < 200) g_shoveSnapMaxRate = 200; if (g_shoveSnapMaxRate > 3000) g_shoveSnapMaxRate = 3000;
+    g_shoveRollBack = TwkIniInt(buf, "CatchShoveRollBack", 1);
+    g_shoveBailBand = TwkIniInt(buf, "CatchShoveBailBandDeg", 10);
+    if (g_shoveBailBand < 0) g_shoveBailBand = 0; if (g_shoveBailBand > 89) g_shoveBailBand = 89;
+    g_overBailDeg  = TwkIniInt(buf, "CatchOverBailDeg", 70);
+    if (g_overBailDeg < 0) g_overBailDeg = 0; if (g_overBailDeg > 180) g_overBailDeg = 180;
     g_plantFix     = TwkIniInt(buf, "CatchPlantFix", 1);
     g_footDescend  = TwkIniInt(buf, "CatchFootDescends", 1);
     g_descendDeg   = TwkIniInt(buf, "CatchDescendDeg", 90);
     if (g_descendDeg < 20) g_descendDeg = 20;
     if (g_descendDeg > 360) g_descendDeg = 360;
     g_earlyMiss    = TwkIniInt(buf, "CatchEarlyMiss", 0);
-    g_verdictProbe = TwkIniInt(buf, "CatchVerdictProbe", 1);
+    g_verdictProbe = TwkIniInt(buf, "CatchVerdictProbe", 0);
     g_holdPose     = TwkIniInt(buf, "CatchHoldPose", 1);
     g_needFlick    = TwkIniInt(buf, "CatchNeedsFreshFlick", 1);
     g_unstick      = TwkIniInt(buf, "CatchUnstick", 1);
@@ -823,6 +957,15 @@ void CatchTweaks_SaveConfig(char* buf, size_t cap) {
     TwkIniSetInt(buf, cap, "CatchAnyRevolution",  g_anyRev);
     TwkIniSetInt(buf, cap, "CatchAnyRevDeg",      g_anyRevDeg);
     TwkIniSetInt(buf, cap, "CatchFootLevelsBoard", g_footLevel);
+    TwkIniSetInt(buf, cap, "CatchOverTrace",       g_overTrace);
+    TwkIniSetInt(buf, cap, "CatchOverBailDeg",     g_overBailDeg);
+    TwkIniSetInt(buf, cap, "CatchOverMs",          g_overMs);
+    TwkIniSetInt(buf, cap, "CatchAnyRevLegacyAim", g_anyRevLegacy);
+    TwkIniSetInt(buf, cap, "CatchShoveSnap",       g_shoveSnap);
+    TwkIniSetInt(buf, cap, "CatchShoveSnapMaxRate", g_shoveSnapMaxRate);
+    TwkIniSetInt(buf, cap, "CatchShoveFinishMaxDeg", g_shoveFinishMaxDeg);
+    TwkIniSetInt(buf, cap, "CatchShoveRollBack",   g_shoveRollBack);
+    TwkIniSetInt(buf, cap, "CatchShoveBailBandDeg", g_shoveBailBand);
     TwkIniSetInt(buf, cap, "CatchPlantFix",       g_plantFix);
     TwkIniSetInt(buf, cap, "CatchFootDescends",   g_footDescend);
     TwkIniSetInt(buf, cap, "CatchDescendDeg",     g_descendDeg);
@@ -2411,7 +2554,7 @@ void CatchTweaks_SetEnabled(bool on) { g_catchFix = on ? 1 : 0; TwkMarkDirty(); 
 // nothing" -- resetting it would silently switch the whole catch feature off.
 void CatchTweaks_ResetDefaults() {
     g_catchFix = 1; g_catchMult = 1.0f; g_catchBeatsDS = 1; g_dsAngleDeg = 60; g_catchDiag = 0;
-    g_manualFlipTol = 90; g_manualRotTol = 0;
+    g_manualFlipTol = 120; g_manualRotTol = 0; g_overBailDeg = 70; g_shoveBailBand = 10;
     g_anyRev = 1; g_anyRevDeg = 60; g_footLevel = 1; g_unstick = 1; g_minSpinDeg = 45; g_maxCutDeg = 180; g_unstickMs = 1000; g_holdPose = 1; g_needFlick = 1;
     g_stopFlip = 1; g_stopFlipDeg = 168; g_snapMs = 90;
     g_snapMaxDeg = 200; g_snapMaxBoost = 3; g_flipAxis = 0;
@@ -2444,6 +2587,19 @@ void  CatchTweaks_SetBoneAdd(int axis, float v) {
     g_boneAdd[axis] = a; TwkMarkDirty();
 }
 float CatchTweaks_ManualTolDeg() { return (float)g_manualFlipTol; }
+float CatchTweaks_OverBailDeg()  { return (float)g_overBailDeg; }
+// A shove has been stopped where it was caught (over- or under-rotated) and the catch is still live.
+// foot_place holds the feet's sockets against per-frame flip-flops for its duration.
+bool  CatchTweaks_ShoveStopHold()   { return g_shoveRbClaimed; }
+float CatchTweaks_ShoveBailBandDeg() { return (float)g_shoveBailBand; }
+void  CatchTweaks_SetShoveBailBandDeg(float deg) {
+    int d = (int)(deg + 0.5f); if (d < 0) d = 0; if (d > 89) d = 89;
+    g_shoveBailBand = d; TwkMarkDirty();
+}
+void  CatchTweaks_SetOverBailDeg(float deg) {
+    int d = (int)(deg + 0.5f); if (d < 0) d = 0; if (d > 180) d = 180;
+    g_overBailDeg = d; TwkMarkDirty();
+}
 // The press-to-catch toggle. Reports FALSE when the input hook is not installed, so the pause-menu
 // row cannot offer a switch that would do nothing.
 bool  CatchTweaks_ClickToCatch() { return g_clickCatch != 0 && g_startInputKey != nullptr; }
@@ -2494,6 +2650,12 @@ void CatchTweaks_DrawMenu(const OmpMenuApi* api) {
         snprintf(b, sizeof(b), "a press with the deck more than %d deg from flat bails on the spot (the game "
                  "ships 120)", g_manualFlipTol);
         api->TextDisabled(b);
+        float ob = (float)g_overBailDeg;
+        if (api->SliderFloat("Over-rotation bail (deg past flat)", &ob, 0.0f, 180.0f, "%.0f")) CatchTweaks_SetOverBailDeg(ob);
+        api->SameLine(); api->TextDisabled("(0 = the window above rules both sides)");
+        float sb = (float)g_shoveBailBand;
+        if (api->SliderFloat("Shove sideways bail band (deg)", &sb, 0.0f, 89.0f, "%.0f")) CatchTweaks_SetShoveBailBandDeg(sb);
+        api->SameLine(); api->TextDisabled("(a shove caught within this of sideways bails -- the feet cannot decide an end there; 0 = off)");
         api->Unindent();
     }
     if (g_startCatchDef) {
@@ -2531,8 +2693,21 @@ void CatchTweaks_DrawMenu(const OmpMenuApi* api) {
     if (api->Checkbox("Hold the second foot until landing", &sfh)) { g_secondFootHold = sfh ? 1 : 0; TwkMarkDirty(); }
     api->SameLine(); api->TextDisabled("(the foot you did NOT catch with stays off the board)");
     bool fl = g_footLevel != 0;
-    if (api->Checkbox("Foot levels the board", &fl)) { g_footLevel = fl ? 1 : 0; TwkMarkDirty(); }
-    api->SameLine(); api->TextDisabled("(the deck rolls flat in step with the foot coming down)");
+    if (api->Checkbox("Over rotation leveling", &fl)) { g_footLevel = fl ? 1 : 0; TwkMarkDirty(); }
+    api->SameLine(); api->TextDisabled("(a board caught past flat rolls back level as the foot comes down)");
+    if (fl) {
+        api->Indent();
+        float om = (float)g_overMs;
+        if (api->SliderFloat("Roll-back time (ms)", &om, 10.0f, 150.0f, "%.0f")) { g_overMs = (int)(om + 0.5f); TwkMarkDirty(); }
+        api->SameLine(); api->TextDisabled("(an over-rotated catch is late in the air -- keep it short)");
+        float sf = (float)g_shoveFinishMaxDeg;
+        if (api->SliderFloat("Shove finish range (deg short)", &sf, 0.0f, 180.0f, "%.0f")) { g_shoveFinishMaxDeg = (int)(sf + 0.5f); TwkMarkDirty(); }
+        api->SameLine(); api->TextDisabled("(a shove caught short by more than this is caught where it is; less and it is finished)");
+        float sr = (float)g_shoveSnapMaxRate;
+        if (api->SliderFloat("Shove finish speed (deg/s)", &sr, 200.0f, 3000.0f, "%.0f")) { g_shoveSnapMaxRate = (int)(sr + 0.5f); TwkMarkDirty(); }
+        api->SameLine(); api->TextDisabled("(how fast an under-rotated shove may be finished under the foot; the board mesh keeps up below ~900)");
+        api->Unindent();
+    }
     if (api->SliderFloat("Boned ollie (%)", &bs, 0.0f, 300.0f, "%.0f")) CatchTweaks_SetBoneScalePct(bs);
     api->SameLine(); api->TextDisabled("(100 = stock, 0 = no bone at all)");
     {
@@ -2625,6 +2800,7 @@ static void TraceFeetCatch(void* skater, void* comp, float ang) {
     if (state == 0) { preVeto = g_vetoAdmitted; preHold = g_holdState;
                       preAir = g_airCaughtFoot; preFlick = g_flickLatch; }
     static float angAt = 0.0f, curAt = 0.0f, tgtAt = 0.0f;
+    static float rotCurAt = 0.0f, rotTgtAt = 0.0f, rotRateAt = 0.0f;   // the shove axis at engage
     static int   frames = 0, quiet = 0;
 
     // The forced-catch timers, captured fresh at the START of each catch. Fresh per catch because
@@ -2632,6 +2808,7 @@ static void TraceFeetCatch(void* skater, void* comp, float ang) {
     // way, and re-deriving from it every frame can never compound.
     static float baseTotal = 0.0f, baseForce = 0.0f, baseDelay = 0.0f;
     static int   typeLat = 0, typeRat = 0;
+    static int   typeFlipsL = 0, typeFlipsR = 0, prevTypeL = 0, prevTypeR = 0;   // nose/tail re-decisions
     // heldRejected is the honest test: if the write does not stick, this lever is the wrong one too.
     static int   heldFrames = 0, heldRejected = 0, heldAlready = 0;
 
@@ -2650,10 +2827,13 @@ static void TraceFeetCatch(void* skater, void* comp, float ang) {
         angAt = ang;
         curAt = twkF(comp, MC_BOARD_FLIP_CUR);
         tgtAt = twkF(comp, MC_BOARD_FLIP_TARGET);
+        rotCurAt = twkF(comp, MC_BOARD_ROT_CUR); rotTgtAt = twkF(comp, MC_BOARD_ROT_TARGET);
+        rotRateAt = twkF(comp, MC_BOARD_ROT_RATE);
         baseTotal = twkF(comp, MC_CATCH_TOTAL_TIME);
         baseForce = twkF(comp, MC_CATCH_FORCE_TIME);
         baseDelay = twkF(comp, MC_CATCH_TO_BOARD_DELAY);
         typeLat = twkB(comp, MC_LFOOT_CATCH); typeRat = twkB(comp, MC_RFOOT_CATCH);
+        prevTypeL = typeLat; prevTypeR = typeRat; typeFlipsL = typeFlipsR = 0;
         heldFrames = heldRejected = heldAlready = 0;
     }
     if (!inCatch) return;
@@ -2671,6 +2851,11 @@ static void TraceFeetCatch(void* skater, void* comp, float ang) {
         if (rr > peakR && rr < 10.0f) peakR = rr;
         if (attL < 0 && rl >= 0.99f) attL = frames;
         if (attR < 0 && rr >= 0.99f) attR = frames;
+        // A foot whose TYPE keeps changing mid-catch is a foot whose placement keeps changing --
+        // the oscillation the user sees on a board caught far past its shove mark.
+        const int tl = twkB(comp, MC_LFOOT_CATCH), tr = twkB(comp, MC_RFOOT_CATCH);
+        if (tl != prevTypeL) { ++typeFlipsL; prevTypeL = tl; }
+        if (tr != prevTypeR) { ++typeFlipsR; prevTypeR = tr; }
     }
     // The orient column was dead -- sawL/sawR were reset and never set, so every catch since this
     // trace was written has printed "L orient=no R orient=no <-- NO FOOT CAUGHT", working ones
@@ -2710,12 +2895,16 @@ static void TraceFeetCatch(void* skater, void* comp, float ang) {
     TwkLog("[feet] catch over %d frames: L orient=%s peak ratio %.2f (plant f%d) | R orient=%s peak "
            "ratio %.2f (plant f%d) "
            "| deck %.0f -> %.0f deg | flip angle %.0f -> %.0f (target %.0f)%s"
-           " | footType L=%d R=%d -> %d/%d | timers total %.3f force %.3f delay %.3f"
+           " | shove %.0f -> %.0f (target %.0f -> %.0f, rate %.0f -> %.0f)"
+           " | footType L=%d R=%d -> %d/%d (type flips L=%d R=%d)%s | timers total %.3f force %.3f delay %.3f"
            " -> %.3f/%.3f/%.3f%s",
            frames, sawL ? "YES" : "no ", peakL, attL, sawR ? "YES" : "no ", peakR, attR,
            angAt, ang, curAt, twkF(comp, MC_BOARD_FLIP_CUR), tgtAt,
            (!sawL && !sawR) ? "   <-- NO FOOT CAUGHT" : "",
+           rotCurAt, twkF(comp, MC_BOARD_ROT_CUR), rotTgtAt, twkF(comp, MC_BOARD_ROT_TARGET),
+           rotRateAt, twkF(comp, MC_BOARD_ROT_RATE),
            typeLat, typeRat, twkB(comp, MC_LFOOT_CATCH), twkB(comp, MC_RFOOT_CATCH),
+           typeFlipsL, typeFlipsR, (typeFlipsL + typeFlipsR > 2) ? "   <-- FEET OSCILLATING" : "",
            baseTotal, baseForce, baseDelay,
            twkF(comp, MC_CATCH_TOTAL_TIME), twkF(comp, MC_CATCH_FORCE_TIME),
            twkF(comp, MC_CATCH_TO_BOARD_DELAY),
@@ -2948,7 +3137,311 @@ void CatchTweaks_PumpFrame() {
             // The deck's distance to grip-up along its current direction -- the snap's own measure,
             // kept every frame so the setter's early-press gate can read it at the press.
             if (fabsf(delta) > 0.01f) g_deckRemaining = (delta > 0.0f) ? (180.0f - ang) : (ang + 180.0f);
-            if (g_stopFlip && catchState != 0 && !armed) {
+            // ---- OVER-ROTATION: roll the deck BACK to flat, the foot coming down with it --------------
+            // See the CatchFootLevelsBoard knob. Everything here is measured off the game's FLIP COUNTER
+            // (_boardFlipCurrentAngle against the trick's own flat: 360 for a kickflip, 355 for a tre) --
+            // that is what the verdict judges and what the foot ratio is computed against. The rendered
+            // deck angle is NOT used to classify. Field (3.19.249 log, every catch): the rendered deck
+            // lags the counter by a variable 10-50 deg and was still RISING toward flat while the counter
+            // had already gone past it, so a classifier on its direction never saw an over-rotation.
+            // Ahead of the snap and the aim-at-flat so both stand down on a catch this owns.
+            {
+                static void* ovDef = nullptr;
+                static float ovBaseF = 0.0f, ovE0 = 0.0f, ovRate = 0.0f, ovFlat = 0.0f;
+                static float ovTgtSign = 1.0f, ovRateSign = 1.0f, ovPrevRem = 0.0f, ovPeak = 0.0f;
+                static int   ovFrames = 0, ovWrong = 0;
+                static long  ovSerial = -1;
+                static bool  ovTried = false;            // one decision per catch, on its first frame
+                void* anOv = FootPlace_AnimInstance();
+                const bool ovGrounded = anOv && twkB(anOv, AN_GROUNDED) != 0;
+                if (catchState == 0) ovTried = false;
+                // One drive write, shared by the per-frame loop and the arm frame (the first cut lost
+                // a whole frame of forward flip between the decision and its first write).
+                auto ovWrite = [&](float cur, float remaining) {
+                    *(float*)((uint8_t*)comp + MC_BOARD_FLIP_RATE)   = ovRateSign * ovRate;
+                    *(float*)((uint8_t*)comp + MC_BOARD_FLIP_TARGET) = ovTgtSign * (fabsf(cur) + remaining);
+                    if (remaining > ovE0) ovE0 = remaining;          // the window spans the true start
+                    if (ovDef) *(float*)((uint8_t*)ovDef + DEF_FLIP_PRECATCH_ANGLE) = ovE0 + 1.0f;
+                };
+                if (g_overActive) {
+                    const float rL = comp ? twkF(comp, MC_LFOOT_CATCH + FCFI_RATIO) : 0.0f;
+                    const float rR = comp ? twkF(comp, MC_RFOOT_CATCH + FCFI_RATIO) : 0.0f;
+                    const float ratio = (rL > rR) ? rL : rR;
+                    if (ratio > ovPeak && ratio < 10.0f) ovPeak = ratio;
+                    const float cur = comp ? twkF(comp, MC_BOARD_FLIP_CUR) : 0.0f;
+                    const float remaining = fabsf(cur) - ovFlat;         // counter degrees still past flat
+                    const bool  ended = (catchState == 0) || ovGrounded || !comp ||
+                                        FlipSpeed_TrickSerial() != ovSerial;
+                    if (!ended) ovWrong = (remaining > ovPrevRem + 0.5f) ? ovWrong + 1 : 0;
+                    const bool  arrived = !ended && remaining <= 1.0f;
+                    const bool  wrong   = !ended && ovWrong >= 3;
+                    const bool  timeout = !ended && ovFrames > 90;
+                    if (ended || arrived || wrong || timeout) {
+                        // WHATEVER ends it, the reversed rate comes off. The first cut skipped this on
+                        // "catch ended", and a touchdown mid-roll-back left the board flipping backwards
+                        // for good (field: "it just keeps flipping back the opposite direction").
+                        if (comp) {
+                            *(float*)((uint8_t*)comp + MC_BOARD_FLIP_RATE) = 0.0f;
+                            // The target comes to the counter WHEREVER it stopped -- not to the flat it
+                            // was aiming at. The last step overshoots flat by 1-5 deg every time (the
+                            // game's clamp reads a target one step stale), and with the target left at
+                            // flat the foot still owed those degrees: on every small roll-back (16-44
+                            // deg) the plant fix's threshold let it through, the ratio peaked at
+                            // 0.91-0.97 and the foot never planted (field: "something about the catch
+                            // looks odd"). Owed 0 here completes the ratio by construction; the game's
+                            // roll-align levels the last degree or two under the planted foot.
+                            *(float*)((uint8_t*)comp + MC_BOARD_FLIP_TARGET) = ovTgtSign * fabsf(cur);
+                        }
+                        if (ovDef) {
+                            float backF = ovBaseF;
+                            for (int i = 0; i < g_nDefSave; i++)
+                                if (g_defSave[i].def == ovDef) {
+                                    backF = g_widened ? g_defSave[i].flip * g_appliedMult : g_defSave[i].flip;
+                                    break;
+                                }
+                            *(float*)((uint8_t*)ovDef + DEF_FLIP_PRECATCH_ANGLE) = backF;
+                        }
+                        TwkLog("[catch] over-rotation: rolled back %.0f of %.0f deg in %d frames (deck now reads "
+                               "%.0f), foot ratio %.2f -- %s", ovE0 - remaining, ovE0, ovFrames, ang, ovPeak,
+                               arrived ? "flat, planted" : wrong ? "WRONG WAY (counter moved further past "
+                               "flat) -- aborted, planted where it is" : timeout ? "timeout, planted" :
+                               ovGrounded ? "TOUCHED DOWN first (flip stopped where it was)" :
+                               (catchState == 0) ? "catch ended first (flip stopped where it was)" : "trick changed");
+                        g_overActive = false; ovDef = nullptr; ovFrames = 0; ovWrong = 0;
+                    } else {
+                        ovWrite(cur, remaining);
+                        if (g_overTrace)
+                            TwkLog("[over] f%02d cur=%.0f rem=%.1f tgt=%.0f rate=%.0f | deck=%.1f roll=%.1f | "
+                                   "ratio L=%.2f R=%.2f flags=0x%02x st=%d | shove %.0f/%.0f r%.0f", ovFrames,
+                                   cur, remaining, ovTgtSign * (fabsf(cur) + remaining), ovRateSign * ovRate, ang,
+                                   twkF(comp, MC_ANIM_ROLL), rL, rR, twkB(comp, MC_BOARD_FLAGS), catchState,
+                                   twkF(comp, MC_BOARD_ROT_CUR), twkF(comp, MC_BOARD_ROT_TARGET),
+                                   twkF(comp, MC_BOARD_ROT_RATE));
+                        ovPrevRem = remaining; ++ovFrames;
+                    }
+                }
+                // The decision, on the catch's FIRST frame, off the counter.
+                if (!g_overActive && !ovTried && catchState != 0 && comp) {
+                    ovTried = true;
+                    const float cur0  = twkF(comp, MC_BOARD_FLIP_CUR);
+                    const float tgt0  = twkF(comp, MC_BOARD_FLIP_TARGET);
+                    const float rate0 = twkF(comp, MC_BOARD_FLIP_RATE);
+                    const int   flags = twkB(comp, MC_BOARD_FLAGS);
+                    const bool  sane  = fabsf(cur0) < 3600.0f && fabsf(tgt0) < 3600.0f && fabsf(rate0) < 100000.0f;
+                    // The trick's own flat: its target, divided by however many revolutions the game
+                    // has extended it to (720 = a 360 flip run past its mark, 710 = a 355 tre).
+                    float base = fabsf(tgt0);
+                    { const float revs = floorf(base / 360.0f + 0.5f); if (revs >= 1.0f) base /= revs; }
+                    if (!(base > 200.0f && base < 400.0f)) base = 360.0f;
+                    const float nearest = base * floorf(fabsf(cur0) / base + 0.5f);
+                    const float over    = fabsf(cur0) - nearest;         // > 0 past flat, < 0 short of it
+                    if (sane && (flags & 0x08)) {
+                        TwkLog("[catch] engage: flip %.0f of %.0f = %.0f deg %s the nearest flat (%.0f) | deck "
+                               "reads %.0f, %s | shove %.0f of %.0f at %.0f deg/s", cur0, tgt0, fabsf(over),
+                               over > 0.0f ? "PAST" : "short of", nearest, ang,
+                               delta > 0.0f ? "rising" : delta < 0.0f ? "falling" : "still",
+                               twkF(comp, MC_BOARD_ROT_CUR), twkF(comp, MC_BOARD_ROT_TARGET),
+                               twkF(comp, MC_BOARD_ROT_RATE));
+                        const float pastFlat = fabsf(cur0) - base;    // counter degrees past the trick's flat (log)
+                        // The bail judges the RENDERED deck, past side only (see the knob): heading away
+                        // from flat = past it; still rising = short, whatever the counter says.
+                        const float visPast = (delta < -0.3f) ? (180.0f - ang) : 0.0f;
+                        if (g_overBailDeg > 0 && visPast > (float)g_overBailDeg && !AutoCatchActive()) {
+                            TwkLog("[catch] over-rotated: the deck reads %.0f deg past flat and heading away (counter "
+                                   "%.0f past), more than CatchOverBailDeg %d -- BAIL", visPast, pastFlat, g_overBailDeg);
+                            RunOut_BailNow(skater);
+                        } else if (g_footLevel && g_anyRev && !ovGrounded && over > 3.0f && fabsf(rate0) > 1.0f) {
+                            void* def = twkP(skater, SK_CURRENT_TRICK_DEF);
+                            const float curF = def ? twkF(def, DEF_FLIP_PRECATCH_ANGLE) : 0.0f;
+                            if (def && curF > 0.0f && curF <= 3600.0f) {
+                                ovDef = def; ovBaseF = curF; ovSerial = FlipSpeed_TrickSerial();
+                                ovE0 = over; ovFlat = nearest;
+                                // its own budget (CatchOverMs): the air left decides, not the trick's speed
+                                float want = over / ((float)g_overMs / 1000.0f);
+                                if (want > 3500.0f) want = 3500.0f;
+                                if (want < 60.0f)   want = 60.0f;
+                                ovRate     = want;
+                                ovRateSign = (rate0 < 0.0f) ? 1.0f : -1.0f;      // the OPPOSITE of the flip
+                                ovTgtSign  = (tgt0 < 0.0f) ? -1.0f : 1.0f;
+                                ovPrevRem = over; ovFrames = 0; ovWrong = 0; ovPeak = 0.0f;
+                                g_overActive = true;
+                                ovWrite(cur0, over);                     // this frame, not the next
+                                TwkLog("[catch] over-rotated: caught %.0f deg PAST flat -- rolling the flip back "
+                                       "over ~%d ms at %.0f deg/s (flip was %.0f), the foot coming down with it",
+                                       over, g_overMs, want, fabsf(rate0));
+                            }
+                        } else if (over < -3.0f && fabsf(cur0) > base + 3.0f) {
+                            // Past 180 on the counter: the nearest flat is the NEXT revolution, the
+                            // game's own extended target already points at it, and the board completes
+                            // forward -- a double. Named in the log so it is never mistaken for a rescue.
+                            TwkLog("[catch] over-rotated %.0f deg past the trick's flat (%.0f short of the next) "
+                                   "-- past the halfway mark: completing forward, a double", pastFlat, -over);                        } else if (over > 3.0f) {
+                            TwkLog("[catch] over-rotated %.0f deg but not rolled back: %s", over,
+                                   !g_footLevel ? "Over rotation leveling is off" :
+                                   !g_anyRev ? "Foot always attaches is off" : ovGrounded ? "grounded" : "no flip rate");
+                        }
+                    }
+                }
+            }
+            // ---- OVER-ROTATED SHOVE: stop it where it is caught (CatchShoveRollBack) --------------------
+            // See the knob. Ahead of the snap: a catch this claims is not the snap's to hurry forward.
+            {
+                // The trick's AUTHORED shove: the LAST rotation target seen while the shove is still
+                // getting under way (counter < 60). The target field only ever shows the CURRENT value:
+                // it RAMPS UP over the first frames of the flick (a first-nonzero read captured 21 deg
+                // on an FS pop shove-it), and the game rewrites it upward the frame the shove runs past
+                // it -- which cannot happen before the counter reaches it, so freezing at 60 is safe.
+                // A NEW shove is any of: flip_speed's trick serial changing (pure shoves never bump it
+                // -- field: that 21-deg mark stayed stale all session and every catch read as 125-219
+                // past it, so every one was finished forward to a full 360), the rotation flag rising,
+                // or the target reading 0 (it is zeroed at landing).
+                static long  shSerial = -1;
+                static float shAuth = 0.0f;
+                static bool  shRotWas = false;
+                {
+                    const long  ser    = FlipSpeed_TrickSerial();
+                    const bool  rotNow = comp && (twkB(comp, MC_BOARD_FLAGS) & 0x20) != 0;
+                    const float t = comp ? fabsf(twkF(comp, MC_BOARD_ROT_TARGET)) : 0.0f;
+                    const float c = comp ? fabsf(twkF(comp, MC_BOARD_ROT_CUR))    : 0.0f;
+                    if (ser != shSerial || (rotNow && !shRotWas) || t < 1.0f) { shSerial = ser; shAuth = 0.0f; }
+                    shRotWas = rotNow;
+                    if (rotNow && t > 10.0f && t < 3600.0f && c < 60.0f) shAuth = t;
+                }
+                static bool srTried = false;
+                void* anSr = FootPlace_AnimInstance();
+                const bool srGrounded = anSr && twkB(anSr, AN_GROUNDED) != 0;
+                if (catchState == 0) { srTried = false; g_shoveRbClaimed = false; }
+                if (!srTried && catchState != 0 && comp && g_shoveRollBack) {
+                    srTried = true;
+                    const int   flags = twkB(comp, MC_BOARD_FLAGS);
+                    const float rc0 = twkF(comp, MC_BOARD_ROT_CUR), rt0 = twkF(comp, MC_BOARD_ROT_TARGET);
+                    const float rr0 = twkF(comp, MC_BOARD_ROT_RATE);
+                    const float c = fabsf(rc0), t = fabsf(rt0);
+                    const bool  sane = c < 3600.0f && t < 3600.0f && fabsf(rr0) < 100000.0f;
+                    // ---- the sideways band (see CatchShoveBailBandDeg): decided first, before the stop
+                    // and before the snap can claim the catch.
+                    if (g_shoveBailBand > 0 && sane && (flags & 0x20) && !srGrounded && !AutoCatchActive()) {
+                        float m = fmodf(c, 180.0f); if (m < 0.0f) m += 180.0f;
+                        const float off90 = fabsf(m - 90.0f);
+                        if (off90 <= (float)g_shoveBailBand) {
+                            g_shoveRbClaimed = true;             // neither the stop nor the snap touches it
+                            TwkLog("[catch] shove caught %.0f deg from sideways (counter %.0f, %.0f mod 180), inside "
+                                   "CatchShoveBailBandDeg %d -- BAIL", off90, c, m, g_shoveBailBand);
+                            RunOut_BailNow(skater);
+                        }
+                    }
+                    if (!g_shoveRbClaimed && sane && (flags & 0x20) && !srGrounded && shAuth > 10.0f &&
+                        t > shAuth + 3.0f && c > shAuth + 3.0f) {
+                        const float over = c - shAuth;              // past the authored mark
+                        {
+                            // Stop it here, however far past: both rate fields (the game's ease has nothing to resume
+                            // toward) and the target brought to the counter (owed 0). The shove-axis
+                            // plant fix keeps it there if anything nudges the target later.
+                            *(float*)((uint8_t*)comp + MC_BOARD_ROT_RATE)     = 0.0f;
+                            *(float*)((uint8_t*)comp + MC_BOARD_ROT_RATE + 4) = 0.0f;
+                            *(float*)((uint8_t*)comp + MC_BOARD_ROT_TARGET)   = (rt0 < 0.0f ? -1.0f : 1.0f) * c;
+                            g_shoveRbClaimed = true;
+                            TwkLog("[catch] shove over-rotated: caught %.0f deg past its %.0f mark (target extended to "
+                                   "%.0f, was turning at %.0f deg/s) -- stopped where it is, the foot takes it there",
+                                   over, shAuth, t, fabsf(rr0));
+                        }
+                    }
+                }
+            }
+            // ---- UNDER-ROTATED SHOVE: finish the rotation in time for the foot (CatchShoveSnap) ---------
+            // See the knob. Independent of the flip drive above -- a shove+flip caught short on the shove
+            // and past on the flip runs both: the flip rolls back while the shove hurries on.
+            {
+                static bool  ssActive = false;
+                static float ssRate = 0.0f, ssOwed0 = 0.0f, ssLastWrite = 0.0f;
+                static int   ssFrames = 0, ssStomped = 0;
+                static long  ssSerial = -1;
+                if (catchState == 0) g_shoveSnapTried = false;
+                void* anSs = FootPlace_AnimInstance();
+                const bool ssGrounded = anSs && twkB(anSs, AN_GROUNDED) != 0;
+                if (ssActive) {
+                    const float rc = comp ? twkF(comp, MC_BOARD_ROT_CUR)    : 0.0f;
+                    const float rt = comp ? twkF(comp, MC_BOARD_ROT_TARGET) : 0.0f;
+                    const float rr = comp ? twkF(comp, MC_BOARD_ROT_RATE)   : 0.0f;
+                    const float owed = fabsf(rt) - fabsf(rc);
+                    const float rL = comp ? twkF(comp, MC_LFOOT_CATCH + FCFI_RATIO) : 0.0f;
+                    const float rR = comp ? twkF(comp, MC_RFOOT_CATCH + FCFI_RATIO) : 0.0f;
+                    // stomp probe: the rate read back off what was written last frame
+                    if (comp && fabsf(fabsf(rr) - ssLastWrite) > ssLastWrite * 0.1f + 1.0f) ++ssStomped;
+                    const bool ended   = (catchState == 0) || ssGrounded || !comp ||
+                                         FlipSpeed_TrickSerial() != ssSerial;
+                    const bool arrived = !ended && owed <= 1.0f;
+                    const bool timeout = !ended && ssFrames > 90;
+                    if (ended || arrived || timeout) {
+                        if (comp && !ended) {
+                            // Stop the shove where it is and bring its target to it: owed 0, the
+                            // rotation term completes. Both rate fields, so the game's own ease has
+                            // nothing to resume toward.
+                            *(float*)((uint8_t*)comp + MC_BOARD_ROT_RATE)     = 0.0f;
+                            *(float*)((uint8_t*)comp + MC_BOARD_ROT_RATE + 4) = 0.0f;
+                            *(float*)((uint8_t*)comp + MC_BOARD_ROT_TARGET)   = (rt < 0.0f) ? -fabsf(rc) : fabsf(rc);
+                        }
+                        TwkLog("[catch] shove snap: finished %.0f of %.0f deg in %d frames (rate read back %.0f, "
+                               "stomped %d), foot ratio L=%.2f R=%.2f -- %s", ssOwed0 - owed, ssOwed0, ssFrames,
+                               rr, ssStomped, rL, rR,
+                               arrived ? "arrived, planted" : timeout ? "timeout" :
+                               ssGrounded ? "TOUCHED DOWN first" : (catchState == 0) ? "catch ended first" :
+                               "trick changed");
+                        ssActive = false; ssFrames = 0; ssStomped = 0;
+                    } else {
+                        const float sgn = (rr < 0.0f) ? -1.0f : 1.0f;
+                        *(float*)((uint8_t*)comp + MC_BOARD_ROT_RATE)     = sgn * ssRate;
+                        *(float*)((uint8_t*)comp + MC_BOARD_ROT_RATE + 4) = sgn * ssRate;
+                        ssLastWrite = ssRate;
+                        if (g_overTrace)
+                            TwkLog("[shove] f%02d cur=%.0f tgt=%.0f owed=%.1f rate=%.0f | ratio L=%.2f R=%.2f "
+                                   "flags=0x%02x st=%d", ssFrames, rc, rt, owed, rr, rL, rR,
+                                   twkB(comp, MC_BOARD_FLAGS), catchState);
+                        ++ssFrames;
+                    }
+                }
+                if (!ssActive && !g_shoveSnapTried && !g_shoveRbClaimed &&
+                    catchState != 0 && comp && g_shoveSnap) {
+                    g_shoveSnapTried = true;
+                    const int   flags = twkB(comp, MC_BOARD_FLAGS);
+                    const float rc0 = twkF(comp, MC_BOARD_ROT_CUR), rt0 = twkF(comp, MC_BOARD_ROT_TARGET);
+                    const float rr0 = twkF(comp, MC_BOARD_ROT_RATE);
+                    const float owed0 = fabsf(rt0) - fabsf(rc0);
+                    const bool  sane = fabsf(rc0) < 3600.0f && fabsf(rt0) < 3600.0f && fabsf(rr0) < 100000.0f;
+                    if (sane && (flags & 0x20) && !ssGrounded && owed0 > 3.0f && owed0 <= 270.0f && fabsf(rr0) > 1.0f) {
+                      if (owed0 > (float)g_shoveFinishMaxDeg) {
+                        // Caught where it is (see CatchShoveFinishMaxDeg): the rotation stops and the
+                        // target comes to the counter -- owed 0, the foot lands on the board as it is.
+                        *(float*)((uint8_t*)comp + MC_BOARD_ROT_RATE)     = 0.0f;
+                        *(float*)((uint8_t*)comp + MC_BOARD_ROT_RATE + 4) = 0.0f;
+                        *(float*)((uint8_t*)comp + MC_BOARD_ROT_TARGET)   = (rt0 < 0.0f ? -1.0f : 1.0f) * fabsf(rc0);
+                        g_shoveRbClaimed = true;
+                        TwkLog("[catch] shove caught %.0f deg short (%.0f of %.0f, turning at %.0f deg/s), more than "
+                               "CatchShoveFinishMaxDeg %d -- caught where it is: the board stops, the foot takes it there",
+                               owed0, fabsf(rc0), fabsf(rt0), fabsf(rr0), g_shoveFinishMaxDeg);
+                      } else {
+                        float want = owed0 / ((float)g_snapMs / 1000.0f);
+                        if (want > (float)g_shoveSnapMaxRate) want = (float)g_shoveSnapMaxRate;
+                        g_catchRescued = true;      // the descent opens the rotation window to the owed amount
+                        if (want > fabsf(rr0)) {
+                            ssActive = true; ssRate = want; ssOwed0 = owed0; ssFrames = 0; ssStomped = 0;
+                            ssSerial = FlipSpeed_TrickSerial();
+                            const float sgn = (rr0 < 0.0f) ? -1.0f : 1.0f;
+                            *(float*)((uint8_t*)comp + MC_BOARD_ROT_RATE)     = sgn * want;
+                            *(float*)((uint8_t*)comp + MC_BOARD_ROT_RATE + 4) = sgn * want;
+                            ssLastWrite = want;
+                            TwkLog("[catch] shove snap: caught with the shove %.0f deg short (%.0f of %.0f) at %.0f "
+                                   "deg/s -- finishing it in %d ms (%.0f deg/s), the foot coming down with it",
+                                   owed0, fabsf(rc0), fabsf(rt0), fabsf(rr0), g_snapMs, want);
+                        } else {
+                            TwkLog("[catch] shove snap: caught with the shove %.0f deg short at %.0f deg/s -- fast "
+                                   "enough, opening the foot's window to it", owed0, fabsf(rr0));
+                        }
+                      }
+                    }
+                }
+            }
+            if (g_stopFlip && catchState != 0 && !armed && !g_overActive) {
                 armed = true;
                 // If the deck is ALREADY flat when the catch registers, do nothing at all. There is
                 // no second revolution to prevent -- the board has arrived -- and zeroing the flip
@@ -2985,12 +3478,17 @@ void CatchTweaks_PumpFrame() {
                     const float maxByBoost = fabsf(rate) * (float)g_snapMaxBoost;
                     if (remaining > 40.0f && fabsf(rate) > 1.0f) {
                         if (remaining <= (float)g_snapMaxDeg) {
+                            // In range = the foot comes down WITH the deck (CatchFootDescends),
+                            // whether or not the rate needed a boost to arrive in time. It used to
+                            // arm only on a boost, so a flip already fast enough kept the rig's own
+                            // short window: the foot hung at zero until the last stretch, then
+                            // dropped -- the same float, one case over.
+                            g_catchRescued = true;
                             if (want > fabsf(rate)) {
                                 float capped = want;
                                 if (capped > maxByBoost) capped = maxByBoost;
                                 if (capped > 2500.0f)    capped = 2500.0f;   // absolute ceiling
                                 *(float*)((uint8_t*)comp + MC_BOARD_FLIP_RATE) = (rate < 0.0f) ? -capped : capped;
-                                g_catchRescued = true;
                                 TwkLog("[catch] caught %.0f deg short -- finishing the flip in %d ms "
                                        "(%.0f -> %.0f deg/s)", remaining, g_snapMs, fabsf(rate), capped);
                             }
@@ -3021,7 +3519,7 @@ void CatchTweaks_PumpFrame() {
             // The aim is computed on magnitudes and put back on the TARGET's sign.
             static bool endedThisCatch = false;
             if (catchState == 0) endedThisCatch = false;
-            if (g_anyRev && comp && catchState != 0 && !endedThisCatch &&
+            if (g_anyRev && comp && catchState != 0 && !endedThisCatch && !g_overActive &&
                 ang >= (180.0f - (float)g_anyRevDeg)) {
                 const float tgt  = twkF(comp, MC_BOARD_FLIP_TARGET);
                 const float cur  = twkF(comp, MC_BOARD_FLIP_CUR);
@@ -3047,15 +3545,28 @@ void CatchTweaks_PumpFrame() {
                                "finish rather than aiming it at flat", ang, owed);
                     }
                 } else if (owed > 1.0f && fabsf(rate) > 1.0f) {
-                    const float toFlat = 180.0f - ang;      // deck degrees still to roll to grip-up
-                    const float aimMag = fabsf(cur) + toFlat;
+                    float aimMag;
+                    if (g_anyRevLegacy) {
+                        aimMag = fabsf(cur) + (180.0f - ang);   // the old rendered-angle aim (A/B only)
+                    } else {
+                        // COUNTER-BASED (see CatchAnyRevLegacyAim): the nearest flat AHEAD of the counter.
+                        // Unless the game has extended the target -- a run past the mark, which is the
+                        // over-rotation drive's business -- that is the target it already has, and
+                        // nothing is written: the flip ends exactly level, no over-aim to twist back.
+                        float base = fabsf(tgt);
+                        { const float revs = floorf(base / 360.0f + 0.5f); if (revs >= 1.0f) base /= revs; }
+                        if (!(base > 200.0f && base < 400.0f)) base = 360.0f;
+                        aimMag = base * ceilf(fabsf(cur) / base - 0.01f);
+                        if (aimMag < fabsf(cur)) aimMag = fabsf(cur);
+                    }
                     const float aim = (tgt < 0.0f) ? -aimMag : aimMag;
                     if (fabsf(aim - tgt) > 1.0f) {
                         *(float*)((uint8_t*)comp + MC_BOARD_FLIP_TARGET) = aim;
                         endedThisCatch = true;
-                        TwkLog("[catch] caught at %.0f deg -- aiming the flip at flat, %.0f deg away "
-                               "(target %.0f -> %.0f, game wanted %.0f more)",
-                               ang, toFlat, tgt, aim, owed);
+                        TwkLog("[catch] caught with the flip at %.0f (deck reads %.0f) -- aiming it at the nearest "
+                               "flat ahead, %.0f deg away (target %.0f -> %.0f, game wanted %.0f more)%s",
+                               fabsf(cur), ang, aimMag - fabsf(cur), tgt, aim, owed,
+                               g_anyRevLegacy ? "  [legacy rendered-angle aim]" : "");
                     }
                 }
             }
@@ -3066,14 +3577,17 @@ void CatchTweaks_PumpFrame() {
             // CatchRatio (computed against the target) freezes with it: the foot hangs partway
             // down. Rate ~0 with rotation still owed is that exact stuck state and can never
             // resolve itself, so the target is brought to the deck: ratio completes, foot plants.
-            if (g_plantFix && comp && catchState != 0) {
+            if (g_plantFix && comp && catchState != 0 && !g_overActive) {
                 const float pfTgt  = twkF(comp, MC_BOARD_FLIP_TARGET);
                 const float pfCur  = twkF(comp, MC_BOARD_FLIP_CUR);
                 const float pfRate = twkF(comp, MC_BOARD_FLIP_RATE);
                 const float pfOwed = fabsf(pfTgt) - fabsf(pfCur);
                 // ...and only NEAR home. Far from it a stopped deck is a failed catch, and completing
                 // the ratio would plant the foot on an upside-down board and make the catch.
-                if (fabsf(pfRate) < 1.0f && pfOwed > 2.0f && pfOwed <= 90.0f) {
+                // > 0.5, not > 2: the over-rotation roll-back stops 1-5 deg off its mark, and the foot's
+                // ratio is 1 - owed/window with a 20-40 deg window -- two degrees owed is a ratio of 0.95
+                // and a foot hovering a hair off the deck (field, 3.19.251).
+                if (fabsf(pfRate) < 1.0f && pfOwed > 0.5f && pfOwed <= 90.0f) {
                     const float pfAim = (pfTgt < 0.0f) ? -fabsf(pfCur) : fabsf(pfCur);
                     *(float*)((uint8_t*)comp + MC_BOARD_FLIP_TARGET) = pfAim;
                     static long plantLogged = -1;
@@ -3083,6 +3597,38 @@ void CatchTweaks_PumpFrame() {
                         TwkLog("[catch] plant fix: deck stopped still owing %.0f deg (target %.0f, "
                                "current %.0f) -- releasing the ratio so the foot lands", pfOwed,
                                pfTgt, pfCur);
+                    }
+                }
+                // ---- the same on the SHOVE axis. The foot ratio is the SMALLER of the flip term and
+                // the rotation term (UpdateFeetCatchInfo runs the same owed/window math on
+                // _boardRotationTarget/Current while flag 0x20 is set), so a stopped board that still
+                // owes ROTATION pins the ratio exactly as owed flip does -- and nothing ever released
+                // it. Field (3.19.252 survey): hardflips and inward heels (180 shove + flip) caught at
+                // grip-up with the board stopped and the catching foot never attaching, roll-back or
+                // not, while every tre flip (360 shove) planted. No distance cap on this axis: the
+                // board's YAW does not decide whether the griptape is up, so a stopped board is
+                // catchable at any yaw. Gated on the flip being settled too, so a shove that simply
+                // has not started yet is never zeroed.
+                {
+                    const int   pfFlags   = twkB(comp, MC_BOARD_FLAGS);
+                    const float pfRotTgt  = twkF(comp, MC_BOARD_ROT_TARGET);
+                    const float pfRotCur  = twkF(comp, MC_BOARD_ROT_CUR);
+                    const float pfRotRate = twkF(comp, MC_BOARD_ROT_RATE);
+                    const float pfRotOwed = fabsf(pfRotTgt) - fabsf(pfRotCur);
+                    const bool  pfRotSane = fabsf(pfRotTgt) < 3600.0f && fabsf(pfRotCur) < 3600.0f &&
+                                            fabsf(pfRotRate) < 100000.0f;
+                    const bool  flipSettled = fabsf(pfRate) < 1.0f || !(pfFlags & 0x08) || pfOwed <= 0.5f;
+                    if (pfRotSane && (pfFlags & 0x20) && flipSettled && fabsf(pfRotRate) < 1.0f && pfRotOwed > 0.5f) {
+                        const float pfRotAim = (pfRotTgt < 0.0f) ? -fabsf(pfRotCur) : fabsf(pfRotCur);
+                        *(float*)((uint8_t*)comp + MC_BOARD_ROT_TARGET) = pfRotAim;
+                        static long rotPlantLogged = -1;
+                        const long pfSer2 = FlipSpeed_TrickSerial();
+                        if (rotPlantLogged != pfSer2) {
+                            rotPlantLogged = pfSer2;
+                            TwkLog("[catch] plant fix (shove axis): board stopped still owing %.0f deg of "
+                                   "rotation (target %.0f, current %.0f, rate %.0f) -- releasing the ratio so "
+                                   "the foot lands", pfRotOwed, pfRotTgt, pfRotCur, pfRotRate);
+                        }
                     }
                 }
             }
@@ -3142,7 +3688,7 @@ void CatchTweaks_PumpFrame() {
                                           owedR > -3600.0f && owedR < 3600.0f;
                         if (!fdDef) {
                             // Begin only where the game's own window would pin the ratio at 0.
-                            if (sane && g_catchRescued && (owedF > curF || owedR > curR)) {
+                            if (sane && g_catchRescued && !g_overActive && (owedF > curF || owedR > curR)) {
                                 fdDef = def; fdSerial = FlipSpeed_TrickSerial();
                                 fdBaseF = curF; fdBaseR = curR;
                                 fdOwedF0 = owedF; fdOwedR0 = owedR;
@@ -3173,67 +3719,10 @@ void CatchTweaks_PumpFrame() {
                     }
                 }
             }
-            // ---- the foot levels the board -------------------------------------------------
-            // On a parked over-rotation (endedThisCatch) the flip is frozen and the game's
-            // roll-align has not started -- it only engages once a foot's CatchRatio passes 0.9,
-            // AFTER the foot has landed on the tilted deck. Until then nothing drives the roll, so
-            // the deck levels as a separate second motion. This drive fills that gap: the rendered
-            // roll (comp+0x628) is slaved to the foot's own CatchRatio, smoothstepped, so the deck
-            // rolls flat exactly in step with the foot coming down on it. Ratios are only READ --
-            // writing one kills the catch outright. At 0.9 the game's align takes over with
-            // ~nothing left to do; grounding or the catch ending releases the drive.
-            {
-                static bool  flArmed = false, flDone = false;
-                static float flStart = 0.0f, flTarget = 0.0f, flLastWrite = 0.0f;
-                static int   flFrames = 0, flStomped = 0;
-                if (catchState == 0) {
-                    if (flFrames > 0) {
-                        TwkLog("[catch] foot-level drive: %d frames, roll %.1f -> %.1f (target %.1f)"
-                               ", stomped %d frames%s", flFrames, flStart, flLastWrite, flTarget,
-                               flStomped, (flStomped > flFrames / 2)
-                                   ? "   <-- WRITE NOT STICKING, lever is wrong" : "");
-                        flFrames = 0;
-                    }
-                    flArmed = false; flDone = false; flStomped = 0;
-                }
-                if (g_footLevel && comp && catchState != 0 && endedThisCatch && !flDone &&
-                    !FootPlace_Grounded()) {
-                    const float rl = twkF(comp, MC_LFOOT_CATCH + FCFI_RATIO);
-                    const float rr = twkF(comp, MC_RFOOT_CATCH + FCFI_RATIO);
-                    const float ratio = (rl > rr) ? rl : rr;
-                    if (ratio >= 0.9f) {
-                        flDone = true;                      // the game's own align owns it from here
-                    } else if (!flArmed) {
-                        // First driven frame: capture where the roll is and aim at the NEAREST
-                        // level wrap -- the rotator roll accumulates degrees across the flip, so
-                        // level is "the closest multiple of 360 (+ the authored target roll)", the
-                        // short way round, same as the game's own quat slerp resolves it.
-                        flStart = twkF(comp, MC_ANIM_ROLL);
-                        float tgtRoll = 0.0f;
-                        void* def = twkP(skater, SK_CURRENT_TRICK_DEF);
-                        if (def) {
-                            const float t = twkF(def, DEF_CATCH_TGT_ROLL);
-                            if (t > -180.0f && t < 180.0f) tgtRoll = t;
-                        }
-                        flTarget = floorf(flStart / 360.0f + 0.5f) * 360.0f + tgtRoll;
-                        flLastWrite = flStart;
-                        flArmed = true; flFrames = 0; flStomped = 0;
-                    } else {
-                        // Stomp probe: if the value moved off what we wrote last frame (and the
-                        // align is not active below 0.9), something else re-writes the roll after
-                        // us and this lever does not stick -- the summary line says so.
-                        const float now = twkF(comp, MC_ANIM_ROLL);
-                        if (fabsf(now - flLastWrite) > 0.5f) ++flStomped;
-                        float r = ratio / 0.9f;
-                        if (r < 0.0f) r = 0.0f; else if (r > 1.0f) r = 1.0f;
-                        const float eased = r * r * (3.0f - 2.0f * r);   // a press: fast mid, soft end
-                        const float roll = flStart + (flTarget - flStart) * eased;
-                        *(float*)((uint8_t*)comp + MC_ANIM_ROLL) = roll;
-                        flLastWrite = roll;
-                        ++flFrames;
-                    }
-                }
-            }
+            // (The lockstep write of the rendered roll that used to sit here -- "the foot levels the
+            // board" -- is gone: the flip update re-stamps that field every frame, so it measured
+            // as WRITE NOT STICKING every time. The over-rotation drive above does the job through
+            // the rate, which is the one lever that moves the deck.)
             if (catchState == 0 && ang > 170.0f) armed = false;
             // Once the flip is aimed at flat the target ends it there by itself; zeroing the rate
             // here would freeze the deck up to (180 - stopFlipDeg) short of level, which is exactly

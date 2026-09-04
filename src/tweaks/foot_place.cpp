@@ -108,8 +108,9 @@ static int g_ok = 1;             // runtime health, NEVER persisted (the catch_l
 // in the pocket -- where the kick curves up into the sole -- that reads as the shoe sinking a little
 // into the deck (field). The auto-adjust's accidental ~0.5 cm had been masking it. Along the deck's
 // normal rather than world up, so it stays a lift off the deck on a bank. 0 = off (the socket as the
-// game places it). Millimetres, so the ini stays integer like every other key.
-static int g_soleLiftMm = 0;
+// game places it). Millimetres, so the ini stays integer like every other key. 7 = the value the
+// field settled on (0.7 cm: the pocket stops sinking, the flat does not start hovering).
+static int g_soleLiftMm = 7;
 // FootFixSoleLiftSwitchMm: the same lift while skating SWITCH (the anim's IsSkatingSwitch, which
 // covers the reversed stances). Separate because the game's own switch placement already floats a
 // touch at 0 (field: "the feet float slightly above when skating switch, always has"), so the value
@@ -120,24 +121,64 @@ static int g_soleLiftSwMm = 0;
 // the deck, z above the flipper pivot, the foot's axes against the deck normal). The one question it
 // answers: does the socket FOLLOW the kick in the pocket (then only a sole lift is missing) or stay
 // on the flat plane (then the kick geometry is). Change-triggered, at most four lines a second.
-static int g_probe = 1;
+// Opt-in, like every other diagnostic in the mod.
+static int g_probe = 0;
+// FootFixSidewaysHold: while a shove has been stopped where it was caught (catch_tweaks'
+// CatchShoveStopHold -- the board parked at an odd yaw, up to sideways), a foot socket that LEAPS
+// more than FootFixSidewaysJumpCm in one frame keeps last frame's placement. Field: "a very sideways
+// catch makes the feet freak out" -- both feet oscillating between two positions. The nose/tail TYPE
+// is measured NOT to be it (type flips 0 on every such catch), so the next suspect is the socket
+// itself: the game deciding each frame which end of a near-90-deg board each foot belongs to, and
+// flipping. A jump filter fixes that if so and touches nothing otherwise: the ride's own socket
+// motion is centimetres a frame, the flip-flop is tens. Released on touchdown.
+// CONFIRMED (3.19.265 field): the socket was the oscillator and the hold stopped the freak-out. What
+// remained: the hold kept whichever placement it saw FIRST, and when the game's first pick was the
+// far end of a sideways board the wrong end got locked in ("the feet try to connect to the wrong
+// socket"). So on a flip-flop the two placements are judged against the foot's RIDING socket --
+// where that foot sits on the board when just rolling, captured every rolling frame -- and the nearer
+// one wins: the near end is the end a real foot reaches for. FootFixSidewaysNearCm is the margin.
+static int g_sideHold   = 1;
+static int g_sideNearCm = 5;     // FootFixSidewaysNearCm -- how much nearer the other end must be to switch
+// (FootFixSidewaysGlideCm/GlideDeg -- 6 cm / 10 deg per-frame gates meant to catch a GLIDE of the foot
+// to the other end -- were built in 3.19.270 and REMOVED in 3.19.271: "the feet instantly move to the
+// board when caught, and it still has the socket issue". The 20 cm jump filter is what ships.)
+// (FootFixSidewaysPlace -- placing the feet ourselves from a deck-frame copy of the riding socket --
+// was built in 3.19.268 and REMOVED in 3.19.269: it fired on near-perfect catches (a shove 6-27 deg
+// "past" its mark is inside the render lag), chose ends per FOOT so one foot swapped while the other
+// did not, and its rotation swept with the settling deck mesh. "Wrong socket placements on almost
+// every catch." Any retry needs a per-BOARD end decision and a reference that does not move with the
+// mesh, and must not run on catches within the render lag of their mark.)
+static int g_sideJumpCm = 20;    // FootFixSidewaysJumpCm
+// FootFixSidewaysTrace: 24 lines per sideways stop -- both sockets (loc + rot), alphas, and the
+// per-frame jump -- so the oscillator is named from the log whether or not the hold catches it.
+static int g_sideTrace  = 0;    // opt-in: 24 lines per sideways catch (1834 lines in one session)
 void FootPlace_ReadConfig(const char* buf) {
     g_on = TwkIniInt(buf, "FootFixShoeHeight", 1) ? 1 : 0;
-    g_soleLiftMm = TwkIniInt(buf, "FootFixSoleLiftMm", 0);
+    g_soleLiftMm = TwkIniInt(buf, "FootFixSoleLiftMm", 7);
     if (g_soleLiftMm < -20) g_soleLiftMm = -20;
     if (g_soleLiftMm > 30)  g_soleLiftMm = 30;
     g_soleLiftSwMm = TwkIniInt(buf, "FootFixSoleLiftSwitchMm", 0);
     if (g_soleLiftSwMm < -20) g_soleLiftSwMm = -20;
     if (g_soleLiftSwMm > 30)  g_soleLiftSwMm = 30;
-    g_probe = TwkIniInt(buf, "FootFixProbe", 1) ? 1 : 0;
+    g_probe = TwkIniInt(buf, "FootFixProbe", 0) ? 1 : 0;
+    g_sideHold   = TwkIniInt(buf, "FootFixSidewaysHold", 1) ? 1 : 0;
+    g_sideJumpCm = TwkIniInt(buf, "FootFixSidewaysJumpCm", 20);
+    g_sideNearCm = TwkIniInt(buf, "FootFixSidewaysNearCm", 5);
+    if (g_sideNearCm < 0) g_sideNearCm = 0; if (g_sideNearCm > 100) g_sideNearCm = 100;
+    if (g_sideJumpCm < 3) g_sideJumpCm = 3; if (g_sideJumpCm > 200) g_sideJumpCm = 200;
+    g_sideTrace  = TwkIniInt(buf, "FootFixSidewaysTrace", 0) ? 1 : 0;
 }
 void FootPlace_SaveConfig(char* buf, size_t cap) {
     TwkIniSetInt(buf, cap, "FootFixShoeHeight",      g_on);
     TwkIniSetInt(buf, cap, "FootFixSoleLiftMm",      g_soleLiftMm);
     TwkIniSetInt(buf, cap, "FootFixSoleLiftSwitchMm", g_soleLiftSwMm);
     TwkIniSetInt(buf, cap, "FootFixProbe",           g_probe);
+    TwkIniSetInt(buf, cap, "FootFixSidewaysHold",    g_sideHold);
+    TwkIniSetInt(buf, cap, "FootFixSidewaysJumpCm",  g_sideJumpCm);
+    TwkIniSetInt(buf, cap, "FootFixSidewaysNearCm",  g_sideNearCm);
+    TwkIniSetInt(buf, cap, "FootFixSidewaysTrace",   g_sideTrace);
 }
-void FootPlace_ResetDefaults()     { g_on = 1; g_ok = 1; g_soleLiftMm = 0; g_soleLiftSwMm = 0; g_probe = 1; }
+void FootPlace_ResetDefaults()     { g_on = 1; g_ok = 1; g_soleLiftMm = 7; g_soleLiftSwMm = 0; g_probe = 0; }
 bool FootPlace_Enabled()           { return g_on != 0; }
 void FootPlace_SetEnabled(bool on) { g_on = on ? 1 : 0; if (on) g_ok = 1; TwkMarkDirty(); }
 
@@ -366,6 +407,85 @@ static void hkUpdateFootAnchors(void* self, double dt, void* a, void* b) {
             }
         }
         if (g_probe && riding) ProbeDeckFrame(self);
+
+        // ---- the sideways-catch socket hold (FootFixSidewaysHold) ---------------------------------
+        {
+            static bool  have[2] = { false, false }, haveRide[2] = { false, false };
+            static float held[2][6];               // loc xyz + rot pyr per foot, the last accepted frame
+            static float ride[2][3];               // each foot's socket while just rolling -- the natural end
+            static int   rej[2] = { 0, 0 }, sw[2] = { 0, 0 }, frames = 0, jumps = 0;
+            const bool grounded = twkB(self, AN_GROUNDED) != 0;
+            const bool holding  = g_sideHold && CatchTweaks_ShoveStopHold() && !grounded;
+            if (!holding && riding && grounded) {
+                // The riding placement, refreshed every rolling frame and frozen the moment the board
+                // leaves the ground: a foot the IK is placing (alpha > 0.5) on a grounded, ridden board.
+                const int locOffR[2] = { AN_L_SOCK_LOC, AN_R_SOCK_LOC };
+                const int alpOffR[2] = { AN_L_ALPHA,    AN_R_ALPHA };
+                for (int f = 0; f < 2; f++) {
+                    if (twkF(self, alpOffR[f]) > 0.5f) {
+                        for (int i = 0; i < 3; i++) ride[f][i] = twkF(self, locOffR[f] + i * 4);
+                        haveRide[f] = true;
+                    }
+                }
+            }
+            if (holding) {
+                const int locOff[2] = { AN_L_SOCK_LOC, AN_R_SOCK_LOC };
+                const int rotOff[2] = { AN_L_SOCK_ROT, AN_R_SOCK_ROT };
+                const int alpOff[2] = { AN_L_ALPHA,    AN_R_ALPHA };
+                float jump[2] = { 0.0f, 0.0f };
+                float cur[2][6];
+                for (int f = 0; f < 2; f++) {
+                    for (int i = 0; i < 3; i++) cur[f][i]     = twkF(self, locOff[f] + i * 4);
+                    for (int i = 0; i < 3; i++) cur[f][3 + i] = twkF(self, rotOff[f] + i * 4);
+                    const float alpha = twkF(self, alpOff[f]);
+                    if (have[f]) {
+                        const float dx = cur[f][0] - held[f][0], dy = cur[f][1] - held[f][1], dz = cur[f][2] - held[f][2];
+                        jump[f] = sqrtf(dx * dx + dy * dy + dz * dz);
+                    }
+                    // Only a foot the IK is actually placing (alpha > 0.5) is held; a foot still in
+                    // the catch pose is left to the animation.
+                    if (alpha > 0.5f && have[f] && jump[f] > (float)g_sideJumpCm) {
+                        // A flip-flop. Of the two placements on offer, the one nearer the foot's riding
+                        // socket wins -- the near end. Without a riding socket to judge by, the first
+                        // placement stands (the old rule).
+                        float dNew = 0.0f, dHeld = 0.0f;
+                        if (haveRide[f]) {
+                            for (int i = 0; i < 3; i++) {
+                                const float a = cur[f][i] - ride[f][i], b = held[f][i] - ride[f][i];
+                                dNew += a * a; dHeld += b * b;
+                            }
+                            dNew = sqrtf(dNew); dHeld = sqrtf(dHeld);
+                        }
+                        if (haveRide[f] && dNew + (float)g_sideNearCm < dHeld) {
+                            for (int i = 0; i < 6; i++) held[f][i] = cur[f][i];     // switch to the nearer end
+                            ++sw[f];
+                        } else {
+                            for (int i = 0; i < 3; i++) *(float*)((uint8_t*)self + locOff[f] + i * 4) = held[f][i];
+                            for (int i = 0; i < 3; i++) *(float*)((uint8_t*)self + rotOff[f] + i * 4) = held[f][3 + i];
+                            ++rej[f];
+                        }
+                        ++jumps;
+                    } else {
+                        for (int i = 0; i < 6; i++) held[f][i] = cur[f][i];
+                        have[f] = true;
+                    }
+                }
+                if (g_sideTrace && frames < 24)
+                    TwkLog("[foot] side f%02d | L (%.0f,%.0f,%.0f) r(%.0f,%.0f,%.0f) a=%.2f jump %.0f%s | R (%.0f,%.0f,%.0f) "
+                           "r(%.0f,%.0f,%.0f) a=%.2f jump %.0f%s", frames,
+                           cur[0][0], cur[0][1], cur[0][2], cur[0][3], cur[0][4], cur[0][5], twkF(self, AN_L_ALPHA), jump[0],
+                           (jump[0] > (float)g_sideJumpCm) ? " HELD" : "",
+                           cur[1][0], cur[1][1], cur[1][2], cur[1][3], cur[1][4], cur[1][5], twkF(self, AN_R_ALPHA), jump[1],
+                           (jump[1] > (float)g_sideJumpCm) ? " HELD" : "");
+                ++frames;
+            } else if (frames) {
+                TwkLog("[foot] sideways hold over %d frames: rejected jumps L=%d R=%d, switched to the nearer end "
+                       "L=%d R=%d (riding socket known L=%d R=%d)%s", frames, rej[0], rej[1], sw[0], sw[1],
+                       haveRide[0] ? 1 : 0, haveRide[1] ? 1 : 0,
+                       jumps ? "   <-- the socket WAS flip-flopping" : "   (no socket jumps -- the oscillation is elsewhere)");
+                have[0] = have[1] = false; rej[0] = rej[1] = 0; sw[0] = sw[1] = 0; frames = 0; jumps = 0;
+            }
+        }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         g_ok = 0;
         TwkLog("[foot] caught fatal applying the foot offsets -> paused (game unaffected)");

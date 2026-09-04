@@ -34,6 +34,9 @@ seam, and with SessionOpenMP absent nothing answers, so it configures itself fro
 `SessionTweaks.ini` instead. That file is written for you on first launch with every setting at its
 default, so there is nothing to author by hand.
 
+**[Full feature list -> FEATURES.md](FEATURES.md)** -- everything both mods do, what is a new
+capability and what is a base-game defect corrected, with the version each landed in.
+
 > Status: working and in testing. Sessions of five players have run without trouble. Expect rough
 > edges, and please report them with a log.
 
@@ -148,7 +151,7 @@ shared-memory backends need none of this.
 
 ### Tests
 
-Four offline gates run without the game and must all pass before a change ships. See
+Six offline gates run without the game and must all pass before a change ships. See
 `tools/README.md`.
 
 ```
@@ -157,7 +160,14 @@ build\Release\omp_looptest.exe      # clock, interpolation and wire codec under 
 build\Release\omp_sessiontest.exe   # session lifecycle: peers joining, going quiet, leaving
 build\Release\omp_shmtest.exe       # two real processes over the shared-memory transport
 build\Release\omp_udptest.exe       # two real processes over loopback UDP
+build\Release\omp_relaytest.exe     # a relay server and three clients, including the amplification rule
 ```
+
+`tools/offcheck/offcheck.py` additionally verifies every struct offset and byte signature in the
+source against the game's shipped PDB.
+
+The shm and udp gates each run two real processes against a named section or a loopback port, so
+back-to-back runs can overlap and report a false failure; re-run one on its own before believing it.
 
 ---
 
