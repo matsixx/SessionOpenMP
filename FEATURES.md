@@ -5,8 +5,10 @@ is the singleplayer gameplay half, and it works with or without the other. They 
 listed together here, but they are separate DLLs and either can be switched off on its own line in
 `mods.txt`.
 
-\[feature] = a new capability. \[fix] = a defect in the base game, measured and corrected.
-\[restored] = something the game used to do and an update removed. Versions are where each landed.
+Session has no multiplayer, so everything in the SessionOpenMP half is a new capability and is listed
+plainly. SessionTweaks changes a game that already skates, so its entries are marked: \[feature] = a
+new capability, \[fix] = a defect in the base game, measured and corrected, \[restored] =
+something the game used to do and an update removed. Versions are where each landed.
 
 ---
 
@@ -21,137 +23,99 @@ Both machines run identical code -- there is no host/client split anywhere in th
 
 ## Connecting
 
-* \[feature] **Online sessions over Epic Online Services**, including **Epic-Steam cross-play**. Host or
-join from the pause menu; the browser lists each session's host, map, player count and mod version.
-* \[feature] **Private games by code** -- a session mints a code and is skipped by the public browser, so
-the code is the only way in.
-* \[feature] **Direct connect** without Epic, over the internet or a LAN. Everyone is introduced to
-everyone, so all players see each other rather than only the host (1.0.0-rc4; before that it worked
-properly for two).
-* \[feature] **A relay server** for more than two players over the internet without port forwarding
-(1.0.0-rc4). Everyone connects out to one address; the relay forwards and holds no game state.
-It ships as source and a prebuilt binary in the package, and runs on Windows or Linux.
-* \[feature] **Shared memory** between two games on one PC, for development and testing.
-* \[feature] **Hide my IP address** -- on by default. Traffic goes through Epic's relays so peers never
-see your address; off is a direct connection, which is faster.
-* \[feature] **Ban list**, per player, kept between sessions.
-* \[fix] Ghost lobbies are hidden: a crashed or killed game leaves its session alive on Epic's backend,
-and those are filtered out of the browser rather than offered as joinable (0.9.5b). Your own crash
-leftovers never appear in your list, and clicking a session joins the one you clicked (0.9.5b).
-* \[fix] The browser follows its own search: signing in, searching, then the results, with nothing
-pressed (1.0.0).
+* **Online sessions over Epic Online Services**, including **Epic-Steam cross-play**. Host or join from the
+pause menu; the browser lists each session's host, map, player count and mod version.
+* **Private games by code** -- a session mints a code and is skipped by the public browser, so the code is
+the only way in.
+* **Direct connect** without Epic, over the internet or a LAN. Everyone is introduced to everyone, so all
+players see each other rather than only the host (1.0.0-rc4; before that it worked properly for two).
+* **A relay server** for more than two players over the internet without port forwarding (1.0.0-rc4).
+Everyone connects out to one address; the relay forwards and holds no game state. It ships as source and a
+prebuilt binary in the package, and runs on Windows or Linux.
+* **Shared memory** between two games on one PC, for development and testing.
+* **Hide my IP address** -- on by default. Traffic goes through Epic's relays so peers never see your
+address; off is a direct connection, which is faster.
+* **Ban list**, per player, kept between sessions.
 
 ## Skating together
 
-* \[feature] **Every other player's skater and board**, transported and interpolated on a shared playback
-clock -- position, orientation, the full animation state, board state and stance.
-* \[feature] **Ragdolls are synced** (1.0.0-rc5). A bail used to be re-simulated on every machine from its
-own starting conditions, so nobody watched the same fall; the owner's actual skeleton is now sent
-while they are down and everyone sees the same flop.
-* \[feature] **Board breaking syncs** -- you see another player snap their board, and see it rebuilt
-(0.8.1b).
-* \[feature] **The analog crouch is visible to other players** when SessionTweaks' pop-control scheme is
-on: peers see the depth you are crouched to, not a stock pop (1.0.0-rc2).
-* \[feature] **Real collision.** Peers are game-class actors, so you can bump into them and their boards.
-* \[fix] Players on a poor connection no longer appear to stretch when their data stops arriving
-(0.7.2b), and a peer's legs follow their board correctly (1.0.0-rc2).
-* \[fix] Players in a different level are not spawned into yours; they disappear when they go to another
-map and reappear when they come back (0.7.1b, 0.8.3b). Going to the apartment mid-session no longer
-breaks the game (0.7.1b).
+* **Every other player's skater and board**, transported and interpolated on a shared playback clock --
+position, orientation, the full animation state, board state and stance.
+* **Ragdolls are synced** (1.0.0-rc5). A bail used to be re-simulated on every machine from its own starting
+conditions, so nobody watched the same fall; the owner's actual skeleton is now sent while they are down and
+everyone sees the same flop.
+* **Board breaking syncs** -- you see another player snap their board, and see it rebuilt (0.8.1b).
+* **The analog crouch is visible to other players** when SessionTweaks' pop-control scheme is on: peers see
+the depth you are crouched to, not a stock pop (1.0.0-rc2).
+* **Real collision.** Peers are game-class actors, so you can bump into them and their boards.
+* **You only share a world with people who are in your level.** Players in a different map are not spawned
+into yours; they disappear when they go somewhere else and reappear when they come back (0.7.1b, 0.8.3b).
 
 ## Cosmetics
 
-* \[feature] **Clothing and board parts sync** -- other players wear what they are actually wearing, and
-ride the deck, trucks and wheels they picked.
-* \[feature] **Pro and female skater models sync** (0.8.1b): peers render with the body they chose, not
-with yours.
-* \[fix] Clothing no longer depends on your own outfit -- playing as a pro skater used to change what
-other people looked like to you (0.8.1b).
-* \[fix] Items with long names sync (0.9.9b), and a peer whose body differs from yours keeps their own
-clothes (1.0.1).
+* **Clothing and board parts sync** -- other players wear what they are actually wearing, and ride the deck,
+trucks and wheels they picked.
+* **Pro and female skater models sync** (0.8.1b): peers render with the body they chose, not with yours.
 
 ## Sound
 
-* \[feature] **Other players make the game's own sounds** -- rolling, grinds, powerslides, reverts, impacts,
-pushes, board hits and the trick pop -- captured at the game's sound-spawn layer on their machine and
-re-issued on their skater on yours, with the real surface type and parameters.
-* \[fix] Rolling no longer cuts in and out between skaters. The game ships a voice limit of one on that
-sound, so with two people rolling only one was audible; the limit is widened before the first sound
-creates it (1.0.1).
-* \[fix] A peer's board no longer makes its own sound on your machine on top of the transported one, and
-a looping cue the game spawns as fire-and-forget can no longer play forever on a proxy (1.0.1).
+* **Other players make the game's own sounds** -- rolling, grinds, powerslides, reverts, impacts, pushes,
+board hits and the trick pop -- captured at the game's sound-spawn layer on their machine and re-issued on
+their skater on yours, with the real surface type and parameters.
 
 ## Talking
 
-* \[feature] **Player nameplates** above each skater, with a distance setting (0.7.0b).
-* \[feature] **Chat**, appearing as a speech bubble over the speaker (0.7.0b), with a **typing indicator**
-while someone is composing (0.9.0b) and notices when players join or leave a session (0.8.3b).
-* \[feature] **Multiplayer name** of your own, separate from your profile name, with a filter.
+* **Player nameplates** above each skater, with a distance setting (0.7.0b).
+* **Chat**, appearing as a speech bubble over the speaker (0.7.0b), with a **typing indicator** while
+someone is composing (0.9.0b) and notices when players join or leave a session (0.8.3b).
+* **Multiplayer name** of your own, separate from your profile name, with a filter.
 
 ## The replay editor
 
-* \[feature] **Your replay editor is your own instance** (0.8.0b). Other players are concealed while you
-scrub rather than recorded into your timeline, so your replay is yours.
-* \[feature] **Sync Replay** (0.8.0b): pick a player on the Look At page and turn it on, and their skater
-is driven from *their* recorded history at your scrub position -- their tricks, in your replay, with
-their sound (1.0.0-rc1).
-* \[feature] **Synced replay length** -- 15 s / 30 s / 60 s / 120 s / All (0.9.6b). Shorter is a much faster
-fetch; the setting decides your own wait, not theirs.
-* \[feature] **A progress readout** over the player whose replay is being fetched (0.9.6b), so a long
-transfer is visibly working rather than hung.
-* \[feature] Watching someone scrub is smooth at full rate (1.0.0-rc1), and a scrubbing player animates
-on your screen rather than freezing.
-* \[fix] **Entering the replay editor with mixed outfits no longer crashes** (1.0.1). Each skater's replay
-component caches a bone index per bone, resolved by name against the mesh it had at the time, and the
-game then writes a transform into the pose at each cached index with no bounds check, on a worker
-thread. A remote player's skater is dressed outside the game's own wardrobe rebuild, so it kept the
-indices of the skeleton it was spawned in; dressed into anything smaller, the replay wrote past the
-pose and the heap damage surfaced later, anywhere. The cache is now re-synced after every dress.
-* \[fix] The replay camera and its float tracks no longer read past the end of their keyframe arrays --
-a base-game fault that uneven frame pacing provokes (1.0.0-rc1).
-* \[fix] Peers in modded clothing no longer deform each other in the editor (0.9.9b); a peer's skater no
-longer stands frozen in your replay (0.9.6b); the Look At list shows everyone in the session
-(1.0.0-rc5).
+* **Your replay editor is your own instance** (0.8.0b). Other players are concealed while you scrub rather
+than recorded into your timeline, so your replay is yours.
+* **Sync Replay** (0.8.0b): pick a player on the Look At page and turn it on, and their skater is driven
+from *their* recorded history at your scrub position -- their tricks, in your replay, with their sound
+(1.0.0-rc1).
+* **Synced replay length** -- 15 s / 30 s / 60 s / 120 s / All (0.9.6b). Shorter is a much faster fetch; the
+setting decides your own wait, not theirs.
+* **A progress readout** over the player whose replay is being fetched (0.9.6b), so a long transfer is
+visibly working rather than hung.
+* Watching someone scrub is smooth at full rate (1.0.0-rc1), and a scrubbing player animates on your screen
+rather than freezing.
 
 ## World objects
 
-* \[feature] **The object dropper syncs** (0.9.0b). Rails, ramps and ledges placed with the dropper are
-shared, with three modes: **Share one set** (everybody sees the same objects -- the host's), **Live edits
-only**, and **off**.
-* \[feature] **The level's own props** are part of the shared set, so a bench somebody moved is where they
-moved it for everyone (0.9.0b, reworked 0.9.5b).
-* \[feature] **Host migration follows the same rule**: when the host leaves, their objects go and the new
-host's set takes over (0.9.5b).
-* \[fix] Your saved profile can never catch the session's furniture -- the game saves world props' live
-positions into your profile, and that path is guarded (0.9.5b).
+* **The object dropper syncs** (0.9.0b). Rails, ramps and ledges placed with the dropper are shared, with
+three modes: **Share one set** (everybody sees the same objects -- the host's), **Live edits only**, and
+**off**.
+* **The level's own props** are part of the shared set, so a bench somebody moved is where they moved it for
+everyone (0.9.0b, reworked 0.9.5b).
+* **Host migration follows the same rule**: when the host leaves, their objects go and the new host's set
+takes over (0.9.5b).
 
 ## Menus, settings and updates
 
-* \[feature] **In-game pause-menu integration** -- a Multiplayer page in the game's own menu, in the game's
-own style, with the sessions browser, players, connection and options as real menu pages.
-* \[feature] **A tabbed F1 panel** -- You, Session, Session Tweaks, Dev (1.0.0-rc4).
-* \[feature] The **B button steps back** through the mod's pages instead of closing the pause menu
-(1.0.0-rc2).
-* \[feature] **An update notice in the game's own popup** at the main menu when your copy is out of date
-(1.0.0-rc4), and **`update.bat`**, a readable PowerShell updater that installs the latest release over
-your copy and keeps your settings (0.7.0b).
-* \[feature] **Version mismatches are visible** in the browser before you join (0.7.0b).
-* \[fix] The multiplayer page follows the session live -- peers joining and leaving, connection state --
-which it had never actually done (1.0.0).
+* **In-game pause-menu integration** -- a Multiplayer page in the game's own menu, in the game's own style,
+with the sessions browser, players, connection and options as real menu pages.
+* **A tabbed F1 panel** -- You, Session, Session Tweaks, Dev (1.0.0-rc4).
+* The **B button steps back** through the mod's pages instead of closing the pause menu (1.0.0-rc2).
+* **An update notice in the game's own popup** at the main menu when your copy is out of date (1.0.0-rc4),
+and **`update.bat`**, a readable PowerShell updater that installs the latest release over your copy and
+keeps your settings (0.7.0b).
+* **Version mismatches are visible** in the browser before you join (0.7.0b).
 
 ## Performance and networking
 
-* \[feature] A quantised snapshot wire -- smallest-three quaternions, 16-bit floats, zero-suppression and
-presence masks -- at a fixed rate, interpolated on a shared clock, with a reliable lane for the things
-that must not be lost.
-* \[feature] **About a third less bandwidth**, and smoother movement with more players (1.0.0-rc2).
-* \[feature] **A whole skeleton fits in one packet for every character** (1.0.0-rc5). Modded garments merge
-as a union of bones, and a 95-bone character turned out to be a 70-bone one plus 25 childless
-terminator bones that describe no motion; those and the merged board rig (the deck already travels as
-its own transform) are no longer sent, so every character updates at the full rate.
-* \[feature] Skaters out of view throttle their animation, and boards beyond 25 m stop physically
-simulating (0.8.0b).
-* \[fix] A send the network refuses is counted and named rather than silently lost (1.0.0-rc4).
+* A quantised snapshot wire -- smallest-three quaternions, 16-bit floats, zero-suppression and presence
+masks -- at a fixed rate, interpolated on a shared clock, with a reliable lane for the things that must not
+be lost.
+* **About a third less bandwidth**, and smoother movement with more players (1.0.0-rc2).
+* **A whole skeleton fits in one packet for every character** (1.0.0-rc5). Modded garments merge as a union
+of bones, and a 95-bone character turned out to be a 70-bone one plus 25 childless terminator bones that
+describe no motion; those and the merged board rig (the deck already travels as its own transform) are no
+longer sent, so every character updates at the full rate.
+* Skaters out of view throttle their animation, and boards beyond 25 m stop physically simulating (0.8.0b).
 
 ---
 
