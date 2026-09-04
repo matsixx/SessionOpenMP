@@ -56,7 +56,7 @@
 #include "ue4ss_abi.h"
 #include "ui/menu_ext.h"
 
-#define TWEAKS_VERSION "3.19.222"
+#define TWEAKS_VERSION "3.19.246"
 #define TWK_WIDEN(x) STR(x)   // STR() prepends L before the macro expands; expand first
 
 // ------------------------------------------------------------------ log (own file, fresh per launch)
@@ -234,7 +234,7 @@ static const char* const kTwkRunOut = "TwkRunOut";
 static const char* const kTwkDrop     = "TwkRunOutDrop";
 static const char* const kTwkVelMin   = "TwkScoopVelMin";
 static const char* const kTwkVelMax   = "TwkScoopVelMax";
-static const char* const kTwkCatchX   = "TwkCatchWindowPct";
+static const char* const kTwkCatchX   = "TwkCatchWindowDeg";
 static const char* const kTwkDsZone   = "TwkDarkslideZone";
 static const char* const kTwkSndVol   = "TwkCatchSoundVol";
 static const char* const kTwkLevel    = "TwkCatchLevel";
@@ -306,7 +306,7 @@ static void pageValue(const char* key, int iv, float fv, void*) {
     else if (!strcmp(key, kTwkDrop))   RunOut_SetMaxDropCm(fv);
     else if (!strcmp(key, kTwkVelMin)) ScoopSpeed_SetVelMin(fv * 10.0f);   // shown in tens
     else if (!strcmp(key, kTwkVelMax)) ScoopSpeed_SetVelMax(fv * 10.0f);
-    else if (!strcmp(key, kTwkCatchX)) CatchTweaks_SetWindowMultPct(fv);
+    else if (!strcmp(key, kTwkCatchX)) CatchTweaks_SetManualTolDeg(fv);
     else if (!strcmp(key, kTwkDsZone)) CatchTweaks_SetDarkslideZoneDeg(fv);
     else if (!strcmp(key, kTwkSndVol))   CatchSound_SetVolumePct(fv);
     else if (!strcmp(key, kTwkLevel))    CatchLevel_SetEnabled(iv != 0);
@@ -371,7 +371,7 @@ static int pageGet(const char* key, int* oi, float* of, void*) {
     else if (!strcmp(key, kTwkDrop))   { *of = RunOut_MaxDropCm();           return 1; }
     else if (!strcmp(key, kTwkVelMin)) { *of = ScoopSpeed_VelMin() / 10.0f;  return 1; }
     else if (!strcmp(key, kTwkVelMax)) { *of = ScoopSpeed_VelMax() / 10.0f;  return 1; }
-    else if (!strcmp(key, kTwkCatchX)) { *of = CatchTweaks_WindowMultPct();  return 1; }
+    else if (!strcmp(key, kTwkCatchX)) { *of = CatchTweaks_ManualTolDeg();   return 1; }
     else if (!strcmp(key, kTwkDsZone)) { *of = CatchTweaks_DarkslideZoneDeg(); return 1; }
     else if (!strcmp(key, kTwkSndVol))   { *of = CatchSound_VolumePct();       return 1; }
     else if (!strcmp(key, kTwkLevel))    { *oi = CatchLevel_Enabled() ? 1 : 0; return 1; }
@@ -467,8 +467,8 @@ static const OmpPageItem2 kTwkBoardItems[] = {
 };
 static const OmpPageItem2 kTwkCatchItems[] = {
     { OMP_ITEM_TOGGLE, kTwkCatch,  "Wider manual catch",      "Widens the catch window while Catch Mode is manual" },
-    { OMP_ITEM_SLIDER, kTwkCatchX, "  Catch window (%)",      "200 = twice the stock window",
-      nullptr, nullptr, 100.0f, 400.0f, 25.0f },
+    { OMP_ITEM_SLIDER, kTwkCatchX, "  Catch window (deg)",    "deck this far from flat at the press still catches; past it you bail (game: 120)",
+      nullptr, nullptr, 30.0f, 180.0f, 5.0f },
     { OMP_ITEM_SLIDER, kTwkDsZone, "  Dark slide zone (deg)", "How far from grip-down a dark slide is still reserved",
       nullptr, nullptr, 10.0f, 170.0f, 10.0f },
     { OMP_ITEM_TOGGLE, kTwkClickCat, "Click a stick to catch", "Press a stick instead of flicking; that foot catches. Only while you are on the board" },
@@ -683,7 +683,7 @@ void Tweaks_PumpFrame() {
     if (g_menuRegistered && g_pageRegistered) return;
     static uint64_t lastTry = 0;
     const uint64_t ms = GetTickCount64();
-    if (ms - lastTry > 2000) { lastTry = ms; tryRegisterMenu(); }
+    if (ms - lastTry > 2000) { lastTry = ms; tryRegisterMenu(); Twk_BindProxyQuery(); }
 }
 
 // ------------------------------------------------------------------ UE4SS shell

@@ -148,6 +148,12 @@ static inline bool TwkCompQuat(const void* comp, float q[4]) {
 // substring search would match a key inside its own explanatory comment and silently disable the
 // feature.
 int TwkIniInt(const char* text, const char* key, int def);
+// IS THIS SKATER SOMEBODY ELSE'S? Every hook in this mod that sits on a per-skater game method must
+// ask, because in co-op each remote player is a real skater with real handlers and the hook fires
+// for all of them. Answered by SessionOpenMP through its OmpSession_IsProxyActor export; without a
+// host (solo play) the answer is always "no", which is exactly the old behaviour.
+int  Twk_IsProxy(void* actor);
+void Twk_BindProxyQuery();     // probe for the export; cheap, retried from the pump until found
 // As above but silent. Use when PROBING for a key's presence (sentinel default), where the
 // "differs from the built-in default" line would be misleading rather than informative.
 int TwkIniIntQuiet(const char* text, const char* key, int def);

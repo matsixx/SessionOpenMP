@@ -1514,6 +1514,15 @@ public:
 
 #define OMP_MOD_API __declspec(dllexport)
 extern "C" {
+    // THE WHOSE-SKATER SEAM. SessionTweaks hooks per-skater game methods (InputHandler::Tick, the
+    // flip/scoop multipliers, CanCatchOrient) and, being a solo-game mod, had no idea a skater could
+    // be anyone but the player. In co-op every proxy is a real skater with its own handlers, so those
+    // hooks fired once per skater in the world -- and the ones that write GLOBAL state (the stick
+    // trackers) were pushing a copy of the local pad sample per proxy per frame, which inflated every
+    // rate derived from them. Field report: "my flips and scoops spin way faster when players are in".
+    // Only this side knows what a proxy is, so it answers; tweaks probes for this export the same way
+    // it finds the menu seam, and in a solo game (no export) nothing is ever a proxy.
+    OMP_MOD_API int OmpSession_IsProxyActor(void* actor) { return omp::session::IsProxyActor(actor) ? 1 : 0; }
     OMP_MOD_API RC::CppUserModBase* start_mod()      { return new SessionOpenMP(); }
     OMP_MOD_API void uninstall_mod(RC::CppUserModBase* mod) { delete mod; }
 }

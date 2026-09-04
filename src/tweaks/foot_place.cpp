@@ -85,6 +85,14 @@ enum {
     // catch field at all -- so anything here is fighting the anim graph. Look elsewhere.
     // The foot sockets the graph consumes. foot_steer writes through these; nothing else here does.
     AN_L_SOCK_LOC  = 0x404,   AN_R_SOCK_LOC = 0x41c,
+    AN_L_SOCK_ROT  = 0x410,   AN_R_SOCK_ROT = 0x428,   // the socket rotators (FRotator, mesh space)
+    AN_L_ALPHA     = 0x3fc,   AN_R_ALPHA    = 0x400,   // Left/RightFootIKAlpha: 0 = socket ignored
+    AN_L_AUTO_OFF  = 0x718,   AN_R_AUTO_OFF = 0x724,   // _last{Left,Right}FootAutoOffset (FVector)
+    SK_BOARD       = 0x568,   // ASkaterCharacterBase -> _skateboard (ASkateboardEx*)
+    BOARD_FLIPPER  = 0x4e8,   // ASkateboardEx -> _flipper: the deck mesh -- its frame IS the deck's
+    COMP_CTW_POS   = 0x1d0,   // USceneComponent ComponentToWorld translation (the quat sits at +0x1c0)
+    AN_IS_SWITCH   = 0x303,   // USkaterAnimInstance::IsSkatingSwitch -- the reversed stances
+    ACTOR_ROOT     = 0x130,   // AActor::RootComponent -- the skater's capsule, for its heading
     // The trick-setup crouch, exported for catch_level. Both are ASSET-GATED: they only mean
     // anything while CrankLoopBlendSpace is non-null, and read stale otherwise.
     AN_IS_CRANKING = 0x497,   AN_CRANK_BS = 0x4a8,
@@ -95,13 +103,41 @@ enum {
 // The ini key remains as a kill switch in case a future game patch makes the suppression wrong.
 static int g_on = 1;             // FootFixShoeHeight
 static int g_ok = 1;             // runtime health, NEVER persisted (the catch_level lesson)
+// FootFixSoleLiftMm: a constant lift of both foot sockets along the DECK's normal while riding (the
+// same gate as the suppression). With the auto-adjust gone the foot sits exactly on the socket, and
+// in the pocket -- where the kick curves up into the sole -- that reads as the shoe sinking a little
+// into the deck (field). The auto-adjust's accidental ~0.5 cm had been masking it. Along the deck's
+// normal rather than world up, so it stays a lift off the deck on a bank. 0 = off (the socket as the
+// game places it). Millimetres, so the ini stays integer like every other key.
+static int g_soleLiftMm = 0;
+// FootFixSoleLiftSwitchMm: the same lift while skating SWITCH (the anim's IsSkatingSwitch, which
+// covers the reversed stances). Separate because the game's own switch placement already floats a
+// touch at 0 (field: "the feet float slightly above when skating switch, always has"), so the value
+// that is right for regular is wrong there -- and the right one may well be NEGATIVE, a drop. Default
+// 0 = the game's own switch placement, exactly as before.
+static int g_soleLiftSwMm = 0;
+// FootFixProbe: while riding, print each foot's socket in the DECK's frame whenever it moves (x along
+// the deck, z above the flipper pivot, the foot's axes against the deck normal). The one question it
+// answers: does the socket FOLLOW the kick in the pocket (then only a sole lift is missing) or stay
+// on the flat plane (then the kick geometry is). Change-triggered, at most four lines a second.
+static int g_probe = 1;
 void FootPlace_ReadConfig(const char* buf) {
     g_on = TwkIniInt(buf, "FootFixShoeHeight", 1) ? 1 : 0;
+    g_soleLiftMm = TwkIniInt(buf, "FootFixSoleLiftMm", 0);
+    if (g_soleLiftMm < -20) g_soleLiftMm = -20;
+    if (g_soleLiftMm > 30)  g_soleLiftMm = 30;
+    g_soleLiftSwMm = TwkIniInt(buf, "FootFixSoleLiftSwitchMm", 0);
+    if (g_soleLiftSwMm < -20) g_soleLiftSwMm = -20;
+    if (g_soleLiftSwMm > 30)  g_soleLiftSwMm = 30;
+    g_probe = TwkIniInt(buf, "FootFixProbe", 1) ? 1 : 0;
 }
 void FootPlace_SaveConfig(char* buf, size_t cap) {
     TwkIniSetInt(buf, cap, "FootFixShoeHeight",      g_on);
+    TwkIniSetInt(buf, cap, "FootFixSoleLiftMm",      g_soleLiftMm);
+    TwkIniSetInt(buf, cap, "FootFixSoleLiftSwitchMm", g_soleLiftSwMm);
+    TwkIniSetInt(buf, cap, "FootFixProbe",           g_probe);
 }
-void FootPlace_ResetDefaults()     { g_on = 1; g_ok = 1; }
+void FootPlace_ResetDefaults()     { g_on = 1; g_ok = 1; g_soleLiftMm = 0; g_soleLiftSwMm = 0; g_probe = 1; }
 bool FootPlace_Enabled()           { return g_on != 0; }
 void FootPlace_SetEnabled(bool on) { g_on = on ? 1 : 0; if (on) g_ok = 1; TwkMarkDirty(); }
 
@@ -126,6 +162,118 @@ static bool SuppressWanted(void* anim) {
         return twkB(anim, AN_ON_BOARD) == 1 && twkB(anim, AN_GROUNDED) == 1 &&
                twkB(anim, AN_CATCH_ST) == 0;
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// The deck's normal in the MESH's space (where the sockets live), pointing skyward. The flipper's
+// local X is the long axis (the flip axis) and Z is normal to the deck, but which way its Z points
+// on this asset is not assumed: the sign is taken from world up, which is only safe while grounded
+// on the board -- the only time this is used.
+static bool DeckNormalMesh(void* a, float out[3]) {
+    void* sk   = twkP(a, AN_SKATER);
+    void* mesh = sk ? twkP(sk, SK_MESH) : nullptr;
+    void* bd   = sk ? twkP(sk, SK_BOARD) : nullptr;
+    void* flp  = bd ? twkP(bd, BOARD_FLIPPER) : nullptr;
+    float qm[4], qf[4];
+    if (!mesh || !flp || !TwkCompQuat(mesh, qm) || !TwkCompQuat(flp, qf)) return false;
+    const float z[3] = { 0.0f, 0.0f, 1.0f };
+    float nw[3];
+    TwkQuatRotate(qf, z, nw);
+    const float s = (nw[2] < 0.0f) ? -1.0f : 1.0f;
+    nw[0] *= s; nw[1] *= s; nw[2] *= s;
+    TwkQuatInvRotate(qm, nw, out);
+    return true;
+}
+
+// FootFixProbe (see the knob). x along the deck, y across, z above the flipper's pivot along its
+// normal (sky-positive); n(...) = the foot's own X/Y/Z axes dotted with that normal -- whichever
+// reads +-1 on the flat is the sole's normal, and how it moves in the pocket is the sole's tilt.
+// Reads the sockets AFTER this frame's write, so the sole lift shows in z.
+static void ProbeDeckFrame(void* a) {
+    static LARGE_INTEGER fq = {};
+    if (!fq.QuadPart) QueryPerformanceFrequency(&fq);
+    static LONGLONG last = 0;
+    static float px[2] = { -999.0f, -999.0f }, pz[2] = { -999.0f, -999.0f }, pn[2][3] = {};
+    LARGE_INTEGER t; QueryPerformanceCounter(&t);
+    if (last && (t.QuadPart - last) < fq.QuadPart / 4) return;
+    void* sk   = twkP(a, AN_SKATER);
+    void* mesh = sk ? twkP(sk, SK_MESH) : nullptr;
+    void* bd   = sk ? twkP(sk, SK_BOARD) : nullptr;
+    void* flp  = bd ? twkP(bd, BOARD_FLIPPER) : nullptr;
+    float qm[4], qf[4];
+    if (!mesh || !flp || !TwkCompQuat(mesh, qm) || !TwkCompQuat(flp, qf)) return;
+    float tm[3], tf[3];
+    for (int i = 0; i < 3; i++) {
+        tm[i] = twkF(mesh, COMP_CTW_POS + i * 4);
+        tf[i] = twkF(flp,  COMP_CTW_POS + i * 4);
+        if (fabsf(tm[i]) > 1e6f || fabsf(tf[i]) > 1e6f) return;
+    }
+    const float z[3] = { 0.0f, 0.0f, 1.0f };
+    float nw[3]; TwkQuatRotate(qf, z, nw);
+    const float s = (nw[2] < 0.0f) ? -1.0f : 1.0f;
+    // Reference sanity. Most of the first field log read the foot HUNDREDS of cm above the "deck",
+    // climbing linearly, with x and y sane: one of the two translations was not where its component
+    // renders. Printed as the mesh-to-flipper distance, and a line whose heights are implausible is
+    // counted rather than printed, so the log is not 2500 lines of a stale reference.
+    static int skipped = 0;
+    const float ref = sqrtf((tm[0] - tf[0]) * (tm[0] - tf[0]) + (tm[1] - tf[1]) * (tm[1] - tf[1]) +
+                            (tm[2] - tf[2]) * (tm[2] - tf[2]));
+    // The skater's heading against the deck's long axis: +1 = the deck's +X points where the
+    // skater faces, -1 = the other way. Says whether "switch" turns the board or the skater.
+    float fx = 0.0f;
+    {
+        void* rt = sk ? twkP(sk, ACTOR_ROOT) : nullptr;
+        float qr[4];
+        if (rt && TwkCompQuat(rt, qr)) {
+            const float e[3] = { 1.0f, 0.0f, 0.0f };
+            float fw[3], xw[3];
+            TwkQuatRotate(qr, e, fw);
+            TwkQuatRotate(qf, e, xw);
+            fx = fw[0] * xw[0] + fw[1] * xw[1] + fw[2] * xw[2];
+        }
+    }
+    const int sw = twkB(a, AN_IS_SWITCH);
+    float x[2], y[2], zz[2], n[2][3], au[2];
+    for (int f = 0; f < 2; f++) {
+        const int locOff = f ? AN_R_SOCK_LOC : AN_L_SOCK_LOC;
+        const int rotOff = f ? AN_R_SOCK_ROT : AN_L_SOCK_ROT;
+        float sock[3], rot[3];
+        for (int i = 0; i < 3; i++) {
+            sock[i] = twkF(a, locOff + i * 4);
+            rot[i]  = twkF(a, rotOff + i * 4);
+            if (fabsf(sock[i]) > 1e5f || fabsf(rot[i]) > 1e5f) return;
+        }
+        float w[3]; TwkQuatRotate(qm, sock, w);
+        const float rel[3] = { w[0] + tm[0] - tf[0], w[1] + tm[1] - tf[1], w[2] + tm[2] - tf[2] };
+        float d[3]; TwkQuatInvRotate(qf, rel, d);
+        x[f] = d[0]; y[f] = d[1]; zz[f] = d[2] * s;
+        float qs[4]; TwkRotatorToQuat(rot, qs);
+        for (int ax = 0; ax < 3; ax++) {
+            float e[3] = { 0.0f, 0.0f, 0.0f }; e[ax] = 1.0f;
+            float em[3], ew[3];
+            TwkQuatRotate(qs, e, em);       // the foot's axis in mesh space
+            TwkQuatRotate(qm, em, ew);      // ... in world
+            n[f][ax] = (ew[0] * nw[0] + ew[1] * nw[1] + ew[2] * nw[2]) * s;
+        }
+        au[f] = twkF(a, (f ? AN_R_AUTO_OFF : AN_L_AUTO_OFF) + 8);
+    }
+    if (fabsf(zz[0]) > 60.0f || fabsf(zz[1]) > 60.0f) { skipped++; return; }   // a stale reference
+    bool changed = false;
+    for (int f = 0; f < 2; f++) {
+        if (fabsf(zz[f] - pz[f]) >= 0.3f || fabsf(x[f] - px[f]) >= 3.0f) changed = true;
+        for (int ax = 0; ax < 3; ax++) if (fabsf(n[f][ax] - pn[f][ax]) >= 0.05f) changed = true;
+    }
+    if (!changed) return;
+    last = t.QuadPart;
+    for (int f = 0; f < 2; f++) {
+        px[f] = x[f]; pz[f] = zz[f];
+        for (int ax = 0; ax < 3; ax++) pn[f][ax] = n[f][ax];
+    }
+    TwkLog("[foot] deck-frame sw=%d fwd.X=%+.2f ref=%.0f  L x=%.1f y=%.1f z=%.1f n(%.2f,%.2f,%.2f) "
+           "auto=%.2f | R x=%.1f y=%.1f z=%.1f n(%.2f,%.2f,%.2f) auto=%.2f | lift %.1f cm | %d stale skipped",
+           sw, fx, ref,
+           x[0], y[0], zz[0], n[0][0], n[0][1], n[0][2], au[0],
+           x[1], y[1], zz[1], n[1][0], n[1][1], n[1][2], au[1],
+           (float)((sw > 0) ? g_soleLiftSwMm : g_soleLiftMm) * 0.1f, skipped);
 }
 
 static void hkUpdateFootAnchors(void* self, double dt, void* a, void* b) {
@@ -175,7 +323,8 @@ static void hkUpdateFootAnchors(void* self, double dt, void* a, void* b) {
     }
     if (!g_ok || !self || !mine) return;
 
-    // ---- foot_steer rides this hook. It has no detour of its own, so its offsets are applied here.
+    // ---- foot_steer rides this hook. It has no detour of its own, so its offsets are applied here,
+    // through the same single write as the sole lift below.
     __try {
         // `dt` is a FLOAT forwarded through a `double` parameter (the thunk rule keeps the bits
         // unconverted for the original), so the float sits in the LOW 32 BITS. Casting reads garbage
@@ -187,16 +336,36 @@ static void hkUpdateFootAnchors(void* self, double dt, void* a, void* b) {
 
         float dL[3] = { 0.0f, 0.0f, 0.0f };
         float dR[3] = { 0.0f, 0.0f, 0.0f };
-        if (!FootSteer_AddOffset(self, realDt, dL, dR)) return;
-        if (dL[0] == 0.0f && dL[1] == 0.0f && dL[2] == 0.0f &&
-            dR[0] == 0.0f && dR[1] == 0.0f && dR[2] == 0.0f) return;
-        // A DELTA on what the game just computed, never an absolute placement: absolute height was
-        // tried and jittered and clipped through the deck, because the animation's own micro-motion
-        // IS the desired motion. Offset preserves it; replacing it fights it every frame.
-        for (int i = 0; i < 3; i++) {
-            *(float*)((uint8_t*)self + AN_L_SOCK_LOC + i * 4) = twkF(self, AN_L_SOCK_LOC + i * 4) + dL[i];
-            *(float*)((uint8_t*)self + AN_R_SOCK_LOC + i * 4) = twkF(self, AN_R_SOCK_LOC + i * 4) + dR[i];
+        FootSteer_AddOffset(self, realDt, dL, dR);      // false = nothing of its own to add
+        // ---- the sole lift (FootFixSoleLiftMm): both feet along the deck's normal, riding only --
+        // the same states the suppression covers. Per foot, weighted by the game's own IK alpha the
+        // way foot_steer is: a zeroed socket plus a delta is not an offset.
+        const bool riding = SuppressWanted(self);
+        const int  liftMm = (twkB(self, AN_IS_SWITCH) > 0) ? g_soleLiftSwMm : g_soleLiftMm;
+        if (riding && liftMm != 0) {
+            float nm[3];
+            if (DeckNormalMesh(self, nm)) {
+                const float lift = (float)liftMm * 0.1f;
+                float wL = twkF(self, AN_L_ALPHA), wR = twkF(self, AN_R_ALPHA);
+                if (!(wL >= 0.0f && wL <= 1.0f)) wL = 1.0f;
+                if (!(wR >= 0.0f && wR <= 1.0f)) wR = 1.0f;
+                if (wL < 0.02f) wL = 0.0f;
+                if (wR < 0.02f) wR = 0.0f;
+                for (int i = 0; i < 3; i++) { dL[i] += nm[i] * lift * wL; dR[i] += nm[i] * lift * wR; }
+            }
         }
+        if (dL[0] != 0.0f || dL[1] != 0.0f || dL[2] != 0.0f ||
+            dR[0] != 0.0f || dR[1] != 0.0f || dR[2] != 0.0f) {
+            // A DELTA on what the game just computed, never an absolute placement: absolute height
+            // was tried and jittered and clipped through the deck, because the animation's own
+            // micro-motion IS the desired motion. Offset preserves it; replacing it fights it every
+            // frame.
+            for (int i = 0; i < 3; i++) {
+                *(float*)((uint8_t*)self + AN_L_SOCK_LOC + i * 4) = twkF(self, AN_L_SOCK_LOC + i * 4) + dL[i];
+                *(float*)((uint8_t*)self + AN_R_SOCK_LOC + i * 4) = twkF(self, AN_R_SOCK_LOC + i * 4) + dR[i];
+            }
+        }
+        if (g_probe && riding) ProbeDeckFrame(self);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         g_ok = 0;
         TwkLog("[foot] caught fatal applying the foot offsets -> paused (game unaffected)");
@@ -269,6 +438,26 @@ void FootPlace_DrawMenu(const OmpMenuApi* api) {
     api->Indent();
     api->TextDisabled("The game sweeps each foot down onto the surface below and lifts the shoe by");
     api->TextDisabled("what it hits -- but that query reaches the road, not the deck. Nothing to tune.");
+    api->Unindent();
+    float lift = (float)g_soleLiftMm * 0.1f;
+    if (api->SliderFloat("Sole lift while riding (cm)", &lift, -1.0f, 2.0f, "%.1f")) {
+        int mm = (int)floorf(lift * 10.0f + 0.5f);
+        if (mm < -20) mm = -20;
+        if (mm > 30)  mm = 30;
+        if (mm != g_soleLiftMm) { g_soleLiftMm = mm; TwkMarkDirty(); }
+    }
+    float liftSw = (float)g_soleLiftSwMm * 0.1f;
+    if (api->SliderFloat("Sole lift while riding SWITCH (cm)", &liftSw, -1.0f, 2.0f, "%.1f")) {
+        int mm = (int)floorf(liftSw * 10.0f + 0.5f);
+        if (mm < -20) mm = -20;
+        if (mm > 30)  mm = 30;
+        if (mm != g_soleLiftSwMm) { g_soleLiftSwMm = mm; TwkMarkDirty(); }
+    }
+    api->Indent();
+    api->TextDisabled("Moves both feet along the deck's normal while you ride. 0 = the socket exactly as");
+    api->TextDisabled("the game places it; a few mm up hides the shoe sinking in at the kick. Switch has");
+    api->TextDisabled("its own value because the game's switch placement already sits a touch high --");
+    api->TextDisabled("negative is a drop.");
     api->Unindent();
 
 

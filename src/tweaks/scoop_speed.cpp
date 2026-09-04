@@ -30,6 +30,7 @@
 #include "scoop_speed.h"
 #include "tweaks_mod.h"
 #include "pop_probe.h"       // the injection experiment's two write points in this module's tick hook
+#include "catch_tweaks.h"    // CatchTweaks_LocalInputHandler: whose tick is this
 #include <cmath>
 #include "MinHook.h"
 
@@ -388,17 +389,49 @@ static float peakStickVel(const StickTracker& T) {   // logged only, for calibra
 typedef void* (*InputTickFn)(void*, double, double, void*);
 static void* g_origTick  = nullptr;
 static void* g_startTick = nullptr;
+// How many DISTINCT handlers ticked this second, and whether mine was among them. This is the
+// measurement behind the whole-skater gate below: in co-op every remote skater ticks an
+// InputHandler of its own, so the count is players-in-the-world, not one.
+static void*    g_ihSeen[16];
+static int      g_ihSeenN = 0;
+static uint64_t g_ihSeenReportMs = 0;
+static bool     g_ihMineSeen = false;
+
 static void* hkInputTick(void* self, double a, double b, void* d) {
+    // WHOSE TICK IS THIS? The trackers are GLOBAL and the pop scheme reads the PHYSICAL pad, so a
+    // tick from a remote skater's handler pushed a duplicate of the local stick sample into the same
+    // history, microseconds after the real one -- once per proxy, every frame. Duplicate samples with
+    // near-zero spacing inflate every rate the trackers report, and those rates are exactly what the
+    // scoop and flip multipliers are made of. Until the local handler is known (first CanCatchOrient)
+    // every tick is treated as mine, which is the solo behaviour and costs nothing in solo.
+    void* localIh = CatchTweaks_LocalInputHandler();
+    const bool mine = (!localIh || self == localIh);
     if (self) {
+        bool seen = false;
+        for (int i = 0; i < g_ihSeenN; i++) if (g_ihSeen[i] == self) { seen = true; break; }
+        if (!seen && g_ihSeenN < 16) g_ihSeen[g_ihSeenN++] = self;
+        if (mine) g_ihMineSeen = true;
+        const uint64_t ms = GetTickCount64();
+        if (ms - g_ihSeenReportMs >= 1000) {
+            if (g_ihSeenN > 1 || !g_ihMineSeen)
+                TwkLog("[scoop] input handlers ticking: %d distinct this second (mine %s)",
+                          g_ihSeenN, localIh ? (g_ihMineSeen ? "seen" : "NOT seen") : "not yet known");
+            g_ihSeenReportMs = ms; g_ihSeenN = 0; g_ihMineSeen = false;
+        }
+    }
+    if (self && mine) {
         __try { trackStick(self); }
         __except (EXCEPTION_EXECUTE_HANDLER) { g_useTracker = 0; }
     }
-    // The injection experiment's early write point: the physical sticks are already sampled above,
-    // so a rewrite here cannot pollute what the trackers saw. No-op unless its knob selects it.
-    PopProbe_TickEarly(self);
-    // Mode 4: `d` is the tick's stick buffer (see PopProbe_TickSticks) -- rewritten in place,
-    // within this call only, before the game derives anything from it.
-    PopProbe_TickSticks((float*)d);
+    if (mine) {
+        // The injection experiment's early write point: the physical sticks are already sampled
+        // above, so a rewrite here cannot pollute what the trackers saw. No-op unless its knob
+        // selects it. Never on a remote skater's handler: that would feed THEM the local pad.
+        PopProbe_TickEarly(self);
+        // Mode 4: `d` is the tick's stick buffer (see PopProbe_TickSticks) -- rewritten in place,
+        // within this call only, before the game derives anything from it.
+        PopProbe_TickSticks((float*)d);
+    }
     Tweaks_PumpFrame();                           // menu-registration retry etc. (shell)
     void* ret = nullptr;
     __try { ret = ((InputTickFn)g_origTick)(self, a, b, d); }
@@ -406,7 +439,7 @@ static void* hkInputTick(void* self, double a, double b, void* d) {
         if (InterlockedIncrement(&g_faults) == 1) TwkLog("[scoop] caught fatal in InputHandler::Tick -> recovered");
         return nullptr;
     }
-    PopProbe_TickLate(self);                      // ...and the late one, after the game's tick ran
+    if (mine) PopProbe_TickLate(self);            // ...and the late one, after the game's tick ran
     return ret;
 }
 
@@ -421,7 +454,6 @@ static float hkScoopSpeed(void* handler, uint64_t bArg, void* inputs, void* d) {
         if (InterlockedIncrement(&g_faults) == 1) TwkLog("[scoop] caught fatal in GetBoardRotationSpeedMultiplier -> recovered");
         return 1.0f;
     }
-    if (handler) g_lastFth = handler;             // publish for pop_probe (see ScoopSpeed_FlipHandler)
     if ((!g_scoopLog && !g_scoopFix) || !handler || !inputs) return stock;
 
     float out = stock;
@@ -429,6 +461,10 @@ static float hkScoopSpeed(void* handler, uint64_t bArg, void* inputs, void* d) {
         void* db     = twkP(handler, FTH_TRICKS_DB);
         void* skater = twkP(handler, FTH_SKATER);
         if (!db || !skater) return stock;
+        // A remote skater's handler asks too. It gets the game's own answer: our multiplier is
+        // built from the LOCAL flick, which is not the gesture that started their trick.
+        if (Twk_IsProxy(skater)) return stock;
+        g_lastFth = handler;                      // publish for pop_probe (see ScoopSpeed_FlipHandler)
         const int   mode = twkB(skater, SKATER_ROT_SPEED_MODE);
         const float minM = twkF(db, DB_ROT_SPEED_MIN_MULT);
         const float maxM = twkF(skater, SKATER_SCOOP_SPEED_MULT) * twkF(db, DB_ROT_SPEED_MAX_MULT);

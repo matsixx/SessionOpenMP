@@ -264,6 +264,11 @@ static void* hkExtraPitch(void* self, void* trickDef, uint64_t inputType, void* 
     }
     __try {
         void* skater = self ? twkP(self, FTH_SKATER) : nullptr;
+        // A remote skater's trick must not arm OUR levelling: this re-targets g_skater and restarts
+        // the whole catch-level state for whichever handler asked, and in co-op every proxy's
+        // FlipTricksHandler asks. (The sibling hooks in this module already gate on the local
+        // skater; this was the one that did not.)
+        if (skater && Twk_IsProxy(skater)) skater = nullptr;
         if (skater) {
             // A new trick can arm while we are still levelling the last one -- a LATE trick does it
             // in the same air, moments after the catch. Clearing the flag below without parking left

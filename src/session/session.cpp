@@ -1328,101 +1328,19 @@ static void dropFrame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, int nPeers,
     g_st.dropRemote = liveRemote;
 }
 
-// =====================================================================================================
-// THE BONE FLOOR -- a stopgap, not a fix. See the note below.
-// =====================================================================================================
-// MEASURED RULE (many headset rounds): a proxy whose merged skeleton has FEWER bones than the local
-// character corrupts memory on the machine that owns that local character, and the fatal surfaces on
-// the next big allocation -- entering the replay editor, reliably. Equal counts never crash. MORE
-// bones on the proxy never crashes. Bone NAMES are irrelevant: two players in DIFFERENT 95-bone
-// garments are fine, so this is an index-and-size fault, not a layout one.
-//
-// The real defect is somewhere in how a smaller skeleton is indexed with a larger character's count,
-// and it has NOT been found -- five mechanisms were tried and each was disproven in the headset
-// (replay-set membership three ways, the merged-mesh pool, the pose seam, our own component prune,
-// and render-state recreation, which made it fire SOONER). Until it is found, this keeps the fault
-// out of reach by making sure no proxy is ever short: if a peer's outfit leaves their proxy below our
-// bone count, one of their garments is swapped for OURS in the same slot, which is guaranteed
-// installed locally and produces our own count.
-//
-// The cost is honest and visible: that one item looks wrong on that peer, on our screen only. Their
-// other clothing, their board and everyone else's look are untouched. Categories are tried ONE AT A
-// TIME and the first that lifts the count wins, so the usual case (a single garment carrying a rig)
-// swaps exactly one item. Cumulative substitution is the fallback when no single swap is enough.
-static repl::CosmeticSet g_ownLook;
-static bool              g_haveOwnLook = false;
-
-static int proxyBones(void* actor) { return game::SkeletonBoneCount(game::SkaterMeshOf(actor)); }
-
-// Copy OUR item for `cat` over theirs. False = we have nothing in that slot, so nothing to lend.
-static bool borrowOurItem(repl::CosmeticSet& set, int32_t cat) {
-    for (int o = 0; o < (int)g_ownLook.nChar; o++) {
-        if (g_ownLook.chr[o].cat != cat) continue;
-        for (int i = 0; i < (int)set.nChar; i++) {
-            if (set.chr[i].cat != cat) continue;
-            set.chr[i] = g_ownLook.chr[o];
-            return true;
-        }
-    }
-    return false;
-}
-
-static void EnforceBoneFloor(void* proxyActor, const repl::CosmeticSet& theirs, void* ownPawn) {
-    if (!proxyActor || !ownPawn || !g_haveOwnLook) return;
-    const int mine = game::SkeletonBoneCount(game::SkaterMeshOf(ownPawn));
-    int have = proxyBones(proxyActor);
-    if (mine <= 0 || have <= 0 || have >= mine) return;      // 0 = unreadable: change nothing
-
-    // ---- try each of their clothing categories alone; first one that lifts the count wins.
-    int unresolved = 0;
-    for (int i = 0; i < (int)theirs.nChar; i++) {
-        repl::CosmeticSet trial = theirs;
-        if (!borrowOurItem(trial, theirs.chr[i].cat)) continue;
-        game::DressProxy(proxyActor, trial, &unresolved, g_logf);
-        const int wasShort = have;                  // the count that TRIGGERED this, not the result
-        have = proxyBones(proxyActor);
-        if (have >= mine) {
-            if (g_logf) { char m[240]; snprintf(m, sizeof(m),
-                "[cosmetics] bone floor: peer's '%s' swapped for ours -- their proxy came out %d "
-                "bone(s) against our %d, which crashes the replay editor; now %d. Only that item "
-                "looks wrong.",
-                theirs.chr[i].name[0] ? theirs.chr[i].name : "?", wasShort, mine, have); g_logf(m); }
-            return;
-        }
-    }
-    // ---- no single swap was enough: take ours cumulatively until the count is met.
-    repl::CosmeticSet trial = theirs;
-    for (int i = 0; i < (int)theirs.nChar; i++) {
-        if (!borrowOurItem(trial, theirs.chr[i].cat)) continue;
-        game::DressProxy(proxyActor, trial, &unresolved, g_logf);
-        have = proxyBones(proxyActor);
-        if (have >= mine) break;
-    }
-    if (g_logf) { char m[200]; snprintf(m, sizeof(m),
-        "[cosmetics] bone floor: needed several of our garments -- proxy now %d bone(s) against our %d%s",
-        have, mine, have >= mine ? "" : " (STILL SHORT -- the replay editor may crash)"); g_logf(m); }
-}
+// THE BONE FLOOR IS GONE (2026-09-02). It lent the local player's garments to any peer whose merged
+// skeleton came out smaller, to keep the replay editor from crashing, at the price of one visibly
+// wrong item -- and it could not work at all across bodies. The crash it papered over is fixed at its
+// cause: a proxy's replay bone cache is re-synced after every dress (RefreshProxyReplayBones, called
+// from the tail of game::DressProxy), so cache and pose agree for any body, garment or count. Field-
+// confirmed on a female peer with the floor already standing aside: "before 75 entries (index 0..86)
+// OUTSIDE THE POSE -> after 58 (index 0..57)", two replay entries, three exits, no fault.
 
 void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
     game::pose::SetLogger(g_logf);           // idempotent; the stale-pose line needs a voice
     if (!g_cfg.enabled) return;
-    // The bone floor's substitutions are judged against OUR merged bone count, and nothing else
-    // re-judges them when WE change clothes: a peer kept wearing our lent shirt after we no longer
-    // wore a rig-carrying garment (field-reported as a wrongly dressed skater), and the reverse --
-    // changing INTO one -- leaves every proxy short until its next look change, which is exactly the
-    // crash window the floor exists to close. So our merged count changing re-dresses everyone.
-    // Cheap: an integer read per frame, and the rebuilds only happen on a wardrobe-change cadence.
-    {
-        static int lastMine = 0;
-        const int mine = ownPawn ? game::SkeletonBoneCount(game::SkaterMeshOf(ownPawn)) : 0;
-        if (mine > 0 && lastMine > 0 && mine != lastMine) {
-            for (auto& sl : g_slots) if (sl.used) sl.wornForActor = nullptr;
-            if (g_logf) { char m[170]; snprintf(m, sizeof(m),
-                "[cosmetics] our skeleton changed (%d -> %d bones) -- re-dressing every peer so the"
-                " bone floor can re-judge its substitutions", lastMine, mine); g_logf(m); }
-        }
-        if (mine > 0) lastMine = mine;
-    }
+    // (The re-dress-everyone-when-OUR-bone-count-changes block lived here. It existed only so the
+    // bone floor could re-judge its garment swaps; with the floor gone there is nothing to re-judge.)
     // Both thresholds live in microseconds here so they are compared against nowUs and nothing else.
     // `nowMs` is passed through to the PROXY only (its own spawn/visual timers are self-consistent).
     const uint64_t quietUs = (uint64_t)(g_cfg.quietMs * 1000.0f);
@@ -1717,7 +1635,6 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
             }
             repl::CosmeticSet own;
             if (game::GatherOwnCosmetics(ownPawn, own, g_logf)) {
-                g_ownLook = own; g_haveOwnLook = true;   // the bone floor borrows garments from this
                 const bool changed = !haveLast || memcmp(&own, &lastSent, sizeof(own)) != 0;
                 const bool heartbeat = !lastCosSendUs || sinceUs(nowUs, lastCosSendUs) > 10000000ull;
                 if (changed || heartbeat || g_cosResend) {
@@ -1997,8 +1914,8 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
                                                           // but a respawn is a different actor and so
                                                           // dresses again by construction
             int unresolved = 0;
-            game::DressProxy(s.proxy.actor(), s.cosmetics, &unresolved, g_logf);
-            EnforceBoneFloor(s.proxy.actor(), s.cosmetics, ownPawn);
+            game::DressProxy(s.proxy.actor(), s.cosmetics, &unresolved, g_logf);   // re-syncs the
+                                                          // replay bone cache itself; no floor needed
             s.proxy.MarkVisualsRefreshed();
             // DIVERGENCE, the honest version: unresolved items are attributable exactly (they are
             // wearing something we do not have installed); a differing mod digest means shared item

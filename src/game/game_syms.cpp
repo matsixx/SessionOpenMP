@@ -275,6 +275,10 @@ static const SigEntry kSigs[] = {
     { "ActorSetLocation",     "48 81 EC F8 00 00 00 48 8B 89 30 01 00 00 48 85 C9 0F 84 ?? ?? ?? ?? 0F 10 99 D0 01 00 00 F3 0F 10 02", false },
     // AActor::Destroy  Epic 0x29b7a70 / Steam 0x297a350 (sigmake)
     { "ActorDestroy",         "48 89 5C 24 08 48 89 6C 24 10 48 89 74 24 18 48 89 7C 24 20 41 56 48 83 EC 20 33 F6 41 0F B6 E8", false },
+    // UAnimInstanceReplayComponent::RefreshCachedBones  Epic 0x3408200 / Steam 0x33cf0c0. Prologue +
+    // the _skeletalMeshComp null test (+0x168) + the lea of _updatedBones (+0x108); the two field
+    // displacements are the identity. Unique in both exes (sigmake).
+    { "ReplayRefreshBones",   "41 56 48 83 EC 60 48 83 B9 68 01 00 00 00 4C 8B F1 0F 84 ?? ?? ?? ?? 48 89 5C 24 70 48 81 C1 08 01 00 00", false },
 };
 static const int kSigN = (int)(sizeof(kSigs) / sizeof(kSigs[0]));
 
@@ -371,6 +375,65 @@ int SkeletonBoneCount(void* meshComp) {
         if (!a.data || a.num <= 0 || a.num > 4096 || a.max < a.num) return 0;
         return a.num;
     } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
+bool RefreshProxyReplayBones(void* proxyActor, void (*logf)(const char*)) {
+    if (!proxyActor || !g_syms.ReplayRefreshBones) return false;
+    void* mesh = SkaterMeshOf(proxyActor);
+    const int bones = SkeletonBoneCount(mesh);
+    if (!mesh || bones <= 0) return false;
+    __try {
+        // OwnedComponents is a TSet: sparse-array data at +0, Num at +8, 16-byte elements with the
+        // pointer at +0. Free slots hold garbage, so every pointer is IDENTIFIED before it is read --
+        // the same class gate the audio cues go through.
+        const uint8_t* set  = (const uint8_t*)proxyActor + off::kActorOwnedComps;
+        const uint8_t* data = *(const uint8_t* const*)set;
+        const int32_t  num  = *(const int32_t*)(set + 8);
+        if (!data || num <= 0 || num > 512) return false;
+        uint8_t* rc = nullptr;
+        for (int i = 0; i < num; i++) {
+            void* c = *(void* const*)(data + (size_t)i * 16);
+            if (!c || ((uintptr_t)c & 7)) continue;
+            if (IsObjectOfClass(c, "AnimInstanceReplayComponent")) { rc = (uint8_t*)c; break; }
+        }
+        if (!rc) return false;
+        auto scan = [&](int* nOut, int* minOut, int* maxOut) {
+            const uint8_t* arr = *(const uint8_t* const*)(rc + off::kAirReplayUpdated);
+            const int32_t  n   = *(const int32_t*)(rc + off::kAirReplayUpdated + 8);
+            int mn = 0x7fffffff, mx = -0x7fffffff;
+            for (int i = 0; arr && i < n && i < 4096; i++) {
+                const int32_t bi = *(const int32_t*)(arr + (size_t)i * 32 + off::kAirReplayDataBoneIdx);
+                if (bi < mn) mn = bi;
+                if (bi > mx) mx = bi;
+            }
+            *nOut = n; *minOut = (n > 0 ? mn : 0); *maxOut = (n > 0 ? mx : -1);
+        };
+        int n0, mn0, mx0; scan(&n0, &mn0, &mx0);
+        // Exactly what the game's rebuild does before it refreshes: the component follows the mesh
+        // the actor wears now, and every bone of that mesh is registered -- by the mesh's own names.
+        *(void**)(rc + off::kAirReplayMeshComp) = mesh;
+        *(uint8_t*)(rc + off::kAirReplayAddAllBones) = 1;
+        g_syms.ReplayRefreshBones(rc);
+        int n1, mn1, mx1; scan(&n1, &mn1, &mx1);
+        const bool bad = (n1 > 0) && (mn1 < 0 || mx1 >= bones);
+        if (bad) {
+            // Should be impossible with all-bones-from-this-mesh; if it happens, an empty list is the
+            // one state that cannot write outside the pose. Num is lowered, storage left alone.
+            *(int32_t*)(rc + off::kAirReplayUpdated + 8) = 0;
+        }
+        if (logf) {
+            char m[300];
+            snprintf(m, sizeof(m), "[replay] proxy bone cache re-synced to its %d-bone mesh: before %d entr%s"
+                                   " (index %d..%d)%s -> after %d (index %d..%d)%s",
+                     bones, n0, n0 == 1 ? "y" : "ies", mn0, mx0,
+                     (n0 > 0 && (mn0 < 0 || mx0 >= bones)) ? " *** OUTSIDE THE POSE: this is what crashed the replay editor ***" : "",
+                     n1, mn1, mx1, bad ? " *** STILL OUTSIDE -- entries emptied ***" : "");
+            logf(m);
+        }
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        if (logf) logf("[replay] proxy bone cache re-sync FAULTED (nothing changed)");
+        return false;
+    }
 }
 int SkeletonTransportBoneCount(void* meshComp, bool alsoBoard) {
     const int total = SkeletonBoneCount(meshComp);
@@ -792,6 +855,7 @@ const Syms& Resolve(void (*logf)(const char*)) {
     g_syms.DropperSave        =                     found[i++];   // hooked, never called directly
     g_syms.ActorSetLocation   =                     found[i++];   // hooked, never called directly
     g_syms.ActorDestroy       = (ActorDestroyFn)  found[i++];
+    g_syms.ReplayRefreshBones = (ReplayRefreshBonesFn) found[i++];
 
     // LOCKSTEP CHECK. The block above is POSITIONAL, and a table entry added without its assignment --
     // or vice versa -- shifts every later symbol onto the wrong address SILENTLY: sigs still resolve

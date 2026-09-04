@@ -26,13 +26,15 @@ void CatchTweaks_DrawMenu(const OmpMenuApi* api);  // RENDER THREAD (menu_ext co
 void CatchTweaks_ResetDefaults();
 bool CatchTweaks_Enabled();
 void CatchTweaks_SetEnabled(bool on);
-// PERCENT, matching the ini's own CatchWindowMult (200 = x2.00) -- integers for the slider row.
-float CatchTweaks_WindowMultPct();      void CatchTweaks_SetWindowMultPct(float pct);
+// The manual catch window: how far from flat the deck may be at a manual press before the game's own
+// verdict bails it (CatchManualFlipAngleThreshold on every flip def; the defs ship 120). Degrees.
+float CatchTweaks_ManualTolDeg();       void CatchTweaks_SetManualTolDeg(float deg);
 float CatchTweaks_DarkslideZoneDeg();   void CatchTweaks_SetDarkslideZoneDeg(float deg);
 int  CatchTweaks_ManualMode();                     // the ECatchMode value meaning MANUAL (-1 unknown)
 // The last ASkaterCharacterBase seen by the catch system, for modules that need to poll skater state
 // from the pump (catch_sound's catch-edge watch). Null until the first CanCatchOrient call.
 void* CatchTweaks_Skater();
+void* CatchTweaks_LocalInputHandler();   // the local skater's InputHandler, null until first seen
 // The highest skater world-Z (cm) seen in the last ~1.5 s, sampled per frame from the
 // CanCatchOrient hook -- run_out computes the drop height of the air that is ending as
 // (this - live Z). -999999 = no fresh samples (no catch-system activity, e.g. a trickless fall).
@@ -50,6 +52,7 @@ void CatchTweaks_PumpFrame();
 // animation-phase point after the physics pass -- because that is the only phase where clearing a
 // foot's catch type outlasts the game's own recompute. GAME THREAD, our skater only.
 void CatchTweaks_PostPhysHold();
+
 // True while a mid-scoop catch is live (armed, or within a short tail after touchdown). pop_probe's
 // manual gate skips Skate_CheckForManuals while this holds: the held scoop stick is also the manual
 // input, and it must not read as a manual request.
@@ -91,5 +94,8 @@ void* CatchTweaks_SetCatchOrientAddr();
 // before the pop -- the held-over test behind CatchNeedsFreshFlick, shared so catch_level can
 // gate its post-physics level assert on it.
 bool  CatchTweaks_HeldOverStale();
+// True ONCE when an air with a missed early press (CatchEarlyMiss) has touched down: run_out's pump
+// takes it and delivers the landing bail through its own policy (low air -> run-out where enabled).
+bool  CatchTweaks_TakeMissedLanding();
 float CatchTweaks_BoneScalePct();  void CatchTweaks_SetBoneScalePct(float v);
 float CatchTweaks_BoneAdd(int axis); void CatchTweaks_SetBoneAdd(int axis, float v);

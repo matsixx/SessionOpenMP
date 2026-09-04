@@ -11,6 +11,10 @@
 // loads into. See LICENSE-EXCEPTION.txt.
 // SessionTweaks -- shared plumbing implementation. See tweaks_common.h for the rules.
 #define _CRT_SECURE_NO_WARNINGS
+// EnumProcessModules via kernel32 (K32EnumProcessModules), no psapi.lib -- same as tweaks_mod.cpp.
+#define PSAPI_VERSION 2
+#include <windows.h>
+#include <psapi.h>
 #include "tweaks_common.h"
 #include <cctype>
 
@@ -61,6 +65,26 @@ uint8_t* TwkScanExe(const char* sig) {
         if (uint8_t* hit = scanRange(base + sec[i].VirtualAddress, sec[i].Misc.VirtualSize, sig)) return hit;
     }
     return nullptr;
+}
+
+// ---- the whose-skater seam (see the header) ----------------------------------------------------
+typedef int (*IsProxyFn)(void*);
+static IsProxyFn g_isProxy = nullptr;
+static bool      g_isProxyLooked = false;
+void Twk_BindProxyQuery() {
+    if (g_isProxy) return;
+    HMODULE mods[512]; DWORD needed = 0;
+    if (!EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &needed)) return;
+    int n = (int)(needed / sizeof(HMODULE)); if (n > 512) n = 512;
+    for (int i = 0; i < n; i++) {
+        auto fn = (IsProxyFn)GetProcAddress(mods[i], "OmpSession_IsProxyActor");
+        if (fn) { g_isProxy = fn; TwkLog("[tweaks] proxy query bound (host: SessionOpenMP) -- remote skaters are now told apart"); return; }
+    }
+    if (!g_isProxyLooked) { g_isProxyLooked = true; }
+}
+int Twk_IsProxy(void* actor) {
+    if (!actor || !g_isProxy) return 0;
+    __try { return g_isProxy(actor) ? 1 : 0; } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
 }
 
 int TwkIniSetInt(char* text, size_t cap, const char* key, int value) {

@@ -97,7 +97,58 @@ static int g_log    = 0;      // BodyFeelLog -- 1 Hz state line
 // routed here: the config line, the resolved signatures and the fault lines are what make
 // somebody's bug report readable, and they cost four lines a session.
 #define TwkLogBail(...) do { if (g_log) TwkLog(__VA_ARGS__); } while (0)
+static const char* forbidTag(bool down) { return down ? "forbidden again" : "allowed"; }
 static int g_bail   = 1;      // BodyFeelBrace -- the skater reaches to protect the fall
+// BodyFeelCCD: continuous collision on every ragdoll body, switched on at the ragdoll edge through
+// the engine's own FBodyInstance::SetUseCCD. The ragdoll ships with discrete collision: each physics
+// step checks where a body IS, not the path it took, so a forearm whipping at bail speed crosses the
+// torso capsule between two steps and never registers -- slow contact catches, fast contact tunnels
+// (field: "sometimes the arm collides with the body, other times it goes right through; same with
+// the legs"). CCD sweeps the path. Left on for the character's lifetime once set: on a kinematic
+// body (riding) the flag is inert, and clearing it at the ragdoll end would mean calling into
+// bodies the game may be tearing down at that exact moment.
+static int g_ccd     = 1;
+// BodyFeelCollisionDump: one-shot at the first bail, BEFORE CCD is touched -- every body's CCD flag
+// and solver iteration counts (live and the asset's defaults), every joint's disable-collision flag,
+// and the physics asset's forbidden-pair table, all by bone name. Says which pairs can never touch
+// (a joint's flag, or the table) versus which merely tunnel.
+static int g_ccdDump = 1;
+// BodyFeelArmTorso: let the UPPER ARMS collide with the torso. The rig's physics asset forbids both
+// upper arms against the pelvis and all three spine bodies (and against each other) in its
+// collision-disable table -- dumped from the field rig, 87 pairs -- so only the forearm ever stops
+// against the chest and the upper arm passes straight through it ("the collision for the arm isn't
+// big enough"). The engine keeps a POINTER to that table (FPhysScene_PhysX::CollisionDisableTableLookup
+// maps the mesh to the asset's own TMap) and PhysXSimFilterShader looks each new contact pair up in it
+// live, so an entry can be retired in place: its two body indices are overwritten with values no real
+// pair can hash to, the element and its hash links are left where they are, and the lookup for the
+// real pair simply stops matching. Done once per asset at first sight of the rig, while every body is
+// still kinematic (no pair is cached yet); every later ragdoll forms its pairs against the edited table.
+//   0 = off (the asset as shipped)   1 = upper arms vs pelvis + spine1 + spine2 (default)
+//   2 = also vs spine3, the shoulder body (may pop at the bail edge if the capsules overlap at rest)
+//   3 = also the two upper arms against each other
+static int g_armTorso = 1;
+// BodyFeelArmTorsoGrabFree: while an arm is GRABBING (the clutch pulling that hand to the hurt part),
+// its upper-arm-vs-torso pairs are forbidden again, and re-allowed when the grab ends. Field: with the
+// pairs allowed, a right arm reaching for the left leg hit the chest capsule and stopped short -- the
+// torso capsules are as deep front-to-back as the body, so an arm cannot pass "in front of" the chest
+// without penetrating it. The tumble keeps the collision; a reach across the body does not. Applied
+// through FBodyInstance::UpdatePhysicsFilterData on the upper arm, which makes the physics engine
+// re-filter that body's live contact pairs at once (a pair killed by the filter stays killed until the
+// shapes separate, so the table edit alone would not free an arm already pressed into the chest).
+// OFF by default (field, .230): with the pairs stood down for a grabbing arm, the arm went through
+// the body again -- the grab IS the moment the arm is against the torso. The reach-across failure
+// it was built for turned out to be the shoulder's own travel (BodyFeelShoulderSwingDeg below).
+static int g_armTorsoGrab = 0;
+// BodyFeelShoulderSwingDeg / BodyFeelShoulderTwistDeg: the shoulder joint's travel for the ragdoll's
+// duration. The rig gives the upper arm a 25-degree cone at the shoulder (dumped: UpperArm <- Clavicle
+// swing 25/25, twist 10; the clavicle joint adds 20) -- fine for a canned pose, but a ragdoll arm
+// reaching across the body has to swing forward past the chest, and with 45 degrees of total travel it
+// cannot. The clutch's pull then takes the straight line THROUGH the torso, and the arm-torso
+// collision only decides whether that line is blocked (arm stops short) or not (arm passes through).
+// Written into the constraint's live profile and pushed to the physics joint; restored with the
+// drives when the ragdoll ends. 0 = the rig's own value.
+static float g_shoulderSwing = 90.0f;
+static float g_shoulderTwist = 45.0f;
 // MUSCLE TONE. This is the piece the research says everyone else has and we did not: an
 // active ragdoll drives EVERY joint toward a pose all the time, and behaviours bias a few
 // joints on top of that baseline. Only three joint groups were being driven here and every
@@ -142,6 +193,18 @@ void BodyFeel_ReadConfig(const char* buf) {
     if (g_amount < 0) g_amount = 0; else if (g_amount > 200) g_amount = 200;
     g_log    = TwkIniInt(buf, "BodyFeelLog", 0);
     g_bail   = TwkIniInt(buf, "BodyFeelBrace", 1);
+    g_ccd     = TwkIniInt(buf, "BodyFeelCCD", 1);
+    g_ccdDump = TwkIniInt(buf, "BodyFeelCollisionDump", 1);
+    g_armTorso = TwkIniInt(buf, "BodyFeelArmTorso", 1);
+    if (g_armTorso < 0) g_armTorso = 0;
+    if (g_armTorso > 3) g_armTorso = 3;
+    g_armTorsoGrab = TwkIniInt(buf, "BodyFeelArmTorsoGrabFree", 0);
+    g_shoulderSwing = (float)TwkIniInt(buf, "BodyFeelShoulderSwingDeg", 90);
+    g_shoulderTwist = (float)TwkIniInt(buf, "BodyFeelShoulderTwistDeg", 45);
+    if (g_shoulderSwing < 0.0f) g_shoulderSwing = 0.0f;
+    if (g_shoulderSwing > 170.0f) g_shoulderSwing = 170.0f;
+    if (g_shoulderTwist < 0.0f) g_shoulderTwist = 0.0f;
+    if (g_shoulderTwist > 170.0f) g_shoulderTwist = 170.0f;
     g_freeJoints = TwkIniInt(buf, "BodyFeelFreeJoints", 1);
     g_driveCurl  = TwkIniInt(buf, "BodyFeelDriveCurl", 1);
     g_curlDeg    = (float)TwkIniInt(buf, "BodyFeelCurlDeg", 280);
@@ -164,6 +227,12 @@ void BodyFeel_SaveConfig(char* buf, size_t cap) {
     TwkIniSetInt(buf, cap, "BodyFeelAmount", g_amount);
     TwkIniSetInt(buf, cap, "BodyFeelLog", g_log);
     TwkIniSetInt(buf, cap, "BodyFeelBrace", g_bail);
+    TwkIniSetInt(buf, cap, "BodyFeelCCD", g_ccd);
+    TwkIniSetInt(buf, cap, "BodyFeelCollisionDump", g_ccdDump);
+    TwkIniSetInt(buf, cap, "BodyFeelArmTorso", g_armTorso);
+    TwkIniSetInt(buf, cap, "BodyFeelArmTorsoGrabFree", g_armTorsoGrab);
+    TwkIniSetInt(buf, cap, "BodyFeelShoulderSwingDeg", (int)g_shoulderSwing);
+    TwkIniSetInt(buf, cap, "BodyFeelShoulderTwistDeg", (int)g_shoulderTwist);
     TwkIniSetInt(buf, cap, "BodyFeelFreeJoints", g_freeJoints);
     TwkIniSetInt(buf, cap, "BodyFeelDriveCurl", g_driveCurl);
     TwkIniSetInt(buf, cap, "BodyFeelCurlDeg", (int)g_curlDeg);
@@ -179,7 +248,7 @@ void BodyFeel_SaveConfig(char* buf, size_t cap) {
     TwkIniSetInt(buf, cap, "BodyFeelToneArmStiff", (int)g_toneArmStiff);
     SaveBraceTuning(buf, cap);
 }
-void BodyFeel_ResetDefaults() { g_on = 1; g_amount = 100; g_bail = 1; ResetBraceTuning(); }
+void BodyFeel_ResetDefaults() { g_on = 1; g_amount = 100; g_bail = 1; g_ccd = 1; g_armTorso = 1; g_armTorsoGrab = 0; g_shoulderSwing = 90.0f; g_shoulderTwist = 45.0f; ResetBraceTuning(); }
 
 bool  BodyFeel_Enabled()          { return g_on != 0; }
 void  BodyFeel_SetEnabled(bool o) { g_on = o ? 1 : 0; TwkMarkDirty(); }
@@ -241,6 +310,7 @@ static float g_headTopCm   = 13.0f;   // and the hands go to the TOP of the skul
 // ends up with their hands near their shoulders, so a splayed arm is drawn gently back in --
 // weak, distance-gated, and internal against its own shoulder so it cannot shift the body.
 static bool  g_grabbing[kMaxBodies];  // this arm is holding the hurt part right now
+static double g_grabStamp = 0.0;      // when g_grabbing was last decided (stale after 0.1 s)
 static float g_settleAccel = 900.0f;
 static float g_settleFar   = 34.0f;   // only an arm further out than this is drawn in
 static float g_settleOut   = 30.0f;   // the rest spot sits well OUT from the shoulder --
@@ -372,6 +442,28 @@ static float g_armKeepAccel  = 1400.0f; // arms held to the FRONT (force toward 
 // it never grinds the body into the floor. 100% = g_extraGrav on top of world gravity.
 static float g_extraGrav     = 750.0f;  // cm/s^2 at Fall weight 100%
 static int   g_fallAmt       = 100;     // Fall weight (%)
+// ---- the reach's SHAPE. The flight reach is one direction for both arms -- the throw, blending to
+// straight down -- so on a backward fall both arms go straight behind the body (field, screenshot:
+// "arms going too far back"). A real backward fall splays the arms out to the sides. Per arm, the
+// reach is rotated from the throw toward that arm's OUTWARD direction (its clavicle away from the
+// shoulder midline -- rig-agnostic, no axis convention) by the splay angle of the fall's kind. The
+// kind is read off the belly compass once it is live: throw against the belly = forward, with it =
+// backward, else sideways (no splay). Forward ships at 0 = the reach as before.
+static float g_splayBack = 60.0f;      // BodyFeelBraceSplayBackDeg
+static float g_splayFwd  = 0.0f;       // BodyFeelBraceSplayFwdDeg
+// ---- PALMS TO THE GROUND. A torque on each hand turning its palm normal onto world down, half of
+// it on the forearm of the same side too (the same world torque -- no forearm axis convention
+// needed), for the flight only. Which local axis of the hand bone is the palm normal is not knowable
+// from here: BodyFeelPalmAxis picks it (0..5 = +X +Y +Z -X -Y -Z), BodyFeelPalmMirror negates it for
+// the LEFT hand (mirrored rigs), and a one-line probe per bail prints each hand's axes against world
+// down and along the forearm so the right code can be read off the log. Damped on the hand's own
+// measured spin so the controller settles rather than swings.
+static int   g_palmAxis   = 2;         // BodyFeelPalmAxis
+static int   g_palmMirror = 1;         // BodyFeelPalmMirror
+static float g_palmAccel  = 150.0f;    // BodyFeelPalmAccel -- rad/s^2 at full error (0 = off)
+static float g_palmDamp   = 6.0f;      // BodyFeelPalmDamp -- rad/s^2 per rad/s of hand spin
+static int   g_fallKind   = 0;         // this bail: 0 unknown, 1 forward, 2 backward, 3 sideways
+static bool  g_palmLogged = false;
 static float g_faceDownZ     = -0.45f;  // bellyZ below this = face-down
 static float g_rollDoneZ     = -0.15f;  // bellyZ above this = rolled off the belly
 // THE BREAK is OFF by default: two rounds of thresholds could not separate a bad slam
@@ -406,6 +498,17 @@ static void ReadBraceTuning(const char* buf) {
     if (g_armAmt < 0) g_armAmt = 0; if (g_armAmt > 300) g_armAmt = 300;
     g_fallAmt = TwkIniInt(buf, "BodyFeelFallPct", 100);
     if (g_fallAmt < 0) g_fallAmt = 0; if (g_fallAmt > 300) g_fallAmt = 300;
+    g_splayBack = (float)TwkIniInt(buf, "BodyFeelBraceSplayBackDeg", 60);
+    g_splayFwd  = (float)TwkIniInt(buf, "BodyFeelBraceSplayFwdDeg", 0);
+    if (g_splayBack < 0.0f) g_splayBack = 0.0f; if (g_splayBack > 90.0f) g_splayBack = 90.0f;
+    if (g_splayFwd  < 0.0f) g_splayFwd  = 0.0f; if (g_splayFwd  > 90.0f) g_splayFwd  = 90.0f;
+    g_palmAxis   = TwkIniInt(buf, "BodyFeelPalmAxis", 2);
+    if (g_palmAxis < 0 || g_palmAxis > 5) g_palmAxis = 2;
+    g_palmMirror = TwkIniInt(buf, "BodyFeelPalmMirror", 1) ? 1 : 0;
+    g_palmAccel  = (float)TwkIniInt(buf, "BodyFeelPalmAccel", 150);
+    g_palmDamp   = (float)TwkIniInt(buf, "BodyFeelPalmDamp", 6);
+    if (g_palmAccel < 0.0f) g_palmAccel = 0.0f; if (g_palmAccel > 2000.0f) g_palmAccel = 2000.0f;
+    if (g_palmDamp  < 0.0f) g_palmDamp  = 0.0f; if (g_palmDamp  > 100.0f)  g_palmDamp  = 100.0f;
     int cp = TwkIniInt(buf, "BodyFeelCarryPct", 55);
     if (cp < 0) cp = 0; if (cp > 150) cp = 150;
     g_carryFrac   = (float)cp / 100.0f;
@@ -421,12 +524,19 @@ static void SaveBraceTuning(char* buf, size_t cap) {
     TwkIniSetInt(buf, cap, "BodyFeelCarryPct", (int)(g_carryFrac * 100.0f + 0.5f));
     TwkIniSetInt(buf, cap, "BodyFeelArmPct", g_armAmt);
     TwkIniSetInt(buf, cap, "BodyFeelFallPct", g_fallAmt);
+    TwkIniSetInt(buf, cap, "BodyFeelBraceSplayBackDeg", (int)g_splayBack);
+    TwkIniSetInt(buf, cap, "BodyFeelBraceSplayFwdDeg",  (int)g_splayFwd);
+    TwkIniSetInt(buf, cap, "BodyFeelPalmAxis",   g_palmAxis);
+    TwkIniSetInt(buf, cap, "BodyFeelPalmMirror", g_palmMirror);
+    TwkIniSetInt(buf, cap, "BodyFeelPalmAccel",  (int)g_palmAccel);
+    TwkIniSetInt(buf, cap, "BodyFeelPalmDamp",   (int)g_palmDamp);
 }
 static void ResetBraceTuning() {
     g_flailMs = 1800; g_flailDelayMs = 0; g_clutchMs = 8250; g_grabDelayMs = 0;
     g_flailAccel = kFlailBase * 1.4f; g_clutchAccel = kClutchBase * 3.0f;
     g_bailAccel = kReachBase * 0.6f;
     g_carryFrac = 0.55f; g_armAmt = 170; g_fallAmt = 100;
+    g_splayBack = 60.0f; g_splayFwd = 0.0f; g_palmAxis = 2; g_palmMirror = 1; g_palmAccel = 150.0f; g_palmDamp = 6.0f;
 }
 bool  BodyFeel_BraceEnabled()          { return g_bail != 0; }
 void  BodyFeel_SetBraceEnabled(bool o) { g_bail = o ? 1 : 0; TwkMarkDirty(); }
@@ -531,6 +641,9 @@ static float  g_throwSpeed  = 0.0f;
 static float  g_bPos[kMaxBodies][3];   // live per-body world positions during the ragdoll
 static float  g_bVel[kMaxBodies][3];
 static bool   g_bOk[kMaxBodies];
+static float  g_bQuat[kMaxBodies][4];     // live per-body world rotation (x,y,z,w), for the palms
+static float  g_bQuatPrev[kMaxBodies][4]; // last frame's, for the hand's measured spin
+static bool   g_bQuatOk[kMaxBodies];      // prev is from the frame before (a spin can be read)
 static bool   g_bPosValid   = false;
 static bool   g_sawFall     = false;
 // WHAT HE HIT WHILE STILL ON THE BOARD. Everything below waits for TOUCHDOWN -- the fall
@@ -866,6 +979,96 @@ static void SetJointDrives(uint8_t* mc, bool on) {
         if (arr[i]) g_setSlerp(arr[i], on);
 }
 
+// ---- shoulder travel (see the knobs). FConstraintInstance::UpdateAngularLimit(this) pushes the live
+// profile's ConeLimit / TwistLimit to the physics joint. Its prologue is shared by three sibling
+// ExecuteWrite wrappers, so it is found the way the drive functions are: a fixed 0x810 past the SLERP
+// drive switch on BOTH exes (Epic 0x2e691b0 / Steam 0x2e2bc10), prologue-checked before trust.
+typedef void (*UpdateAngLimitFn)(void*);
+static UpdateAngLimitFn g_updateAngLimit = nullptr;
+static bool g_angLimitTried = false;
+static bool g_shouldersWide = false;
+struct ShoulderSave { uint8_t* c; float s1, s2, tw; };
+static ShoulderSave g_shoulderSave[4];
+static int g_nShoulderSave = 0;
+enum { CP_SWING1 = 0x8c + 0x3c + 0x14,    // ProfileInstance.ConeLimit.Swing1LimitDegrees
+       CP_SWING2 = 0x8c + 0x3c + 0x18,    //                        .Swing2LimitDegrees
+       CP_TWIST  = 0x8c + 0x5c + 0x14 };  // ProfileInstance.TwistLimit.TwistLimitDegrees
+
+static void ResolveUpdateAngLimit() {
+    if (g_angLimitTried) return;
+    g_angLimitTried = true;
+    uint8_t* base = (uint8_t*)g_setSlerp;
+    if (!base) base = TwkScanExe(SIG_SET_SLERP_DRIVE);
+    if (!base) {
+        TwkLog("[body] FConstraintInstance::UpdateAngularLimit: no anchor -- shoulders keep the rig's travel");
+        return;
+    }
+    static const uint8_t kPro[] = { 0x48, 0x83, 0xEC, 0x38, 0x48, 0x8D, 0x44, 0x24, 0x40,
+                                    0x48, 0x89, 0x4C, 0x24, 0x40 };
+    uint8_t* cand = base + 0x810;
+    bool ok = true;
+    for (int i = 0; i < (int)sizeof(kPro); i++) if (cand[i] != kPro[i]) { ok = false; break; }
+    g_updateAngLimit = ok ? (UpdateAngLimitFn)cand : nullptr;
+    TwkLog("[body] FConstraintInstance::UpdateAngularLimit %s",
+           ok ? "resolved (SLERP switch + 0x810, prologue verified)"
+              : "MISMATCH -- shoulders keep the rig's travel");
+}
+
+// on: widen every UpperArm <- Clavicle joint (both sides), remembering the rig's values;
+// off: put them back. Pointers are re-checked against the live constraint list before a restore,
+// because the game may have rebuilt its constraints in between.
+static void WidenShoulders(uint8_t* mc, bool on) {
+    if (!mc || on == g_shouldersWide) return;
+    if (on && g_shoulderSwing <= 0.0f && g_shoulderTwist <= 0.0f) return;
+    ResolveUpdateAngLimit();
+    if (!g_updateAngLimit) return;
+    __try {
+        uint8_t** arr = *(uint8_t***)(mc + 0x990);
+        const int n = *(int*)(mc + 0x990 + 8);
+        if (!arr || n <= 0) return;
+        if (on) {
+            g_nShoulderSave = 0;
+            for (int i = 0; i < n && i < 40 && g_nShoulderSave < 4; i++) {
+                uint8_t* c = arr[i]; if (!c) continue;
+                char n1[64] = "?", n2[64] = "?";
+                GrindPop_FNameToString(c + 0x20, n1, sizeof(n1));
+                GrindPop_FNameToString(c + 0x28, n2, sizeof(n2));
+                const bool shoulder = (strstr(n1, "UpperArm") && strstr(n2, "Clavicle")) ||
+                                      (strstr(n2, "UpperArm") && strstr(n1, "Clavicle"));
+                if (!shoulder) continue;
+                ShoulderSave& sv = g_shoulderSave[g_nShoulderSave++];
+                sv.c = c;
+                sv.s1 = *(float*)(c + CP_SWING1); sv.s2 = *(float*)(c + CP_SWING2);
+                sv.tw = *(float*)(c + CP_TWIST);
+                if (g_shoulderSwing > 0.0f) {
+                    *(float*)(c + CP_SWING1) = g_shoulderSwing;
+                    *(float*)(c + CP_SWING2) = g_shoulderSwing;
+                }
+                if (g_shoulderTwist > 0.0f) *(float*)(c + CP_TWIST) = g_shoulderTwist;
+                g_updateAngLimit(c);
+                TwkLogBail("[body] shoulder %s <- %s: swing %.0f/%.0f twist %.0f -> %.0f/%.0f/%.0f "
+                           "for the ragdoll", n1, n2, sv.s1, sv.s2, sv.tw,
+                           *(float*)(c + CP_SWING1), *(float*)(c + CP_SWING2), *(float*)(c + CP_TWIST));
+            }
+            g_shouldersWide = g_nShoulderSave > 0;
+        } else {
+            for (int k = 0; k < g_nShoulderSave; k++) {
+                ShoulderSave& sv = g_shoulderSave[k];
+                bool live = false;
+                for (int i = 0; i < n && i < 40; i++) if (arr[i] == sv.c) { live = true; break; }
+                if (!live) continue;
+                *(float*)(sv.c + CP_SWING1) = sv.s1; *(float*)(sv.c + CP_SWING2) = sv.s2;
+                *(float*)(sv.c + CP_TWIST) = sv.tw;
+                g_updateAngLimit(sv.c);
+            }
+            g_nShoulderSave = 0; g_shouldersWide = false;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        TwkLog("[body] caught fatal widening the shoulders -> off");
+        g_shoulderSwing = 0.0f; g_shoulderTwist = 0.0f; g_shouldersWide = false; g_nShoulderSave = 0;
+    }
+}
+
 static bool g_jointsLogged = false;
 static void LogJointLimits(uint8_t* mc) {
     if (g_jointsLogged || !mc || !g_log) return;
@@ -930,6 +1133,303 @@ static void BodyBoneName(uint8_t* mc, uint8_t* arr2, int i, char* out, int cap) 
     if (info && bx >= 0 && bx < nb)
         GrindPop_FNameToString(info + (size_t)bx * BONEINFO_STRIDE, out, cap);
 }
+// ---- ragdoll self-collision: CCD at the edge + the one-shot collision dump ---------------------------
+// FBodyInstance::SetUseCCD(this, bool). Read off its own prologue (Epic 0x2e585a0 / Steam 0x2e1b000,
+// sig unique in both): bit 0 of the byte at +0x5b is bUseCCD; the call flips it and pushes the flag
+// to the physics engine. The two solver iteration counts sit at +0x74/+0x75 (PDB) and are only read
+// when a body is created, so they are dumped, not written.
+typedef void (*SetUseCcdFn)(void*, bool);
+static SetUseCcdFn g_setUseCcd = nullptr;
+static bool        g_setUseCcdTried = false;
+static const char* SIG_SET_USE_CCD =
+    "40 53 48 83 EC 30 44 0F B6 41 5B 48 8B D9 41 0F B6 C0 24 01 3A C2 ?? ?? 41 80 E0 FE 48 89 4C 24 40";
+static bool g_ccdDumped = false;
+enum {
+    BI_FLAGS_CCD     = 0x05b,   // FBodyInstance bitfield byte; bit 0 = bUseCCD
+    BI_POS_ITERS     = 0x074,   // FBodyInstance::PositionSolverIterationCount (uint8)
+    BI_VEL_ITERS     = 0x075,   // FBodyInstance::VelocitySolverIterationCount (uint8)
+    SKM_PHYS_ASSET   = 0x168,   // USkeletalMesh::PhysicsAsset
+    PA_BODY_SETUPS   = 0x040,   // UPhysicsAsset::SkeletalBodySetups (TArray<USkeletalBodySetup*>)
+    PA_DISABLE_TABLE = 0x0d0,   // UPhysicsAsset::CollisionDisableTable (TMap<FRigidBodyIndexPair,bool>)
+    BS_DEFAULT_INST  = 0x128,   // UBodySetup::DefaultInstance (FBodyInstance)
+    CMP_CONSTRAINTS  = 0x990,   // USkeletalMeshComponent::Constraints (TArray<FConstraintInstance*>)
+    CI_BONE1         = 0x020,   // FConstraintInstance::ConstraintBone1 (FName)
+    CI_BONE2         = 0x028,   //                     ConstraintBone2
+    CI_DISABLE_COLL  = 0x08c + 0x110,   // ProfileInstance.bDisableCollision -- bit 0 of that byte
+};
+
+static void ResolveSetUseCcd() {
+    if (g_setUseCcdTried) return;
+    g_setUseCcdTried = true;
+    g_setUseCcd = (SetUseCcdFn)TwkScanExe(SIG_SET_USE_CCD);
+    TwkLog("[body] FBodyInstance::SetUseCCD %s",
+           g_setUseCcd ? "resolved" : "SIG NOT FOUND -- ragdoll CCD cannot be applied");
+}
+
+// Idempotent per body (a set bit is skipped), so calling it at every ragdoll edge costs nothing
+// after the first and re-covers a mesh the game rebuilt in between.
+static void ApplyRagdollCcd(uint8_t* mc) {
+    if (!g_ccd || !mc) return;
+    ResolveSetUseCcd();
+    if (!g_setUseCcd) return;
+    __try {
+        uint8_t** arr = *(uint8_t***)(mc + CMP_BODIES);
+        const int n = *(int*)(mc + CMP_BODIES + 8);
+        if (!arr || n <= 0) return;
+        int flipped = 0, had = 0;
+        for (int i = 0; i < n && i < kMaxBodies; i++) {
+            uint8_t* bi = arr[i]; if (!bi) continue;
+            if (bi[BI_FLAGS_CCD] & 1) { had++; continue; }
+            g_setUseCcd(bi, true);
+            flipped++;
+        }
+        static bool said = false;
+        if (!said || g_log) {
+            said = true;
+            TwkLog("[body] ragdoll CCD: enabled on %d of %d bodies (%d already had it)", flipped, n, had);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        TwkLog("[body] caught fatal enabling ragdoll CCD -> off for this session");
+        g_ccd = 0;
+    }
+}
+
+// The asset's disable table is a TMap: a TSparseArray of elements at +0x00 (Data / Num at +0x08 /
+// AllocFlags bit array: inline words +0x10, secondary +0x20, NumBits +0x28). Element layout for
+// TPair<FRigidBodyIndexPair,bool>: two int32 body indices, the bool, then the two hash ints --
+// stride 0x14. Read only, and every element is range-checked against the body count before it is
+// believed: a stride that is wrong reads as indices outside the rig, and is reported as such.
+static void DumpRagdollCollisionOnce(uint8_t* mc) {
+    if (!g_ccdDump || g_ccdDumped || !mc) return;
+    g_ccdDumped = true;
+    __try {
+        uint8_t** arr = *(uint8_t***)(mc + CMP_BODIES);
+        const int n = *(int*)(mc + CMP_BODIES + 8);
+        void* skm = *(void**)(mc + CMP_SKELMESH);
+        uint8_t* pa = skm ? *(uint8_t**)((uint8_t*)skm + SKM_PHYS_ASSET) : nullptr;
+        uint8_t** setups = pa ? *(uint8_t***)(pa + PA_BODY_SETUPS) : nullptr;
+        const int nSetups = pa ? *(int*)(pa + PA_BODY_SETUPS + 8) : 0;
+        TwkLog("[body] collision dump (rig first seen): %d bodies, physics asset %p with %d body setups",
+               n, (void*)pa, nSetups);
+        static char names[kMaxBodies][40];
+        for (int i = 0; i < kMaxBodies; i++) { names[i][0] = '?'; names[i][1] = 0; }
+        for (int i = 0; i < n && i < kMaxBodies; i++) {
+            uint8_t* bi = arr ? arr[i] : nullptr;
+            BodyBoneName(mc, (uint8_t*)arr, i, names[i], sizeof(names[i]));
+            if (!bi) continue;
+            int dCcd = -1, dPos = -1, dVel = -1;
+            if (setups && i < nSetups && setups[i]) {
+                uint8_t* di = setups[i] + BS_DEFAULT_INST;
+                dCcd = di[BI_FLAGS_CCD] & 1; dPos = di[BI_POS_ITERS]; dVel = di[BI_VEL_ITERS];
+            }
+            TwkLog("[body]   body %2d %-22s live: ccd=%d iters pos/vel %d/%d | asset default: ccd=%d "
+                   "iters %d/%d | blend %.2f", i, names[i], bi[BI_FLAGS_CCD] & 1, bi[BI_POS_ITERS],
+                   bi[BI_VEL_ITERS], dCcd, dPos, dVel, *(float*)(bi + BI_BLEND_WEIGHT));
+        }
+        // Joined pairs: a joint may forbid collision between the two bodies it joins.
+        uint8_t** cs = *(uint8_t***)(mc + CMP_CONSTRAINTS);
+        const int nc = *(int*)(mc + CMP_CONSTRAINTS + 8);
+        int off = 0;
+        for (int i = 0; i < nc && i < 64; i++) {
+            uint8_t* c = cs ? cs[i] : nullptr; if (!c) continue;
+            char b1[40] = "?", b2[40] = "?";
+            GrindPop_FNameToString(c + CI_BONE1, b1, sizeof(b1));
+            GrindPop_FNameToString(c + CI_BONE2, b2, sizeof(b2));
+            const int fl = c[CI_DISABLE_COLL];
+            if (fl & 1) off++;
+            TwkLog("[body]   joint %2d %-18s <-> %-18s collision between them: %s (flags 0x%02x)",
+                   i, b1, b2, (fl & 1) ? "DISABLED" : "allowed", fl);
+        }
+        TwkLog("[body]   %d of %d joints disable collision between their two bodies", off, nc);
+        // The asset's own forbidden pairs (non-adjacent bodies that may never touch).
+        if (!pa) { TwkLog("[body]   no physics asset pointer -- pair table not read"); return; }
+        uint8_t* tbl = pa + PA_DISABLE_TABLE;
+        uint8_t* data = *(uint8_t**)(tbl + 0x00);
+        const int num = *(int*)(tbl + 0x08);
+        const int numBits = *(int*)(tbl + 0x28);
+        void* sec = *(void**)(tbl + 0x20);
+        const uint32_t* bits = (const uint32_t*)(sec ? sec : (tbl + 0x10));
+        if (num == 0) { TwkLog("[body]   forbidden-pair table: EMPTY -- every non-adjacent pair may collide"); return; }
+        if (!data || num < 0 || num > 4096 || numBits < num) {
+            TwkLog("[body]   forbidden-pair table: implausible (num %d bits %d) -- layout belief wrong, not read",
+                   num, numBits);
+            return;
+        }
+        int shown = 0, bad = 0;
+        for (int i = 0; i < num && i < numBits; i++) {
+            if (!((bits[i >> 5] >> (i & 31)) & 1)) continue;
+            const uint8_t* e = data + (size_t)i * 0x14;
+            const int a = *(const int*)(e + 0), b = *(const int*)(e + 4);
+            const int v = e[8];
+            if (a < 0 || b < 0 || a >= n || b >= n || v > 1) { bad++; continue; }
+            if (shown < 80)
+                TwkLog("[body]   forbidden pair: %-18s x %-18s (value %d)", names[a], names[b], v);
+            shown++;
+        }
+        TwkLog("[body]   forbidden-pair table: %d pairs listed%s", shown,
+               bad ? " (some entries read out of range -- stride or layout doubt)" : "");
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        TwkLog("[body] collision dump: caught fatal -- partial");
+    }
+}
+
+// Are the bone names resolvable yet? At level load the resolver can lag the mesh by seconds
+// (the classifier below has the same retry), and a pair chosen by name needs the names.
+static bool RigNamesReady(uint8_t* mc, uint8_t* arr, int n) {
+    int ok = 0;
+    for (int i = 0; i < n && i < kMaxBodies; i++) {
+        char nm[40];
+        BodyBoneName(mc, arr, i, nm, sizeof(nm));
+        if (nm[0] != '?') ok++;
+    }
+    return n > 0 && ok * 2 >= n;
+}
+static bool WantArmTorso(const char* a, const char* b) {
+    const bool ua = strstr(a, "UpperArm") != nullptr, ub = strstr(b, "UpperArm") != nullptr;
+    if (ua && ub) return g_armTorso >= 3;
+    const char* other = ua ? b : ub ? a : nullptr;
+    if (!other) return false;
+    if (strstr(other, "Pelvis") || strstr(other, "Spine1") || strstr(other, "Spine2")) return g_armTorso >= 1;
+    if (strstr(other, "Spine3")) return g_armTorso >= 2;
+    return false;
+}
+// Every retired entry, so it can be forbidden again for one arm while that arm grabs. `side` is the
+// upper arm's (0 left, 1 right); -1 = the two upper arms against each other (level 3), which stands
+// down while EITHER arm grabs.
+struct RetiredPair { int elem; int a, b; int side; };
+static RetiredPair g_retired[24];
+static int  g_nRetired = 0;
+static int  g_upperArmBody[2] = { -1, -1 };     // body index per side, for the re-filter
+static bool g_armStoodDown[2] = { false, false };
+// FBodyInstance::UpdatePhysicsFilterData(this): rebuilds the body's shape filter data, which the physics
+// engine answers by re-running the filter shader on that body's pairs. Sig unique in both exes
+// (Epic 0x2e5d730 / Steam 0x2e20190).
+typedef void (*UpdateFilterFn)(void*);
+static UpdateFilterFn g_updateFilter = nullptr;
+static bool           g_updateFilterTried = false;
+static const char* SIG_UPDATE_FILTER =
+    "40 53 48 83 EC 30 48 8B 81 F0 00 00 00 48 8B D9 48 85 C0 ?? ?? 66 66 66 0F 1F 84 00 00 00 00 00";
+static void*  g_pairsAsset = nullptr;   // the asset whose table has been edited
+static double g_pairsAt    = 0.0;       // next attempt (1 Hz until the names resolve)
+static void EnableArmTorsoPairs(uint8_t* mc) {
+    if (!mc || g_armTorso <= 0) return;
+    __try {
+        void* skm = *(void**)(mc + CMP_SKELMESH);
+        uint8_t* pa = skm ? *(uint8_t**)((uint8_t*)skm + SKM_PHYS_ASSET) : nullptr;
+        if (!pa || pa == g_pairsAsset) return;
+        uint8_t** arr = *(uint8_t***)(mc + CMP_BODIES);
+        const int n = *(int*)(mc + CMP_BODIES + 8);
+        if (!arr || n <= 0 || n > kMaxBodies) return;
+        static char names[kMaxBodies][40];
+        for (int i = 0; i < n; i++) BodyBoneName(mc, (uint8_t*)arr, i, names[i], sizeof(names[i]));
+        uint8_t* tbl = pa + PA_DISABLE_TABLE;
+        uint8_t* data = *(uint8_t**)(tbl + 0x00);
+        const int num = *(int*)(tbl + 0x08);
+        const int numBits = *(int*)(tbl + 0x28);
+        void* sec = *(void**)(tbl + 0x20);
+        const uint32_t* bits = (const uint32_t*)(sec ? sec : (tbl + 0x10));
+        if (!data || num <= 0 || num > 4096 || numBits < num) {
+            TwkLog("[body] arm-torso collision: pair table unreadable (num %d) -- left as shipped", num);
+            g_pairsAsset = pa;
+            return;
+        }
+        int retired = 0;
+        g_nRetired = 0; g_upperArmBody[0] = g_upperArmBody[1] = -1;
+        g_armStoodDown[0] = g_armStoodDown[1] = false;
+        for (int i = 0; i < n; i++) {
+            if (!strstr(names[i], "UpperArm")) continue;
+            const int sd = (strstr(names[i], "_L_") || strstr(names[i], "_l_")) ? 0 : 1;
+            g_upperArmBody[sd] = i;
+        }
+        for (int i = 0; i < num && i < numBits; i++) {
+            if (!((bits[i >> 5] >> (i & 31)) & 1)) continue;
+            uint8_t* e = data + (size_t)i * 0x14;
+            const int a = *(int*)(e + 0), b = *(int*)(e + 4);
+            if (a < 0 || b < 0 || a >= n || b >= n) continue;        // not a live pair (or already ours)
+            if (!WantArmTorso(names[a], names[b])) continue;
+            if (g_nRetired >= 24) break;
+            // Only the two indices move, to values no real pair can carry; links and counts stay.
+            *(int*)(e + 0) = 0x40000000 | a;
+            *(int*)(e + 4) = 0x40000000 | b;
+            RetiredPair& r = g_retired[g_nRetired++];
+            r.elem = i; r.a = a; r.b = b;
+            const bool ua = strstr(names[a], "UpperArm") != nullptr, ub = strstr(names[b], "UpperArm") != nullptr;
+            r.side = (ua && ub) ? -1 : (a == g_upperArmBody[0] || b == g_upperArmBody[0]) ? 0 : 1;
+            retired++;
+            TwkLog("[body]   arm-torso collision: %s x %s may now collide", names[a], names[b]);
+        }
+        g_pairsAsset = pa;
+        TwkLog("[body] arm-torso collision: level %d, %d forbidden pair(s) retired on asset %p",
+               g_armTorso, retired, (void*)pa);
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        TwkLog("[body] caught fatal editing the collision pair table -> feature off");
+        g_armTorso = 0;
+    }
+}
+
+static void ResolveUpdateFilter() {
+    if (g_updateFilterTried) return;
+    g_updateFilterTried = true;
+    g_updateFilter = (UpdateFilterFn)TwkScanExe(SIG_UPDATE_FILTER);
+    TwkLog("[body] FBodyInstance::UpdatePhysicsFilterData %s", g_updateFilter
+           ? "resolved" : "SIG NOT FOUND -- a grabbing arm's torso pairs cannot be re-filtered live");
+}
+
+// Forbid (down) or re-allow (up) one arm's retired pairs, then have the engine re-filter that upper
+// arm's live pairs so the change lands on contacts already in progress. Level-3 arm-vs-arm entries
+// follow whichever arm is down.
+static void ArmTorsoStandDown(int side, bool down) {
+    if (side < 0 || side > 1 || g_nRetired <= 0) return;
+    if (g_armStoodDown[side] == down) return;
+    if (!g_armTorsoGrab && down) return;
+    __try {
+        void* skm = g_mesh ? *(void**)((uint8_t*)g_mesh + CMP_SKELMESH) : nullptr;
+        uint8_t* pa = skm ? *(uint8_t**)((uint8_t*)skm + SKM_PHYS_ASSET) : nullptr;
+        if (!pa || pa != g_pairsAsset) return;                 // the table we edited, or nothing
+        uint8_t* data = *(uint8_t**)(pa + PA_DISABLE_TABLE);
+        const int num = *(int*)(pa + PA_DISABLE_TABLE + 0x08);
+        if (!data || num <= 0) return;
+        g_armStoodDown[side] = down;
+        const bool anyDown = g_armStoodDown[0] || g_armStoodDown[1];
+        int n = 0;
+        for (int k = 0; k < g_nRetired; k++) {
+            const RetiredPair& r = g_retired[k];
+            if (r.elem < 0 || r.elem >= num) continue;
+            const bool forbid = (r.side == side) ? down : (r.side == -1) ? anyDown : g_armStoodDown[r.side];
+            uint8_t* e = data + (size_t)r.elem * 0x14;
+            *(int*)(e + 0) = forbid ? r.a : (0x40000000 | r.a);
+            *(int*)(e + 4) = forbid ? r.b : (0x40000000 | r.b);
+            n++;
+        }
+        ResolveUpdateFilter();
+        const int ub = g_upperArmBody[side];
+        if (g_updateFilter && g_mesh && ub >= 0) {
+            uint8_t** arr = *(uint8_t***)((uint8_t*)g_mesh + CMP_BODIES);
+            const int nb = *(int*)((uint8_t*)g_mesh + CMP_BODIES + 8);
+            if (arr && ub < nb && arr[ub]) g_updateFilter(arr[ub]);
+        }
+        TwkLogBail("[body] arm-torso: %s arm %s -- %d pair(s) %s%s", side ? "RIGHT" : "LEFT",
+                   down ? "grabbing, torso collision stood down" : "let go, torso collision back",
+                   n, forbidTag(down), g_updateFilter ? "" : " (no live re-filter)");
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        TwkLog("[body] caught fatal in the arm-torso stand-down -> feature off");
+        g_armTorsoGrab = 0;
+    }
+}
+
+// Every ragdoll frame: an arm counts as grabbing when the clutch decided so this frame or last
+// (the stamp guards against a stale g_grabbing after the clutch has stopped running).
+static void ArmTorsoClutchSync(double t) {
+    if (g_nRetired <= 0) return;
+    bool want[2] = { false, false };
+    if (g_armTorsoGrab && (t - g_grabStamp) < 0.1) {
+        for (int i = 0; i < g_nBodies && i < kMaxBodies; i++)
+            if (g_grabbing[i] && g_reacher[i]) want[g_leftSide[i] ? 0 : 1] = true;
+    }
+    ArmTorsoStandDown(0, want[0]);
+    ArmTorsoStandDown(1, want[1]);
+}
+
 typedef void (*AddForceFn)(void*, const float*, bool, bool);
 static AddForceFn g_addForce = nullptr;
 static AddForceFn g_addTorque = nullptr;   // FBodyInstance::AddTorqueInRadians -- same
@@ -990,14 +1490,79 @@ static void ResolveAddForce() {
 }
 
 static void ForgetMesh() {
+    g_shouldersWide = false; g_nShoulderSave = 0;   // the constraints go with the mesh
     g_mesh = nullptr; g_nBodies = 0; g_feel = 1.0f; g_pulse = 0.0f;
     // A new character on a new map deserves the benefit of the doubt.
     if (g_fault) { g_fault = 0; TwkLog("[body] new character -- reactive body armed again"); }
 }
 
+// ---- palms to the ground (see the knobs) --------------------------------------------------------------
+// The torque that carries the hand's palm normal onto world down, as a world vector so the forearm can
+// take a share of the same one. Returns false when the hand has no usable rotation this frame.
+static bool PalmTorqueFor(int i, float dt, float outTq[3]) {
+    if (!g_bOk[i]) return false;
+    float ax[3] = { 0.0f, 0.0f, 0.0f };
+    ax[g_palmAxis % 3] = (g_palmAxis < 3) ? 1.0f : -1.0f;
+    if (g_palmMirror && g_leftSide[i]) { ax[0] = -ax[0]; ax[1] = -ax[1]; ax[2] = -ax[2]; }
+    float nrm[3]; TwkQuatRotate(g_bQuat[i], ax, nrm);
+    const float d[3] = { 0.0f, 0.0f, -1.0f };
+    const float cosE = nrm[0]*d[0] + nrm[1]*d[1] + nrm[2]*d[2];
+    // the axis that turns nrm onto d; at the exact anti-pole any axis will do -- use world X
+    float axis[3] = { nrm[1]*d[2] - nrm[2]*d[1], nrm[2]*d[0] - nrm[0]*d[2], nrm[0]*d[1] - nrm[1]*d[0] };
+    if (cosE < -0.98f) { axis[0] = 1.0f; axis[1] = 0.0f; axis[2] = 0.0f; }
+    // |axis| = sin(error): full push at 90 degrees, easing to nothing at zero
+    for (int a = 0; a < 3; a++) outTq[a] = axis[a] * g_palmAccel;
+    // damping on the hand's own spin, measured from the frame-to-frame rotation
+    if (g_bQuatOk[i] && dt > 0.001f && g_palmDamp > 0.0f) {
+        const float c[4] = { -g_bQuatPrev[i][0], -g_bQuatPrev[i][1], -g_bQuatPrev[i][2], g_bQuatPrev[i][3] };
+        float dq[4]; TwkQuatMul(g_bQuat[i], c, dq);
+        if (dq[3] < 0.0f) { dq[0] = -dq[0]; dq[1] = -dq[1]; dq[2] = -dq[2]; dq[3] = -dq[3]; }
+        float wq = dq[3]; if (wq > 1.0f) wq = 1.0f;
+        const float ang = 2.0f * acosf(wq);
+        const float sh = sqrtf(1.0f - wq * wq);
+        if (sh > 1e-4f && ang < 3.0f) {
+            const float k = ang / dt / sh;              // rad/s along dq's axis
+            for (int a = 0; a < 3; a++) outTq[a] -= dq[a] * k * g_palmDamp;
+        }
+    }
+    return true;
+}
+
+// Once per bail: each hand's local axes against world down and along the forearm, so the palm axis
+// code can be read off the log. The axis most along the forearm is the bone's length; the palm normal
+// is one of the other two (sign by which way it faces), and the left hand may be the mirror.
+static void PalmProbe(uint8_t** arr2, int n2) {
+    if (g_palmLogged || !g_log) return;
+    int hand[2] = { -1, -1 }, fore[2] = { -1, -1 };
+    for (int i = 0; i < n2 && i < kMaxBodies; i++) {
+        if (!g_bOk[i] || !g_reacher[i]) continue;
+        const int sd = g_leftSide[i] ? 0 : 1;
+        if (g_handBody[i]) hand[sd] = i; else fore[sd] = i;
+    }
+    if (hand[0] < 0 || hand[1] < 0 || fore[0] < 0 || fore[1] < 0) return;
+    g_palmLogged = true;
+    for (int sd = 0; sd < 2; sd++) {
+        const int h = hand[sd], f = fore[sd];
+        float along[3] = { g_bPos[h][0] - g_bPos[f][0], g_bPos[h][1] - g_bPos[f][1], g_bPos[h][2] - g_bPos[f][2] };
+        const float am = sqrtf(along[0]*along[0] + along[1]*along[1] + along[2]*along[2]);
+        if (am > 0.1f) { along[0] /= am; along[1] /= am; along[2] /= am; }
+        float dn[3], al[3];
+        for (int ax = 0; ax < 3; ax++) {
+            float e[3] = { 0.0f, 0.0f, 0.0f }; e[ax] = 1.0f;
+            float wv[3]; TwkQuatRotate(g_bQuat[h], e, wv);
+            dn[ax] = -wv[2];
+            al[ax] = wv[0]*along[0] + wv[1]*along[1] + wv[2]*along[2];
+        }
+        TwkLog("[body] palm probe %s hand: down.X=%+.2f down.Y=%+.2f down.Z=%+.2f | along-forearm.X=%+.2f "
+               "Y=%+.2f Z=%+.2f | using axis %d%s", sd ? "RIGHT" : "LEFT", dn[0], dn[1], dn[2],
+               al[0], al[1], al[2], g_palmAxis, (g_palmMirror && sd == 0) ? " mirrored" : "");
+    }
+}
+
 // Restore every body we steered to its authored weight. Guarded; shared by every stand-down.
 static void RestoreAll() {
     if (!g_mesh || !g_nBodies) { ForgetMesh(); return; }
+    WidenShoulders((uint8_t*)g_mesh, false);
     __try {
         uint8_t* arr = *(uint8_t**)((uint8_t*)g_mesh + CMP_BODIES);
         const int n = *(int*)((uint8_t*)g_mesh + CMP_BODIES + 8);
@@ -1080,7 +1645,11 @@ void BodyFeel_PumpFrame() {
                 g_blendLogged = false;
                 g_bellyOk = false;
                 g_faceDownSince = 0.0; g_rollUntil = 0.0;
+                g_fallKind = 0; g_palmLogged = false;
+                for (int i = 0; i < kMaxBodies; i++) g_bQuatOk[i] = false;
                 LogJointLimits((uint8_t*)g_mesh);
+                ApplyRagdollCcd((uint8_t*)g_mesh);
+                ArmTorsoStandDown(0, false); ArmTorsoStandDown(1, false);   // allowed at the start
                 TwkLogBail("[body] at bail: physical animation flag = %d (1 means the game is "
                        "still driving bones toward the animated pose)",
                        (int)*((uint8_t*)sk + SK_PHYSANIM_ON));
@@ -1088,6 +1657,7 @@ void BodyFeel_PumpFrame() {
                     SetJointDrives((uint8_t*)g_mesh, false);
                     g_drivesFreed = true;
                 }
+                WidenShoulders((uint8_t*)g_mesh, true);
                 DriveSpineCurl((uint8_t*)g_mesh, true);
                 g_rollDone = false; g_rollTries = 0; g_legsLimp = false;
                 // the legs pedal first; the curl takes them over when the flail is spent
@@ -1097,6 +1667,7 @@ void BodyFeel_PumpFrame() {
                 g_armBroken[0] = g_armBroken[1] = false; g_retargetUntil = 0.0;
                 for (int i = 0; i < kMaxBodies; i++) g_bOk[i] = false;
             }
+            ArmTorsoClutchSync(t);
             const double el = t - g_braceStart;
             if (g_bail && g_on && !g_fault && g_amount > 0 && g_addForce && g_nReachers &&
                 g_mesh && el < 30.0) {
@@ -1134,6 +1705,12 @@ void BodyFeel_PumpFrame() {
                             const float* bp = (const float*)(cst + (size_t)bx * 48 + 0x10);
                             float w[3] = { bp[0]*msc[0], bp[1]*msc[1], bp[2]*msc[2] };
                             QuatRotate(mq, w);
+                            {   // the bone's rotation through the mesh's: world = mesh o bone
+                                const float* bq = (const float*)(cst + (size_t)bx * 48);
+                                for (int a = 0; a < 4; a++) g_bQuatPrev[i][a] = g_bQuat[i][a];
+                                TwkQuatMul(mq, bq, g_bQuat[i]);
+                                g_bQuatOk[i] = was;
+                            }
                             w[0] += mp[0]; w[1] += mp[1]; w[2] += mp[2];
                             if (was && g_bPosValid && dt > 0.001f) {
                                 for (int a = 0; a < 3; a++) {
@@ -1588,18 +2165,77 @@ void BodyFeel_PumpFrame() {
                             // differential -- hands 1.3x, forearms 0.7x of the same
                             // reach -- levers the wrist into extension, palm presented
                             // to the ground, whatever the fall direction.
-                            const float fh2[3] = { f[0]*1.3f, f[1]*1.3f, f[2]*1.3f };
-                            const float ff2[3] = { f[0]*0.7f, f[1]*0.7f, f[2]*0.7f };
+                            // ---- which way is this fall? Read once the belly compass is live,
+                            // latched for the bail (see the splay knobs).
+                            if (g_fallKind == 0 && g_bellyOk) {
+                                const float hm = sqrtf(g_throw[0]*g_throw[0] + g_throw[1]*g_throw[1]);
+                                const float bm = sqrtf(g_belly[0]*g_belly[0] + g_belly[1]*g_belly[1]);
+                                if (hm > 0.2f && bm > 0.2f) {
+                                    const float c = (g_throw[0]*g_belly[0] + g_throw[1]*g_belly[1]) / (hm * bm);
+                                    g_fallKind = (c > 0.2f) ? 1 : (c < -0.2f) ? 2 : 3;
+                                    TwkLogBail("[body] brace: falling %s -> splay %.0f deg",
+                                               g_fallKind == 1 ? "FORWARD" : g_fallKind == 2 ? "BACKWARD" : "sideways",
+                                               g_fallKind == 1 ? g_splayFwd : g_fallKind == 2 ? g_splayBack : 0.0f);
+                                }
+                            }
+                            const float splayDeg = (g_fallKind == 2) ? g_splayBack
+                                                 : (g_fallKind == 1) ? g_splayFwd : 0.0f;
+                            const bool clavOk = g_clavIdx[0] >= 0 && g_clavIdx[1] >= 0 &&
+                                                g_bOk[g_clavIdx[0]] && g_bOk[g_clavIdx[1]];
+                            float mid[3] = { 0.0f, 0.0f, 0.0f };
+                            if (clavOk) for (int a = 0; a < 3; a++)
+                                mid[a] = (g_bPos[g_clavIdx[0]][a] + g_bPos[g_clavIdx[1]][a]) * 0.5f;
+                            const float cs = cosf(splayDeg * 0.01745329f), sn = sinf(splayDeg * 0.01745329f);
+                            const float fmag = g_bailAccel * amt;          // |f|, by construction
+                            float palmTq[2][3] = { { 0, 0, 0 }, { 0, 0, 0 } };
+                            bool  palmOk[2] = { false, false };
+                            PalmProbe((uint8_t**)arr2, n2);
                             for (int i = 0; i < n2 && i < kMaxBodies; i++) {
                                 uint8_t* bi = ((uint8_t**)arr2)[i];
                                 if (!bi) continue;
                                 if (g_reacher[i]) {
-                                    if (g_armBroken[g_leftSide[i] ? 0 : 1]) continue;
-                                    g_addForce(bi, g_handBody[i] ? fh2 : ff2, true, true);
+                                    const int sd = g_leftSide[i] ? 0 : 1;
+                                    if (g_armBroken[sd]) continue;
+                                    float fr[3] = { f[0], f[1], f[2] };
+                                    if (splayDeg > 0.0f && clavOk) {
+                                        // this arm's outward: its clavicle away from the shoulder
+                                        // midline, squared against the reach so it widens the reach
+                                        // rather than shortening it
+                                        float out[3] = { g_bPos[g_clavIdx[sd]][0] - mid[0],
+                                                         g_bPos[g_clavIdx[sd]][1] - mid[1],
+                                                         g_bPos[g_clavIdx[sd]][2] - mid[2] };
+                                        const float od = (out[0]*dir[0] + out[1]*dir[1] + out[2]*dir[2]) / (dm * dm);
+                                        for (int a = 0; a < 3; a++) out[a] -= dir[a] * od;
+                                        const float om = sqrtf(out[0]*out[0] + out[1]*out[1] + out[2]*out[2]);
+                                        if (om > 1.0f)
+                                            for (int a = 0; a < 3; a++)
+                                                fr[a] = (dir[a] / dm * cs + out[a] / om * sn) * fmag;
+                                    }
+                                    const float k = g_handBody[i] ? 1.3f : 0.7f;
+                                    const float fk[3] = { fr[0]*k, fr[1]*k, fr[2]*k };
+                                    g_addForce(bi, fk, true, true);
+                                    if (g_handBody[i] && g_palmAccel > 0.0f && g_addTorque) {
+                                        float tq[3];
+                                        if (PalmTorqueFor(i, dt, tq)) {
+                                            g_addTorque(bi, tq, true, true);
+                                            palmTq[sd][0] = tq[0]; palmTq[sd][1] = tq[1]; palmTq[sd][2] = tq[2];
+                                            palmOk[sd] = true;
+                                        }
+                                    }
                                 }
                                 else if (g_kneeBody[i]) g_addForce(bi, fc, true, true);
                                 else if (g_headBody[i]) g_addForce(bi, h, true, true);
                             }
+                            // the forearms take half of their hand's palm torque (same world vector)
+                            if (g_addTorque)
+                                for (int i = 0; i < n2 && i < kMaxBodies; i++) {
+                                    if (!g_reacher[i] || g_handBody[i]) continue;
+                                    const int sd = g_leftSide[i] ? 0 : 1;
+                                    if (!palmOk[sd] || g_armBroken[sd]) continue;
+                                    uint8_t* bi = ((uint8_t**)arr2)[i]; if (!bi) continue;
+                                    const float th[3] = { palmTq[sd][0]*0.5f, palmTq[sd][1]*0.5f, palmTq[sd][2]*0.5f };
+                                    g_addTorque(bi, th, true, true);
+                                }
                         }
                     } else {
                         // ---- THE CLUTCH: constant from the instant of touchdown. Hands
@@ -2419,6 +3055,7 @@ void BodyFeel_PumpFrame() {
                                 }
                             }
                             for (int i = 0; i < kMaxBodies; i++) g_grabbing[i] = false;
+                            g_grabStamp = t;
                             for (int i = 0; i < n2 && i < kMaxBodies; i++) {
                                 if (!g_bOk[i] || i == g_impactBody) continue;
                                 uint8_t* bi = ((uint8_t**)arr2)[i]; if (!bi) continue;
@@ -2489,6 +3126,7 @@ void BodyFeel_PumpFrame() {
                 SetJointDrives((uint8_t*)g_mesh, true);
                 g_drivesFreed = false;
             }
+            WidenShoulders((uint8_t*)g_mesh, false);
             ForgetMesh();
             return;
         }
@@ -2509,6 +3147,16 @@ void BodyFeel_PumpFrame() {
                    "post-physics (the game re-authors them per frame; our write rides on top)",
                    mesh, n);
             g_classified = false; g_classifyAt = 0.0;
+        }
+        // ---- the rig's collision rules, at first sight and before any pair exists: the dump
+        // of what shipped, then the arm-torso retire. Retried at 1 Hz until the names resolve;
+        // idempotent per asset after that.
+        if (t >= g_pairsAt) {
+            g_pairsAt = t + 1.0;
+            if (RigNamesReady((uint8_t*)mesh, (uint8_t*)arr, n)) {
+                DumpRagdollCollisionOnce((uint8_t*)mesh);
+                EnableArmTorsoPairs((uint8_t*)mesh);
+            }
         }
         // ---- classify the REACHERS for the bail brace: hands + forearms, by bone name.
         // At level load the first attempt can find NOTHING (the SkeletalMesh pointer or the

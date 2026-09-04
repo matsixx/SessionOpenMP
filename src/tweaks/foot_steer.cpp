@@ -309,6 +309,8 @@ struct Sample {
     // The two ways the game can fight an offset, both scalar so they fit on one line:
     float autoL, autoR; // its foot-to-deck auto-adjust, whose sweep starts from where WE put the foot
     float gapL, gapR;   // how far the IK's own target sits from the socket it was given
+    float liftL, liftR; // the return-arc bump per foot (0..1 of FootSteerReturnLiftCm) -- a value
+                        // still standing at the last airborne sample is a foot held off the deck
     float rotL[3];      // the LEFT socket's rotator: if this sweeps through a flip, the foot's
                         // orientation target is riding the deck, which is why a fixed euler delta
                         // on it cannot mean a fixed twist
@@ -339,6 +341,8 @@ static void dumpSamples() {
     // stance where only the state byte is set is a stance where the veto never fires.
     int nSwitch = 0, nCatchS = 0, nCatchL = 0, nCatchR = 0;
     float deckMin = 9e9f, deckMax = -9e9f;   // the board's travel relative to you: a bone shows here
+    float liftMax = 0.0f, liftEndL = 0.0f, liftEndR = 0.0f;   // the arc's peak, and what was left
+                                                              // standing at the last airborne sample
     for (int i = 0; i < g_nBuf; i++) {
         const Sample& s = g_buf[i];
         if (s.st & 2) nCatch++;  if (s.st & 4) nCrank++;
@@ -353,6 +357,8 @@ static void dumpSamples() {
         if (s.autoR < auMin) auMin = s.autoR;  if (s.autoR > auMax) auMax = s.autoR;
         if (s.gapL > gapMax) gapMax = s.gapL;
         if (s.gapR > gapMax) gapMax = s.gapR;
+        if (s.liftL > liftMax) liftMax = s.liftL;  if (s.liftR > liftMax) liftMax = s.liftR;
+        liftEndL = s.liftL; liftEndR = s.liftR;
         if (s.deckX > -9000.0f) {
             if (s.deckX < deckMin) deckMin = s.deckX;
             if (s.deckX > deckMax) deckMax = s.deckX;
@@ -363,13 +369,16 @@ static void dumpSamples() {
     TwkLog("[steer] air: %d samples over %.2f s%s | AIRBORNE=%d of them | foot IK alpha L %.2f..%.2f "
            "R %.2f..%.2f (%d airborne samples with NO ik) | auto-adjust Z %.2f..%.2f cm | worst "
            "target gap %.1f cm | crank=%d | AIRBORNE catch: state=%d Lfoot=%d Rfoot=%d%s | "
-           "switch=%d | board %.1f..%.1f cm from you%s",
+           "switch=%d | board %.1f..%.1f cm from you%s | return lift peak %.2f, at last air sample "
+           "L %.2f R %.2f%s",
            g_nBuf, g_buf[g_nBuf - 1].t, g_bufFull ? " (TRUNCATED)" : "", nAir,
            aLmin, aLmax, aRmin, aRmax, nAlpha0, auMin, auMax, gapMax, nCrank,
            nCatchS, nCatchL, nCatchR,
            // The whole question in one tag: the veto only reads the per-foot pair.
            (nCatchS > 0 && nCatchL == 0 && nCatchR == 0) ? "  <-- STATE ONLY, VETO CANNOT FIRE" : "",
-           nSwitch, deckMin, deckMax, (deckMax > 8.0f) ? "  <-- THE GAME'S BONE FIRED" : "");
+           nSwitch, deckMin, deckMax, (deckMax > 8.0f) ? "  <-- THE GAME'S BONE FIRED" : "",
+           liftMax, liftEndL, liftEndR,
+           (liftEndL > 0.05f || liftEndR > 0.05f) ? "  <-- RESIDUAL LIFT HELD THROUGH THE AIR" : "");
     // A decimated trace rather than everything: the shape over the stretch is what is being read,
     // and 250 lines per trick would bury it.
     const int want = 12;
@@ -382,13 +391,13 @@ static void dumpSamples() {
         if (s.fR < 0.0f) strcpy(fr, "-"); else snprintf(fr, sizeof(fr), "%.1f", s.fR);
         TwkLog("[steer]   t=%.2f %c%c%c%c a(%.2f,%.2f) sockL(%.1f,%.1f,%.1f) sockR(%.1f,%.1f,%.1f) "
                "stickL(%+.2f,%+.2f) stickR(%+.2f,%+.2f) flick(%s,%s) autoZ(%+.2f,%+.2f) "
-               "gap(%.1f,%.1f) catch(s=%d,L=%d,R=%d) deckX(%.1f) meshX(%.1f)",
+               "gap(%.1f,%.1f) lift(%.2f,%.2f) catch(s=%d,L=%d,R=%d) deckX(%.1f) meshX(%.1f)",
                s.t, (s.st & 1) ? 'A' : '.', (s.st & 2) ? 'C' : '.', (s.st & 4) ? 'K' : '.',
                (s.st & 8) ? 'W' : '.',
                s.aL, s.aR,
                s.sL[0], s.sL[1], s.sL[2], s.sR[0], s.sR[1], s.sR[2],
                s.lx, s.ly, s.rx, s.ry, fl, fr, s.autoL, s.autoR, s.gapL, s.gapR,
-               s.cS, s.cL, s.cR, s.deckX, s.meshX);
+               s.liftL, s.liftR, s.cS, s.cL, s.cR, s.deckX, s.meshX);
         TwkLog("[steer]      gate: flip=%d rot=%d airTrick=%d trickDef=%s",
                s.fl, s.ro, s.at, s.hasDef ? "YES" : "null");
     }
@@ -432,16 +441,34 @@ static bool updateFoot(Foot& F, bool rightStick, bool armed, bool catchNow, floa
         // against the magnitude the return began at, and the bump is a half-sine: zero at both ends
         // (no discontinuity when it starts, none when it lands) and widest halfway, which is exactly
         // where the straight line would be deepest inside the board.
-        if (tgtMag >= curMag) { F.retFrom = 0.0f; F.lift = 0.0f; }
-        else {
-            if (F.retFrom <= 0.0f) F.retFrom = curMag;
-            const float prog = (F.retFrom > 1e-4f) ? (1.0f - curMag / F.retFrom) : 1.0f;
-            F.lift = sinf(3.14159265f * ((prog < 0.0f) ? 0.0f : (prog > 1.0f) ? 1.0f : prog));
-        }
-        const float rate = (tgtMag >= curMag) ? (1000.0f / g_responseMs) : (1000.0f / g_returnMs);
+        const bool returning = tgtMag < curMag;
+        if (!returning) { F.retFrom = 0.0f; F.lift = 0.0f; }
+        else if (F.retFrom <= 0.0f) F.retFrom = curMag;
+        const float rate = returning ? (1000.0f / g_returnMs) : (1000.0f / g_responseMs);
         const float step = rate * dt;
         if (d <= step) { F.s[0] = tx; F.s[1] = ty; }
         else           { F.s[0] += dx * (step / d); F.s[1] += dy * (step / d); }
+        // THE LIFT IS TAKEN FROM WHERE THE FOOT NOW IS, AND IT DIES WITH THE RETURN. It used to be
+        // taken from the PRE-move magnitude and was never touched again once the return had arrived
+        // (arrival makes d zero, and this whole block is skipped from then on). So the last return
+        // step froze the bump at whatever the half-sine read one step short of home -- for a small
+        // leaked deflection, a front-stick catch flick say, that is most of the bump -- and the foot
+        // stayed lifted by it for as long as the steer was armed: the whole rest of the air, down
+        // to the deck, cleared only by the landing ease-out. Field: the catching front foot held a
+        // few cm above the deck all the way down and sat on it the moment the board touched --
+        // exactly the lifetime of an armed steer. Random per catch, because it depends on where the
+        // last step happened to land inside the bump.
+        if (returning) {
+            const float newMag = sqrtf(F.s[0] * F.s[0] + F.s[1] * F.s[1]);
+            if (newMag <= 1e-4f) { F.lift = 0.0f; F.retFrom = 0.0f; }     // home: the arc is over
+            else {
+                const float prog = (F.retFrom > 1e-4f) ? (1.0f - newMag / F.retFrom) : 1.0f;
+                F.lift = sinf(3.14159265f * ((prog < 0.0f) ? 0.0f : (prog > 1.0f) ? 1.0f : prog));
+            }
+        }
+    } else if (F.lift != 0.0f || F.retFrom != 0.0f) {
+        // At rest on the target: no return can be in progress, so no arc may be standing.
+        F.lift = 0.0f; F.retFrom = 0.0f;
     }
     return blanked;
 }
@@ -791,6 +818,7 @@ bool FootSteer_AddOffset(void* a, float dt, float outL[3], float outR[3]) {
                     s.gapR = sqrtf(tg[0] * tg[0] + tg[1] * tg[1] + tg[2] * tg[2]);
                     if (!(s.gapL >= 0.0f && s.gapL < 1e5f)) s.gapL = -1.0f;
                     if (!(s.gapR >= 0.0f && s.gapR < 1e5f)) s.gapR = -1.0f;
+                    s.liftL = g_footL.lift; s.liftR = g_footR.lift;
                     for (int i = 0; i < 3; i++) s.rotL[i] = twkF(a, AN_L_SOCK_ROT + i * 4);
                     // The board ACTOR's root component is not a usable position source here -- it
                     // read static while the skater rolled away from it, so the difference just

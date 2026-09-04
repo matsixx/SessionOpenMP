@@ -22,6 +22,11 @@ kReplayCamLookAt               AReplayCamera::_lookAtTarget
 kSoundConcMaxCount             FSoundConcurrencySettings::MaxCount
 kSoundBaseDuration             USoundBase::Duration
 kWidgetMyWidget                UWidget::MyWidget
+kAirReplayAddAllBones          UAnimInstanceReplayComponent::_addAllBones
+kAirReplayUpdated              UAnimInstanceReplayComponent::_updatedBones
+kAirReplayMeshComp             UAnimInstanceReplayComponent::_skeletalMeshComp
+kAirReplayDataBoneIdx          FAnimInstanceReplayData::BoneIndex
+kActorOwnedComps               AActor::OwnedComponents
 kWidgetVisibility              UWidget::Visibility
 kRefCtlSharedCount             SharedPointerInternals::FReferenceControllerBase::SharedReferenceCount
 kCompQuat                      USceneComponent::ComponentToWorld

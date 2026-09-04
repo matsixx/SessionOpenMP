@@ -142,6 +142,7 @@ typedef void  (*RagdollFn)(void*);
 typedef void* (*BailFn)(void*, void*, uint64_t, uint64_t);
 typedef void  (*SetLocRotFn)(void*, const float*, const float*, bool, void*, unsigned char);
 static void* g_origBail = nullptr, *g_startBail = nullptr;
+static volatile LONG g_bailCalls = 0;   // Bail calls seen on our skater (catch_tweaks' verdict probe)
 static SetOnFootFn g_setOnFoot = nullptr;
 static RagdollFn   g_enableRagdoll = nullptr;
 static SetLocRotFn g_setLocRot = nullptr;
@@ -239,6 +240,7 @@ static void* hkBail(void* skater, void* reason, uint64_t b1, uint64_t b2) {
     // decision of ours.
     void* const mineB = CatchTweaks_Skater();
     const bool ours = !(mineB && skater && mineB != skater);
+    if (ours) InterlockedIncrement(&g_bailCalls);       // every Bail on our skater, whatever the policy does
     if (ours && g_runOut && g_setOnFoot && skater) {
         __try {
             const uint64_t callerRva = (uint64_t)_ReturnAddress() - (uint64_t)GetModuleHandleA(nullptr);
@@ -307,6 +309,47 @@ static void* hkBail(void* skater, void* reason, uint64_t b1, uint64_t b2) {
 
 // The fall watch + deferred facing, one poll per input tick (game thread).
 void RunOut_PumpFrame() {
+    // ---- a MISSED early catch has landed (catch_tweaks refused the press; CatchEarlyMiss): this
+    // landing is a bail whatever the deck did, through the same policy as a marked landing bail --
+    // low air on manual -> the run-out where enabled, otherwise the game's own Bail. Delivered here,
+    // outside the game's bail callstack, exactly like the fall watch's impact bail below.
+    if (CatchTweaks_TakeMissedLanding()) {
+        __try {
+            void* skater = CatchTweaks_Skater();
+            void* mc = skater ? twkP(skater, SK_MOVE_COMP) : nullptr;
+            if (skater && mc) {
+                if (twkB(mc, MC_MOVEMENT_MODE) == 6 && twkB(mc, MC_CUSTOM_MODE) == 5) {
+                    TwkLog("[runout] missed catch: the game is already bailing at touchdown");
+                } else {
+                    const int  mm      = CatchTweaks_ManualMode();
+                    const bool manual  = (mm >= 0) && (twkB(skater, SK_CATCH_MODE) == mm);
+                    const int  onBoard = twkB(mc, MC_IS_ON_BOARD);
+                    float height = -1.0f;
+                    const float apexZ = CatchTweaks_RecentMaxZ();
+                    const float nowZ  = TwkActorZ(skater);
+                    if (apexZ > -100000.0f && nowZ > -100000.0f) height = apexZ - nowZ;
+                    const bool bigAir = height < 0.0f || height >= g_runOutMaxDrop;
+                    if (g_runOut && g_setOnFoot && manual && !bigAir && onBoard > 0 &&
+                        twkB(skater, SK_THROWDOWN) == 0) {
+                        const float kept = doRunOut(skater, mc);
+                        InterlockedIncrement(&g_uiRunOuts);
+                        TwkLog("[runout] missed catch: RUN OUT (height %.0f cm < %.0f cm, kept %.0f cm/s)",
+                               height, g_runOutMaxDrop, kept);
+                    } else if (g_origBail) {
+                        static wchar_t missChars[] = L"SessionTweaks missed catch";
+                        static struct { wchar_t* d; int n; int max; } missStr =
+                            { missChars, (int)(sizeof(missChars) / 2), (int)(sizeof(missChars) / 2) };
+                        InterlockedIncrement(&g_uiRealBails);
+                        TwkLog("[runout] missed catch: BAIL (height %.0f cm, onBoard=%d, manual=%d)",
+                               height, onBoard, manual ? 1 : 0);
+                        ((BailFn)g_origBail)(skater, &missStr, 1, 1);
+                    }
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            if (InterlockedIncrement(&g_faults) == 1) TwkLog("[runout] caught fatal delivering a missed catch -> skipped");
+        }
+    }
     // ---- pending facing correction, applied OUTSIDE the game's bail callstack
     if (g_faceSkater) {
         void* sk = g_faceSkater;
@@ -448,6 +491,7 @@ void RunOut_Install() {
            g_runOutMaxDrop, (void*)g_setOnFoot, (void*)g_enableRagdoll, g_catchOrientRva);
 }
 
+long RunOut_BailCalls() { return g_bailCalls; }
 bool RunOut_Enabled() { return g_runOut != 0; }
 void RunOut_SetEnabled(bool on) { g_runOut = on ? 1 : 0; TwkMarkDirty(); }
 void RunOut_ResetDefaults() {

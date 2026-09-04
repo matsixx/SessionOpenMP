@@ -239,6 +239,11 @@ using PickableOfFn      = void* (*)(void* actor);
 // plain props with no components anyone else drives, and they ACCUMULATE: every peer's set arrives on
 // every map change and at every rejoin, so leaving them hidden would pile up statues for the session.
 using ActorDestroyFn    = bool  (*)(void* actor, bool netForce, bool shouldModifyLevel);
+// UAnimInstanceReplayComponent::RefreshCachedBones(this). Empties the recorded per-bone history and
+// re-registers every bone against _skeletalMeshComp by NAME -> index. The game calls it from
+// BeginPlay and from its own wardrobe rebuild; a proxy dressed by this mod never goes through that
+// rebuild, which is the replay-editor crash. See RefreshProxyReplayBones.
+using ReplayRefreshBonesFn = void (*)(void* replayComp);
 // UObjectDropperPersistentHandler::Load -- HOOKED, never called. It is the one moment at which the
 // level's own props are still where the MAP put them: Load walks the player's save and moves each
 // prop it names to the saved pose, so anything captured before it runs is the map default and
@@ -413,6 +418,7 @@ struct Syms {
     ObjInfoByIdFn     DropperObjInfoById = nullptr;
     PickableOfFn      DropperPickableOf = nullptr;
     ActorDestroyFn    ActorDestroy     = nullptr;
+    ReplayRefreshBonesFn ReplayRefreshBones = nullptr;
     void*             DropperLoad      = nullptr;   // HOOKED, never called directly
     // UObjectDropperPersistentHandler::Save -- HOOKED, never called. THE HARD SAVE GUARD. A prop we
     // spawn for a session is a real dropped object as far as the game is concerned, and the session
@@ -499,6 +505,13 @@ void  DumpSkeletonBones(void* meshComp, void (*logf)(const char*));
 // they describe nothing a receiver needs. They sit immediately below the terminators, which is what
 // lets one prefix trim reach both.
 int   SkeletonTransportBoneCount(void* meshComp, bool alsoBoard);
+// Re-sync a proxy's UAnimInstanceReplayComponent to the mesh it is wearing NOW, exactly as the game's
+// own wardrobe rebuild would: point it at the current mesh component, take every bone from that mesh
+// (so no name can miss and cache -1), and call the game's RefreshCachedBones. Then verify: every cached
+// index must sit inside the mesh's bone count, or the entry list is emptied rather than left to write
+// outside the pose. Logs the before/after so the first field run proves the stale state and the repair.
+// Returns false if the component could not be found or the symbol is missing (then nothing changed).
+bool  RefreshProxyReplayBones(void* proxyActor, void (*logf)(const char*));
 // The merged skeleton's bones as name hashes, in index order. A NAME is the only handle on a bone
 // that survives the trip between two players: a character is merged from body + garments and the
 // merge takes the UNION of their bones, so two people's skeletons agree on names and on nothing
@@ -710,6 +723,24 @@ namespace off {
     constexpr int kWidgetMyWidget     = 0xd8;    // UWidget::MyWidget (TWeakPtr<SWidget>, 16 B)
     constexpr int kWidgetVisibility   = 0xc3;    // UWidget::Visibility (ESlateVisibility, 1 B)
     constexpr int kRefCtlSharedCount  = 0x08;    // SharedPointerInternals::FReferenceControllerBase::SharedReferenceCount
+    // THE REPLAY-EDITOR CRASH, finally located (2026-09-02). UAnimInstanceReplayComponent caches, per
+    // bone, a BoneIndex resolved by name against _skeletalMeshComp (AddBoneToUpdate ->
+    // USkinnedMeshComponent::GetBoneIndex, stored UNGUARDED: a missing bone caches -1). During
+    // playback, Replaying fills a map keyed by those indices and FAnimNode_Replay::
+    // EvaluateComponentSpace_AnyThread writes Pose[BoneIndex] -- a 48-byte FTransform plus a flag
+    // byte -- with NO bounds check against the pose, on the anim worker thread. The cache is rebuilt
+    // (RefreshCachedBones) from BeginPlay and from the game's own wardrobe rebuild (the delegate
+    // bound in ASkaterCharacterBase::InitCharacterVisuals). A proxy is spawned in the LOCAL look and
+    // then dressed by this mod through RefreshVisuals, which is not that path: its cache keeps the
+    // indices of its FIRST skeleton. Dress it smaller and every index at or past the new count
+    // writes past the pose; dress a male-class proxy in a female body and the name list resolves to
+    // -1, writing before it. Either way the heap is damaged during replay and the crash lands
+    // anywhere, later. Local <= peer never crashed because the stale indices all stayed inside.
+    constexpr int kAirReplayAddAllBones = 0xe0;    // UAnimInstanceReplayComponent::_addAllBones (bool)
+    constexpr int kAirReplayUpdated     = 0x108;   // ::_updatedBones (TArray<FAnimInstanceReplayData>, stride 32)
+    constexpr int kAirReplayMeshComp    = 0x168;   // ::_skeletalMeshComp (USkeletalMeshComponent*)
+    constexpr int kAirReplayDataBoneIdx = 0x00;    // FAnimInstanceReplayData::BoneIndex
+    constexpr int kActorOwnedComps      = 0x1a0;   // AActor::OwnedComponents (TSet<UActorComponent*>)
     constexpr int kContainerPage      = 0x2a0;   // _menuPage (UMenuPage*) -- the page the container is
                                                  // showing, which is the page a back action applies to
     // UMenuPage:

@@ -774,6 +774,9 @@ static void bisectCulprit(void* proxyActor, void* charMap, void* brdMap,
     logf("[cosmetics] BISECT complete");
 }
 
+// Kill-switch for the replay bone-cache re-sync (see the end of DressProxy). Off restores the crash.
+static bool g_replayBoneRefresh = true;
+
 bool DressProxy(void* proxyActor, const repl::CosmeticSet& c, int* unresolved, void (*logf)(const char*)) {
     const Syms& S = Get();
     if (!proxyActor || !S.RefreshVisuals) return false;
@@ -924,6 +927,12 @@ bool DressProxy(void* proxyActor, const repl::CosmeticSet& c, int* unresolved, v
                  unmatchedColors, ok ? "" : " (refresh faulted)");
         logf(m);
     }
+    // THE REPLAY-EDITOR CRASH FIX. The game's own wardrobe rebuild re-syncs the skater's replay bone
+    // cache after the merge; this dress path is not that rebuild, so the proxy's cache kept the indices
+    // of whatever skeleton it was spawned with and the replay editor wrote through them into a pose of
+    // a different size (game_syms.h, kAirReplay*). Doing the same re-sync here, after every dress,
+    // makes the cache and the pose agree by construction -- for any body, any garment, any count.
+    if (ok && g_replayBoneRefresh) RefreshProxyReplayBones(proxyActor, logf);
     return ok;
 }
 

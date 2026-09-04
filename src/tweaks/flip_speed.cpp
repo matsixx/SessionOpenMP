@@ -224,7 +224,7 @@ static void DumpTrickDefOnce(void* def) {
            "| exRollPitch dn=%.1f up=%.1f exRollScoop bs=%.1f fs=%.1f "
            "| startPitch ovr=%d (%.1f..%.1f) endPitch (%.1f..%.1f) "
            "| precatch %.0f/%.0f pitchPre %.1f..%.1f otherFoot=%.2f | catchTgt P=%.1f R=%.1f "
-           "| inputs[%d]=%s",
+           "| inputs[%d]=%s | manualCatchThr flip=%.0f rot=%.0f forceAuto=%d",
            nm, (int)twkB(def, 0x1bc), (int)twkB(def, 0x50),
            (int)twkB(def, 0x228), twkF(def, 0x22c), twkF(def, 0x230),
            twkF(def, 0x234), twkF(def, 0x238), twkF(def, 0x244), twkF(def, 0x248),
@@ -232,7 +232,7 @@ static void DumpTrickDefOnce(void* def) {
            twkF(def, 0x208 + 0xc), twkF(def, 0x208 + 0x10),
            twkF(def, 0x258), twkF(def, 0x25c), twkF(def, 0x260), twkF(def, 0x264),
            twkF(def, 0x268), twkF(def, 0x26c), twkF(def, 0x270),
-           nIn, ins);
+           nIn, ins, twkF(def, 0x290), twkF(def, 0x294), (int)twkB(def, 0x254));
 }
 
 static float hkFlipMult(void* self, void* def, unsigned char inputType, void* inputs) {
@@ -249,13 +249,16 @@ static float hkFlipMult(void* self, void* def, unsigned char inputType, void* in
         // at all -- the stock function returns 1.0 immediately for it. Substituting there would
         // put a flip speed on tricks the game deliberately gives none.
         if (inputType == 0) return stock;
+        void* skater = twkP(self, FTH_SKATER);
+        void* db     = twkP(self, FTH_TRICKS_DB);
+        if (!skater || !db) return stock;
+        // A remote skater's trick is not the player's: it gets the stock multiplier, and it must
+        // not bump the trick serial the catch logic keys its timing off.
+        if (Twk_IsProxy(skater)) return stock;
         if (def) CatchSound_ObjName(def, g_lastTrick, sizeof(g_lastTrick));
         DumpTrickDefOnce(def);
         InterlockedIncrement(&g_trickSerial);          // a trick just started; the pump watches it
         { LARGE_INTEGER t; QueryPerformanceCounter(&t); g_trickQpc = t.QuadPart; }
-        void* skater = twkP(self, FTH_SKATER);
-        void* db     = twkP(self, FTH_TRICKS_DB);
-        if (!skater || !db) return stock;
         const bool syncing = (twkB(skater, SK_SYNC_FLAGS) & 0x20) != 0;
         if (syncing && g_respectSync) {
             static bool said = false;
