@@ -32,6 +32,7 @@ float CatchTweaks_ManualTolDeg();       void CatchTweaks_SetManualTolDeg(float d
 float CatchTweaks_OverBailDeg();        void CatchTweaks_SetOverBailDeg(float deg);
 bool  CatchTweaks_ShoveStopHold();      // a shove stopped where it was caught, catch still live
 float CatchTweaks_ShoveBailBandDeg();   void CatchTweaks_SetShoveBailBandDeg(float deg);
+bool  CatchTweaks_ShoveFixes();         void CatchTweaks_SetShoveFixes(bool on);   // the shove-axis master
 float CatchTweaks_DarkslideZoneDeg();   void CatchTweaks_SetDarkslideZoneDeg(float deg);
 int  CatchTweaks_ManualMode();                     // the ECatchMode value meaning MANUAL (-1 unknown)
 // The last ASkaterCharacterBase seen by the catch system, for modules that need to poll skater state
@@ -61,9 +62,6 @@ void CatchTweaks_PostPhysHold();
 // input, and it must not read as a manual request.
 bool CatchTweaks_ScoopCatchLive();
 // A registered catch ends the flip at griptape-up instead of letting it spin another revolution.
-bool CatchTweaks_StopsFlip();  void CatchTweaks_SetStopsFlip(bool on);
-bool CatchTweaks_AnyRevolution();  void CatchTweaks_SetAnyRevolution(bool on);
-bool CatchTweaks_FootLevelsBoard(); void CatchTweaks_SetFootLevelsBoard(bool on);
 // Tune the game's own boned ollie. It is authored catch-orient data -- FCatchOrientSettings carries
 // four BoardRelativeOffset vectors that shove the board forward of the skater while both sticks are
 // held, the legs following because the feet are IK'd to the deck. Lives here because this module

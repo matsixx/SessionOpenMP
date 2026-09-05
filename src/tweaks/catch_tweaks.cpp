@@ -554,6 +554,12 @@ static int   g_anyRevLegacy = 0;
 // completes. Pure shoves and shove+flips alike. An over-rotated shove is left alone: its term clamps
 // to 1 and is never the blocker. Absolute ceiling 1500 deg/s; a shove already fast enough is left at
 // its own speed and only gets the window.
+// CatchShoveFixes: the master switch for everything this module does on the SHOVE axis of a catch --
+// the snap (an under-rotated shove finished in time for the foot), catching a shove where it is
+// (under- or over-rotated), the sideways band bail, the shove-axis plant fix, and the sideways socket
+// hold that rides on the stop. Off = the game's own shove catching, exactly as shipped. The flip axis
+// (roll-back, aim-at-flat, over-rotation bail) is a separate family and is not touched by this.
+static int   g_shoveFixes   = 1;
 static int   g_shoveSnap    = 1;
 // CatchShoveSnapMaxRate: the snap's speed ceiling on the shove axis, deg/s. 720, not the 1500 it
 // shipped with: the board MESH trails the game's counter by ~85 ms, so a shove finished at 1500 had
@@ -894,6 +900,7 @@ void CatchTweaks_ReadConfig(const char* buf) {
     g_overMs       = TwkIniInt(buf, "CatchOverMs", 40);
     if (g_overMs < 10) g_overMs = 10; if (g_overMs > 300) g_overMs = 300;
     g_anyRevLegacy = TwkIniInt(buf, "CatchAnyRevLegacyAim", 0);
+    g_shoveFixes   = TwkIniInt(buf, "CatchShoveFixes", 1) ? 1 : 0;
     g_shoveSnap    = TwkIniInt(buf, "CatchShoveSnap", 1);
     g_shoveSnapMaxRate = TwkIniInt(buf, "CatchShoveSnapMaxRate", 720);
     g_shoveFinishMaxDeg = TwkIniInt(buf, "CatchShoveFinishMaxDeg", 30);
@@ -961,6 +968,7 @@ void CatchTweaks_SaveConfig(char* buf, size_t cap) {
     TwkIniSetInt(buf, cap, "CatchOverBailDeg",     g_overBailDeg);
     TwkIniSetInt(buf, cap, "CatchOverMs",          g_overMs);
     TwkIniSetInt(buf, cap, "CatchAnyRevLegacyAim", g_anyRevLegacy);
+    TwkIniSetInt(buf, cap, "CatchShoveFixes",      g_shoveFixes);
     TwkIniSetInt(buf, cap, "CatchShoveSnap",       g_shoveSnap);
     TwkIniSetInt(buf, cap, "CatchShoveSnapMaxRate", g_shoveSnapMaxRate);
     TwkIniSetInt(buf, cap, "CatchShoveFinishMaxDeg", g_shoveFinishMaxDeg);
@@ -2554,7 +2562,7 @@ void CatchTweaks_SetEnabled(bool on) { g_catchFix = on ? 1 : 0; TwkMarkDirty(); 
 // nothing" -- resetting it would silently switch the whole catch feature off.
 void CatchTweaks_ResetDefaults() {
     g_catchFix = 1; g_catchMult = 1.0f; g_catchBeatsDS = 1; g_dsAngleDeg = 60; g_catchDiag = 0;
-    g_manualFlipTol = 120; g_manualRotTol = 0; g_overBailDeg = 70; g_shoveBailBand = 10;
+    g_manualFlipTol = 120; g_manualRotTol = 0; g_overBailDeg = 70; g_shoveBailBand = 10; g_shoveFixes = 1;
     g_anyRev = 1; g_anyRevDeg = 60; g_footLevel = 1; g_unstick = 1; g_minSpinDeg = 45; g_maxCutDeg = 180; g_unstickMs = 1000; g_holdPose = 1; g_needFlick = 1;
     g_stopFlip = 1; g_stopFlipDeg = 168; g_snapMs = 90;
     g_snapMaxDeg = 200; g_snapMaxBoost = 3; g_flipAxis = 0;
@@ -2592,6 +2600,8 @@ float CatchTweaks_OverBailDeg()  { return (float)g_overBailDeg; }
 // foot_place holds the feet's sockets against per-frame flip-flops for its duration.
 bool  CatchTweaks_ShoveStopHold()   { return g_shoveRbClaimed; }
 float CatchTweaks_ShoveBailBandDeg() { return (float)g_shoveBailBand; }
+bool  CatchTweaks_ShoveFixes()         { return g_shoveFixes != 0; }
+void  CatchTweaks_SetShoveFixes(bool on) { g_shoveFixes = on ? 1 : 0; TwkMarkDirty(); }
 void  CatchTweaks_SetShoveBailBandDeg(float deg) {
     int d = (int)(deg + 0.5f); if (d < 0) d = 0; if (d > 89) d = 89;
     g_shoveBailBand = d; TwkMarkDirty();
@@ -2618,17 +2628,11 @@ bool  CatchTweaks_LeftRightFootSkater() {
         return !sk || (twkB(sk, SK_STANCE_OPTS) & 1) != 0;
     } __except (EXCEPTION_EXECUTE_HANDLER) { return true; }
 }
-bool  CatchTweaks_StopsFlip() { return g_stopFlip != 0; }
-void  CatchTweaks_SetStopsFlip(bool on) { g_stopFlip = on ? 1 : 0; TwkMarkDirty(); }
 bool  CatchTweaks_TakeMissedLanding() {
     if (!g_missPending) return false;
     g_missPending = false;
     return true;
 }
-bool  CatchTweaks_AnyRevolution() { return g_anyRev != 0; }
-void  CatchTweaks_SetAnyRevolution(bool on) { g_anyRev = on ? 1 : 0; TwkMarkDirty(); }
-bool  CatchTweaks_FootLevelsBoard() { return g_footLevel != 0; }
-void  CatchTweaks_SetFootLevelsBoard(bool on) { g_footLevel = on ? 1 : 0; TwkMarkDirty(); }
 void  CatchTweaks_SetManualTolDeg(float deg) {
     int d = (int)(deg + 0.5f);
     if (d < 30) d = 30; if (d > 180) d = 180;
@@ -2692,14 +2696,18 @@ void CatchTweaks_DrawMenu(const OmpMenuApi* api) {
     bool sfh = g_secondFootHold != 0;
     if (api->Checkbox("Hold the second foot until landing", &sfh)) { g_secondFootHold = sfh ? 1 : 0; TwkMarkDirty(); }
     api->SameLine(); api->TextDisabled("(the foot you did NOT catch with stays off the board)");
-    bool fl = g_footLevel != 0;
-    if (api->Checkbox("Over rotation leveling", &fl)) { g_footLevel = fl ? 1 : 0; TwkMarkDirty(); }
-    api->SameLine(); api->TextDisabled("(a board caught past flat rolls back level as the foot comes down)");
-    if (fl) {
+    // Catch ends the flip, Foot always attaches and Over rotation leveling are bug fixes: always on,
+    // ini kill-switches only (CatchStopsFlip / CatchAnyRevolution / CatchFootLevelsBoard), no row here
+    // or in the pause menu.
+    api->TextDisabled("Over-rotated catches (always on): the roll-back and the shove handling");
+    {
         api->Indent();
         float om = (float)g_overMs;
         if (api->SliderFloat("Roll-back time (ms)", &om, 10.0f, 150.0f, "%.0f")) { g_overMs = (int)(om + 0.5f); TwkMarkDirty(); }
         api->SameLine(); api->TextDisabled("(an over-rotated catch is late in the air -- keep it short)");
+        bool shf = g_shoveFixes != 0;
+        if (api->Checkbox("Shove catch fixes", &shf)) CatchTweaks_SetShoveFixes(shf);
+        api->SameLine(); api->TextDisabled("(snap, catch-where-it-is, sideways bail, shove plant fix, socket hold -- off = the game's own shove catching)");
         float sf = (float)g_shoveFinishMaxDeg;
         if (api->SliderFloat("Shove finish range (deg short)", &sf, 0.0f, 180.0f, "%.0f")) { g_shoveFinishMaxDeg = (int)(sf + 0.5f); TwkMarkDirty(); }
         api->SameLine(); api->TextDisabled("(a shove caught short by more than this is caught where it is; less and it is finished)");
@@ -3311,7 +3319,7 @@ void CatchTweaks_PumpFrame() {
                 void* anSr = FootPlace_AnimInstance();
                 const bool srGrounded = anSr && twkB(anSr, AN_GROUNDED) != 0;
                 if (catchState == 0) { srTried = false; g_shoveRbClaimed = false; }
-                if (!srTried && catchState != 0 && comp && g_shoveRollBack) {
+                if (!srTried && catchState != 0 && comp && g_shoveRollBack && g_shoveFixes) {
                     srTried = true;
                     const int   flags = twkB(comp, MC_BOARD_FLAGS);
                     const float rc0 = twkF(comp, MC_BOARD_ROT_CUR), rt0 = twkF(comp, MC_BOARD_ROT_TARGET);
@@ -3401,7 +3409,7 @@ void CatchTweaks_PumpFrame() {
                     }
                 }
                 if (!ssActive && !g_shoveSnapTried && !g_shoveRbClaimed &&
-                    catchState != 0 && comp && g_shoveSnap) {
+                    catchState != 0 && comp && g_shoveSnap && g_shoveFixes) {
                     g_shoveSnapTried = true;
                     const int   flags = twkB(comp, MC_BOARD_FLAGS);
                     const float rc0 = twkF(comp, MC_BOARD_ROT_CUR), rt0 = twkF(comp, MC_BOARD_ROT_TARGET);
@@ -3618,7 +3626,7 @@ void CatchTweaks_PumpFrame() {
                     const bool  pfRotSane = fabsf(pfRotTgt) < 3600.0f && fabsf(pfRotCur) < 3600.0f &&
                                             fabsf(pfRotRate) < 100000.0f;
                     const bool  flipSettled = fabsf(pfRate) < 1.0f || !(pfFlags & 0x08) || pfOwed <= 0.5f;
-                    if (pfRotSane && (pfFlags & 0x20) && flipSettled && fabsf(pfRotRate) < 1.0f && pfRotOwed > 0.5f) {
+                    if (g_shoveFixes && pfRotSane && (pfFlags & 0x20) && flipSettled && fabsf(pfRotRate) < 1.0f && pfRotOwed > 0.5f) {
                         const float pfRotAim = (pfRotTgt < 0.0f) ? -fabsf(pfRotCur) : fabsf(pfRotCur);
                         *(float*)((uint8_t*)comp + MC_BOARD_ROT_TARGET) = pfRotAim;
                         static long rotPlantLogged = -1;

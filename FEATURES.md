@@ -157,7 +157,8 @@ wait and level-angle knobs.
 * \[fix] Catch sound (2.10-2.11, rebuilt 2.68): the game's catch sound is an anim notify most flip catches do
 not carry, and where they do it fires \~300 ms late (double sounds). One source, played at the catch,
 recorded into the replay, volume slider; ollies/nollies stay silent by design.
-* \[fix] Catch ends the flip (2.28.0): a caught board stops at griptape-up instead of a second revolution.
+* \[fix] Catch ends the flip (2.28.0): a caught board stops at griptape-up instead of a second revolution. Always on since 3.19.276 (ini kill-switch only), as are "Foot always attaches" and
+over-rotation leveling.
 * \[fix] Foot always attaches (pre-3.18, aim corrected 3.19.251): the game extends the flip target to 720 the
 moment the deck runs past 360 uncaught, which drops the foot's attach ratio to 0 mid-catch and the foot
 never plants; the target is aimed at the nearest flat (on the counter, not the rendered angle).
@@ -187,6 +188,8 @@ speed). Over-rotation bail slider on the rendered deck, past side only (3.19.250
 short (ceiling 720 deg/s), otherwise caught where it is; over-rotated shoves stop where caught (3.19.259).
 * \[feature] Shove sideways bail (3.19.272): a shove caught within a band of sideways -- where the game cannot
 decide which end each foot belongs to -- bails.
+* \[feature] Shove catch fixes toggle (3.19.275): one switch for the whole shove-axis family above (snap,
+catch-where-it-is, sideways bail, shove-axis plant fix, socket hold); off = the game's own shove catching.
 * \[fix] Feet oscillating on a board parked at an odd yaw (3.19.265/267): a foot socket that jumps 20+ cm in a
 frame keeps last frame's placement; the end nearer the foot's riding spot wins.
 

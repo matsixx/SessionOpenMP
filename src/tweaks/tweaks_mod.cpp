@@ -56,7 +56,7 @@
 #include "ue4ss_abi.h"
 #include "ui/menu_ext.h"
 
-#define TWEAKS_VERSION "3.19.274"
+#define TWEAKS_VERSION "3.19.276"
 #define TWK_WIDEN(x) STR(x)   // STR() prepends L before the macro expands; expand first
 
 // ------------------------------------------------------------------ log (own file, fresh per launch)
@@ -237,6 +237,7 @@ static const char* const kTwkVelMax   = "TwkScoopVelMax";
 static const char* const kTwkCatchX   = "TwkCatchWindowDeg";
 static const char* const kTwkOverBail = "TwkCatchOverBailDeg";
 static const char* const kTwkShoveBand = "TwkCatchShoveBailBandDeg";
+static const char* const kTwkShoveFix  = "TwkCatchShoveFixes";
 static const char* const kTwkDsZone   = "TwkDarkslideZone";
 static const char* const kTwkSndVol   = "TwkCatchSoundVol";
 static const char* const kTwkLevel    = "TwkCatchLevel";
@@ -247,9 +248,7 @@ static const char* const kTwkGSwing   = "TwkGrindSwing";
 static const char* const kTwkGSwingAmt = "TwkGrindSwingAmt";
 static const char* const kTwkPitch    = "TwkPitchRange";
 static const char* const kTwkPitchAmt = "TwkPitchSpread";
-static const char* const kTwkStopFlip = "TwkCatchStopsFlip";
 static const char* const kTwkClickCat = "TwkCatchClickToCatch";
-static const char* const kTwkAnyRev   = "TwkCatchAnyRevolution";
 static const char* const kTwkCloth     = "TwkCloth";
 static const char* const kTwkClothMove = "TwkClothMove";
 static const char* const kTwkClothHem  = "TwkClothHemLift";
@@ -258,7 +257,6 @@ static const char* const kTwkClothCuff = "TwkClothCuffGrip";
 static const char* const kTwkCamFollow    = "TwkCamFollow";
 static const char* const kTwkCamPitchDrop = "TwkCamPitchDrop";
 static const char* const kTwkCamPitch  = "TwkCamPitch";
-static const char* const kTwkFootLvl  = "TwkCatchFootLevelsBoard";
 static const char* const kTwkFlip     = "TwkFlipSpeed";
 static const char* const kTwkFlipMin  = "TwkFlipVelMin";
 static const char* const kTwkFlipMax  = "TwkFlipVelMax";
@@ -312,14 +310,12 @@ static void pageValue(const char* key, int iv, float fv, void*) {
     else if (!strcmp(key, kTwkCatchX)) CatchTweaks_SetManualTolDeg(fv);
     else if (!strcmp(key, kTwkOverBail)) CatchTweaks_SetOverBailDeg(fv);
     else if (!strcmp(key, kTwkShoveBand)) CatchTweaks_SetShoveBailBandDeg(fv);
+    else if (!strcmp(key, kTwkShoveFix))  CatchTweaks_SetShoveFixes(iv != 0);
     else if (!strcmp(key, kTwkDsZone)) CatchTweaks_SetDarkslideZoneDeg(fv);
     else if (!strcmp(key, kTwkSndVol))   CatchSound_SetVolumePct(fv);
     else if (!strcmp(key, kTwkLevel))    CatchLevel_SetEnabled(iv != 0);
     else if (!strcmp(key, kTwkLevelMs))  CatchLevel_SetResponseMs(fv);
-    else if (!strcmp(key, kTwkStopFlip)) CatchTweaks_SetStopsFlip(iv != 0);
     else if (!strcmp(key, kTwkClickCat)) CatchTweaks_SetClickToCatch(iv != 0);
-    else if (!strcmp(key, kTwkAnyRev))   CatchTweaks_SetAnyRevolution(iv != 0);
-    else if (!strcmp(key, kTwkFootLvl))  CatchTweaks_SetFootLevelsBoard(iv != 0);
     else if (!strcmp(key, kTwkGPitch))    GrindPop_SetPitchEnabled(iv != 0);
     else if (!strcmp(key, kTwkGPitchAmt)) GrindPop_SetPitchScale(fv);
     else if (!strcmp(key, kTwkGSwing))    GrindPop_SetSwingEnabled(iv != 0);
@@ -380,14 +376,12 @@ static int pageGet(const char* key, int* oi, float* of, void*) {
     else if (!strcmp(key, kTwkCatchX)) { *of = CatchTweaks_ManualTolDeg();   return 1; }
     else if (!strcmp(key, kTwkOverBail)) { *of = CatchTweaks_OverBailDeg();  return 1; }
     else if (!strcmp(key, kTwkShoveBand)) { *of = CatchTweaks_ShoveBailBandDeg(); return 1; }
+    else if (!strcmp(key, kTwkShoveFix))  { *oi = CatchTweaks_ShoveFixes() ? 1 : 0; return 1; }
     else if (!strcmp(key, kTwkDsZone)) { *of = CatchTweaks_DarkslideZoneDeg(); return 1; }
     else if (!strcmp(key, kTwkSndVol))   { *of = CatchSound_VolumePct();       return 1; }
     else if (!strcmp(key, kTwkLevel))    { *oi = CatchLevel_Enabled() ? 1 : 0; return 1; }
     else if (!strcmp(key, kTwkLevelMs))  { *of = CatchLevel_ResponseMs();      return 1; }
-    else if (!strcmp(key, kTwkStopFlip)) { *oi = CatchTweaks_StopsFlip() ? 1 : 0; return 1; }
     else if (!strcmp(key, kTwkClickCat)) { *oi = CatchTweaks_ClickToCatch() ? 1 : 0; return 1; }
-    else if (!strcmp(key, kTwkAnyRev))   { *oi = CatchTweaks_AnyRevolution() ? 1 : 0; return 1; }
-    else if (!strcmp(key, kTwkFootLvl))  { *oi = CatchTweaks_FootLevelsBoard() ? 1 : 0; return 1; }
     else if (!strcmp(key, kTwkGPitch))    { *oi = GrindPop_PitchEnabled() ? 1 : 0; return 1; }
     else if (!strcmp(key, kTwkGPitchAmt)) { *of = GrindPop_PitchScale();           return 1; }
     else if (!strcmp(key, kTwkGSwing))    { *oi = GrindPop_SwingEnabled() ? 1 : 0; return 1; }
@@ -480,28 +474,23 @@ static const OmpPageItem2 kTwkCatchItems[] = {
       nullptr, nullptr, 30.0f, 180.0f, 5.0f },
     { OMP_ITEM_SLIDER, kTwkOverBail, "  Over-rotation bail (deg)", "Bail if the board is caught after it rotates past this angle from flat; 0 = the catch window rules both sides",
       nullptr, nullptr, 0.0f, 180.0f, 5.0f },
-    { OMP_ITEM_SLIDER, kTwkShoveBand, "  Shove sideways bail (deg)", "Bail if a shove is caught within this many degrees of sideways, where the feet cannot pick an end; 0 = off",
-      nullptr, nullptr, 0.0f, 85.0f, 5.0f },
     { OMP_ITEM_SLIDER, kTwkDsZone, "  Dark slide zone (deg)", "How far from grip-down a dark slide is still reserved",
       nullptr, nullptr, 10.0f, 170.0f, 10.0f },
     { OMP_ITEM_TOGGLE, kTwkClickCat, "Click a stick to catch", "Press a stick instead of flicking; that foot catches. Only while you are on the board" },
-    { OMP_ITEM_TOGGLE, kTwkStopFlip, "Catch ends the flip",   "A caught board stops at griptape-up instead of spinning another full flip" },
-    { OMP_ITEM_TOGGLE, kTwkAnyRev,  "Foot always attaches",    "A caught board ends its flip flat under your foot, whatever revolution it was on" },
-    { OMP_ITEM_TOGGLE, kTwkFootLvl, "  Over rotation leveling", "A board caught past flat rolls back level as the foot comes down, instead of the foot taking a tilted deck" },
     { OMP_ITEM_TOGGLE, kTwkLevel,   "Auto leveling on catch", "Eases the board flat when it hits your foot" },
     { OMP_ITEM_SLIDER, kTwkLevelMs, "  Ease speed (ms)",      "How fast that ease runs; higher is slower and more visible",
       nullptr, nullptr, 20.0f, 200.0f, 5.0f },
+    { OMP_ITEM_TOGGLE, kTwkShoveFix,  "Shove catch fixes",     "An under-rotated shove is finished or caught where it is, an over-rotated one is caught where it is; off = the game's own shove catching" },
+    { OMP_ITEM_SLIDER, kTwkShoveBand, "  Shove sideways bail (deg)", "Bail if a shove is caught within this many degrees of sideways, where the feet cannot pick an end; 0 = off",
+      nullptr, nullptr, 0.0f, 85.0f, 5.0f },
     { OMP_ITEM_SLIDER, kTwkSndVol,  "Catch sound (%)",        "Our replay-recorded catch sound; 100 = the cue's authored level",
       nullptr, nullptr, 50.0f, 300.0f, 10.0f },
-    // The run-out rows live on a nested page: this page hit the engine's 14-row window (the host
-    // appends a Back row) when the shove range slider arrived, and a page that runs off the screen
-    // does not scroll (see menu_ext.h) -- it loses its Back row.
-    { OMP_ITEM_PAGE,   "Run out",     "Run out",                "Run out on foot instead of bailing when a low trick is missed" },
-};
-static const OmpPageItem2 kTwkRunOutItems[] = {
     { OMP_ITEM_TOGGLE, kTwkRunOut, "Run out instead of bail", "Low missed tricks run out on foot (needs manual Catch Mode)" },
     { OMP_ITEM_SLIDER, kTwkDrop,   "  Real bail if drop over (cm)", "Above this drop a missed trick still bails",
       nullptr, nullptr, 50.0f, 600.0f, 25.0f },
+    // Bug fixes have no row -- always on, ini kill-switch only, like CatchUnstick and CatchPlantFix:
+    // CatchStopsFlip (catch ends the flip), CatchAnyRevolution (foot always attaches),
+    // CatchFootLevelsBoard (over-rotation leveling). Twelve rows; the window is thirteen.
 };
 static const OmpPageItem2 kTwkGrindItems[] = {
     { OMP_ITEM_TOGGLE, kTwkGPitch,    "Pitch control out of grinds", "Board Control pitch works coming off a grind (set Board Control Mode to manual)" },
@@ -622,7 +611,6 @@ static const OmpPageItem2 kTwkCameraItems[] = {
 static_assert(sizeof(kTwkRootItems)  / sizeof(kTwkRootItems[0])  <= 13 &&
               sizeof(kTwkBoardItems) / sizeof(kTwkBoardItems[0]) <= 13 &&
               sizeof(kTwkCatchItems) / sizeof(kTwkCatchItems[0]) <= 13 &&
-              sizeof(kTwkRunOutItems) / sizeof(kTwkRunOutItems[0]) <= 13 &&
               sizeof(kTwkGrindItems) / sizeof(kTwkGrindItems[0]) <= 13 &&
               sizeof(kTwkFeetItems)  / sizeof(kTwkFeetItems[0])  <= 13 &&
               sizeof(kTwkCameraItems) / sizeof(kTwkCameraItems[0]) <= 13 &&
@@ -674,7 +662,6 @@ static bool tryRegisterMenu() {
                 TWK_SUBPAGE("Pop control",    kTwkPopItems);
                 TWK_SUBPAGE("Board & tricks", kTwkBoardItems);
                 TWK_SUBPAGE("Catch & bail",   kTwkCatchItems);
-                TWK_SUBPAGE("Run out",        kTwkRunOutItems);   // nested under Catch & bail
                 TWK_SUBPAGE("Grinds",         kTwkGrindItems);
                 TWK_SUBPAGE("Feet",           kTwkFeetItems);
                 TWK_SUBPAGE("Camera",         kTwkCameraItems);
