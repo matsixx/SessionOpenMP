@@ -56,7 +56,7 @@
 #include "ue4ss_abi.h"
 #include "ui/menu_ext.h"
 
-#define TWEAKS_VERSION "3.19.276"
+#define TWEAKS_VERSION "3.19.277"
 #define TWK_WIDEN(x) STR(x)   // STR() prepends L before the macro expands; expand first
 
 // ------------------------------------------------------------------ log (own file, fresh per launch)
@@ -480,7 +480,7 @@ static const OmpPageItem2 kTwkCatchItems[] = {
     { OMP_ITEM_TOGGLE, kTwkLevel,   "Auto leveling on catch", "Eases the board flat when it hits your foot" },
     { OMP_ITEM_SLIDER, kTwkLevelMs, "  Ease speed (ms)",      "How fast that ease runs; higher is slower and more visible",
       nullptr, nullptr, 20.0f, 200.0f, 5.0f },
-    { OMP_ITEM_TOGGLE, kTwkShoveFix,  "Shove catch fixes",     "An under-rotated shove is finished or caught where it is, an over-rotated one is caught where it is; off = the game's own shove catching" },
+    { OMP_ITEM_TOGGLE, kTwkShoveFix,  "Shove over/under rotate", "Catch a shove that has not finished turning, or has turned too far" },
     { OMP_ITEM_SLIDER, kTwkShoveBand, "  Shove sideways bail (deg)", "Bail if a shove is caught within this many degrees of sideways, where the feet cannot pick an end; 0 = off",
       nullptr, nullptr, 0.0f, 85.0f, 5.0f },
     { OMP_ITEM_SLIDER, kTwkSndVol,  "Catch sound (%)",        "Our replay-recorded catch sound; 100 = the cue's authored level",

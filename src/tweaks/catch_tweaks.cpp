@@ -2706,8 +2706,8 @@ void CatchTweaks_DrawMenu(const OmpMenuApi* api) {
         if (api->SliderFloat("Roll-back time (ms)", &om, 10.0f, 150.0f, "%.0f")) { g_overMs = (int)(om + 0.5f); TwkMarkDirty(); }
         api->SameLine(); api->TextDisabled("(an over-rotated catch is late in the air -- keep it short)");
         bool shf = g_shoveFixes != 0;
-        if (api->Checkbox("Shove catch fixes", &shf)) CatchTweaks_SetShoveFixes(shf);
-        api->SameLine(); api->TextDisabled("(snap, catch-where-it-is, sideways bail, shove plant fix, socket hold -- off = the game's own shove catching)");
+        if (api->Checkbox("Shove over/under rotate", &shf)) CatchTweaks_SetShoveFixes(shf);
+        api->SameLine(); api->TextDisabled("(catch a shove that has not finished turning, or has turned too far)");
         float sf = (float)g_shoveFinishMaxDeg;
         if (api->SliderFloat("Shove finish range (deg short)", &sf, 0.0f, 180.0f, "%.0f")) { g_shoveFinishMaxDeg = (int)(sf + 0.5f); TwkMarkDirty(); }
         api->SameLine(); api->TextDisabled("(a shove caught short by more than this is caught where it is; less and it is finished)");
