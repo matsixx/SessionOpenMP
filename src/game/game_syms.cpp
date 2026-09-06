@@ -279,6 +279,10 @@ static const SigEntry kSigs[] = {
     // the _skeletalMeshComp null test (+0x168) + the lea of _updatedBones (+0x108); the two field
     // displacements are the identity. Unique in both exes (sigmake).
     { "ReplayRefreshBones",   "41 56 48 83 EC 60 48 83 B9 68 01 00 00 00 4C 8B F1 0F 84 ?? ?? ?? ?? 48 89 5C 24 70 48 81 C1 08 01 00 00", false },
+    // ASkaterCharacterBase::SetIsPhysicalAnimationEnabled (Epic 0x1004c40 / Steam 0xfc4a70, sigmake).
+    // The +0x8c0 virtual call is the gate the setter early-outs on; the +0x711 store (and 0xef / shl 4
+    // / or) is the physAnim bit it writes -- the tail displacement 11 07 00 00 is the identity.
+    { "SetPhysAnimEnabled",   "48 89 5C 24 08 57 48 83 EC 20 48 8B 01 0F B6 FA 48 8B D9 FF 90 ?? ?? ?? ?? 40 3A C7 ?? ?? 44 0F B6 83 11 07 00 00", false },
 };
 static const int kSigN = (int)(sizeof(kSigs) / sizeof(kSigs[0]));
 
@@ -594,9 +598,73 @@ bool LocalMapName(void* pawn, char* out, int cap) {
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
+
+bool ProbePhysAnim(void* sk, PhysAnimProbe* out) {
+    if (!sk || !out) return false;
+    *out = PhysAnimProbe{};
+    __try {
+        void* mesh = SkaterMeshOf(sk);
+        out->physOn = *((const uint8_t*)sk + off::kSkaterPhysAnimOn);
+        // The component: Blueprint-created and instance arrays, then the owned set (the walk
+        // RefreshProxyReplayBones does). One bound to THIS mesh wins; else any -- the game unbinds
+        // it while rolling fast and rebinds after, the object persists.
+        void* any = nullptr; const char* anyHow = "";
+        auto consider = [&](void* c, const char* how) -> bool {
+            if (!c || ((uintptr_t)c & 7) || !IsObjectOfClass(c, "PhysicalAnimationComponent")) return false;
+            if (mesh && *(void**)((uint8_t*)c + off::kPaMeshComp) == mesh) {
+                out->comp = c; out->how = how; out->bound = true; return true;
+            }
+            if (!any) { any = c; anyHow = how; }
+            return false;
+        };
+        const int lists[2] = { off::kActorBpComps, off::kActorInstComps };
+        const char* const names[2] = { "BlueprintCreatedComponents", "InstanceComponents" };
+        for (int l = 0; l < 2 && !out->comp; l++) {
+            void** arr = *(void***)((uint8_t*)sk + lists[l]);
+            const int n = *(int*)((uint8_t*)sk + lists[l] + 8);
+            if (!arr || n <= 0 || n > 512) continue;
+            for (int i = 0; i < n && !consider(arr[i], names[l]); i++) {}
+        }
+        if (!out->comp) {
+            const uint8_t* set  = (const uint8_t*)sk + off::kActorOwnedComps;
+            const uint8_t* data = *(const uint8_t* const*)set;
+            const int num     = *(const int*)(set + 8);
+            const int maxBits = *(const int*)(set + 0x2c);
+            const uint32_t* bits = (maxBits <= 128) ? (const uint32_t*)(set + 0x10)
+                                                    : *(const uint32_t* const*)(set + 0x20);
+            if (data && bits && num > 0 && num <= 512) {
+                for (int i = 0; i < num; i++) {
+                    if (!((bits[i >> 5] >> (i & 31)) & 1u)) continue;
+                    if (consider(*(void* const*)(data + (size_t)i * 16), "OwnedComponents")) break;
+                }
+            }
+        }
+        if (!out->comp && any) { out->comp = any; out->how = anyHow; }
+        if (mesh) {
+            const uint8_t* const* arr = *(const uint8_t* const* const*)((const uint8_t*)mesh + off::kMeshBodies);
+            const int n = *(const int*)((const uint8_t*)mesh + off::kMeshBodies + 8);
+            if (arr && n > 0 && n <= 256) {
+                float sum = 0.f;
+                for (int i = 0; i < n; i++) {
+                    const uint8_t* bi = arr[i];
+                    if (!bi) continue;
+                    out->bodies++;
+                    if ((bi[off::kBodySimByte] >> off::kBodySimBit) & 1) out->simBodies++;
+                    const float w = *(const float*)(bi + off::kBodyBlendWeight);
+                    if (w > 0.01f) out->liveBodies++;
+                    sum += w;
+                    if (w > out->maxBlend) out->maxBlend = w;
+                }
+                if (out->bodies) out->avgBlend = sum / (float)out->bodies;
+            }
+        }
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
 #else
 bool ObjectName(const void*, char* o, int c) { if (o && c) o[0] = 0; return false; }
 void* SkaterMeshOf(void*)      { return nullptr; }
+bool  ProbePhysAnim(void*, PhysAnimProbe*) { return false; }
 int   SkeletonBoneCount(void*) { return 0; }
 int   SkeletonBoneHashes(void*, uint32_t*, int) { return 0; }
 bool LocalSkaterName(void*, char* o, int c) { if (o && c) o[0] = 0; return false; }
@@ -856,6 +924,7 @@ const Syms& Resolve(void (*logf)(const char*)) {
     g_syms.ActorSetLocation   =                     found[i++];   // hooked, never called directly
     g_syms.ActorDestroy       = (ActorDestroyFn)  found[i++];
     g_syms.ReplayRefreshBones = (ReplayRefreshBonesFn) found[i++];
+    g_syms.SetPhysAnimEnabled = (SetPhysAnimEnabledFn) found[i++];
 
     // LOCKSTEP CHECK. The block above is POSITIONAL, and a table entry added without its assignment --
     // or vice versa -- shifts every later symbol onto the wrong address SILENTLY: sigs still resolve
@@ -1294,5 +1363,13 @@ int   CrankIndexFromPtr(void*) { return -1; }
 void* CrankPtrFromIndex(int) { return nullptr; }
 int   BoardMovementMode(void*) { return -1; }
 #endif
+
+void FormatPhysAnimProbe(const PhysAnimProbe& p, char* out, int cap) {
+    char comp[64];
+    if (!p.comp) snprintf(comp, sizeof(comp), "NONE");
+    else snprintf(comp, sizeof(comp), "%s(%s)", p.bound ? "bound" : "UNBOUND", p.how);
+    snprintf(out, cap, "physOn=%d comp=%s bodies=%d sim=%d live=%d blend avg=%.2f max=%.2f",
+             p.physOn, comp, p.bodies, p.simBodies, p.liveBodies, p.avgBlend, p.maxBlend);
+}
 
 }} // namespace omp::game

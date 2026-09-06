@@ -646,6 +646,8 @@ static void publishNameplates() {
     NameplateTuning& T = Nameplates_Tuning();
     T.maxDistCm       = (float)MpPrefs_NameDistM()   * 100.0f;
     T.bubbleMaxDistCm = (float)MpPrefs_BubbleDistM() * 100.0f;
+    // Peer body physics (Other options): the same push-every-frame rule.
+    omp::game::Proxy::Tuning().syncPhysAnim = MpPrefs_PeerBodyPhysics() != 0;
     int vw = 0, vh = 0;
     g_npNoName = g_npOffScreen = 0;
     // A permanent early-out announces itself once: without these two symbols there is no projection
@@ -1523,6 +1525,13 @@ extern "C" {
     // Only this side knows what a proxy is, so it answers; tweaks probes for this export the same way
     // it finds the menu seam, and in a solo game (no export) nothing is ever a proxy.
     OMP_MOD_API int OmpSession_IsProxyActor(void* actor) { return omp::session::IsProxyActor(actor) ? 1 : 0; }
+    // The body-feel bridge to SessionTweaks (src/tweaks/proxy_body_feel.cpp): the tweaks module hands
+    // over its own riding-body settings, reads back each proxy and its owner's, and asks whether the
+    // player wants peer body physics at all (Other options).
+    OMP_MOD_API void OmpSession_SetOwnBodyFeel(const int16_t* v, int n, int ver) { omp::session::SetOwnBodyFeel(v, n, ver); }
+    OMP_MOD_API int  OmpSession_ProxyActors(void** out, int cap) { return omp::session::ProxyActors(out, cap); }
+    OMP_MOD_API int  OmpSession_ProxyBodyFeel(void* actor, int16_t* out, int cap, int* verOut) { return omp::session::ProxyBodyFeel(actor, out, cap, verOut); }
+    OMP_MOD_API int  OmpSession_PeerBodyPhysicsOn() { return MpPrefs_PeerBodyPhysics() ? 1 : 0; }
     OMP_MOD_API RC::CppUserModBase* start_mod()      { return new SessionOpenMP(); }
     OMP_MOD_API void uninstall_mod(RC::CppUserModBase* mod) { delete mod; }
 }

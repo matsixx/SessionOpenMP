@@ -57,6 +57,7 @@
 #include "catch_tweaks.h"     // CatchTweaks_Skater() -- the live skater, without a hook of our own
 #include "catch_level.h"      // CatchLevel_PostPhysAssert() -- the post-physics level re-assert
 #include "body_feel.h"       // BodyFeel_PostPhysApply() -- per-body blend-weight scaling
+#include "proxy_body_feel.h" // ProxyBodyFeel_PostPhysApply() -- the same write on a remote player's proxy
 #include <cmath>
 #include "MinHook.h"
 
@@ -335,6 +336,7 @@ static void hkUpdateFootAnchors(void* self, double dt, void* a, void* b) {
     // trajectory re-arm to the renderer. Our skater only; the function gates itself further.
     if (mine) CatchLevel_PostPhysAssert();
     if (mine) BodyFeel_PostPhysApply();     // per-body physics-blend scaling (same surviving write point)
+    if (!mine && self) ProxyBodyFeel_PostPhysApply(twkP(self, AN_SKATER));   // a remote player's proxy: its own rig's write
     if (mine) CatchTweaks_PostPhysHold();   // the scoop-foot hold (same surviving write point)
     unsigned char savedAA = 0;
     bool suppressed = false;

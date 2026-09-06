@@ -38,6 +38,7 @@ static int      g_bubbleDistM = 35;
 // looking at the same spot, and it takes nothing away permanently -- your own props are hidden for
 // the session and come straight back.
 static int      g_dropMode    = MPDROP_SHARED;
+static int      g_peerBody    = MPBODY_ON;
 // OFF by default: sharing the level's own furniture is unfinished, and the setting exists so it
 // cannot take the working half down with it.
 
@@ -61,6 +62,8 @@ static void saveAll() {
     fprintf(f, "BubbleDistM=%d\n", g_bubbleDistM);
     fprintf(f, "# Dropped objects: 0 off, 1 only what is placed during the session, 2 share one set.\n");
     fprintf(f, "DropMode=%d\n", g_dropMode);
+    fprintf(f, "# Other players' body physics on your screen: 0 off, 1 on.\n");
+    fprintf(f, "PeerBodyPhysics=%d\n", g_peerBody);
     fprintf(f, "# The level's own props (benches, barriers): 0 leave them alone, 1 share them.\n");
     // PeerId is an IDENTITY, not a preference: deleting the line makes this install a different
     // person to everyone who has played with it. Written last, with a warning above it.
@@ -114,6 +117,14 @@ void MpPrefs_SetDropMode(int mode) {
              (mode == MPDROP_OFF) ? "off" : (mode == MPDROP_LIVE) ? "live edits only"
                                                                   : "share one set");
     say(m);
+}
+int  MpPrefs_PeerBodyPhysics() { return g_peerBody; }
+void MpPrefs_SetPeerBodyPhysics(int on) {
+    on = clampI(on, MPBODY_OFF, MPBODY_ON);
+    if (on == g_peerBody) return;
+    g_peerBody = on;
+    saveAll();
+    say(on ? "[prefs] peer body physics: on" : "[prefs] peer body physics: off");
 }
 int  MpPrefs_SyncSeconds() { return g_syncSeconds; }
 void MpPrefs_SetSyncSeconds(int seconds) {
@@ -180,6 +191,7 @@ void MpPrefs_Init(const char* dir, void (*logf)(const char*)) {
             else if (!_stricmp(key, "NameDistM"))   g_nameDistM   = clampI(atoi(val), MPNAME_DIST_MIN, MPNAME_DIST_MAX);
             else if (!_stricmp(key, "BubbleDistM")) g_bubbleDistM = clampI(atoi(val), MPBUBBLE_DIST_MIN, MPBUBBLE_DIST_MAX);
             else if (!_stricmp(key, "DropMode"))    g_dropMode    = clampI(atoi(val), MPDROP_OFF, MPDROP_SHARED);
+            else if (!_stricmp(key, "PeerBodyPhysics")) g_peerBody = clampI(atoi(val), MPBODY_OFF, MPBODY_ON);
             else if (!_stricmp(key, "PeerId")) {
                 // Only accept a well-formed one. A truncated or hand-edited id would still "work"
                 // right up until it collided with somebody, which is the worst time to find out.

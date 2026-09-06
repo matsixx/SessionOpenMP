@@ -151,6 +151,10 @@ struct OmpPageItem2 {
     const char* onLabel;
     // SLIDER only -- the DISPLAYED range and the step. The host converts to and from the engine's
     // normalised 0..1 bar for you, so these are in your own units.
+    // ACTION rows may use `step` too: > 0 makes the row HOLD-TO-CONFIRM for that many seconds, and
+    // < 0 gives it the same hold as the game's own Exit to desktop -- the engine's progress circle and
+    // confirming sound included. 0 (the default) is a plain press. A host built before this reads
+    // nothing here and treats the row as a plain press.
     // The game prints a slider's value with "%d". CHOOSE UNITS WHOSE INTEGERS MEAN SOMETHING:
     // centimetres, degrees, percent -- not "0.5 to 6.0 metres", which can only ever read 0..6.
     float       minValue, maxValue, step;

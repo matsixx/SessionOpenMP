@@ -43,6 +43,11 @@ struct Flags {
     // was missing before it was written -- the feature is unfinished, so it will be wanted again.
     // Capped internally, so turning it on cannot flood a log.
     bool dropWorld        = false;
+    // MEASUREMENT ROUND: every 2 s per skater, is the game's physical animation live -- the
+    // component found and bound to the mesh, and how many bodies carry a PhysicsBlendWeight (that
+    // weight IS the visible body physics). We never enable it on a proxy; whether the Blueprint does
+    // so on a wire-driven skater decides if a peer's body-feel settings could be re-run locally.
+    bool paProbe          = false;
 };
 
 // Header-only: one shared instance across every translation unit that includes this.

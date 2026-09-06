@@ -70,6 +70,30 @@ enum {
     SKM_REFSKEL_INFO   = 0x1b0 + 0x20, // USkeletalMesh::RefSkeleton.FinalRefBoneInfo (TArray)
     BONEINFO_STRIDE    = 12,      // FMeshBoneInfo { FName Name; int32 ParentIndex; }
     SK_ROOT            = 0x130,   // AActor::RootComponent
+    // the physical-animation component (riding arms, layer 2 -- see the knobs)
+    ACT_BP_COMPS       = 0x200,   // AActor::BlueprintCreatedComponents (TArray<UActorComponent*>)
+    ACT_INST_COMPS     = 0x1f0,   // AActor::InstanceComponents
+    ACT_OWNED_COMPS    = 0x1a0,   // AActor::OwnedComponents (TSet<UActorComponent*>, 80B)
+    UOBJ_CLASS         = 0x010,   // UObjectBase::ClassPrivate
+    UOBJ_NAME          = 0x018,   // UObjectBase::NamePrivate (FName)
+    USTRUCT_SUPER      = 0x040,   // UStruct::SuperStruct (a Blueprint subclass still counts)
+    PA_STRENGTH_MULT   = 0x0b0,   // UPhysicalAnimationComponent::StrengthMultiplyer
+    PA_MESH            = 0x0b8,   // ::SkeletalMeshComponent -- must be OUR mesh
+    PA_RUNTIME         = 0x0c0,   // ::RuntimeInstanceData TArray<{FConstraintInstance*, PxRigidDynamic*}> (16B)
+    PA_DRIVEDATA       = 0x0d0,   // ::DriveData TArray<FPhysicalAnimationData> (36B), index-paired with the above
+    PAD_STRIDE         = 36,
+    PAD_BODYNAME       = 0x00,    // FName
+    PAD_LOCAL          = 0x08,    // bIsLocalSimulation (no linear drive when set)
+    PAD_ORIENT         = 0x0c,    // OrientationStrength     = angular stiffness
+    PAD_ANGVEL         = 0x10,    // AngularVelocityStrength = angular damping
+    PAD_POS            = 0x14,    // PositionStrength        = linear stiffness
+    PAD_VEL            = 0x18,    // VelocityStrength        = linear damping
+    PAD_MAXLIN         = 0x1c,    // MaxLinearForce  (0 = unlimited)
+    PAD_MAXANG         = 0x20,    // MaxAngularForce (0 = unlimited)
+    CI_SWING_STIFF     = 0x8c + 0xc4 + 0x10, // FConstraintInstance::ProfileInstance.AngularDrive.SwingDrive.Stiffness
+    CI_LIN_STIFF       = 0x8c + 0x78 + 0x00, // ProfileInstance.LinearDrive.XDrive.Stiffness
+    BI_SIM_BYTE        = 0x010,  // FBodyInstance bitfield byte holding bSimulatePhysics
+    BI_SIM_BIT         = 0,   //   ... and its bit (PDB declaration order within the byte)
     CTW_TRANSLATION    = 0x1c0 + 0x10, // USceneComponent ComponentToWorld: quat 16B, then pos
     CTW_QUAT           = 0x1c0,   // ComponentToWorld start (FTransform: quat, pos, scale)
     CMP_CST_ARR        = 0x4b0,   // USkinnedMeshComponent::ComponentSpaceTransformsArray[2]
@@ -342,19 +366,60 @@ static float g_carryFrac   = 0.55f;   // fraction of pre-bail speed the ragdoll 
 static int   g_carryMs     = 250;
 static float g_carryGain   = 8.0f;    // accel = along-throw deficit * gain (1/s)
 static float g_carryMax    = 6000.0f; // cm/s^2 clamp per body
-// RIDING ARM REFLEXES: the arms as balance, not luggage (field: "arms just keep the
-// animation's momentum... make them more reactive"). The game zeroes most body weights at
-// speed, so first the arms get a physics-weight FLOOR (the motors+physics stay alive),
-// then three reflex forces lean them against those motors: carve sway (centripetal), air/
-// grind spread (up-and-out balance), landing absorb (downward accent on the pulse).
-static int   g_armAmt      = 170;     // Arm reactivity (%) -- 0 = stock luggage arms
-static float g_armFloor    = 0.35f;   // weight floor on arm bodies while riding
+// RIDING ARMS (3.19.283 rewrite -- field: "less stiff, still reactive"): the arms as inertial
+// balance, not luggage. Three layers, each doing what the one below cannot:
+//   1. PHYSICS FRACTION. The game authors most body blend weights to 0 at speed (field: 0 on 15
+//      of 21 bodies) -- pure animation, the luggage look. The arm bodies get a FLOOR (g_armLoose)
+//      so the simulated arm is what gets drawn.
+//   2. MUSCLE TONE. Even fully simulated, the arm is welded to the animation by the game's
+//      physical-animation drive: UPhysicalAnimationComponent keeps a kinematic target per body
+//      on the animated pose, joined to the body by a constraint whose angular/linear drives run
+//      at the profile's strength. At that strength the body cannot lag its target by a visible
+//      amount, so no inertia ever shows. While riding, the ARM entries' drives are re-written
+//      in place (FConstraintInstance::SetAngularDriveParams / SetLinearDriveParams on the
+//      component's own runtime constraints): stiffness x g_armHold, damping x g_armDamp, force
+//      limits as authored. The arm then follows the animation as a damped pendulum -- lags an
+//      acceleration, drops on a landing, swings out of a carve -- because the engine now lets
+//      real inertia through. The profile data itself is never touched; the live drive is checked
+//      against the intent every tick and re-written when the game re-stamps it (a profile apply,
+//      counted), and put back to the authored strength on ragdoll, restore or the layer going off.
+//   3. INTENT, continuous instead of thresholded: an eased air/rail balance intent spreads the
+//      arms up-and-out, a pseudo-inertial force (-root acceleration x g_armInertia) exaggerates
+//      what layer 2 lets through, and the landing pulse adds a downward accent.
+// The old yaw-rate carve sway is gone: a carve's centripetal pull is in the acceleration.
+static int   g_armAmt      = 170;     // Arm reactivity (%) -- scales the INTENT forces; 0 = stock luggage arms
+static float g_armLoose    = 0.0f;    // BodyFeelArmLoosePct: physics-fraction floor on the arm bodies (stock 0)
+static float g_armHold     = 1.0f;    // BodyFeelArmHoldPct: arm drive stiffness as a fraction of authored (stock 1)
+static float g_armDamp     = 1.0f;    // BodyFeelArmDampPct: arm drive damping as a fraction of authored (stock 1)
+static float g_armInertia  = 0.0f;    // BodyFeelArmInertiaPct: pseudo-inertial gain on the root acceleration (stock 0)
+static int   g_armDriveLog = 1;       // BodyFeelArmDriveLog: print the profile's arm drives on change
 static float g_armFloorNow = 0.0f;    // per-frame resolved floor (0 = layer off)
-static float g_swayGain    = 1.0f;    // accel = gain * |yawRate| * speed
-static float g_swayMax     = 2200.0f; // cm/s^2 cap on the sway
-static float g_swaySign    = 1.0f;    // flip if the arms lean INTO the turn
-static float g_spreadAccel = 900.0f;  // air/grind balance spread (55% up, 45% out)
-static float g_landAccent  = 1200.0f; // downward absorb accent, scaled by the landing pulse
+static float g_spreadAccel = 0.0f;    // air/rail balance spread at full intent (55% up, 45% out); stock 0
+static float g_landAccent  = 0.0f;    // downward absorb accent, scaled by the landing pulse; stock 0
+static float g_inertiaMax  = 2500.0f; // cm/s^2 cap on the inertial reaction (a teleport is a spike)
+static float g_accSmooth   = 0.25f;   // per-tick smoothing on the root acceleration
+// TORSO AND HEAD TONE (3.19.284): the muscle-tone layer on the spine chain, the clavicles and the
+// neck/head. The game's profile drives all twenty bodies at one strength, so whenever physical
+// animation is bound (idle, slow riding, airs, rails -- the game UNBINDS it while rolling fast,
+// its own guard against the "goat legs" shift of a fast body chain) the torso is as welded to the
+// animation as the arms were. Softened, the chest leans into a carve and compresses on a landing,
+// the head lags an acceleration, and the arms' targets ride the simulated spine (local
+// simulation), so the upper body moves as one thing. AMPLIFY, NEVER ENABLE: these floors only
+// raise a physics fraction the game already authored above zero, and only while it has physical
+// animation bound -- a body the game wants purely animated stays that way. The legs, pelvis and
+// root are never touched: the feet live on the board and the catch reads them.
+static int   g_torsoOn       = 0;      // BodyFeelTorso (stock: off)
+static float g_torsoLoose    = 0.0f;   // BodyFeelTorsoLoosePct: floor on spine/clavicle bodies the game already blends
+static float g_torsoHold     = 1.0f;   // BodyFeelTorsoHoldPct: spine/clavicle drive stiffness, fraction of authored
+static float g_torsoDamp     = 1.0f;   // BodyFeelTorsoDampPct
+static float g_torsoInertia  = 0.0f;   // BodyFeelTorsoInertiaPct: the chest's lean against the root acceleration
+static float g_headLoose     = 0.0f;   // BodyFeelHeadLoosePct
+static float g_headHold      = 1.0f;   // BodyFeelHeadHoldPct
+static float g_headDamp      = 1.0f;   // BodyFeelHeadDampPct
+static float g_headInertia   = 0.0f;   // BodyFeelHeadInertiaPct: head lag
+static float g_torsoFloorNow = 0.0f;   // per-frame resolved (0 = layer off or PA unbound)
+static float g_headFloorNow  = 0.0f;
+static int   g_snapLog       = 1;      // BodyFeelSnapLog: per-body simulate/weight line on state edges (40 per session)
 // TORQUE-SPACE (field direction: "rotate joints, don't pull"): the flail, the roll and
 // the arms-in-front keeper act via AddTorqueInRadians in accel mode (rad/s^2).
 // (THE STUMBLE lived here 3.19.113-120 and was removed on field verdict.)
@@ -498,6 +563,37 @@ static void ReadBraceTuning(const char* buf) {
     g_bailAccel   = kReachBase  * BraceClampPct((float)TwkIniInt(buf, "BodyFeelReachPct", 60)) / 100.0f;
     g_armAmt = TwkIniInt(buf, "BodyFeelArmPct", 170);
     if (g_armAmt < 0) g_armAmt = 0; if (g_armAmt > 300) g_armAmt = 300;
+    g_armLoose   = (float)TwkIniInt(buf, "BodyFeelArmLoosePct", 0) / 100.0f;
+    if (g_armLoose < 0.0f) g_armLoose = 0.0f; if (g_armLoose > 1.0f) g_armLoose = 1.0f;
+    g_armHold    = (float)TwkIniInt(buf, "BodyFeelArmHoldPct", 100) / 100.0f;
+    if (g_armHold < 0.0f) g_armHold = 0.0f; if (g_armHold > 3.0f) g_armHold = 3.0f;
+    g_armDamp    = (float)TwkIniInt(buf, "BodyFeelArmDampPct", 100) / 100.0f;
+    if (g_armDamp < 0.0f) g_armDamp = 0.0f; if (g_armDamp > 5.0f) g_armDamp = 5.0f;
+    g_armInertia = (float)TwkIniInt(buf, "BodyFeelArmInertiaPct", 0) / 100.0f;
+    if (g_armInertia < 0.0f) g_armInertia = 0.0f; if (g_armInertia > 3.0f) g_armInertia = 3.0f;
+    g_armDriveLog = TwkIniInt(buf, "BodyFeelArmDriveLog", 1) ? 1 : 0;
+    g_torsoOn      = TwkIniInt(buf, "BodyFeelTorso", 0) ? 1 : 0;
+    g_torsoLoose   = (float)TwkIniInt(buf, "BodyFeelTorsoLoosePct", 0) / 100.0f;
+    g_torsoHold    = (float)TwkIniInt(buf, "BodyFeelTorsoHoldPct", 100) / 100.0f;
+    g_torsoDamp    = (float)TwkIniInt(buf, "BodyFeelTorsoDampPct", 100) / 100.0f;
+    g_torsoInertia = (float)TwkIniInt(buf, "BodyFeelTorsoInertiaPct", 0) / 100.0f;
+    g_headLoose    = (float)TwkIniInt(buf, "BodyFeelHeadLoosePct", 0) / 100.0f;
+    g_headHold     = (float)TwkIniInt(buf, "BodyFeelHeadHoldPct", 100) / 100.0f;
+    g_headDamp     = (float)TwkIniInt(buf, "BodyFeelHeadDampPct", 100) / 100.0f;
+    g_headInertia  = (float)TwkIniInt(buf, "BodyFeelHeadInertiaPct", 0) / 100.0f;
+    g_snapLog      = TwkIniInt(buf, "BodyFeelSnapLog", 1) ? 1 : 0;
+    g_spreadAccel  = (float)TwkIniInt(buf, "BodyFeelArmSpread", 0);
+    if (g_spreadAccel < 0.0f) g_spreadAccel = 0.0f; if (g_spreadAccel > 3000.0f) g_spreadAccel = 3000.0f;
+    g_landAccent   = (float)TwkIniInt(buf, "BodyFeelArmLandDrop", 0);
+    if (g_landAccent < 0.0f) g_landAccent = 0.0f; if (g_landAccent > 3000.0f) g_landAccent = 3000.0f;
+    {   // the same fences as the arms' knobs
+        float* fr[] = { &g_torsoLoose, &g_headLoose };
+        for (float* f : fr) { if (*f < 0.0f) *f = 0.0f; if (*f > 1.0f) *f = 1.0f; }
+        float* hd[] = { &g_torsoHold, &g_headHold, &g_torsoInertia, &g_headInertia };
+        for (float* f : hd) { if (*f < 0.0f) *f = 0.0f; if (*f > 3.0f) *f = 3.0f; }
+        float* dp[] = { &g_torsoDamp, &g_headDamp };
+        for (float* f : dp) { if (*f < 0.0f) *f = 0.0f; if (*f > 5.0f) *f = 5.0f; }
+    }
     g_fallAmt = TwkIniInt(buf, "BodyFeelFallPct", 100);
     if (g_fallAmt < 0) g_fallAmt = 0; if (g_fallAmt > 300) g_fallAmt = 300;
     g_splayBack = (float)TwkIniInt(buf, "BodyFeelBraceSplayBackDeg", 60);
@@ -525,6 +621,23 @@ static void SaveBraceTuning(char* buf, size_t cap) {
     TwkIniSetInt(buf, cap, "BodyFeelReachPct", (int)(g_bailAccel   / kReachBase  * 100.0f + 0.5f));
     TwkIniSetInt(buf, cap, "BodyFeelCarryPct", (int)(g_carryFrac * 100.0f + 0.5f));
     TwkIniSetInt(buf, cap, "BodyFeelArmPct", g_armAmt);
+    TwkIniSetInt(buf, cap, "BodyFeelArmLoosePct",   (int)(g_armLoose   * 100.0f + 0.5f));
+    TwkIniSetInt(buf, cap, "BodyFeelArmHoldPct",    (int)(g_armHold    * 100.0f + 0.5f));
+    TwkIniSetInt(buf, cap, "BodyFeelArmDampPct",    (int)(g_armDamp    * 100.0f + 0.5f));
+    TwkIniSetInt(buf, cap, "BodyFeelArmInertiaPct", (int)(g_armInertia * 100.0f + 0.5f));
+    TwkIniSetInt(buf, cap, "BodyFeelArmDriveLog",   g_armDriveLog);
+    TwkIniSetInt(buf, cap, "BodyFeelTorso",           g_torsoOn);
+    TwkIniSetInt(buf, cap, "BodyFeelTorsoLoosePct",   (int)(g_torsoLoose   * 100.0f + 0.5f));
+    TwkIniSetInt(buf, cap, "BodyFeelTorsoHoldPct",    (int)(g_torsoHold    * 100.0f + 0.5f));
+    TwkIniSetInt(buf, cap, "BodyFeelTorsoDampPct",    (int)(g_torsoDamp    * 100.0f + 0.5f));
+    TwkIniSetInt(buf, cap, "BodyFeelTorsoInertiaPct", (int)(g_torsoInertia * 100.0f + 0.5f));
+    TwkIniSetInt(buf, cap, "BodyFeelHeadLoosePct",    (int)(g_headLoose    * 100.0f + 0.5f));
+    TwkIniSetInt(buf, cap, "BodyFeelHeadHoldPct",     (int)(g_headHold     * 100.0f + 0.5f));
+    TwkIniSetInt(buf, cap, "BodyFeelHeadDampPct",     (int)(g_headDamp     * 100.0f + 0.5f));
+    TwkIniSetInt(buf, cap, "BodyFeelHeadInertiaPct",  (int)(g_headInertia  * 100.0f + 0.5f));
+    TwkIniSetInt(buf, cap, "BodyFeelSnapLog",         g_snapLog);
+    TwkIniSetInt(buf, cap, "BodyFeelArmSpread",       (int)(g_spreadAccel + 0.5f));
+    TwkIniSetInt(buf, cap, "BodyFeelArmLandDrop",     (int)(g_landAccent + 0.5f));
     TwkIniSetInt(buf, cap, "BodyFeelFallPct", g_fallAmt);
     TwkIniSetInt(buf, cap, "BodyFeelBraceSplayBackDeg", (int)g_splayBack);
     TwkIniSetInt(buf, cap, "BodyFeelBraceSplayFwdDeg",  (int)g_splayFwd);
@@ -538,6 +651,12 @@ static void ResetBraceTuning() {
     g_flailAccel = kFlailBase * 1.4f; g_clutchAccel = kClutchBase * 3.0f;
     g_bailAccel = kReachBase * 0.6f;
     g_carryFrac = 0.55f; g_armAmt = 170; g_fallAmt = 100;
+    // "Style settings" ships at STOCK (3.19.287, user's call): no floors, drives as authored, no
+    // forces, torso layer off -- the sliders are tuned UP from the base game.
+    g_armLoose = 0.0f; g_armHold = 1.0f; g_armDamp = 1.0f; g_armInertia = 0.0f;
+    g_torsoOn = 0; g_torsoLoose = 0.0f; g_torsoHold = 1.0f; g_torsoDamp = 1.0f; g_torsoInertia = 0.0f;
+    g_headLoose = 0.0f; g_headHold = 1.0f; g_headDamp = 1.0f; g_headInertia = 0.0f;
+    g_spreadAccel = 0.0f; g_landAccent = 0.0f;
     g_splayBack = 60.0f; g_splayFwd = 0.0f; g_palmAxis = 2; g_palmMirror = 1; g_palmAccel = 150.0f; g_palmDamp = 6.0f;
 }
 bool  BodyFeel_BraceEnabled()          { return g_bail != 0; }
@@ -590,6 +709,38 @@ void  BodyFeel_SetGrabDelayMs(float v)  {
 }
 float BodyFeel_GrabPct()               { return g_clutchAccel / kClutchBase * 100.0f; }
 void  BodyFeel_SetGrabPct(float v)     { g_clutchAccel = kClutchBase * BraceClampPct(v) / 100.0f; TwkMarkDirty(); }
+// "Style settings" page (3.19.285, renamed 3.19.288): the riding-arm and torso layers' knobs. Fractions travel as
+// percentages; the fences match the ini reader's. Every one is read live by the riding block, and a
+// changed hold/damping re-writes the drives on the next tick (a mismatch, not a re-stamp).
+static float Fence(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
+float BodyFeel_ArmLoosePct()             { return g_armLoose * 100.0f; }
+void  BodyFeel_SetArmLoosePct(float v)   { g_armLoose = Fence(v, 0.0f, 100.0f) / 100.0f; TwkMarkDirty(); }
+float BodyFeel_ArmHoldPct()              { return g_armHold * 100.0f; }
+void  BodyFeel_SetArmHoldPct(float v)    { g_armHold = Fence(v, 0.0f, 300.0f) / 100.0f; TwkMarkDirty(); }
+float BodyFeel_ArmDampPct()              { return g_armDamp * 100.0f; }
+void  BodyFeel_SetArmDampPct(float v)    { g_armDamp = Fence(v, 0.0f, 500.0f) / 100.0f; TwkMarkDirty(); }
+float BodyFeel_ArmInertiaPct()           { return g_armInertia * 100.0f; }
+void  BodyFeel_SetArmInertiaPct(float v) { g_armInertia = Fence(v, 0.0f, 300.0f) / 100.0f; TwkMarkDirty(); }
+float BodyFeel_ArmSpread()               { return g_spreadAccel; }
+void  BodyFeel_SetArmSpread(float v)     { g_spreadAccel = Fence(v, 0.0f, 3000.0f); TwkMarkDirty(); }
+float BodyFeel_ArmLandDrop()             { return g_landAccent; }
+void  BodyFeel_SetArmLandDrop(float v)   { g_landAccent = Fence(v, 0.0f, 3000.0f); TwkMarkDirty(); }
+bool  BodyFeel_TorsoEnabled()            { return g_torsoOn != 0; }
+void  BodyFeel_SetTorsoEnabled(bool o)   { g_torsoOn = o ? 1 : 0; TwkMarkDirty(); }
+float BodyFeel_TorsoLoosePct()           { return g_torsoLoose * 100.0f; }
+void  BodyFeel_SetTorsoLoosePct(float v) { g_torsoLoose = Fence(v, 0.0f, 100.0f) / 100.0f; TwkMarkDirty(); }
+float BodyFeel_TorsoHoldPct()            { return g_torsoHold * 100.0f; }
+void  BodyFeel_SetTorsoHoldPct(float v)  { g_torsoHold = Fence(v, 0.0f, 300.0f) / 100.0f; TwkMarkDirty(); }
+float BodyFeel_TorsoDampPct()            { return g_torsoDamp * 100.0f; }
+void  BodyFeel_SetTorsoDampPct(float v)  { g_torsoDamp = Fence(v, 0.0f, 500.0f) / 100.0f; TwkMarkDirty(); }
+float BodyFeel_TorsoLeanPct()            { return g_torsoInertia * 100.0f; }
+void  BodyFeel_SetTorsoLeanPct(float v)  { g_torsoInertia = Fence(v, 0.0f, 300.0f) / 100.0f; TwkMarkDirty(); }
+float BodyFeel_HeadLoosePct()            { return g_headLoose * 100.0f; }
+void  BodyFeel_SetHeadLoosePct(float v)  { g_headLoose = Fence(v, 0.0f, 100.0f) / 100.0f; TwkMarkDirty(); }
+float BodyFeel_HeadLagPct()              { return g_headInertia * 100.0f; }
+float BodyFeel_HeadHoldPct()             { return g_headHold * 100.0f; }
+float BodyFeel_HeadDampPct()             { return g_headDamp * 100.0f; }
+void  BodyFeel_SetHeadLagPct(float v)    { g_headInertia = Fence(v, 0.0f, 300.0f) / 100.0f; TwkMarkDirty(); }
 
 // ------------------------------------------------------------------ state
 static void*  g_mesh       = nullptr;             // the mesh the captures belong to
@@ -666,6 +817,31 @@ static double g_landT       = 0.0;
 static float  g_oscHz       = 0.9f;    // per-bail squeeze/rock pace
 static float  g_lastYaw     = 0.0f;    // root yaw, for the carve-sway reflex
 static float  g_yawRate     = 0.0f;    // rad/s, smoothed
+static float  g_velPrev[3]  = {0,0,0}; // last tick's smoothed velocity, for the acceleration
+static float  g_rootAcc[3]  = {0,0,0}; // smoothed root acceleration (cm/s^2): the arms' inertial reaction
+static float  g_airIntent   = 0.0f;    // eased 0..1 arms-out balance intent (air 1, rail 0.6)
+// the physical-animation component (riding arms, layer 2 -- see the knobs)
+static void*  g_paComp      = nullptr; // the UPhysicalAnimationComponent driving g_mesh
+static double g_paFindAt    = 0.0;     // next discovery retry (the component lists fill in late)
+static bool   g_paSoft      = false;   // the arm drives currently carry OUR strengths
+static int    g_paRestamps  = 0;       // times the game put the authored strength back under us
+static int    g_paArmN      = 0;       // arm entries in the live profile
+static float  g_paSig       = -1.0f;   // profile fingerprint, for the on-change dump
+static uint64_t g_paName[kMaxBodies];  // cached raw BodyName per entry
+static int8_t g_paKind[kMaxBodies];    // -1 unresolved, 0 other, 1 arm, 2 spine, 3 clavicle, 4 neck/head
+static void*  g_paObj       = nullptr; // the component itself, found once per mesh, bound to our mesh or not
+static bool   g_paBound     = false;   // bound to our mesh this tick (the game unbinds it while rolling fast)
+static void*  g_paOther     = nullptr; // what it was bound to the last time it was not ours (log)
+static int    g_paTorsoN    = 0;       // spine + clavicle entries in the live profile
+static int    g_paHeadN     = 0;       // neck/head entries
+// the torso layer's classification + the measurement snapshot
+static bool   g_spineBody[kMaxBodies]; // spine1..3
+static bool   g_clavBody[kMaxBodies];  // clavicles
+static float  g_leanW[kMaxBodies];     // torso/head intent weight per body (chest 1, head 0.5, ...)
+static char   g_bodyShort[kMaxBodies][12]; // lowercase bone name without the rig prefix, for the snapshot
+static int    g_snapCount   = 0;
+static int    g_snapBand    = -1;      // speed band of the last snapshot
+static double g_snapAt      = 0.0;
 static float  g_belly[3]    = {0,0,0}; // the body's FRONT (knee-hinge compass, re-added)
 static bool   g_bellyOk     = false;
 static double g_faceDownSince = 0.0;
@@ -1491,8 +1667,214 @@ static void ResolveAddForce() {
     }
 }
 
+// ---- the physical-animation drives (riding arms, layer 2 -- see the knobs) -----------------------------
+// FConstraintInstance::SetAngularDriveParams(this, spring, damping, forceLimit) and SetLinearDriveParams:
+// write the profile instance and push it to the physics joint. Unique on both exes (Epic 0x2e688a0 /
+// 0x2e68b40, Steam 0x2e2b300 / 0x2e2b5a0). The game calls exactly these from its own
+// SetMotorStrength, with the profile's numbers x StrengthMultiplyer -- so does this, scaled.
+typedef void (*SetDriveFn)(void*, float, float, float);
+static SetDriveFn g_setAngDrive = nullptr;
+static SetDriveFn g_setLinDrive = nullptr;
+static bool g_paDriveTried = false;
+static const char* SIG_SET_ANG_DRIVE =
+    "48 83 EC 38 48 8D 44 24 40 F3 0F 11 89 60 01 00 00 48 89 44 24 28 48 8D 54 24 20 48 8D 05 ?? ?? ?? ??";
+static const char* SIG_SET_LIN_DRIVE =
+    "48 83 EC 38 48 8D 44 24 40 F3 0F 11 89 1C 01 00 00 48 89 44 24 28 48 8D 54 24 20 48 8D 05 ?? ?? ?? ??";
+
+static void ResolvePaDrives() {
+    if (g_paDriveTried) return;
+    g_paDriveTried = true;
+    g_setAngDrive = (SetDriveFn)TwkScanExe(SIG_SET_ANG_DRIVE);
+    g_setLinDrive = (SetDriveFn)TwkScanExe(SIG_SET_LIN_DRIVE);
+    TwkLog("[body] arm drives: SetAngularDriveParams %s, SetLinearDriveParams %s",
+           g_setAngDrive ? "resolved" : "SIG NOT FOUND -- the arms keep the stock muscle tone",
+           g_setLinDrive ? "resolved" : "SIG NOT FOUND");
+}
+
+// Is this object a UPhysicalAnimationComponent (or a Blueprint child of one)? By class name, up the
+// super chain, through the FName resolver the bone classifier uses.
+static bool IsPhysAnimClass(void* obj) {
+    if (!obj) return false;
+    uint8_t* cls = *(uint8_t**)((uint8_t*)obj + UOBJ_CLASS);
+    for (int depth = 0; cls && depth < 6; depth++) {
+        char nm[64];
+        if (GrindPop_FNameToString(cls + UOBJ_NAME, nm, sizeof(nm)) &&
+            strcmp(nm, "PhysicalAnimationComponent") == 0) return true;
+        cls = *(uint8_t**)(cls + USTRUCT_SUPER);
+    }
+    return false;
+}
+
+// The skater's UPhysicalAnimationComponent. Not a member of the skater (the PDB has none), so it is
+// found by class in the actor's component lists: the Blueprint-created and instance arrays first, then
+// the owned set. One bound to OUR mesh (+0xb8) wins; failing that, any (the game unbinds it while
+// rolling fast and rebinds after -- the object persists, so it is found once and then WATCHED).
+static void* FindPhysAnimIn(void* sk, void* mesh, bool strict, const char** how) {
+    static const int lists[2] = { ACT_BP_COMPS, ACT_INST_COMPS };
+    static const char* const names[2] = { "BlueprintCreatedComponents", "InstanceComponents" };
+    for (int l = 0; l < 2; l++) {
+        void** arr = *(void***)((uint8_t*)sk + lists[l]);
+        const int n = *(int*)((uint8_t*)sk + lists[l] + 8);
+        if (!arr || n <= 0 || n > 512) continue;
+        for (int i = 0; i < n; i++) {
+            void* c = arr[i];
+            if (c && IsPhysAnimClass(c) && (!strict || *(void**)((uint8_t*)c + PA_MESH) == mesh)) {
+                *how = names[l]; return c;
+            }
+        }
+    }
+    // TSet<UActorComponent*>: a sparse array of 16-byte {value, hashNext, hashIndex} slots plus a bit
+    // array saying which slots are live (four inline words up to 128 bits, else a secondary block).
+    uint8_t* set = (uint8_t*)sk + ACT_OWNED_COMPS;
+    uint8_t* data = *(uint8_t**)(set + 0x00);
+    const int num = *(int*)(set + 0x08);
+    const int maxBits = *(int*)(set + 0x2c);
+    const uint32_t* bits = (maxBits <= 128) ? (const uint32_t*)(set + 0x10)
+                                            : *(const uint32_t**)(set + 0x20);
+    if (data && bits && num > 0 && num <= 512) {
+        for (int i = 0; i < num; i++) {
+            if (!((bits[i >> 5] >> (i & 31)) & 1u)) continue;
+            void* c = *(void**)(data + (size_t)i * 16);
+            if (c && IsPhysAnimClass(c) && (!strict || *(void**)((uint8_t*)c + PA_MESH) == mesh)) {
+                *how = "OwnedComponents"; return c;
+            }
+        }
+    }
+    return nullptr;
+}
+static void* FindPhysAnim(void* sk, void* mesh, const char** how) {
+    *how = "";
+    void* c = FindPhysAnimIn(sk, mesh, true, how);
+    return c ? c : FindPhysAnimIn(sk, mesh, false, how);
+}
+
+// The profile's entries, classified once per BodyName (the raw FName is cached; a swap that renames an
+// entry re-classifies it). -1 = the name did not resolve yet, retried next tick.
+static void ClassifyPaEntry(int i, const uint8_t* e) {
+    const uint64_t raw = *(const uint64_t*)(e + PAD_BODYNAME);
+    if (g_paKind[i] >= 0 && g_paName[i] == raw) return;
+    g_paName[i] = raw; g_paKind[i] = -1;
+    char nm[64];
+    if (!GrindPop_FNameToString(e + PAD_BODYNAME, nm, sizeof(nm))) return;
+    for (char* c = nm; *c; c++) if (*c >= 'A' && *c <= 'Z') *c += 32;
+    g_paKind[i] = (strstr(nm, "upperarm") || strstr(nm, "lowerarm") || strstr(nm, "forearm") ||
+                   strstr(nm, "hand")) ? 1
+                : strstr(nm, "spine") ? 2 : strstr(nm, "clavicle") ? 3
+                : (strstr(nm, "head") || strstr(nm, "neck")) ? 4 : 0;
+}
+
+// The arm entries as the game authored them -- the numbers the softening scales. Printed at first sight
+// and whenever the profile's fingerprint changes (a per-state profile swap would show up here).
+static void DumpPaProfile(uint8_t* pa, const char* why) {
+    const uint8_t* dd = *(uint8_t**)(pa + PA_DRIVEDATA);
+    const int n = *(int*)(pa + PA_DRIVEDATA + 8);
+    TwkLog("[body] arm drives: profile %s -- %d entries, strength multiplier %.2f: %d arm, %d torso, "
+           "%d head entries softened", why, n, *(float*)(pa + PA_STRENGTH_MULT), g_paArmN, g_paTorsoN, g_paHeadN);
+    for (int i = 0; i < n && i < kMaxBodies; i++) {
+        const uint8_t* e = dd + (size_t)i * PAD_STRIDE;
+        if (g_paKind[i] < 1) continue;
+        char nm[64]; nm[0] = 0;
+        GrindPop_FNameToString(e + PAD_BODYNAME, nm, sizeof(nm));
+        TwkLog("[body]   %-20s %s orient %.0f angVel %.0f pos %.0f vel %.0f maxLin %.0f maxAng %.0f",
+               nm, *(e + PAD_LOCAL) ? "local" : "world",
+               *(const float*)(e + PAD_ORIENT), *(const float*)(e + PAD_ANGVEL),
+               *(const float*)(e + PAD_POS), *(const float*)(e + PAD_VEL),
+               *(const float*)(e + PAD_MAXLIN), *(const float*)(e + PAD_MAXANG));
+    }
+}
+
+// Write the arm entries' drives: OUR strengths while soft, the authored ones on restore. Only entries
+// whose live value differs are written. The live SwingDrive stiffness is the tell-tale: the game
+// re-stamping its profile puts the authored value back, which reads as a mismatch here and is re-written
+// (counted when `count`). Returns the number of entries written.
+static int ApplyPaDrives(bool armSoft, bool torsoSoft, bool count) {
+    uint8_t* pa = (uint8_t*)g_paComp;
+    if (!pa || !g_setAngDrive) return 0;
+    if (*(void**)(pa + PA_MESH) != g_mesh) { g_paComp = nullptr; return 0; }
+    const uint8_t* dd = *(uint8_t**)(pa + PA_DRIVEDATA);
+    const int n = *(int*)(pa + PA_DRIVEDATA + 8);
+    uint8_t* rt = *(uint8_t**)(pa + PA_RUNTIME);
+    const int rn = *(int*)(pa + PA_RUNTIME + 8);
+    if (!dd || !rt || n <= 0 || rn < n) return 0;
+    const float mult = *(float*)(pa + PA_STRENGTH_MULT);
+    int wrote = 0, arms = 0, torso = 0, head = 0;
+    float sig = (float)n;
+    for (int i = 0; i < n && i < kMaxBodies; i++) {
+        const uint8_t* e = dd + (size_t)i * PAD_STRIDE;
+        ClassifyPaEntry(i, e);
+        const int k = g_paKind[i];
+        if (k < 1) continue;
+        float kS = 1.0f, kD = 1.0f;
+        if (k == 1)      { arms++;  if (armSoft)   { kS = g_armHold;   kD = g_armDamp;   } }
+        else if (k <= 3) { torso++; if (torsoSoft) { kS = g_torsoHold; kD = g_torsoDamp; } }
+        else             { head++;  if (torsoSoft) { kS = g_headHold;  kD = g_headDamp;  } }
+        const float orient = *(const float*)(e + PAD_ORIENT), angVel = *(const float*)(e + PAD_ANGVEL);
+        const float pos    = *(const float*)(e + PAD_POS),    vel    = *(const float*)(e + PAD_VEL);
+        sig += orient + angVel + pos + vel;
+        uint8_t* ci = *(uint8_t**)(rt + (size_t)i * 16);
+        if (!ci) continue;
+        const float wantA = orient * mult * kS, liveA = *(float*)(ci + CI_SWING_STIFF);
+        if (fabsf(liveA - wantA) > 0.01f + 0.001f * fabsf(wantA)) {
+            if (count && fabsf(liveA - orient * mult) <= 0.01f + 0.001f * fabsf(orient * mult)) g_paRestamps++;
+            g_setAngDrive(ci, wantA, angVel * mult * kD, *(const float*)(e + PAD_MAXANG) * mult);
+            wrote++;
+        }
+        if (g_setLinDrive && !*(e + PAD_LOCAL)) {
+            const float wantL = pos * mult * kS, liveL = *(float*)(ci + CI_LIN_STIFF);
+            if (fabsf(liveL - wantL) > 0.01f + 0.001f * fabsf(wantL))
+                g_setLinDrive(ci, wantL, vel * mult * kD, *(const float*)(e + PAD_MAXLIN) * mult);
+        }
+    }
+    g_paArmN = arms; g_paTorsoN = torso; g_paHeadN = head;
+    if (g_armDriveLog && fabsf(sig - g_paSig) > 0.5f) {
+        const bool first = g_paSig < 0.0f;
+        g_paSig = sig;
+        DumpPaProfile(pa, first ? "at first sight" : "CHANGED");
+    }
+    return wrote;
+}
+
+// MEASUREMENT (3.19.284, 40 lines per session): on a state edge, every body's simulate flag and the
+// weight the game authored, one line. Settles what the game does to the bodies while rolling fast
+// with physical animation unbound -- kinematic (our floors are moot there) or simulating drive-less.
+static void SnapshotBodies(const char* why, float speed, bool grounded, bool onRail) {
+    if (!g_snapLog || g_snapCount >= 40 || !g_mesh) return;
+    g_snapCount++;
+    uint8_t* arr = *(uint8_t**)((uint8_t*)g_mesh + CMP_BODIES);
+    const int n = *(int*)((uint8_t*)g_mesh + CMP_BODIES + 8);
+    char line[480];
+    int used = snprintf(line, sizeof(line), "[body] snap %s: speed %.2f %s, PA %s |", why, speed,
+                        !grounded ? "air" : (onRail ? "rail" : "ground"),
+                        g_paBound ? "bound" : "unbound");
+    for (int i = 0; arr && i < n && i < kMaxBodies; i++) {
+        uint8_t* bi = ((uint8_t**)arr)[i]; if (!bi) continue;
+        const int sim = (*(bi + BI_SIM_BYTE) >> BI_SIM_BIT) & 1;
+        const float live = *(float*)(bi + BI_BLEND_WEIGHT);
+        // ours if the live value is still our last write, else the game's
+        const float w = (g_written[i] >= 0.0f && fabsf(live - g_written[i]) < 0.0001f) ? g_authored[i] : live;
+        const int wr = snprintf(line + used, sizeof(line) - used, " %s %d/%.2f",
+                                g_bodyShort[i][0] ? g_bodyShort[i] : "?", sim, w);
+        if (wr <= 0 || used + wr >= (int)sizeof(line) - 1) break;
+        used += wr;
+    }
+    TwkLog("%s", line);
+}
+
+// Authored strength back on every softened entry. Ragdoll, restore, the layers switching off.
+static void RestorePaDrives(const char* why) {
+    if (!g_paSoft) return;
+    g_paSoft = false;
+    __try {
+        const int w = ApplyPaDrives(false, false, false);
+        if (w) TwkLog("[body] arm drives: authored strength restored on %d entries (%s)", w, why);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { g_paComp = nullptr; }
+}
+
 static void ForgetMesh() {
     g_shouldersWide = false; g_nShoulderSave = 0;   // the constraints go with the mesh
+    g_paComp = nullptr; g_paObj = nullptr; g_paBound = false; g_paSoft = false; g_paFindAt = 0.0;
+    g_airIntent = 0.0f; g_torsoFloorNow = 0.0f; g_headFloorNow = 0.0f;
+    // g_paSig is kept: the profile is the same asset across ragdolls, and the dump is per CHANGE
     g_mesh = nullptr; g_nBodies = 0; g_feel = 1.0f; g_pulse = 0.0f;
     // A new character on a new map deserves the benefit of the doubt.
     if (g_fault) { g_fault = 0; TwkLog("[body] new character -- reactive body armed again"); }
@@ -1564,6 +1946,7 @@ static void PalmProbe(uint8_t** arr2, int n2) {
 // Restore every body we steered to its authored weight. Guarded; shared by every stand-down.
 static void RestoreAll() {
     if (!g_mesh || !g_nBodies) { ForgetMesh(); return; }
+    RestorePaDrives("restore");
     WidenShoulders((uint8_t*)g_mesh, false);
     __try {
         uint8_t* arr = *(uint8_t**)((uint8_t*)g_mesh + CMP_BODIES);
@@ -1600,6 +1983,11 @@ void BodyFeel_PumpFrame() {
                     for (int a = 0; a < 3; a++) {
                         const float v = (pos[a] - g_pos[a]) / dt;
                         g_vel[a] += (v - g_vel[a]) * 0.35f;
+                        // the root's acceleration off the smoothed velocity, smoothed again: the
+                        // riding arms' inertial reaction (free fall reads as -g, a landing as the
+                        // opposite spike, a carve as the centripetal pull)
+                        g_rootAcc[a] += ((g_vel[a] - g_velPrev[a]) / dt - g_rootAcc[a]) * g_accSmooth;
+                        g_velPrev[a] = g_vel[a];
                     }
                 }
                 const float* rq = (const float*)((uint8_t*)root + CTW_QUAT);
@@ -1627,6 +2015,7 @@ void BodyFeel_PumpFrame() {
             // command path. Everything else in the module stays hands-off during the ragdoll.
             if (!g_wasRagdoll) {
                 g_wasRagdoll = true; g_braceStart = t;
+                RestorePaDrives("ragdoll");      // the fall gets the authored muscle tone
                 float m = sqrtf(g_vel[0]*g_vel[0] + g_vel[1]*g_vel[1] + g_vel[2]*g_vel[2]);
                 if (m > 100.0f) { for (int a = 0; a < 3; a++) g_throw[a] = g_vel[a] / m; }
                 else { g_throw[0] = 0; g_throw[1] = 0; g_throw[2] = -1.0f; }
@@ -3190,6 +3579,15 @@ void BodyFeel_PumpFrame() {
                 g_footBody[i] = false;
                 g_handBody[i] = strstr(nm, "hand") != nullptr;
                 g_armBody[i]  = strstr(nm, "upperarm") != nullptr;
+                g_spineBody[i] = strstr(nm, "spine") != nullptr;
+                g_clavBody[i]  = strstr(nm, "clavicle") != nullptr;
+                g_leanW[i] = strstr(nm, "spine3") ? 1.0f : strstr(nm, "spine2") ? 0.6f :
+                             strstr(nm, "spine1") ? 0.3f : g_clavBody[i] ? 0.4f :
+                             strstr(nm, "head") ? 0.5f : strstr(nm, "neck") ? 0.3f : 0.0f;
+                {
+                    const char* src = (strncmp(nm, "amxx_", 5) == 0) ? nm + 5 : nm;
+                    snprintf(g_bodyShort[i], sizeof(g_bodyShort[i]), "%s", src);
+                }
                 // Excluded from "the part that hit": root/ik helpers, FEET (they arrive
                 // last in every tumble and stole the grab -- log showed retarget-to-foot
                 // on 6 of 8 bails), and HANDS (via g_handBody in the scans -- the brace
@@ -3241,15 +3639,66 @@ void BodyFeel_PumpFrame() {
 
         const float speed = *(float*)((uint8_t*)an + AN_SPEED_RATIO);
         const bool grounded = *((uint8_t*)an + AN_GROUNDED_BF) != 0;
-        // ---- RIDING ARM REFLEXES (see the knob comment). The physical-anim motors act
-        // as the return spring; the forces are a lean, not a pose.
+        // ---- RIDING ARMS (see the knob comment): the floor, the muscle tone, the intent ------
         const float armK = (float)g_armAmt / 100.0f;
         g_armFloorNow = 0.0f;
-        if (armK > 0.0f && g_amount > 0) {
-            g_armFloorNow = g_armFloor * (armK < 1.0f ? armK : 1.0f);
+        const bool onRail = (*((uint8_t*)an + AN_IS_GRINDING_BF) |
+                             *((uint8_t*)an + AN_IS_GRINDING_BF + 1)) != 0;
+        {   // the balance intent, eased: an air or a rail fades the arms out and back, no pop
+            const float want = !grounded ? 1.0f : (onRail ? 0.6f : 0.0f);
+            const float tauI = (want > g_airIntent) ? 0.12f : 0.30f;
+            g_airIntent += (want - g_airIntent) * (dt > 0.0f ? (1.0f - expf(-dt / tauI)) : 1.0f);
+        }
+        // layer 2's component: found once per mesh by class (retried at 1 Hz until the actor's
+        // component lists fill in), then WATCHED every tick for whether the game has it bound to
+        // our mesh. It unbinds while rolling fast (the game's own guard against the "goat legs"
+        // shift of a fast body chain) and rebinds after; a rebind is met the same frame, or the
+        // arms would pop stiff for the length of a retry interval.
+        if (!g_paObj && t >= g_paFindAt) {
+            g_paFindAt = t + 1.0;
+            ResolvePaDrives();
+            const char* how = "";
+            g_paObj = FindPhysAnim(sk, mesh, &how);
+            if (g_paObj)
+                TwkLog("[body] arm drives: UPhysicalAnimationComponent %p via %s (%s)", g_paObj, how,
+                       *(void**)((uint8_t*)g_paObj + PA_MESH) == mesh ? "bound to our mesh" : "not bound yet");
+        }
+        {
+            void* to = g_paObj ? *(void**)((uint8_t*)g_paObj + PA_MESH) : nullptr;
+            const bool bound = g_paObj && to == mesh;
+            if (bound != g_paBound) {
+                g_paBound = bound;
+                if (bound) { g_paSoft = false; g_paRestamps = 0; }  // fresh constraints: the first apply is no re-stamp
+                else g_paOther = to;
+                SnapshotBodies(bound ? "PA bound" : (to ? "PA bound elsewhere" : "PA unbound"),
+                               speed, grounded, onRail);
+                g_snapAt = t;
+            }
+            g_paComp = bound ? g_paObj : nullptr;
+            // the speed-band edges too (slow / mid / fast), at most one a second
+            const int band = speed < 0.15f ? 0 : (speed < 0.5f ? 1 : 2);
+            if (band != g_snapBand && t - g_snapAt > 1.0) {
+                g_snapBand = band;
+                SnapshotBodies(band == 0 ? "slow" : (band == 1 ? "mid speed" : "fast"), speed, grounded, onRail);
+                g_snapAt = t;
+            }
+        }
+        const bool armLayer   = armK > 0.0f && g_amount > 0;
+        const bool torsoLayer = g_torsoOn != 0 && g_amount > 0;
+        g_armFloorNow   = armLayer ? g_armLoose * (armK < 1.0f ? armK : 1.0f) : 0.0f;
+        g_torsoFloorNow = (torsoLayer && g_paBound) ? g_torsoLoose : 0.0f;
+        g_headFloorNow  = (torsoLayer && g_paBound) ? g_headLoose  : 0.0f;
+        if (g_paComp && (armLayer || torsoLayer)) {
+            const bool first = !g_paSoft;
+            g_paSoft = true;
+            ApplyPaDrives(armLayer, torsoLayer, !first);
+        } else if (g_paSoft) {
+            RestorePaDrives("layers off");
+        }
+        const float landMag = (grounded && g_pulse > 0.05f) ? g_pulse * g_landAccent : 0.0f;
+        if (armLayer) {
             ResolveAddForce();
             if (g_addForce) {
-                const bool grinding = *((uint8_t*)an + AN_IS_GRINDING_BF) != 0;
                 uint8_t* mc2 = (uint8_t*)mesh;
                 int ri2 = *(int*)(mc2 + CMP_CST_READIDX); if (ri2 != 1) ri2 = 0;
                 uint8_t* cst2 = *(uint8_t**)(mc2 + CMP_CST_ARR + (size_t)ri2 * 0x10);
@@ -3268,9 +3717,7 @@ void BodyFeel_PumpFrame() {
                         float w2[3] = { bp[0]*ms2[0], bp[1]*ms2[1], bp[2]*ms2[2] };
                         QuatRotate(mq2, w2);
                         w2[0] += mp2[0]; w2[1] += mp2[1]; w2[2] += mp2[2];
-                        if (i == g_pelvisBody) {
-                            pel[0] = w2[0]; pel[1] = w2[1]; pel[2] = w2[2];
-                        }
+                        if (i == g_pelvisBody) { pel[0] = w2[0]; pel[1] = w2[1]; pel[2] = w2[2]; }
                         if (g_reacher[i] && nR < 8) {
                             rIdx[nR] = i;
                             rp[nR][0] = w2[0]; rp[nR][1] = w2[1]; rp[nR][2] = w2[2];
@@ -3278,27 +3725,22 @@ void BodyFeel_PumpFrame() {
                         }
                     }
                 }
-                // CARVE SWAY: centripetal reaction, sideways off the travel direction.
-                const float hvx = g_vel[0], hvy = g_vel[1];
-                const float hsp = sqrtf(hvx*hvx + hvy*hvy);
-                float sway[3] = {0, 0, 0};
-                if (hsp > 60.0f && fabsf(g_yawRate) > 0.3f) {
-                    const float ax = hvy / hsp, ay = -hvx / hsp;   // right of travel
-                    const float sgn = (g_yawRate > 0.0f ? 1.0f : -1.0f) * g_swaySign;
-                    float mag = g_swayGain * fabsf(g_yawRate) * hsp;
-                    if (mag > g_swayMax) mag = g_swayMax;
-                    sway[0] = ax * sgn * mag; sway[1] = ay * sgn * mag;
+                // INERTIA: the arms lag the root's acceleration -- a carve's centripetal pull, the
+                // brake into a landing, the push -- on top of what the softened drives already let
+                // through. Half weight on the vertical (free fall floats them, a landing drops them).
+                float inr[3] = { -g_rootAcc[0] * g_armInertia, -g_rootAcc[1] * g_armInertia,
+                                 -g_rootAcc[2] * g_armInertia * 0.5f };
+                {
+                    const float m = sqrtf(inr[0]*inr[0] + inr[1]*inr[1] + inr[2]*inr[2]);
+                    if (m > g_inertiaMax) { const float sc = g_inertiaMax / m; inr[0] *= sc; inr[1] *= sc; inr[2] *= sc; }
                 }
-                const bool spreadOn = !grounded || grinding;
-                const float spreadMag = g_spreadAccel * (grinding && grounded ? 0.6f : 1.0f);
-                const float landMag = (grounded && g_pulse > 0.05f)
-                                      ? g_pulse * g_landAccent : 0.0f;
+                const float spreadMag = g_spreadAccel * g_airIntent;
                 for (int k = 0; k < nR; k++) {
                     const int i = rIdx[k];
                     uint8_t* bi = ((uint8_t**)arr)[i]; if (!bi) continue;
                     const float bs = g_handBody[i] ? 1.0f : 0.55f;
-                    float f2[3] = { sway[0], sway[1], 0.0f };
-                    if (spreadOn) {
+                    float f2[3] = { inr[0], inr[1], inr[2] };
+                    if (spreadMag > 1.0f) {
                         float ox = rp[k][0] - pel[0], oy = rp[k][1] - pel[1];
                         const float om = sqrtf(ox*ox + oy*oy);
                         if (om > 5.0f) {
@@ -3313,6 +3755,26 @@ void BodyFeel_PumpFrame() {
                     f2[0] *= scl; f2[1] *= scl; f2[2] *= scl;
                     if (f2[0] != 0.0f || f2[1] != 0.0f || f2[2] != 0.0f)
                         g_addForce(bi, f2, true, true);
+                }
+            }
+        }
+        // TORSO AND HEAD INTENT (see the knob comment): the chest leans against the root's
+        // acceleration -- a carve, a brake, a landing -- and the head lags it, weighted up the
+        // spine (chest 1, head 0.5). Only while the game has physical animation bound: an
+        // unbound body is animation, and a force on it is at best nothing.
+        if (torsoLayer && g_paBound) {
+            ResolveAddForce();
+            if (g_addForce) {
+                const float bodyK = (float)g_amount / 100.0f;
+                for (int i = 0; i < n && i < kMaxBodies; i++) {
+                    if (g_leanW[i] <= 0.0f) continue;
+                    uint8_t* bi = ((uint8_t**)arr)[i]; if (!bi) continue;
+                    const float gain = (g_headBody[i] ? g_headInertia : g_torsoInertia) * g_leanW[i] * bodyK;
+                    float f3[3] = { -g_rootAcc[0] * gain, -g_rootAcc[1] * gain, -g_rootAcc[2] * gain * 0.5f };
+                    const float m = sqrtf(f3[0]*f3[0] + f3[1]*f3[1] + f3[2]*f3[2]);
+                    if (m > g_inertiaMax) { const float sc = g_inertiaMax / m; f3[0] *= sc; f3[1] *= sc; f3[2] *= sc; }
+                    f3[2] -= landMag * 0.5f * g_leanW[i] * bodyK;
+                    if (f3[0] != 0.0f || f3[1] != 0.0f || f3[2] != 0.0f) g_addForce(bi, f3, true, true);
                 }
             }
         }
@@ -3352,6 +3814,14 @@ void BodyFeel_PumpFrame() {
                        "pulse %.2f (writes land post-physics; see the apply line)",
                        g_feel, target, speed, grounded ? 0 : 1, grinding ? 1 : 0,
                        PopProbe_CrouchDepth01(), g_pulse);
+                TwkLog("[body] arms: floor %.2f hold x%.2f damp x%.2f | torso floor %.2f hold x%.2f, head floor %.2f "
+                       "hold x%.2f | PA %s, %d arm / %d torso / %d head entries, %d re-stamps | root acc "
+                       "(%.0f, %.0f, %.0f) intent %.2f",
+                       g_armFloorNow, g_armHold, g_armDamp, g_torsoFloorNow, g_torsoHold, g_headFloorNow, g_headHold,
+                       !g_paObj ? "NOT FOUND" : (g_paBound ? (g_paSoft ? "bound, softened" : "bound")
+                                                           : (g_paOther ? "bound elsewhere by the game" : "unbound by the game")),
+                       g_paArmN, g_paTorsoN, g_paHeadN, g_paRestamps,
+                       g_rootAcc[0], g_rootAcc[1], g_rootAcc[2], g_airIntent);
             }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -3402,6 +3872,8 @@ void BodyFeel_PostPhysApply() {
             } else {
                 out = g_authored[i] * g_feel;
                 if (g_armBody[i] && out < g_armFloorNow) out = g_armFloorNow;
+                else if ((g_spineBody[i] || g_clavBody[i]) && out < g_torsoFloorNow) out = g_torsoFloorNow;
+                else if (g_headBody[i] && out < g_headFloorNow) out = g_headFloorNow;
             }
             if (out < 0.0f) out = 0.0f; else if (out > 1.0f) out = 1.0f;
             *w = out; g_written[i] = out;

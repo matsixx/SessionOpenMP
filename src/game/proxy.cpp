@@ -995,6 +995,44 @@ void Proxy::Apply(const repl::State& s, uint64_t nowMs, uint64_t nowUs, void (*l
                      (int)s.boardMode, (int)s.brokenState, TypeRejects());
             logf(m);
         }
+        // GAME BODY PHYSICS ON PROXIES (syncPhysAnim). The lifecycle that switches physical animation
+        // on and off never runs on a wire-driven proxy (on at SetOnBoardMode, off at DoBoardPickup and
+        // Bail), so it is MIRRORED here off the wire flags: wanted while the owner is on-board and not
+        // bailing, not wanted otherwise, and the game's own setter is called whenever the flag bit
+        // disagrees. The setter early-outs when already in the requested state, so this is a compare
+        // per frame and a call per edge; the 500 ms guard is for a setter whose internal gate refuses
+        // (the bit then never flips, and it must not be hammered). Field: without the off edge a
+        // walking peer kept physics on, and a bailing one had it fighting their transported skeleton.
+        // The pref (Other options) folds into `want`, so switching it off disables live proxies too.
+        if (S.SetPhysAnimEnabled && actor_ && nowMs >= paEnableMs_) {
+            const bool want = g_tun.syncPhysAnim && s.onBoard && !s.bailing;
+            const int flags = safeByte(actor_, off::kSkaterPhysAnimOn);   // bit 0x10 = physAnim
+            if (flags >= 0 && (((flags >> 4) & 1) != 0) != want) {
+                paEnableMs_ = nowMs + 500;
+#ifdef _WIN32
+                __try { S.SetPhysAnimEnabled(actor_, want); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+#endif
+                if (logf) { char m[120];
+                    snprintf(m, sizeof(m), "[proxy] physical animation %s (%s)", want ? "ON" : "OFF",
+                             !g_tun.syncPhysAnim ? "peer body physics off" : s.bailing ? "bail" :
+                             s.onBoard ? "on-board" : "off-board");
+                    logf(m); }
+            }
+        }
+
+        // MEASUREMENT (debug::paProbe): is the game's physical animation live on this proxy? Same
+        // line shape as the LOCAL one session::Frame prints, so the two compare in one log.
+        if (debug::Get().paProbe && nowMs >= paProbeMs_) {
+            paProbeMs_ = nowMs + 2000;
+            game::PhysAnimProbe p;
+            char pl[200], m[280];
+            if (game::ProbePhysAnim(actor_, &p)) {
+                game::FormatPhysAnimProbe(p, pl, sizeof(pl));
+                snprintf(m, sizeof(m), "[paprobe] PROXY onBoard=%d grounded=%d bail=%d | %s",
+                         (int)(s.onBoard != 0), (int)(s.grounded != 0), (int)(s.bailing != 0), pl);
+                logf(m);
+            } else logf("[paprobe] PROXY probe unreadable");
+        }
     }
 }
 

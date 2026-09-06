@@ -380,6 +380,10 @@ static uint8_t   g_dropRow[0x90];
 static FTextBlob g_dropOpts[3];
 static uint64_t  g_dropKey = 0;
 static int       g_dropAt  = -1;         // widget index within the LAST build; -1 = not on this page
+static uint8_t   g_peerBodyRow[0x90];    // "Peer body physics", on PG_OTHER
+static FTextBlob g_peerBodyOpts[2];
+static uint64_t  g_peerBodyKey = 0;
+static int       g_peerBodyAt  = -1;
 static const int kMpDropAfter = 0;       // beside "Player names", under "Your name"
 // ---- THE LEVEL'S OWN PROPS. Its own row rather than another state on "Dropped objects", because it
 // is a different feature with a different maturity: sharing the map's furniture is unfinished, and
@@ -624,8 +628,31 @@ static uint32_t g_tmplPlatforms  = 0xFFFFFFFFu;
 static uint8_t  g_tmplEditorOnly = 0;
 static float    g_tmplInputDelay = 0.0f;
 static bool     g_tmplCaptured   = false;
+// The stock "Exit to desktop" row's _selectionInputDelay -- the game's own hold-to-confirm length --
+// captured from whichever page first shows that row, so a guest row asking for "the same hold as Exit
+// to desktop" gets exactly that. 1 s stands in until it has been seen.
+static float    g_tmplHoldDelay  = 0.0f;
+static bool     g_holdCaptured   = false;
+
+static void captureHold(const TArrayHdr* items) {
+    if (g_holdCaptured || !items || !items->data || items->num <= 0) return;
+    for (int i = 0; i < items->num && i < 64; i++) {
+        const uint8_t* it = (const uint8_t*)items->data + (size_t)i * off::kItemSize;
+        char nm[96];
+        if (!fnameStr(it + off::kItemKey, nm, sizeof(nm)) || !strstr(nm, "ExitToDesktop")) continue;
+        const float d = *(const float*)(it + 0x60);
+        if (d > 0.0f && d < 30.0f) {
+            g_tmplHoldDelay = d; g_holdCaptured = true;
+            char m[160];
+            snprintf(m, sizeof(m), "[menu] hold-to-confirm length from the stock '%s' row: %.2f s", nm, d);
+            log(m);
+        }
+        return;
+    }
+}
 
 static void captureTemplate(const TArrayHdr* items) {
+    captureHold(items);
     if (g_tmplCaptured || !items || !items->data || items->num <= 0) return;
     const uint8_t* it = (const uint8_t*)items->data;
     g_tmplPlatforms  = *(const uint32_t*)(it + 0x08);
@@ -640,7 +667,17 @@ static void captureTemplate(const TArrayHdr* items) {
 static void stampTemplate(uint8_t* row) {
     *(uint32_t*)(row + 0x08) = g_tmplPlatforms;
     *(row + 0x0c)            = g_tmplEditorOnly;
-    *(float*)(row + 0x60)    = g_tmplInputDelay;
+    // The input delay IS the game's hold-to-confirm: a row whose definition carries a non-zero
+    // _selectionInputDelay confirms only after the accept button has been held that long, with the
+    // container's own progress circle and confirming sound (UMenuPageContainer::NativeTick accumulates
+    // _inputDelayed against _inputDelayedMax while _isInputPressed and fires OnConfirmAction at the
+    // end; Exit to desktop is the stock example). A guest ACTION row asks for it through
+    // OmpPageItem2::step -- buildRows parks the request in this field (> 0 seconds, or -1 = the same
+    // hold as Exit to desktop); every other row of ours gets the page's own delay as before.
+    float d = *(float*)(row + 0x60);
+    if (d < 0.0f)       d = (g_tmplHoldDelay > 0.0f) ? g_tmplHoldDelay : 1.0f;
+    else if (d == 0.0f) d = g_tmplInputDelay;
+    *(float*)(row + 0x60) = d;
 }
 
 static void buildRows() {
@@ -694,6 +731,13 @@ static void buildRows() {
                             "the same objects; yours come back when you leave.",
                             kDropOpts, 3, &g_dropKey, g_dropOpts))
             g_dropKey = 0;
+        // Peer body physics: the same shape, the same independence.
+        static const char* kBodyOpts[2] = { "Off", "On" };
+        if (!buildOptionRow(g_peerBodyRow, "OmpPeerBody", "Peer body physics",
+                            "Other players' bodies react with physics on your screen, using their "
+                            "own settings. Off saves CPU in a big lobby.",
+                            kBodyOpts, 2, &g_peerBodyKey, g_peerBodyOpts))
+            g_peerBodyKey = 0;
         static const char* kModeOpts[3] = { "Off", "Off board only", "Always" };
         if (!buildOptionRow(g_nameModeRow, "OmpNameMode", "Show names",
                             "When to show a player's name above their head. Off board only keeps "
@@ -793,6 +837,9 @@ static void buildRows() {
             else if (it.kind == OMP_ITEM_SLIDER) ok = buildSliderRow(row, it, &g_guestItemKeys[p][i]);
             else                                 ok = buildRow(row, it.key, it.label, it.desc, &g_guestItemKeys[p][i]);
             if (!ok) { g.dead = true; break; }
+            // hold-to-confirm request (see stampTemplate, which resolves it at build time)
+            if (it.kind == OMP_ITEM_ACTION && it.step != 0.0f)
+                *(float*)(row + 0x60) = (it.step > 0.0f) ? it.step : -1.0f;
         }
     }
     char m[120];
@@ -1188,7 +1235,7 @@ static const TArrayHdr* chooseArray(void* page, const TArrayHdr* items, TArrayHd
         // The roster goes on EVERY row of this page, so the right-hand panel keeps showing it no
         // matter which row the player happens to be sitting on.
         buildRosterText();
-        g_privacyAt = -1; g_dropAt = -1;
+        g_privacyAt = -1; g_dropAt = -1; g_peerBodyAt = -1;
         for (int i = 0; i < kMpRowCount; i++) {
             uint8_t* row = g_mpRows + (size_t)i * off::kItemSize;
             setRowRoster(row);
@@ -1232,7 +1279,7 @@ static const TArrayHdr* chooseArray(void* page, const TArrayHdr* items, TArrayHd
         // independent-failure rule -- a key left at 0 is simply never added, so one broken control
         // still leaves the others usable.
         buildRosterText();
-        g_privacyAt = -1; g_dropAt = -1;
+        g_privacyAt = -1; g_dropAt = -1; g_peerBodyAt = -1;
         if (g_namesOpenKey) add(g_namesOpenRow, true);
         if (g_dropKey) {
             // The value goes on the DEFINITION here (so the row reads right even if the stamp is
@@ -1240,6 +1287,10 @@ static const TArrayHdr* chooseArray(void* page, const TArrayHdr* items, TArrayHd
             // survives the rebuild.
             *(int32_t*)(g_dropRow + off::kItemMultiStart) = MpPrefs_DropMode();
             g_dropAt = n; add(g_dropRow, true);
+        }
+        if (g_peerBodyKey) {
+            *(int32_t*)(g_peerBodyRow + off::kItemMultiStart) = MpPrefs_PeerBodyPhysics();
+            g_peerBodyAt = n; add(g_peerBodyRow, true);
         }
         if (g_privacyKey) { g_privacyAt = n; add(g_privacyRow, true); }
         add(g_mpRows + (size_t)(kMpRowCount - 1) * off::kItemSize, true);       // the shared Back row
@@ -1463,6 +1514,14 @@ static void stampValues(void* page) {
                 S.MenuMultiSetIndex(widget, MpPrefs_DropMode());
         }
         g_dropAt = -1;
+    }
+    if (g_peerBodyAt >= 0 && S.MenuMultiSetIndex) {
+        const TArrayHdr* pw = (const TArrayHdr*)((uint8_t*)page + off::kPageItemWidgets);
+        if (pw->data && g_peerBodyAt < pw->num) {
+            if (void* widget = ((void**)pw->data)[g_peerBodyAt])
+                S.MenuMultiSetIndex(widget, MpPrefs_PeerBodyPhysics());
+        }
+        g_peerBodyAt = -1;
     }
     // The player-names page, same argument: a slider's value can ONLY live on the widget, and the
     // definition's option index does not survive DeserializePage.
@@ -2132,6 +2191,10 @@ static bool handleValueChange(void* params, bool isSlider) {
         }
         if (g_dropKey && k == g_dropKey && !isSlider) {
             MpPrefs_SetDropMode(*(const int32_t*)((const uint8_t*)params + off::kChangeParamsNew));
+            return true;
+        }
+        if (g_peerBodyKey && k == g_peerBodyKey && !isSlider) {
+            MpPrefs_SetPeerBodyPhysics(*(const int32_t*)((const uint8_t*)params + off::kChangeParamsNew));
             return true;
         }
         if (isSlider && (k == g_nameDistKey || k == g_bubbleDistKey)) {

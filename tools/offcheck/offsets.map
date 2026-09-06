@@ -591,3 +591,13 @@ BOARD_IFACE                    -   # interface sub-object, not a reflected membe
 #   PB_* (6)                          a sub-object embedded at component+0x138, self-verifying via
 #                                     its +0x208 back-pointer. The PDB does not name the type.
 #   TD_* (3) / SM_HASCLOTH            see the earlier notes.
+
+# ---- physical-animation probe (debug::paProbe): the offsets body_feel drives through, read-only here
+kSkaterPhysAnimOn              ASkaterCharacterBase::_isPhysicalAnimationEnabled
+kActorBpComps                  AActor::BlueprintCreatedComponents
+kActorInstComps                AActor::InstanceComponents
+kPaMeshComp                    UPhysicalAnimationComponent::SkeletalMeshComponent
+kMeshBodies                    USkeletalMeshComponent::Bodies
+kBodyBlendWeight               FBodyInstance::PhysicsBlendWeight
+kBodySimByte                   -   # a bitfield byte (bSimulatePhysics bit 0); the PDB names the bit, not the byte
+kBodySimBit                    -

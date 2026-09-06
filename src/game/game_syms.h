@@ -244,6 +244,7 @@ using ActorDestroyFn    = bool  (*)(void* actor, bool netForce, bool shouldModif
 // BeginPlay and from its own wardrobe rebuild; a proxy dressed by this mod never goes through that
 // rebuild, which is the replay-editor crash. See RefreshProxyReplayBones.
 using ReplayRefreshBonesFn = void (*)(void* replayComp);
+using SetPhysAnimEnabledFn = void (*)(void* skater, bool enable);
 // UObjectDropperPersistentHandler::Load -- HOOKED, never called. It is the one moment at which the
 // level's own props are still where the MAP put them: Load walks the player's save and moves each
 // prop it names to the saved pose, so anything captured before it runs is the map default and
@@ -419,6 +420,14 @@ struct Syms {
     PickableOfFn      DropperPickableOf = nullptr;
     ActorDestroyFn    ActorDestroy     = nullptr;
     ReplayRefreshBonesFn ReplayRefreshBones = nullptr;
+    // ASkaterCharacterBase::SetIsPhysicalAnimationEnabled(this, bool). Sets the physAnim bit at
+    // +0x711, and when the skater is on-board fires BroadcastEnablePhysicalAnimation (the BP timer
+    // event that binds the component and starts the body-physics blend); off-board it broadcasts
+    // Disable. Self-early-outs when already in the requested state, so it is safe to poll. The
+    // lifecycle never runs this on a wire-driven proxy (enable rides SetOnBoardMode/intro/teleport,
+    // none of which a stamped-in proxy takes), which is why a peer has ZERO body physics -- see the
+    // paProbe field note. Used to give proxies the game's own body physics.
+    SetPhysAnimEnabledFn SetPhysAnimEnabled = nullptr;
     void*             DropperLoad      = nullptr;   // HOOKED, never called directly
     // UObjectDropperPersistentHandler::Save -- HOOKED, never called. THE HARD SAVE GUARD. A prop we
     // spawn for a session is a real dropped object as far as the game is concerned, and the session
@@ -488,6 +497,21 @@ bool ObjectName(const void* obj, char* out, int cap);
 // A skater's mesh component, and the bone count of the skeleton it is drawing.
 void* SkaterMeshOf(void* skaterActor);
 int   SkeletonBoneCount(void* meshComp);
+// MEASUREMENT: is the game's physical animation live on this skater? The component is found by class
+// in the actor's component lists (the skater has no member for it); "bound" means it points at the
+// skater's mesh; the body counts read the per-body PhysicsBlendWeight the Blueprint modulates each
+// frame -- that weight IS the visible body physics, so liveBodies > 0 is the real yes.
+struct PhysAnimProbe {
+    int   physOn = -1;          // _isPhysicalAnimationEnabled (-1 = unreadable)
+    void* comp = nullptr;       // the UPhysicalAnimationComponent, or null
+    const char* how = "";       // which component list it was found in
+    bool  bound = false;        // comp->SkeletalMeshComponent == the skater's mesh
+    int   bodies = 0, simBodies = 0, liveBodies = 0;   // total / bSimulatePhysics / blend > 0.01
+    float avgBlend = 0.f, maxBlend = 0.f;
+};
+bool ProbePhysAnim(void* skaterActor, PhysAnimProbe* out);
+// One line, the same shape for a proxy and the local skater, so the two compare by eye.
+void FormatPhysAnimProbe(const PhysAnimProbe& p, char* out, int cap);
 // ONE-SHOT DIAGNOSTIC: every bone of the merged skeleton, as "index name parent". Answers what the
 // difference between a 70-bone and a 95-bone character actually IS -- garments merge as a UNION of
 // bones, so the extras are whatever joints the worn items bring, and whether they are inert children
@@ -741,6 +765,15 @@ namespace off {
     constexpr int kAirReplayMeshComp    = 0x168;   // ::_skeletalMeshComp (USkeletalMeshComponent*)
     constexpr int kAirReplayDataBoneIdx = 0x00;    // FAnimInstanceReplayData::BoneIndex
     constexpr int kActorOwnedComps      = 0x1a0;   // AActor::OwnedComponents (TSet<UActorComponent*>)
+    // Physical-animation probe. Same PDB-named offsets SessionTweaks' body_feel drives through.
+    constexpr int kSkaterPhysAnimOn     = 0x711;   // ASkaterCharacterBase::_isPhysicalAnimationEnabled (bool)
+    constexpr int kActorBpComps         = 0x200;   // AActor::BlueprintCreatedComponents (TArray<UActorComponent*>)
+    constexpr int kActorInstComps       = 0x1f0;   // AActor::InstanceComponents (TArray<UActorComponent*>)
+    constexpr int kPaMeshComp           = 0xb8;    // UPhysicalAnimationComponent::SkeletalMeshComponent
+    constexpr int kMeshBodies           = 0x980;   // USkeletalMeshComponent::Bodies (TArray<FBodyInstance*>)
+    constexpr int kBodyBlendWeight      = 0x11c;   // FBodyInstance::PhysicsBlendWeight (0..1)
+    constexpr int kBodySimByte          = 0x10;    // FBodyInstance bitfield byte holding bSimulatePhysics
+    constexpr int kBodySimBit           = 0;
     constexpr int kContainerPage      = 0x2a0;   // _menuPage (UMenuPage*) -- the page the container is
                                                  // showing, which is the page a back action applies to
     // UMenuPage:

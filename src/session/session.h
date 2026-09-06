@@ -65,6 +65,11 @@ struct Stats {
 void Init(void (*logf)(const char*));
 void Shutdown();
 void SetConfig(const Config& c);
+// The body-feel bridge (SessionTweaks <-> proxies), reached through the loader's exports: the tweaks
+// module hands over its own riding-body settings, and reads back each live proxy and its owner's.
+void SetOwnBodyFeel(const int16_t* v, int n, int ver);
+int  ProxyActors(void** out, int cap);                              // live proxy skater actors
+int  ProxyBodyFeel(void* actor, int16_t* out, int cap, int* verOut); // 0 = that peer sent none
 const Config& GetConfig();
 Stats GetStats();
 

@@ -298,6 +298,19 @@ bool UnpackCosmetics(const uint8_t* data, int len, CosmeticSet& out, uint8_t* se
 // two message types, routed by magic).
 bool IsCosmeticsPacket(const uint8_t* data, int len);
 
+// ---- BODY FEEL SETTINGS: SessionTweaks' riding-body knobs, a short fixed vector of ints, OPAQUE to
+// this layer. The tweaks module on the receiving machine re-runs its riding body on the sender's
+// proxy with these values, so a peer moves on your screen the way they move on theirs. Rare and tiny
+// (a few dozen bytes: on change, on a new peer, and a 10 s heartbeat), sent reliable.
+struct BodyFeelSet {
+    uint8_t ver = 0;                 // 0 = nothing received / nothing to send
+    uint8_t n = 0;
+    int16_t v[32] = {};
+};
+int  PackBodyFeel(const BodyFeelSet& b, uint8_t* out, int cap);
+bool IsBodyFeelPacket(const uint8_t* data, int len);
+bool UnpackBodyFeel(const uint8_t* data, int len, BodyFeelSet& out);
+
 // ---- CHAT -----------------------------------------------------------------------------------------
 // A third message type on the same transport, routed by magic like the other two. Sent RELIABLE: a
 // dropped pose is invisible a sixtieth of a second later, a dropped sentence is just gone.

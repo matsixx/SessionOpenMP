@@ -68,6 +68,15 @@ enum { MPDROP_OFF = 0, MPDROP_LIVE = 1, MPDROP_SHARED = 2 };
 int  MpPrefs_DropMode();                 // MPDROP_* -- default MPDROP_SHARED
 void MpPrefs_SetDropMode(int mode);
 
+// ---- PEER BODY PHYSICS. Whether other players' skaters get body physics on YOUR screen: the game's
+// own physical animation switched on for their proxies (it never is otherwise -- a peer rides as pure
+// animation), and, when they run SessionTweaks, their riding-body settings re-run on their proxy.
+// Costs ~21 simulated bodies per visible peer. Default on. The loader pushes it into the proxy tuning
+// every frame; the tweaks module asks through the bridge.
+enum { MPBODY_OFF = 0, MPBODY_ON = 1 };
+int  MpPrefs_PeerBodyPhysics();          // MPBODY_* -- default MPBODY_ON
+void MpPrefs_SetPeerBodyPhysics(int on);
+
 // ---- THE LEVEL'S OWN PROPS (the benches and barriers the map ships with, which the dropper can also
 // shove around). A SEPARATE setting from the one above, and OFF by default, deliberately: sharing
 // them is the unfinished half of this feature and it must not be able to destabilise the inventory

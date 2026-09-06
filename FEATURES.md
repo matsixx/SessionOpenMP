@@ -48,6 +48,10 @@ everyone sees the same flop.
 * **The analog crouch is visible to other players** when SessionTweaks' pop-control scheme is on: peers see
 the depth you are crouched to, not a stock pop (1.0.0-rc2).
 * **Real collision.** Peers are game-class actors, so you can bump into them and their boards.
+* **Other players' bodies react with physics** (1.0.3). The game never switches physical animation on for a
+remote skater, so peers used to ride as pure animation; they now get the game's own reactive body, and when
+they run Session Tweaks their own riding-body settings travel with them -- a peer carries their arms, torso
+and head on your screen the way they do on theirs. Turn it off in Multiplayer -> Other options.
 * **You only share a world with people who are in your level.** Players in a different map are not spawned
 into yours; they disappear when they go somewhere else and reappear when they come back (0.7.1b, 0.8.3b).
 
@@ -177,6 +181,9 @@ re-decided to the plain foot the game would have chosen.
 * \[feature] Click a stick to catch, Skater XL style (3.19.192-199), pause-menu row, configurable keys.
 * \[fix] An ordinary ollie occasionally tilting the wrong way once (2.53.2); tricks popping with the board held
 flat after a late trick (3.14.0); a very slow flip caught before it had begun (3.18.0-3.18.2, auto catch).
+* \[fix] The catching foot hanging off the deck on quarter-pipe catches (3.19.286): the flip stopped at
+grip-up with the counter still short of its flat and the catch ended before the foot could plant; the plant
+now lands in the same write as the stop.
 * \[fix] The catching foot hovering above the deck for the whole air (3.19.223/224): the foot descends with
 the board; the game's attach window is opened to the rotation still owed.
 * \[fix] Fakie backside pop shove could never be caught (3.19.227): the min-spin gate only counted the flip axis.
@@ -236,6 +243,15 @@ the top of the head), flails in the air, rolls over from face-down, tucks, falls
 riding; every steering force an internal couple; joints driven in torque space with muscle tone.
 * \[fix] The floating ragdoll (3.19.108): bodies resting on an invisible surface -- solved at the cause.
 * \[fix] The reactive body switching itself off on a map change (3.19.207).
+* \[feature] Riding arms as inertial balance (3.19.283): the arm bodies stay mostly simulated at speed and
+their physical-animation drives are softened in place while riding, so the arms lag accelerations, drop on
+landings and swing out of carves; continuous air/rail spread and an inertial reaction replace the old
+threshold reflexes.
+* \[feature] Torso and head tone (3.19.284): the spine, clavicles and head get the same softened
+muscle tone while physical animation is bound; the chest leans into carves and compresses on landings.
+* \[feature] Style settings (3.19.285, renamed 3.19.288): the riding arms and the torso/head tone get their own
+page -- looseness, muscle tone, inertia, spread and head lag, all needing Reactive body on. In a SessionOpenMP
+session these travel to the other players, so your skater carries itself the same way on their screen.
 * \[feature] Ragdoll self-collision (3.19.228-231): continuous collision on every body, upper arms collide with
 the torso, real shoulder travel; backward-fall brace splays the arms with palms to the ground (3.19.232).
 

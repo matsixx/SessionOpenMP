@@ -247,6 +247,7 @@ if(EXISTS "${UE4SS_LIB}")
             src/tweaks/grind_pop.cpp
             src/tweaks/pop_probe.cpp
             src/tweaks/body_feel.cpp
+            src/tweaks/proxy_body_feel.cpp
             src/tweaks/camera_height.cpp
             ${MINHOOK_SRC}/src/buffer.c
             ${MINHOOK_SRC}/src/hook.c

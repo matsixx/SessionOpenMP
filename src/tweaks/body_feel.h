@@ -45,3 +45,18 @@ float BodyFeel_FlailPct();      void BodyFeel_SetFlailPct(float v);
 float BodyFeel_GrabMs();        void BodyFeel_SetGrabMs(float v);
 float BodyFeel_GrabDelayMs();   void BodyFeel_SetGrabDelayMs(float v);
 float BodyFeel_GrabPct();       void BodyFeel_SetGrabPct(float v);
+// "Style settings" page: the riding arms and the torso/head tone (fractions as percentages).
+float BodyFeel_ArmLoosePct();   void BodyFeel_SetArmLoosePct(float v);
+float BodyFeel_ArmHoldPct();    void BodyFeel_SetArmHoldPct(float v);
+float BodyFeel_ArmDampPct();    void BodyFeel_SetArmDampPct(float v);
+float BodyFeel_ArmInertiaPct(); void BodyFeel_SetArmInertiaPct(float v);
+float BodyFeel_ArmSpread();     void BodyFeel_SetArmSpread(float v);      // cm/s^2
+float BodyFeel_ArmLandDrop();   void BodyFeel_SetArmLandDrop(float v);    // cm/s^2
+bool  BodyFeel_TorsoEnabled();  void BodyFeel_SetTorsoEnabled(bool on);
+float BodyFeel_TorsoLoosePct(); void BodyFeel_SetTorsoLoosePct(float v);
+float BodyFeel_TorsoHoldPct();  void BodyFeel_SetTorsoHoldPct(float v);
+float BodyFeel_TorsoDampPct();  void BodyFeel_SetTorsoDampPct(float v);
+float BodyFeel_TorsoLeanPct();  void BodyFeel_SetTorsoLeanPct(float v);
+float BodyFeel_HeadLoosePct();  void BodyFeel_SetHeadLoosePct(float v);
+float BodyFeel_HeadLagPct();    void BodyFeel_SetHeadLagPct(float v);
+float BodyFeel_HeadHoldPct();   float BodyFeel_HeadDampPct();      // read-only: the wire needs the whole head set

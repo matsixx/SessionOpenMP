@@ -52,11 +52,12 @@
 #include "camera_height.h"
 #include "pop_probe.h"
 #include "body_feel.h"
+#include "proxy_body_feel.h"
 #include "MinHook.h"
 #include "ue4ss_abi.h"
 #include "ui/menu_ext.h"
 
-#define TWEAKS_VERSION "3.19.277"
+#define TWEAKS_VERSION "3.19.288"
 #define TWK_WIDEN(x) STR(x)   // STR() prepends L before the macro expands; expand first
 
 // ------------------------------------------------------------------ log (own file, fresh per launch)
@@ -284,6 +285,20 @@ static const char* const kTwkFlailPow  = "TwkBodyFlailPct";
 static const char* const kTwkGrabLen   = "TwkBodyGrabMs";
 static const char* const kTwkGrabDel   = "TwkBodyGrabDelayMs";
 static const char* const kTwkGrabPow   = "TwkBodyGrabPct";
+// "Style settings"
+static const char* const kTwkArmLoose   = "TwkBodyArmLoosePct";
+static const char* const kTwkArmHold    = "TwkBodyArmHoldPct";
+static const char* const kTwkArmDamp    = "TwkBodyArmDampPct";
+static const char* const kTwkArmInert   = "TwkBodyArmInertiaPct";
+static const char* const kTwkArmSpread  = "TwkBodyArmSpread";
+static const char* const kTwkArmLand    = "TwkBodyArmLandDrop";
+static const char* const kTwkTorso      = "TwkBodyTorso";
+static const char* const kTwkTorsoLoose = "TwkBodyTorsoLoosePct";
+static const char* const kTwkTorsoHold  = "TwkBodyTorsoHoldPct";
+static const char* const kTwkTorsoDamp  = "TwkBodyTorsoDampPct";
+static const char* const kTwkTorsoLean  = "TwkBodyTorsoLeanPct";
+static const char* const kTwkHeadLoose  = "TwkBodyHeadLoosePct";
+static const char* const kTwkHeadLag    = "TwkBodyHeadLagPct";
 static const char* const kTwkPop       = "TwkPopControl";
 static const char* const kTwkPopWin    = "TwkPopWindow";
 static const char* const kTwkPopGate   = "TwkPopGate";
@@ -357,6 +372,19 @@ static void pageValue(const char* key, int iv, float fv, void*) {
     else if (!strcmp(key, kTwkGrabLen))   BodyFeel_SetGrabMs(fv);
     else if (!strcmp(key, kTwkGrabDel))   BodyFeel_SetGrabDelayMs(fv);
     else if (!strcmp(key, kTwkGrabPow))   BodyFeel_SetGrabPct(fv);
+    else if (!strcmp(key, kTwkArmLoose))   BodyFeel_SetArmLoosePct(fv);
+    else if (!strcmp(key, kTwkArmHold))    BodyFeel_SetArmHoldPct(fv);
+    else if (!strcmp(key, kTwkArmDamp))    BodyFeel_SetArmDampPct(fv);
+    else if (!strcmp(key, kTwkArmInert))   BodyFeel_SetArmInertiaPct(fv);
+    else if (!strcmp(key, kTwkArmSpread))  BodyFeel_SetArmSpread(fv);
+    else if (!strcmp(key, kTwkArmLand))    BodyFeel_SetArmLandDrop(fv);
+    else if (!strcmp(key, kTwkTorso))      BodyFeel_SetTorsoEnabled(iv != 0);
+    else if (!strcmp(key, kTwkTorsoLoose)) BodyFeel_SetTorsoLoosePct(fv);
+    else if (!strcmp(key, kTwkTorsoHold))  BodyFeel_SetTorsoHoldPct(fv);
+    else if (!strcmp(key, kTwkTorsoDamp))  BodyFeel_SetTorsoDampPct(fv);
+    else if (!strcmp(key, kTwkTorsoLean))  BodyFeel_SetTorsoLeanPct(fv);
+    else if (!strcmp(key, kTwkHeadLoose))  BodyFeel_SetHeadLoosePct(fv);
+    else if (!strcmp(key, kTwkHeadLag))    BodyFeel_SetHeadLagPct(fv);
     else if (!strcmp(key, kTwkPop))       PopProbe_SetSchemeEnabled(iv != 0);
     else if (!strcmp(key, kTwkPopWin))    PopProbe_SetTrickWindowMs(fv);
     else if (!strcmp(key, kTwkPopGate))   PopProbe_SetCrouchGatePct(fv);
@@ -423,6 +451,19 @@ static int pageGet(const char* key, int* oi, float* of, void*) {
     else if (!strcmp(key, kTwkGrabLen))   { *of = BodyFeel_GrabMs();                   return 1; }
     else if (!strcmp(key, kTwkGrabDel))   { *of = BodyFeel_GrabDelayMs();              return 1; }
     else if (!strcmp(key, kTwkGrabPow))   { *of = BodyFeel_GrabPct();                  return 1; }
+    else if (!strcmp(key, kTwkArmLoose))   { *of = BodyFeel_ArmLoosePct();    return 1; }
+    else if (!strcmp(key, kTwkArmHold))    { *of = BodyFeel_ArmHoldPct();     return 1; }
+    else if (!strcmp(key, kTwkArmDamp))    { *of = BodyFeel_ArmDampPct();     return 1; }
+    else if (!strcmp(key, kTwkArmInert))   { *of = BodyFeel_ArmInertiaPct();  return 1; }
+    else if (!strcmp(key, kTwkArmSpread))  { *of = BodyFeel_ArmSpread();      return 1; }
+    else if (!strcmp(key, kTwkArmLand))    { *of = BodyFeel_ArmLandDrop();    return 1; }
+    else if (!strcmp(key, kTwkTorso))      { *oi = BodyFeel_TorsoEnabled() ? 1 : 0; return 1; }
+    else if (!strcmp(key, kTwkTorsoLoose)) { *of = BodyFeel_TorsoLoosePct();  return 1; }
+    else if (!strcmp(key, kTwkTorsoHold))  { *of = BodyFeel_TorsoHoldPct();   return 1; }
+    else if (!strcmp(key, kTwkTorsoDamp))  { *of = BodyFeel_TorsoDampPct();   return 1; }
+    else if (!strcmp(key, kTwkTorsoLean))  { *of = BodyFeel_TorsoLeanPct();   return 1; }
+    else if (!strcmp(key, kTwkHeadLoose))  { *of = BodyFeel_HeadLoosePct();   return 1; }
+    else if (!strcmp(key, kTwkHeadLag))    { *of = BodyFeel_HeadLagPct();     return 1; }
     else if (!strcmp(key, kTwkPop))       { *oi = PopProbe_SchemeEnabled()  ? 1 : 0;   return 1; }
     else if (!strcmp(key, kTwkPopWin))    { *of = PopProbe_TrickWindowMs();            return 1; }
     else if (!strcmp(key, kTwkPopGate))   { *of = PopProbe_CrouchGatePct();            return 1; }
@@ -446,8 +487,12 @@ static const OmpPageItem2 kTwkRootItems[] = {
     { OMP_ITEM_PAGE, "Camera",         "Camera",          "Make the camera's height follow your skater everywhere" },
     { OMP_ITEM_PAGE, "Clothing",       "Clothing",        "Cloth physics on your shirt and trousers" },
     { OMP_ITEM_PAGE, "Physical animation", "Physical animation", "The reactive body and ragdoll bails: bracing, grabbing what hurt, the landing flail" },
+    { OMP_ITEM_PAGE, "Style settings", "Style settings", "How your arms, torso and head carry while riding. Needs Reactive body on." },
     // Kept on the front page deliberately: it resets EVERY Session Tweaks setting, not one category.
-    { OMP_ITEM_ACTION, kTwkReset,  "Reset to defaults",   "Restore every Session Tweaks setting to its shipped value" },
+    // Held, like the game's Exit to desktop (step < 0 = the same hold length): a stray press on the
+    // last row of the front page must not wipe every setting.
+    { OMP_ITEM_ACTION, kTwkReset,  "Reset to defaults",   "Hold to restore every Session Tweaks setting to its shipped value",
+      nullptr, nullptr, 0.0f, 0.0f, -1.0f },
 };
 static const OmpPageItem2 kTwkBoardItems[] = {
     { OMP_ITEM_TOGGLE, kTwkScoop,  "Scoop speed fix",         "Stick speed drives how fast the board scoops" },
@@ -539,7 +584,7 @@ static const OmpPageItem2 kTwkPhysItems[] = {
       "Master strength for everything on this page; 0 = stock stiffness everywhere",
       nullptr, nullptr, 0.0f, 200.0f, 10.0f },
     { OMP_ITEM_SLIDER, kTwkArmPow,   "  Arm reactivity (%)",
-      "Balance arms while riding: swing wide in carves, spread in the air and on rails, absorb landings",
+      "Scales the arm forces on the Style settings page (spread, landing drop, inertia); they ship at 0",
       nullptr, nullptr, 0.0f, 300.0f, 10.0f },
     { OMP_ITEM_TOGGLE, kTwkBrace,    "Bail reactions",
       "Ragdolls brace the fall, grab what hurt and flail on landing instead of going limp" },
@@ -570,6 +615,46 @@ static const OmpPageItem2 kTwkPhysItems[] = {
     { OMP_ITEM_SLIDER, kTwkGrabPow,  "  Grab strength (%)",
       "How hard the hands reach for the hurt",
       nullptr, nullptr, 0.0f, 300.0f, 10.0f },
+};
+static const OmpPageItem2 kTwkPhys2Items[] = {
+    { OMP_ITEM_SLIDER, kTwkArmLoose,   "Arm looseness (%)",
+      "How much of each arm is physics while riding; higher shows more swing and lag",
+      nullptr, nullptr, 0.0f, 100.0f, 5.0f },
+    { OMP_ITEM_SLIDER, kTwkArmHold,    "Arm hold (%)",
+      "Muscle tone holding the arm to the animation; 100 is stock, lower swings and lags more",
+      nullptr, nullptr, 5.0f, 200.0f, 5.0f },
+    { OMP_ITEM_SLIDER, kTwkArmDamp,    "Arm damping (%)",
+      "How quickly an arm swing settles; raise it if the arms wobble, lower it for more follow-through",
+      nullptr, nullptr, 20.0f, 300.0f, 10.0f },
+    { OMP_ITEM_SLIDER, kTwkArmInert,   "Arm inertia (%)",
+      "How hard the arms lag a carve, a brake or a landing, on top of what the tone lets through",
+      nullptr, nullptr, 0.0f, 200.0f, 10.0f },
+    { OMP_ITEM_SLIDER, kTwkArmSpread,  "Air and rail spread",
+      "How far the arms spread up and out for balance in the air and on rails",
+      nullptr, nullptr, 0.0f, 2000.0f, 100.0f },
+    { OMP_ITEM_SLIDER, kTwkArmLand,    "Landing arm drop",
+      "How hard the arms drop when you land; scales with the size of the landing",
+      nullptr, nullptr, 0.0f, 2000.0f, 100.0f },
+    { OMP_ITEM_TOGGLE, kTwkTorso,      "Torso and head tone",
+      "The chest leans into carves and compresses on landings and the head lags; the legs are never touched" },
+    { OMP_ITEM_SLIDER, kTwkTorsoLoose, "  Torso looseness (%)",
+      "How much of the torso is physics when the game blends it; higher shows more lean",
+      nullptr, nullptr, 0.0f, 100.0f, 5.0f },
+    { OMP_ITEM_SLIDER, kTwkTorsoHold,  "  Torso hold (%)",
+      "Muscle tone holding the spine to the animation; 100 is stock, lower leans more",
+      nullptr, nullptr, 5.0f, 200.0f, 5.0f },
+    { OMP_ITEM_SLIDER, kTwkTorsoDamp,  "  Torso damping (%)",
+      "How quickly a lean settles; raise it if the torso wobbles",
+      nullptr, nullptr, 20.0f, 300.0f, 10.0f },
+    { OMP_ITEM_SLIDER, kTwkTorsoLean,  "  Torso lean (%)",
+      "How hard the chest leans against a carve, a brake or a landing",
+      nullptr, nullptr, 0.0f, 200.0f, 10.0f },
+    { OMP_ITEM_SLIDER, kTwkHeadLoose,  "  Head looseness (%)",
+      "How much of the head and neck is physics; keep it under the torso's or it bobbles",
+      nullptr, nullptr, 0.0f, 100.0f, 5.0f },
+    { OMP_ITEM_SLIDER, kTwkHeadLag,    "  Head lag (%)",
+      "How much the head lags an acceleration",
+      nullptr, nullptr, 0.0f, 200.0f, 10.0f },
 };
 static const OmpPageItem2 kTwkPopItems[] = {
     { OMP_ITEM_TOGGLE, kTwkPop,       "Pop control scheme",
@@ -616,7 +701,8 @@ static_assert(sizeof(kTwkRootItems)  / sizeof(kTwkRootItems[0])  <= 13 &&
               sizeof(kTwkCameraItems) / sizeof(kTwkCameraItems[0]) <= 13 &&
               sizeof(kTwkClothItems)  / sizeof(kTwkClothItems[0])  <= 13 &&
               sizeof(kTwkPopItems)    / sizeof(kTwkPopItems[0])    <= 13 &&
-              sizeof(kTwkPhysItems)   / sizeof(kTwkPhysItems[0])   <= 13,
+              sizeof(kTwkPhysItems)   / sizeof(kTwkPhysItems[0])   <= 13 &&
+              sizeof(kTwkPhys2Items)  / sizeof(kTwkPhys2Items[0])  <= 13,
               "A Session Tweaks page exceeds the engine's visible-row window (14 incl. the Back row "
               "the host appends). Split it into another category page rather than raising this.");
 
@@ -656,7 +742,7 @@ static bool tryRegisterMenu() {
                          (int)(sizeof(kTwkRootItems) / sizeof(kTwkRootItems[0])),
                          &pageSelect, &pageValue, &pageGet, nullptr, nullptr)) {
                     g_pageRegistered = true;
-                    TwkLog("[tweaks] registered the pause-menu page (the front page + 8 category pages)");
+                    TwkLog("[tweaks] registered the pause-menu page (the front page + 9 category pages)");
                 }
                 #define TWK_SUBPAGE(title, arr)                     regp(title, arr, (int)(sizeof(arr) / sizeof(arr[0])),                          &pageSelect, &pageValue, &pageGet, nullptr, nullptr)
                 TWK_SUBPAGE("Pop control",    kTwkPopItems);
@@ -667,6 +753,7 @@ static bool tryRegisterMenu() {
                 TWK_SUBPAGE("Camera",         kTwkCameraItems);
                 TWK_SUBPAGE("Clothing",       kTwkClothItems);
                 TWK_SUBPAGE("Physical animation", kTwkPhysItems);
+                TWK_SUBPAGE("Style settings",     kTwkPhys2Items);
                 #undef TWK_SUBPAGE
             }
         }
@@ -686,6 +773,7 @@ void Tweaks_PumpFrame() {
     GrindPop_PumpFrame();            // grind-exit pop records: names resolved and logged out here
     PopProbe_PumpFrame();            // AFTER grind_pop: its drain feeds PopProbe_OnJump first
     BodyFeel_PumpFrame();            // breathes the physical-animation stiffness (after pop_probe: reads its crouch depth)
+    ProxyBodyFeel_PumpFrame();       // the same riding body on remote players' proxies, with THEIR settings (SessionOpenMP bridge)
     if (g_dirty && (LONGLONG)GetTickCount64() - g_dirtyMs > 2000) {
         InterlockedExchange(&g_dirty, 0);
         saveSettings();

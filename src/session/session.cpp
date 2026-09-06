@@ -47,6 +47,7 @@ struct Slot {
     bool        quietHandled = false;
     // ---- cosmetics: their look, and whether this proxy is currently wearing it.
     repl::CosmeticSet cosmetics;
+    repl::BodyFeelSet bodyFeel;          // the peer's SessionTweaks riding-body knobs (ver 0 = none)
     bool        haveCosmetics = false;
     // Keyed on the ACTOR, never a plain "already dressed" bool: `Proxy::Forget()` drops the actor on a
     // world change while the SLOT survives (same peer), so a bool stays true and the RESPAWNED proxy is
@@ -469,6 +470,21 @@ void OnPacket(int peerIdx, const uint8_t* data, int len, uint64_t nowUs) {
     }
     // Several message types share this transport, routed by magic. Cosmetics are rare and large; the
     // 60 Hz snapshot stays small and self-contained.
+    // A peer's body-feel settings (their SessionTweaks riding-body knobs). Held on the slot for the
+    // tweaks module to read back per proxy; nothing here touches the game.
+    if (repl::IsBodyFeelPacket(data, len)) {
+        repl::BodyFeelSet b;
+        if (!repl::UnpackBodyFeel(data, len, b)) return;
+        Slot* bs = slotFor(peerIdx, nowUs);
+        if (!bs) return;
+        const bool changed = bs->bodyFeel.ver != b.ver || bs->bodyFeel.n != b.n ||
+                             memcmp(bs->bodyFeel.v, b.v, sizeof(int16_t) * (size_t)b.n) != 0;
+        bs->bodyFeel = b;
+        if (changed && g_logf) { char m[120]; snprintf(m, sizeof(m),
+            "[bodyfeel] peer %d riding-body settings: v%d, %d values", peerIdx, (int)b.ver, (int)b.n);
+            g_logf(m); }
+        return;                                      // NOT a snapshot: no stream push, no liveness
+    }
     if (repl::IsCosmeticsPacket(data, len)) {
         repl::CosmeticSet c; uint8_t section = 0;
         if (!repl::UnpackCosmetics(data, len, c, &section)) return;
@@ -681,6 +697,44 @@ bool IsProxyActor(void* actor) {
     if (!actor) return false;
     for (auto& s : g_slots) if (s.used && s.proxy.actor() == actor) return true;
     return false;
+}
+
+// ---- the body-feel bridge. Our own settings arrive from the tweaks module whenever they change;
+// the publish in Frame ships them. Each proxy's owner's set is read back by actor.
+static repl::BodyFeelSet g_ownBodyFeel;
+static bool              g_ownBodyFeelDirty = false;
+void SetOwnBodyFeel(const int16_t* v, int n, int ver) {
+    if (!v || n <= 0 || ver <= 0) return;
+    if (n > 32) n = 32;
+    repl::BodyFeelSet b;
+    b.ver = (uint8_t)ver; b.n = (uint8_t)n;
+    memcpy(b.v, v, sizeof(int16_t) * (size_t)n);
+    if (g_ownBodyFeel.ver == b.ver && g_ownBodyFeel.n == b.n &&
+        memcmp(g_ownBodyFeel.v, b.v, sizeof(int16_t) * (size_t)n) == 0) return;
+    g_ownBodyFeel = b;
+    g_ownBodyFeelDirty = true;
+}
+int ProxyActors(void** out, int cap) {
+    int n = 0;
+    if (!out || cap <= 0) return 0;
+    for (auto& s : g_slots) {
+        if (!s.used || !s.proxy.actor()) continue;
+        if (n >= cap) break;
+        out[n++] = s.proxy.actor();
+    }
+    return n;
+}
+int ProxyBodyFeel(void* actor, int16_t* out, int cap, int* verOut) {
+    if (!actor || !out || cap <= 0) return 0;
+    for (auto& s : g_slots) {
+        if (!s.used || s.proxy.actor() != actor) continue;
+        if (!s.bodyFeel.ver) return 0;
+        int n = s.bodyFeel.n; if (n > cap) n = cap;
+        memcpy(out, s.bodyFeel.v, sizeof(int16_t) * (size_t)n);
+        if (verOut) *verOut = s.bodyFeel.ver;
+        return n;
+    }
+    return 0;
 }
 
 // A world change starts a settle window during which NOTHING is spawned. Loading a level does not
@@ -1424,6 +1478,22 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
         repl::State own;
         if (gatherOwn(ownPawn, own)) {
             g_ownLast = own; g_haveOwn = true;
+            // MEASUREMENT (debug::paProbe): the local skater's physical-animation state, in the
+            // same shape as the proxies' [paprobe] line.
+            if (g_logf && debug::Get().paProbe) {
+                static uint64_t nextMs = 0;
+                if (nowMs >= nextMs) {
+                    nextMs = nowMs + 2000;
+                    game::PhysAnimProbe p;
+                    char pl[200], m[280];
+                    if (game::ProbePhysAnim(ownPawn, &p)) {
+                        game::FormatPhysAnimProbe(p, pl, sizeof(pl));
+                        snprintf(m, sizeof(m), "[paprobe] LOCAL onBoard=%d grounded=%d bail=%d | %s",
+                                 (int)(own.onBoard != 0), (int)(own.grounded != 0), (int)(own.bailing != 0), pl);
+                        g_logf(m);
+                    }
+                }
+            }
             own.typing = (g_cfg.isTyping && g_cfg.isTyping()) ? 1 : 0;
             // Sender-side crank edge probe: one line per rising edge and per def-identity change, so
             // the log can distinguish "the crank never left this machine" from "it was sent and the
@@ -1582,6 +1652,25 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
                     g_lastPubUs += period;
                     if (nowUs - g_lastPubUs >= period) g_lastPubUs = nowUs;
                 }
+            }
+        }
+    }
+
+    // ---- 1.4 PUBLISH our BODY-FEEL SETTINGS: tiny, its own message type. On change, on a new peer
+    // (rides g_cosResend, read BEFORE the cosmetics block clears it), and a 10 s heartbeat.
+    if (ownPawn && sendable > 0 && g_ownBodyFeel.ver) {
+        static uint64_t lastBfSendUs = 0;
+        const bool heartbeat = !lastBfSendUs || sinceUs(nowUs, lastBfSendUs) > 10000000ull;
+        if (g_ownBodyFeelDirty || heartbeat || g_cosResend) {
+            uint8_t pkt[96];
+            const int n = repl::PackBodyFeel(g_ownBodyFeel, pkt, sizeof(pkt));
+            if (n > 0) {
+                PeerStats ps;
+                for (int i = 0; i < nPeers; i++)
+                    if (GetStats(i, &ps) && ps.state != 5) Send(i, pkt, n, true);   // reliable
+                lastBfSendUs = nowUs;
+                if (g_ownBodyFeelDirty && g_logf) g_logf("[bodyfeel] own riding-body settings changed -> published");
+                g_ownBodyFeelDirty = false;
             }
         }
     }

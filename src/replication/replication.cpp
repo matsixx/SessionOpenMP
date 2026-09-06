@@ -61,6 +61,7 @@ namespace omp { namespace repl {
 //   OMPI -> PushSpeedMultiplier (a peer on an older build animates every push at 1.0x, silently)
 //   OMPJ -> CLAIMED by the replay-sync transfer protocol (replaysync.cpp) -- never a snapshot value
 //   OMPK -> board brokenState byte (a peer's board break/repair renders on their proxy)
+//   OMPQ -> CLAIMED by the body-feel settings message (kBodyFeelMagic) -- never a snapshot value
 // "OMPR": the size batch. The timestamp shrank to a u32 (0.25 ms units), feet and hands travel
 // body-relative in h16, the crank fields ride only cranked frames, the anim escape mask covers only
 // the fields that can escape, and loop/trick names are interned (sent on change + refresh, cached on
@@ -640,6 +641,37 @@ bool IsCosmeticsPacket(const uint8_t* d, int len) {
     if (!d || len < 4) return false;
     uint32_t m = 0; memcpy(&m, d, 4);
     return m == kCosMagic;
+}
+
+// ---- body-feel settings: magic, version, count, then count x int16. Opaque values; the order is
+// the tweaks module's contract with itself (proxy_body_feel.h), append-only.
+static const uint32_t kBodyFeelMagic = 0x51504D4Fu;   // "OMPQ"
+
+bool IsBodyFeelPacket(const uint8_t* d, int len) {
+    if (!d || len < 4) return false;
+    uint32_t m = 0; memcpy(&m, d, 4);
+    return m == kBodyFeelMagic;
+}
+int PackBodyFeel(const BodyFeelSet& b, uint8_t* out, int cap) {
+    const int n = b.n > 32 ? 32 : (int)b.n;
+    if (!out || cap < 6 + n * 2) return 0;
+    Wr w{out, cap, 0, true};
+    w.u32(kBodyFeelMagic);
+    w.u8(b.ver);
+    w.u8((uint8_t)n);
+    for (int i = 0; i < n; i++) w.u16((uint16_t)b.v[i]);
+    return w.ok ? w.n : 0;
+}
+bool UnpackBodyFeel(const uint8_t* d, int len, BodyFeelSet& out) {
+    if (!IsBodyFeelPacket(d, len) || len < 6) return false;
+    out = BodyFeelSet{};
+    Rd r{d, len, 4, true};
+    out.ver = r.u8();
+    int n = r.u8(); if (n > 32) n = 32;
+    for (int i = 0; i < n; i++) out.v[i] = (int16_t)r.u16();
+    if (!r.ok) { out = BodyFeelSet{}; return false; }
+    out.n = (uint8_t)n;
+    return true;
 }
 
 // One item: category, variant, instance, then a length-prefixed name. Names are the only variable part,

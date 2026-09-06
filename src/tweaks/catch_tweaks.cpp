@@ -145,6 +145,7 @@ enum {
     BOARD_FLIPPER           = 0x4e8,   // ASkateboardEx -> _flipper (UStaticMeshComponent, the DECK
                                        // mesh that visually flips -- its transform is the truth)
     COMP_CTW_QUAT           = 0x1c0,   // USceneComponent -> ComponentToWorld rotation quat (x,y,z,w)
+    COMP_REL_ROT            = 0x128,   // USceneComponent -> RelativeRotation (FRotator: pitch, yaw, roll)
     // mc+0x798 _inAirTime and +0x79c _inAirPopTime both stay 0 through popped-trick airs, and
     // mc+0x77c _boardFlipCurrentAngle always reads 0. Do not gate on these movement-component state
     // fields; measure the rendered geometry instead (the flipper component's quat, TwkActorZ).
@@ -798,6 +799,23 @@ static void* g_localIh    = nullptr;    // the local skater's InputHandler, capt
 void* CatchTweaks_Skater() { return g_lastSkater; }
 void* CatchTweaks_LocalInputHandler() { return g_localIh; }
 
+// Is AUTO catch the live setting? The over/under-rotation work below is manual-only: on auto the
+// game finishes and catches the board its own way, and ours reads as the board stopping dead or
+// turning back under the foot.
+//
+// This reads the skater's own _catchMode and compares it against 2, which is the game's definition of
+// manual: SetCatchOrient gates its bad-catch verdict on `_catchMode (skater+0x63d) == 2` in the
+// shipped function. Deliberately NOT g_manualMode -- that one is learned from a neighbouring field
+// and was field-caught stamping the AUTO value as manual, which would make these gates pass on auto.
+// An unreadable mode means "carry on as before" rather than a silent behaviour change.
+static bool AutoCatchLive()
+{
+    void* sk = g_lastSkater;
+    if (!sk) return false;
+    __try { return twkB(sk, SK_CATCH_MODE) != 2; }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
 static double DsNow() {
     static LARGE_INTEGER f{}; if (!f.QuadPart) QueryPerformanceFrequency(&f);
     LARGE_INTEGER t; QueryPerformanceCounter(&t);
@@ -1395,6 +1413,18 @@ static float BoardGripAxis(void* skater, int axis) {
     return 180.0f - roll;                                   // 180 = flat, to match the old semantics
 }
 static float BoardGrip(void* skater) { return BoardGripAxis(skater, g_flipAxis); }
+// MEASUREMENT (3.19.286): the flipper's roll in the BOARD'S OWN frame -- its relative rotation about
+// its long axis, raw degrees. BoardGrip measures roll against WORLD up; on a quarter-pipe transition
+// the two disagree by the wall's tilt about the board, and the field symptom (the flip stopped at
+// world-flat with the counter still 8-25 deg from its flat) is that disagreement. Logged beside the
+// world reading at engage and at the stop so it can be seen before anything is moved onto it.
+static float BoardLocalRoll(void* skater) {
+    void* board   = skater ? twkP(skater, SK_BOARD) : nullptr;
+    void* flipper = board ? twkP(board, BOARD_FLIPPER) : nullptr;
+    if (!flipper) return -999.0f;
+    const float roll = twkF(flipper, COMP_REL_ROT + 8);
+    return (roll > -100000.0f && roll < 100000.0f) ? roll : -999.0f;
+}
 
 
 // ---- the board-offset borrow (CatchScoopHoldMode 3; see the knob comment) -----------------
@@ -3228,8 +3258,8 @@ void CatchTweaks_PumpFrame() {
                         ovPrevRem = remaining; ++ovFrames;
                     }
                 }
-                // The decision, on the catch's FIRST frame, off the counter.
-                if (!g_overActive && !ovTried && catchState != 0 && comp) {
+                // The decision, on the catch's FIRST frame, off the counter. Manual only.
+                if (!g_overActive && !ovTried && catchState != 0 && comp && !AutoCatchLive()) {
                     ovTried = true;
                     const float cur0  = twkF(comp, MC_BOARD_FLIP_CUR);
                     const float tgt0  = twkF(comp, MC_BOARD_FLIP_TARGET);
@@ -3245,8 +3275,8 @@ void CatchTweaks_PumpFrame() {
                     const float over    = fabsf(cur0) - nearest;         // > 0 past flat, < 0 short of it
                     if (sane && (flags & 0x08)) {
                         TwkLog("[catch] engage: flip %.0f of %.0f = %.0f deg %s the nearest flat (%.0f) | deck "
-                               "reads %.0f, %s | shove %.0f of %.0f at %.0f deg/s", cur0, tgt0, fabsf(over),
-                               over > 0.0f ? "PAST" : "short of", nearest, ang,
+                               "reads %.0f (local roll %.0f), %s | shove %.0f of %.0f at %.0f deg/s", cur0, tgt0,
+                               fabsf(over), over > 0.0f ? "PAST" : "short of", nearest, ang, BoardLocalRoll(skater),
                                delta > 0.0f ? "rising" : delta < 0.0f ? "falling" : "still",
                                twkF(comp, MC_BOARD_ROT_CUR), twkF(comp, MC_BOARD_ROT_TARGET),
                                twkF(comp, MC_BOARD_ROT_RATE));
@@ -3319,7 +3349,7 @@ void CatchTweaks_PumpFrame() {
                 void* anSr = FootPlace_AnimInstance();
                 const bool srGrounded = anSr && twkB(anSr, AN_GROUNDED) != 0;
                 if (catchState == 0) { srTried = false; g_shoveRbClaimed = false; }
-                if (!srTried && catchState != 0 && comp && g_shoveRollBack && g_shoveFixes) {
+                if (!srTried && catchState != 0 && comp && g_shoveRollBack && g_shoveFixes && !AutoCatchLive()) {
                     srTried = true;
                     const int   flags = twkB(comp, MC_BOARD_FLAGS);
                     const float rc0 = twkF(comp, MC_BOARD_ROT_CUR), rt0 = twkF(comp, MC_BOARD_ROT_TARGET);
@@ -3409,7 +3439,7 @@ void CatchTweaks_PumpFrame() {
                     }
                 }
                 if (!ssActive && !g_shoveSnapTried && !g_shoveRbClaimed &&
-                    catchState != 0 && comp && g_shoveSnap && g_shoveFixes) {
+                    catchState != 0 && comp && g_shoveSnap && g_shoveFixes && !AutoCatchLive()) {
                     g_shoveSnapTried = true;
                     const int   flags = twkB(comp, MC_BOARD_FLAGS);
                     const float rc0 = twkF(comp, MC_BOARD_ROT_CUR), rt0 = twkF(comp, MC_BOARD_ROT_TARGET);
@@ -3528,7 +3558,7 @@ void CatchTweaks_PumpFrame() {
             static bool endedThisCatch = false;
             if (catchState == 0) endedThisCatch = false;
             if (g_anyRev && comp && catchState != 0 && !endedThisCatch && !g_overActive &&
-                ang >= (180.0f - (float)g_anyRevDeg)) {
+                !AutoCatchLive() && ang >= (180.0f - (float)g_anyRevDeg)) {
                 const float tgt  = twkF(comp, MC_BOARD_FLIP_TARGET);
                 const float cur  = twkF(comp, MC_BOARD_FLIP_CUR);
                 const float rate = twkF(comp, MC_BOARD_FLIP_RATE);
@@ -3626,7 +3656,8 @@ void CatchTweaks_PumpFrame() {
                     const bool  pfRotSane = fabsf(pfRotTgt) < 3600.0f && fabsf(pfRotCur) < 3600.0f &&
                                             fabsf(pfRotRate) < 100000.0f;
                     const bool  flipSettled = fabsf(pfRate) < 1.0f || !(pfFlags & 0x08) || pfOwed <= 0.5f;
-                    if (g_shoveFixes && pfRotSane && (pfFlags & 0x20) && flipSettled && fabsf(pfRotRate) < 1.0f && pfRotOwed > 0.5f) {
+                    if (g_shoveFixes && !AutoCatchLive() && pfRotSane && (pfFlags & 0x20) && flipSettled &&
+                        fabsf(pfRotRate) < 1.0f && pfRotOwed > 0.5f) {
                         const float pfRotAim = (pfRotTgt < 0.0f) ? -fabsf(pfRotCur) : fabsf(pfRotCur);
                         *(float*)((uint8_t*)comp + MC_BOARD_ROT_TARGET) = pfRotAim;
                         static long rotPlantLogged = -1;
@@ -3743,8 +3774,27 @@ void CatchTweaks_PumpFrame() {
                     // All three axis readings, so "the deck was still sideways" is checkable: the
                     // correct long axis is the one that reads ~180 when the board is genuinely flat.
                     TwkLog("[catch] flip stopped at grip-up (%.0f deg, was %.0f deg/s) -- "
-                           "no second revolution [axis %d; X%.0f Y%.0f Z%.0f]", ang, rate, g_flipAxis,
-                           BoardGripAxis(skater, 0), BoardGripAxis(skater, 1), BoardGripAxis(skater, 2));
+                           "no second revolution [axis %d; X%.0f Y%.0f Z%.0f; local roll %.0f]", ang, rate, g_flipAxis,
+                           BoardGripAxis(skater, 0), BoardGripAxis(skater, 1), BoardGripAxis(skater, 2),
+                           BoardLocalRoll(skater));
+                    // The counter this leaves behind is the plant fix's case -- but the game ends the
+                    // catch on the frame after the rate hits zero, before the next pump tick reaches
+                    // the plant fix (field, 3.19.285 log: both catches that stopped short of home ended
+                    // with the foot hanging at ratio 0.64 / 0.91, and the plant fix never ran once all
+                    // session). So it is applied HERE, in the same write as the stop: a counter within
+                    // 90 deg of its flat is brought home, the foot's ratio completes on the frame the
+                    // catch completes. Where it shows: quarter-pipe transitions, where the deck reads
+                    // world-flat 8-25 deg before the counter's flat (see BoardLocalRoll).
+                    if (g_plantFix) {
+                        const float pTgt  = twkF(comp, MC_BOARD_FLIP_TARGET);
+                        const float pCur  = twkF(comp, MC_BOARD_FLIP_CUR);
+                        const float pOwed = fabsf(pTgt) - fabsf(pCur);
+                        if (pOwed > 0.5f && pOwed <= 90.0f) {
+                            *(float*)((uint8_t*)comp + MC_BOARD_FLIP_TARGET) = (pTgt < 0.0f) ? -fabsf(pCur) : fabsf(pCur);
+                            TwkLog("[catch] plant fix at the stop: the counter still owed %.0f deg (target %.0f, "
+                                   "current %.0f) -- target brought to the deck so the foot lands", pOwed, pTgt, pCur);
+                        }
+                    }
                 }
                 armed = false;
             }

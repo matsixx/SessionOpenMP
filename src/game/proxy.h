@@ -48,6 +48,15 @@ struct ProxyTuning {
                                           // query-collidable board at the dismount point.
     bool  bailSync        = true;         // owner's ragdoll edge -> execute Bail locally on the proxy,
                                           // and ResetRagDoll on the falling edge to recover
+    // GAME BODY PHYSICS ON PROXIES. A wire-driven proxy never walks the lifecycle that switches
+    // physical animation on and off (SetOnBoardMode / DoBoardPickup / Bail), so a peer rides as pure
+    // animation with no body physics at all -- confirmed by paProbe (physOn=0, every body blend 0.00).
+    // With this on, the game's own SetIsPhysicalAnimationEnabled is mirrored off the wire flags: on
+    // while the owner is on-board and not bailing, off otherwise. ~21 simulated bodies per riding
+    // proxy. The peer's own SessionTweaks riding-body settings ride on top of this, in the tweaks
+    // module (proxy_body_feel), through the body-feel bridge exports. Driven by the "Peer body
+    // physics" preference (Other options), pushed in every frame by the loader.
+    bool  syncPhysAnim    = true;
     // FULL RAGDOLL SYNC. With this on, a bail whose packet also carries the owner's SKELETON is
     // driven from that skeleton instead of by simulating a local ragdoll: everyone sees the same
     // flop, because they are all watching the owner's actual one rather than their own re-run of it.
@@ -209,6 +218,8 @@ private:
     uint8_t    animTickState_ = 0xff;     // what we last wrote (0xff = nothing)
     uint64_t   animCheckUs_   = 0;        // projection cadence (~5 Hz per proxy)
     uint64_t   animSeenUs_    = 0;        // last time the proxy projected on screen (hysteresis)
+    uint64_t   paProbeMs_     = 0;        // debug::paProbe cadence (2 s per proxy)
+    uint64_t   paEnableMs_    = 0;        // syncPhysAnim poll cadence (per proxy)
     uint8_t    lastPushState_ = 0, lastBrakeState_ = 0, lastBailing_ = 0;
     uint8_t    lastBroken_ = 0;           // last APPLIED brokenState -- only advances with the board
                                           // linked, so a break arriving before the board link still
