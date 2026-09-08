@@ -217,7 +217,7 @@ void Proxy::Forget() {
     for (auto& l : audioLoops_) { l.slot = 0; l.comp = nullptr; }
     actor_ = nullptr; world_ = nullptr; tries_ = 0; lastTryMs_ = 0;
     refreshed_ = repOff_ = boardRepOff_ = tickOff_ = boardHidden_ = simOn_ = boardLogged_ = false;
-    nearLocal_ = true; present_ = true;
+    nearLocal_ = true; boardNear_ = true; present_ = true;
     animTickSaved_ = 0xff; animTickState_ = 0xff; animCheckUs_ = 0; animSeenUs_ = 0;
     animOnBoardSeen_ = -1; animHoldUntilUs_ = 0; animFrozenLogMs_ = 0;
     lastBailing_ = 0;
@@ -911,8 +911,18 @@ void Proxy::Apply(const repl::State& s, uint64_t nowMs, uint64_t nowUs, void (*l
 #endif
                 }
             }
-            StampBoard(s);
-            st_.carryStamps++;
+            // ...UNLESS IT IS NOT A CARRY. A board can be off-board and still be a real rolling
+            // object: sitting sets one down, and so does a mount the game refuses. The sender says
+            // which (repl::State::boardSim, read from the deck's own body), because the pose cannot
+            // -- a carried board and a rolling one both just move. Stamping a rolling board is what
+            // made it unhittable: the stamp turns simulation OFF, and a non-simulating deck has no
+            // body for another skater to stall on, so it could be shoved around by depenetration but
+            // never ridden. Driven, it is the same live rigid body a bailed board already is.
+            const bool loose = s.boardSim && g_tun.looseBoardSim && boardNear_ && g_tun.velocityDrive;
+            if (!loose || !VelocityDrive(s, nowUs)) {
+                StampBoard(s);
+                st_.carryStamps++;
+            }
         } else if (!boardHidden_) {              // park+hide, the A/B fallback
             boardHidden_ = true;
             StopBoardSim();
@@ -950,7 +960,7 @@ void Proxy::Apply(const repl::State& s, uint64_t nowMs, uint64_t nowUs, void (*l
         // range, and the session's distance gate (with hysteresis) turns the sim back on before the
         // local player can reach it. Fewer live rigid bodies, and the whole velocity-drive PhysX
         // call chain skipped for everyone out of reach.
-        if (!nearLocal_) { if (simOn_) StopBoardSim(); StampBoard(s); }
+        if (!boardNear_) { if (simOn_) StopBoardSim(); StampBoard(s); }
         else if (handHeld) { st_.carryStamps++; StampBoard(s); }
         else if (!g_tun.velocityDrive || airborne) { if (airborne) st_.airSkips++; StampBoard(s); }
         else if (!VelocityDrive(s, nowUs)) StampBoard(s);

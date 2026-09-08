@@ -73,7 +73,13 @@ namespace omp { namespace repl {
 //           NOT "OMPL": the dropper used that letter and RETIRED it by name (dropsync.cpp), so a
 //           build from that era would route these snapshots into its own dropper and misparse them.
 //           T is the first letter this namespace has never handed out.
-static const uint32_t kMagic = 0x54504D4Fu; // "OMPT"
+//   OMPW -> boardSim, one byte after the head look: whether the sender's board is simulating. Lets a
+//           receiver tell a board carried under an arm from one loose on the ground, which the pose
+//           alone cannot say. U and V were spoken for (V by voice), so W is next.
+//   OMPX -> boardSim moved AHEAD of the deck, because the deck's own encoding now depends on it: a
+//           loose board travels as an ABSOLUTE world position, a ridden one keeps the body-relative
+//           h16 delta. See the deck block in Pack for why 20 m stopped being a safe assumption.
+static const uint32_t kMagic = 0x58504D4Fu; // "OMPX"
 
 static bool finite3(const float* v, float lim) {
     for (int i = 0; i < 3; i++) if (!(v[i] > -lim && v[i] < lim)) return false;   // rejects NaN/Inf too
@@ -317,9 +323,17 @@ int Pack(const State& s, uint64_t senderUs, uint8_t* out, int cap, int* poseWrot
                                               ? 65534u : (unsigned)(s.crankClock * 10000.f + 0.5f)));
     w.h16(clampf(s.grindPitch, 1000.f)); w.h16(clampf(s.grindYaw, 1000.f));
     for (int i = 0; i < 3; i++) w.f32(s.bodyPos[i]);             // the one absolute anchor
+    w.u8(s.boardSim ? 1 : 0);                                    // ahead of the deck: it picks the frame
     w.u32(qPack(s.deckQuat));
-    for (int i = 0; i < 3; i++) w.h16(clampf(s.deckPos[i] - s.bodyPos[i], 2000.f));   // board >20 m from
-                                                                 // the rider is garbage anyway (snap land)
+    // THE DECK, in one of two frames. A RIDDEN board is under its rider, so it rides as a body-relative
+    // h16 delta: 6 bytes, and the clamp below is unreachable. A LOOSE board has no rider to hang off --
+    // it was set down and it rolls -- and "more than 20 m from the rider is garbage anyway (snap land)"
+    // stopped being true the moment sitting let one roll away. Past the clamp the delta SATURATED, so
+    // every observer pinned the board 20 m from its owner while the real one kept going, and the drive
+    // fought a target it could never reach. A loose board therefore travels ABSOLUTE: 6 bytes more, and
+    // only while a board is actually loose, which is rare and brief.
+    if (s.boardSim) for (int i = 0; i < 3; i++) w.f32(s.deckPos[i]);
+    else            for (int i = 0; i < 3; i++) w.h16(clampf(s.deckPos[i] - s.bodyPos[i], 2000.f));
     if (s.bodyRotOk) w.u32(qPack(s.bodyQuat));
     if (s.meshOk)    w.u32(qPack(s.meshQuat));
     if (s.relOk)     for (int i = 0; i < 3; i++) w.h16(clampf(s.relPos[i], 1000.f));
@@ -499,8 +513,10 @@ bool Unpack(const uint8_t* d, int len, State& out, uint64_t* senderUs) {
     { const float gp = r.h16(); out.grindPitch  = (gp > -1001.f && gp < 1001.f) ? gp : 0;
       const float gy = r.h16(); out.grindYaw    = (gy > -1001.f && gy < 1001.f) ? gy : 0; }
     for (int i = 0; i < 3; i++) out.bodyPos[i] = r.f32();
+    out.boardSim = r.u8() ? 1 : 0;
     qUnpack(r.u32(), out.deckQuat);
-    for (int i = 0; i < 3; i++) out.deckPos[i] = out.bodyPos[i] + r.h16();
+    if (out.boardSim) for (int i = 0; i < 3; i++) out.deckPos[i] = r.f32();
+    else              for (int i = 0; i < 3; i++) out.deckPos[i] = out.bodyPos[i] + r.h16();
     if (out.bodyRotOk) qUnpack(r.u32(), out.bodyQuat);
     if (out.meshOk)    qUnpack(r.u32(), out.meshQuat);
     if (out.relOk)     for (int i = 0; i < 3; i++) out.relPos[i] = r.h16();

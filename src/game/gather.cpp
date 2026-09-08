@@ -139,6 +139,13 @@ bool GatherOwnState(void* pawn, repl::State& out) {
         if (deck) {
             rd((uint8_t*)deck + off::kCompPos,  out.deckPos,  12);
             rd((uint8_t*)deck + off::kCompQuat, out.deckQuat, 16);
+            // ---- IS THIS BOARD LOOSE? Asked of the deck's OWN body, not of any one feature that
+            // lets go of a board: sitting puts one down, a mount the game refuses drops one, and
+            // both end up here. A carried board is attached to the hand and does not simulate, so
+            // this bit is exactly "there is a real rolling object over there" -- which is what the
+            // receiver needs to decide between driving it as a rigid body and stamping the pose.
+            { const int sb = rdByte((uint8_t*)deck + off::kCompBodyInstance, off::kBodySimByte);
+              out.boardSim = (sb > 0 && ((sb >> off::kBodySimBit) & 1)) ? 1 : 0; }
             // ---- and the deck IN THE SENDER'S OWN BODY FRAME. The receiver hangs the board off the
             // rider rather than off a world point, so any phase error between the body and board
             // channels shows as `v_rel * tau` (~0 while riding) instead of `v_body * tau`, which is

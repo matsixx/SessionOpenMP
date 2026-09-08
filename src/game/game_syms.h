@@ -548,6 +548,11 @@ struct PhysAnimProbe {
     const char* how = "";       // which component list it was found in
     bool  bound = false;        // comp->SkeletalMeshComponent == the skater's mesh
     int   bodies = 0, simBodies = 0, liveBodies = 0;   // total / bSimulatePhysics / blend > 0.01
+    // WHAT THIS SKATER CAN ACTUALLY HIT. A body only pushes a loose board if its CollisionEnabled
+    // includes PHYSICS -- a kinematic body still does, which is how a walking player's own feet kick
+    // their board around. If a proxy's bodies come back query-only or none, then off the board a peer
+    // is a capsule and nothing else, which is exactly what that feels like.
+    int   physColl = 0, queryColl = 0, noColl = 0;
     float avgBlend = 0.f, maxBlend = 0.f;
 };
 bool ProbePhysAnim(void* skaterActor, PhysAnimProbe* out);
@@ -815,6 +820,9 @@ namespace off {
     constexpr int kBodyBlendWeight      = 0x11c;   // FBodyInstance::PhysicsBlendWeight (0..1)
     constexpr int kBodySimByte          = 0x10;    // FBodyInstance bitfield byte holding bSimulatePhysics
     constexpr int kBodySimBit           = 0;
+    constexpr int kCompBodyInstance     = 0x2c8;   // UPrimitiveComponent::BodyInstance (FBodyInstance)
+    constexpr int kBodyCollisionEnabled = 0x20;    // FBodyInstance::CollisionEnabled (ECollisionEnabled:
+                                                   // 0 none, 1 query only, 2 physics only, 3 both)
     constexpr int kBodyBoneIndex        = 0x1c;    // FBodyInstance::InstanceBoneIndex (int16, into the ref skeleton)
     constexpr int kBodyPosIters         = 0x74;    // FBodyInstance::PositionSolverIterationCount (uint8)
     constexpr int kBodyVelIters         = 0x75;    // FBodyInstance::VelocitySolverIterationCount (uint8)

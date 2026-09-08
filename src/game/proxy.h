@@ -41,6 +41,8 @@ struct ProxyTuning {
     float driveMaxAngRad  = 25.0f;        // rad/s clamp
     float quietStopMs     = 1500.0f;      // stream silent this long -> stop simulating (no zombie boards)
     bool  vetoBail        = true;         // a proxy must not DECIDE to bail; the owner transports it
+    bool  looseBoardSim   = true;         // off board, a SIMULATING board is driven like a bailed one
+                                          // instead of stamped -- see the carry note in Apply
     bool  carryBoard      = true;         // off board: stamp the transported pose. PlaceInHand runs on
                                           // the SENDER's machine and the deck pose is already on the
                                           // wire, so the carried board needs no local reproduction.
@@ -160,6 +162,11 @@ public:
     // Written by the session each frame from the distance between the LOCAL player and this peer
     // (with hysteresis). Far = the board is stamped, never simulated.
     void       SetNearLocal(bool near) { nearLocal_ = near; }
+    // The BOARD's own distance, kept apart from the skater's. A board that has been set down is no
+    // longer near its owner: it rolls. One that has rolled over to you has to be a real rigid body
+    // even though its owner is far off, and a distant owner must still not be paying for body
+    // physics just because their board is at your feet. One number could not answer both.
+    void       SetBoardNear(bool near) { boardNear_ = near; }
     static ProxyTuning& Tuning();
 
     // ---- visuals handshake with the cosmetics layer -------------------------------------------------
@@ -211,6 +218,7 @@ private:
     bool       boardHidden_ = false, simOn_ = false, boardLogged_ = false;
     bool       present_ = true;           // false = concealed because the peer is in another level
     bool       nearLocal_ = true;         // default near: sim until the session has measured
+    bool       boardNear_ = true;         // ...and the same for the board, measured to the DECK
     // The offscreen anim throttle's driver state. The engine's own visibility flag proved capable
     // of going stale on a mesh that is plainly being drawn (field: a skater frozen mid-pose ON
     // SCREEN until a montage or ragdoll kicked the graph), so visibility is decided by OUR viewport

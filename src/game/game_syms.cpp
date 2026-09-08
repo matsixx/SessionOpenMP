@@ -685,6 +685,11 @@ bool ProbePhysAnim(void* sk, PhysAnimProbe* out) {
                     if (!bi) continue;
                     out->bodies++;
                     if ((bi[off::kBodySimByte] >> off::kBodySimBit) & 1) out->simBodies++;
+                    switch (bi[off::kBodyCollisionEnabled]) {
+                        case 2: case 3: out->physColl++;  break;   // physics: this one can push things
+                        case 1:         out->queryColl++; break;   // traces only
+                        default:        out->noColl++;    break;
+                    }
                     const float w = *(const float*)(bi + off::kBodyBlendWeight);
                     if (w > 0.01f) out->liveBodies++;
                     sum += w;
@@ -1416,8 +1421,10 @@ void FormatPhysAnimProbe(const PhysAnimProbe& p, char* out, int cap) {
     char comp[64];
     if (!p.comp) snprintf(comp, sizeof(comp), "NONE");
     else snprintf(comp, sizeof(comp), "%s(%s)", p.bound ? "bound" : "UNBOUND", p.how);
-    snprintf(out, cap, "physOn=%d comp=%s bodies=%d sim=%d live=%d blend avg=%.2f max=%.2f",
-             p.physOn, comp, p.bodies, p.simBodies, p.liveBodies, p.avgBlend, p.maxBlend);
+    snprintf(out, cap, "physOn=%d comp=%s bodies=%d sim=%d live=%d coll=%d/%d/%d(phys/query/none) "
+                       "blend avg=%.2f max=%.2f",
+             p.physOn, comp, p.bodies, p.simBodies, p.liveBodies,
+             p.physColl, p.queryColl, p.noColl, p.avgBlend, p.maxBlend);
 }
 
 }} // namespace omp::game

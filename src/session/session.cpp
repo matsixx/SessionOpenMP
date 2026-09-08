@@ -107,6 +107,7 @@ struct Slot {
     // Within board-sim range of the local player (hysteresis lives here, where the distance is
     // measured). Starts near so a board simulates until proven far.
     bool        boardNear = true;
+    bool        deckNear = true;    // the same verdict for the DECK, which a set-down board takes away
     // Non-null = this actor is concealed because the LOCAL player is in replay playback. The replay
     // editor is your own instance: peers stay fully live underneath (driven, buffered, current the
     // frame you exit) but invisible. Keyed on the ACTOR, wornForActor-style, so a respawn mid-
@@ -345,7 +346,7 @@ static Slot* slotFor(int peerIdx, uint64_t nowUs) {
         s.haveCosmetics = false; s.wornForActor = nullptr; s.peerReplaying = false;
         s.peerTyping = false;
         s.rejectedSpoken = false; s.unvouchedSpoken = false;
-        s.replayHidden = false; s.boardNear = true; s.replayConcealedActor = nullptr;
+        s.replayHidden = false; s.boardNear = true; s.deckNear = true; s.replayConcealedActor = nullptr;
         s.away = false; s.joinAnnounced = false;
         s.syncOn = false; s.syncReqSentUs = 0;
         for (auto& d : s.drop) d = Slot::DropObj();
@@ -2259,6 +2260,7 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
                         if (!advancing) rs.nLoops = 0;
                         rs.nEvents = 0; rs.bailing = 0; rs.replaying = 0;
                         s.proxy.SetNearLocal(false);      // the board STAMPS at the replayed pose
+                        s.proxy.SetBoardNear(false);
                         s.proxy.Apply(rs, nowMs, nowUs, g_logf);
                         if (advancing && tPos - s.syncAudioUs < 400000ull) {
                             repl::AudioEvent ev[repl::kAudioMaxEvents * 2];
@@ -2342,16 +2344,33 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
         // last gathered own state, theirs from the interpolated stream. Hysteresis so the boundary
         // cannot flap the sim; unknown positions keep the last verdict rather than guessing.
         if (g_haveOwn && g_ownLast.bodyPosOk && out.bodyPosOk) {
-            const float dx = out.bodyPos[0] - g_ownLast.bodyPos[0];
-            const float dy = out.bodyPos[1] - g_ownLast.bodyPos[1];
-            const float dz = out.bodyPos[2] - g_ownLast.bodyPos[2];
-            const float d2 = dx*dx + dy*dy + dz*dz;
             const float inCm  = game::Proxy::Tuning().boardSimMaxDistM * 100.f;
             const float outCm = inCm + game::Proxy::Tuning().boardSimHystM * 100.f;
-            if (s.boardNear) { if (d2 > outCm * outCm) s.boardNear = false; }
-            else             { if (d2 < inCm  * inCm)  s.boardNear = true;  }
+            // The SKATER's distance: what their body physics is worth paying for.
+            {
+                const float dx = out.bodyPos[0] - g_ownLast.bodyPos[0];
+                const float dy = out.bodyPos[1] - g_ownLast.bodyPos[1];
+                const float dz = out.bodyPos[2] - g_ownLast.bodyPos[2];
+                const float d2 = dx*dx + dy*dy + dz*dz;
+                if (s.boardNear) { if (d2 > outCm * outCm) s.boardNear = false; }
+                else             { if (d2 < inCm  * inCm)  s.boardNear = true;  }
+            }
+            // ...and the BOARD's, measured to the DECK and kept separate. Measuring the rider for
+            // both is what left a set-down board unhittable once it had rolled: the board can be at
+            // your feet while its owner is half a map away, and it still has to be a real rigid body.
+            // The reverse matters just as much -- that owner must not start paying for body physics
+            // simply because their board came to you.
+            {
+                const float ex = out.deckPos[0] - g_ownLast.bodyPos[0];
+                const float ey = out.deckPos[1] - g_ownLast.bodyPos[1];
+                const float ez = out.deckPos[2] - g_ownLast.bodyPos[2];
+                const float e2 = ex*ex + ey*ey + ez*ez;
+                if (s.deckNear) { if (e2 > outCm * outCm) s.deckNear = false; }
+                else            { if (e2 < inCm  * inCm)  s.deckNear = true;  }
+            }
         }
         s.proxy.SetNearLocal(s.boardNear);
+        s.proxy.SetBoardNear(s.deckNear);
         // This peer is in the replay editor, so their machine will not evaluate OUR skeleton -- they
         // need results, not drivers. Latched per frame and read by pose::Capture on the way out. Only
         // peers we are actually driving count: a quiet or departed peer's last known flag must not

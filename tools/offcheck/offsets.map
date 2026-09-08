@@ -606,3 +606,5 @@ kBodyPosIters                  FBodyInstance::PositionSolverIterationCount
 kBodyVelIters                  FBodyInstance::VelocitySolverIterationCount
 kBodyResponses                 FBodyInstance::CollisionResponses   # ResponseToChannels is its first member: one byte per channel
 kBodyActorHandle               FBodyInstance::ActorHandle
+kBodyCollisionEnabled          FBodyInstance::CollisionEnabled
+kCompBodyInstance              UPrimitiveComponent::BodyInstance

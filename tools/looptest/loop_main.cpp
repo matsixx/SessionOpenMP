@@ -99,6 +99,7 @@ static bool codecCheck() {
     // Broken state deliberately NOT 0 (the intact default and every failure path's fallback) and NOT
     // 1 (the only value the game currently sends) -- the byte must travel value-preserving.
     s.brokenState = 2;
+    s.boardSim = 1;                             // a board loose on the ground, not one under an arm
     // anim blob: field-table-shaped, adversarial values -- zeros, ratios, a big magnitude that MUST
     // escape to f32, negatives, and byte fields.
     { int off = 0, i = 0;
@@ -183,6 +184,34 @@ static bool codecCheck() {
     near1(o.grindYaw,   s.grindYaw,   0.25f, "grindYaw");     // f16 at ~271: quantum ~0.25
     if (o.boardMode != 9) { printf("  codec: boardMode %d\n", o.boardMode); bad++; }
     if (o.brokenState != 2) { printf("  codec: brokenState %d\n", o.brokenState); bad++; }
+    if (o.boardSim != 1) { printf("  codec: boardSim %d\n", o.boardSim); bad++; }
+
+    // A BOARD THAT HAS ROLLED AWAY. The deck used to travel only as a body-relative h16 delta clamped
+    // to 20 m, on the reasoning that a board further than that from its rider was garbage anyway --
+    // true until sitting let one be set down and roll. Past the clamp the delta saturated and every
+    // observer pinned the board 20 m from its owner while the real one kept going. A LOOSE board now
+    // travels absolute, so 50 m has to come back exactly; a RIDDEN one keeps the delta, and this
+    // pins that too, so the cheap encoding cannot be lost by accident either.
+    {
+        State f{}; f.deckQuat[3] = 1.f; f.bodyPosOk = 1;
+        f.bodyPos[0] = 12345.67f; f.bodyPos[1] = -9876.5f; f.bodyPos[2] = 42.125f;
+        f.deckPos[0] = f.bodyPos[0] + 5000.f;      // 50 m away: well past the old clamp
+        f.deckPos[1] = f.bodyPos[1] - 3000.f;
+        f.deckPos[2] = f.bodyPos[2] + 250.f;
+        f.boardSim = 1;
+        uint8_t fb[4096];
+        const int fn = Pack(f, 123456789ull, fb, sizeof(fb));
+        State fo;
+        if (fn <= 0 || !Unpack(fb, fn, fo, nullptr)) { printf("  codec: loose-board pack/unpack failed\n"); bad++; }
+        else for (int i = 0; i < 3; i++)
+            near1(fo.deckPos[i], f.deckPos[i], 0.15f, "loose deckPos at 50 m");
+
+        f.boardSim = 0;                            // ridden: the delta, and the clamp is expected
+        const int rn = Pack(f, 123456789ull, fb, sizeof(fb));
+        State ro;
+        if (rn <= 0 || !Unpack(fb, rn, ro, nullptr)) { printf("  codec: ridden-board pack/unpack failed\n"); bad++; }
+        else if (rn >= fn) { printf("  codec: ridden board is not cheaper (%d >= %d)\n", rn, fn); bad++; }
+    }
     if (o.crankDefOff != 3 || !o.crankOn) { printf("  codec: crank fields\n"); bad++; }
     near1(o.crankPocket, s.crankPocket, 0.001f, "crankPocket");
     if (o.pushFlags != 0x40 || o.pushState != 3 || o.brakeState != 2) { printf("  codec: push/brake\n"); bad++; }

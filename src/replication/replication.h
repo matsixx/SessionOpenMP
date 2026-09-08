@@ -145,6 +145,12 @@ struct State {
     // the START of the mount while the board is still hand-carried for a beat -- driving the board
     // during that window chases the swinging hand, so mode 9 means stamp instead of drive.
     uint8_t  boardMode = 0;
+    // Is the sender's board SIMULATING right now? Off the board that is the whole difference between
+    // a board tucked under an arm and one loose on the ground, and the receiver cannot tell from the
+    // pose alone -- both just move. Sitting sets a board down, and so does a mount the game refuses;
+    // this is read from the deck's own body rather than from any one feature, so it covers both and
+    // anything later that lets go of a board.
+    uint8_t  boardSim = 0;
     // The board's _currentBrokenBoardState byte (0 = intact). A STATE, not an event: the receiver
     // latch-compares and calls the game's own break/rebuild on change, so a peer already broken at
     // proxy spawn renders broken with no edge ever seen. Travels value-preserving -- the game's own
