@@ -16,6 +16,7 @@
 #include "game_syms.h"
 #include "audio.h"
 #include "pose.h"
+#include "peer_bodies.h"       // what a peer's physical animation is actually allowed to cost
 #include "spectate.h"          // hand the replay camera back before this actor's pointer dies
 #include "../replication/anim_fields.h"
 
@@ -208,7 +209,8 @@ void Proxy::Forget() {
                                                                        // nothing to restore INTO
     DropProxyActor(actor_);               // no longer one of ours -- drop it before the pointer dies
     DropAnimSlot(this);                   // the anim instance died with the world; never post-apply to it
-    { void* pm = actor_ ? safePtr(actor_, off::kSkaterMesh) : nullptr; if (pm) pose::Forget(pm); }
+    { void* pm = actor_ ? safePtr(actor_, off::kSkaterMesh) : nullptr;
+      if (pm) { pose::Forget(pm); PeerBodiesForget(pm); } }
     // The peer's sounds died with their components. Drop the handles WITHOUT calling Stop -- the
     // objects are gone -- and the audio slots must not survive into a replacement actor either, for
     // the same reason the change-edge caches below are cleared.
@@ -217,6 +219,7 @@ void Proxy::Forget() {
     refreshed_ = repOff_ = boardRepOff_ = tickOff_ = boardHidden_ = simOn_ = boardLogged_ = false;
     nearLocal_ = true; present_ = true;
     animTickSaved_ = 0xff; animTickState_ = 0xff; animCheckUs_ = 0; animSeenUs_ = 0;
+    animOnBoardSeen_ = -1; animHoldUntilUs_ = 0; animFrozenLogMs_ = 0;
     lastBailing_ = 0;
     lastBroken_ = 0;
     // change-edge caches too: a REPLACEMENT actor must get every write again even when the wire value
@@ -269,6 +272,9 @@ struct AnimSlot {
     // the wire's onBoard, for the transition-pose save edge (see AnimPostApply).
     uint8_t  onBoard = 0;
     int8_t   lastOnBoardSaved = -1;   // -1 = no edge yet (a fresh slot must not "transition")
+    // When the game last ran this instance's anim update. Stamped before any of the freshness gates
+    // below, so it means "the graph is running", never "the graph is being fed".
+    uint64_t lastUpdMs = 0;
 };
 static AnimSlot g_animSlots[kAnimSlots];
 
@@ -296,6 +302,11 @@ static void StoreAnimForPostPass(Proxy* owner, void* ai, const repl::State& s, u
 static void DropAnimSlot(Proxy* owner) {
     for (auto& s : g_animSlots) if (s.owner == owner) s = AnimSlot{};
 }
+// When this proxy's anim graph last actually ran. 0 = it never has, or it has no slot yet.
+static uint64_t AnimLastUpdateMsFor(const Proxy* owner) {
+    for (const auto& s : g_animSlots) if (s.owner == owner) return s.lastUpdMs;
+    return 0;
+}
 
 static void (*g_animLogf)(const char*) = nullptr;   // set by Apply; the post-pass has no logf of its own
 
@@ -313,6 +324,7 @@ void AnimPostApply(void* ai) {
     for (auto& s : g_animSlots) {
         if (s.ai != ai || !s.owner) continue;
         InterlockedIncrement(&g_animUpdCalls);
+        s.lastUpdMs = GetTickCount64();
         // The replay editor shows recordings only: during playback the replay system owns every
         // proxy's anim state, and the slot going stale in 500 ms is not fast enough to stop the
         // first half-second of fresh blobs stamping over it.
@@ -556,6 +568,11 @@ void Proxy::Apply(const repl::State& s, uint64_t nowMs, uint64_t nowUs, void (*l
                 struct { wchar_t* d; int n; int max; } reason =
                     { reasonChars, (int)(sizeof(reasonChars) / 2), (int)(sizeof(reasonChars) / 2) };
 #ifdef _WIN32
+                // The trim comes off FIRST. What follows is a REAL ragdoll on these bodies, and a
+                // ragdoll whose bodies ignore the level falls through the floor. The state-driven
+                // restore further down would catch it in the same frame anyway; doing it here means
+                // the order does not depend on where in Apply that block happens to sit.
+                { void* bm = safePtr(actor_, off::kSkaterMesh); if (bm) PeerBodiesRestore(bm, logf); }
                 __try {
                     *((uint8_t*)actor_ + off::kSkaterCanBail) = 1;
                     S.Bail(actor_, &reason, true, true);          // (reason, 1, 1) = the in-game pattern;
@@ -952,6 +969,34 @@ void Proxy::Apply(const repl::State& s, uint64_t nowMs, uint64_t nowUs, void (*l
     // matter what the stale flag thinks), cull mode after it has been off screen for a beat. In
     // cull mode the ENGINE keeps authority, so a skater visible only as a shadow still animates --
     // our decision only ever ADDS ticking, never withholds it.
+    // A STATE CHANGE MUST NOT HAPPEN BEHIND A CULLED GRAPH. Everything that drives a proxy's
+    // animation runs inside USkaterAnimInstance::NativeUpdateAnimation -- the whole transported field
+    // blob AND the mount/dismount transition-pose save, both in AnimPostApply -- and
+    // OnlyTickPoseWhenRendered stops that function being called at all. Continuous values survive
+    // that: they are simply re-applied when the graph resumes. One-shot values do not.
+    // FootToBoardTransitionType and its twin are STEPPED bytes that exist for a few frames, so a
+    // mount that happens entirely off screen delivers them to a graph that is not running and they
+    // are gone by the time it resumes; and the onBoard edge that calls SaveFootTrans is itself
+    // inside AnimPostApply, so it fires whenever the peer is next drawn -- seconds late, saving the
+    // wrong pose into the transition buffer. The graph comes back holding an ON-FOOT state while
+    // riding values stream into it, and nothing fixes it until the state machine sees a real
+    // transition: the next mount or dismount that happens ON SCREEN. Field report, and the reason
+    // getting off and back on the board clears it.
+    // So the graph is ticked THROUGH a transition wherever the peer is standing. It costs about a
+    // second and a half of animation per mount, and it makes the off-screen case behave like the
+    // on-screen one instead of having to recover from it afterwards.
+    if (animOnBoardSeen_ != (int8_t)(s.onBoard ? 1 : 0)) {
+        const bool firstSample = animOnBoardSeen_ < 0;   // a fresh proxy has not "transitioned"
+        animOnBoardSeen_ = (int8_t)(s.onBoard ? 1 : 0);
+        if (!firstSample) {
+            animHoldUntilUs_ = nowUs + 1500000ull;   // the mount blend, with room either side
+            const bool wasCulled = (animTickState_ == 3);
+            animCheckUs_ = 0;                        // re-decide NOW, not up to 200 ms from now
+            if (wasCulled && logf)
+                logf("[proxy] board transition while their animation was culled -- ticking it through");
+        }
+    }
+
     if (g_tun.offscreenAnimThrottle && !g_tun.recordPeers && nowUs >= animCheckUs_) {
         animCheckUs_ = nowUs + 200000ull;                       // 5 Hz: cheaper than one bone
         void* mesh = safePtr(actor_, off::kSkaterMesh);
@@ -965,14 +1010,55 @@ void Proxy::Apply(const repl::State& s, uint64_t nowMs, uint64_t nowUs, void (*l
             // An UNRESOLVABLE view (menus, loads) reads as never-seen and settles into cull mode,
             // where the engine's own flag still animates whatever it renders -- the worst case is
             // exactly the old behaviour, never a new freeze.
-            const bool wantCull = (nowUs - animSeenUs_) > 1000000ull;
-            const uint8_t want = wantCull ? 3 : (animTickSaved_ != 0xff ? animTickSaved_ : 0);
+            // WATCHDOG: the graph must be RUNNING whenever this skater can be seen. AnimPostApply
+            // stamps every real anim update, so a proxy that projects on screen and has not updated
+            // for over a second is FROZEN -- welded to whatever pose and whatever transported values
+            // it held when it stopped, which is what a peer stuck in the wrong animation looks like.
+            // This code has already been bitten once by the engine's own rendered-recently flag going
+            // stale on a mesh that is plainly being drawn, and the projection test cannot see causes
+            // like that. So the condition is detected directly, healed by forcing a ticking option,
+            // and reported with the bytes needed to tell WHY it happened -- rather than leaving the
+            // skater wrong until their next board transition happens to kick the graph.
+            const uint64_t lastUpdMs = AnimLastUpdateMsFor(this);
+            const uint64_t sinceUpd  = lastUpdMs ? (GetTickCount64() - lastUpdMs) : 0;
+            const bool frozenOnScreen = onScreen && lastUpdMs && sinceUpd > 1500;
+            const uint64_t nowTick = GetTickCount64();
+            if (frozenOnScreen && logf && nowTick - animFrozenLogMs_ > 30000) {
+                animFrozenLogMs_ = nowTick;
+                char m[200];
+                snprintf(m, sizeof(m),
+                         "[proxy] their animation is FROZEN while on screen (%llu ms since the graph "
+                         "last ran; tick option now %d, mesh default %d) -- forcing it to tick",
+                         (unsigned long long)sinceUpd, (int)animTickState_, (int)animTickSaved_);
+                logf(m);
+            }
+
+            const bool holding  = nowUs < animHoldUntilUs_ || frozenOnScreen;
+            const bool wantCull = (nowUs - animSeenUs_) > 1000000ull && !holding;
+            uint8_t want;
+            if (wantCull) {
+                want = 3;
+            } else if (holding) {
+                // Through a transition the pose must ACTUALLY tick, whatever this mesh's own default
+                // happens to be -- restoring a default of OnlyTickMontagesWhenNotRendered (2) or
+                // OnlyTickPoseWhenRendered (3) would leave the graph frozen off screen and the
+                // transition missed all over again, which is the whole bug. Only 0 and 1 tick
+                // unconditionally; AlwaysTickPose (1) runs the graph without also paying to refresh
+                // bones on a skater nobody is looking at, so it is the one to force.
+                const uint8_t def = (animTickSaved_ != 0xff) ? animTickSaved_ : 1;
+                want = (def <= 1) ? def : 1;
+            } else {
+                want = (animTickSaved_ != 0xff) ? animTickSaved_ : 0;
+            }
             if (want != animTickState_) {
                 __try {
                     uint8_t* opt = (uint8_t*)mesh + off::kMeshAnimTickOption;
-                    if (animTickSaved_ == 0xff) animTickSaved_ = *opt;   // the mesh's own default
-                    *opt = (want == 3) ? 3 : animTickSaved_;
-                    animTickState_ = (want == 3) ? 3 : animTickSaved_;
+                    if (animTickSaved_ == 0xff) {
+                        animTickSaved_ = *opt;                              // the mesh's own default
+                        if (!wantCull && !holding) want = animTickSaved_;   // which IS "not culled"
+                    }
+                    *opt = want;
+                    animTickState_ = want;
                     static bool said = false;
                     if (!said && logf) { said = true;
                         logf("[proxy] offscreen anim throttle ON (projection-driven, cull after 1s off screen)"); }
@@ -1008,7 +1094,16 @@ void Proxy::Apply(const repl::State& s, uint64_t nowMs, uint64_t nowUs, void (*l
         // walking peer kept physics on, and a bailing one had it fighting their transported skeleton.
         // The pref (Other options) folds into `want`, so switching it off disables live proxies too.
         if (S.SetPhysAnimEnabled && actor_ && nowMs >= paEnableMs_) {
-            const bool want = g_tun.syncPhysAnim && s.onBoard && !s.bailing;
+            // WORTH PAYING FOR: body physics is ~21 simulated bodies per peer, and in a full lobby
+            // that is the largest thing this mod asks of the CPU. None of it can be seen on a peer
+            // who is far away or off screen, so it is not run for them. Distance is the session's
+            // own measure (the same one that parks a distant board); the cull flag is the offscreen
+            // anim throttle's decision, and a proxy whose animation is culled has no pose for the
+            // physics to react to anyway. With the throttle off that byte is 0xff, so that half of
+            // the gate goes inert rather than wrong. Coming back into view re-enables it within a
+            // frame, and the setter is idempotent, so this costs one compare while it holds.
+            const bool worthIt = nearLocal_ && animTickState_ != 3;
+            const bool want = g_tun.syncPhysAnim && s.onBoard && !s.bailing && worthIt;
             const int flags = safeByte(actor_, off::kSkaterPhysAnimOn);   // bit 0x10 = physAnim
             if (flags >= 0 && (((flags >> 4) & 1) != 0) != want) {
                 paEnableMs_ = nowMs + 500;
@@ -1018,8 +1113,32 @@ void Proxy::Apply(const repl::State& s, uint64_t nowMs, uint64_t nowUs, void (*l
                 if (logf) { char m[120];
                     snprintf(m, sizeof(m), "[proxy] physical animation %s (%s)", want ? "ON" : "OFF",
                              !g_tun.syncPhysAnim ? "peer body physics off" : s.bailing ? "bail" :
-                             s.onBoard ? "on-board" : "off-board");
+                             !s.onBoard ? "off-board" : !nearLocal_ ? "too far to see" :
+                             animTickState_ == 3 ? "off screen" : "on-board");
                     logf(m); }
+            }
+        }
+
+        // ...AND HOW MUCH OF IT IS PAID FOR. Physical animation on a peer hands the engine their
+        // whole PhysicsAsset: about 21 simulated bodies, each with a kinematic target body and a
+        // motor joint, solved and collided against the level every physics tick. Almost none of it
+        // can be seen on someone else's skater -- the game's own blueprint zeroes the blend weight
+        // on nearly every body while riding, so the bodies are simulated and the result discarded.
+        // peer_bodies puts the legs back on the animation, takes what is left out of the level's
+        // narrowphase, divides the solver counts down, and remembers every value it changed.
+        //
+        // THIS SITS OUTSIDE THE BLOCK ABOVE ON PURPOSE. That one is throttled 500 ms per edge, and a
+        // bail landing inside that window would leave the trim in place while the game's own Bail
+        // ragdolls this proxy for real -- and a ragdoll that ignores the level falls through the
+        // floor. So the restore is driven by the state itself, every frame, and costs two reads once
+        // it has run. Bailing counts as off even before the enable block catches up.
+        if (actor_) {
+            const int paFlags = safeByte(actor_, off::kSkaterPhysAnimOn);
+            const bool paLive = paFlags >= 0 && (((paFlags >> 4) & 1) != 0) && !s.bailing;
+            void* trimMesh = safePtr(actor_, off::kSkaterMesh);
+            if (trimMesh) {
+                if (paLive) PeerBodiesTrim(trimMesh, nowMs, logf);
+                else        PeerBodiesRestore(trimMesh, logf);
             }
         }
 

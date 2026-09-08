@@ -55,12 +55,13 @@
 #include "body_feel.h"
 #include "proxy_body_feel.h"
 #include "upscale.h"
+#include "max_detail.h"
 #include "upscale_fsr.h"
 #include "MinHook.h"
 #include "ue4ss_abi.h"
 #include "ui/menu_ext.h"
 
-#define TWEAKS_VERSION "3.19.354"
+#define TWEAKS_VERSION "3.19.361"
 #define TWK_WIDEN(x) STR(x)   // STR() prepends L before the macro expands; expand first
 
 // ------------------------------------------------------------------ log (own file, fresh per launch)
@@ -105,6 +106,7 @@ static void saveSettings() {
     CameraHeight_SaveConfig(buf, sizeof(buf));
     Sit_SaveConfig(buf, sizeof(buf));
     Upscale_SaveConfig(buf, sizeof(buf));
+    MaxDetail_SaveConfig(buf, sizeof(buf));
     f = fopen(g_iniPath, "w");
     if (!f) { TwkLog("[tweaks] settings save FAILED (cannot write %s)", g_iniPath); return; }
     fwrite(buf, 1, strlen(buf), f);
@@ -145,6 +147,7 @@ static void readConfig(const char* dir) {
     CameraHeight_ReadConfig(buf);
     Sit_ReadConfig(buf);
     Upscale_ReadConfig(buf);
+    MaxDetail_ReadConfig(buf);
     // No ini yet: write one holding the defaults just loaded. Without the multiplayer mod there is
     // no menu to change a setting through, so the file IS the interface -- and a file that lists
     // every key at its current value is the only way to discover what can be configured. Writing it
@@ -177,6 +180,7 @@ static void resetAllDefaults() {
     CameraHeight_ResetDefaults();
     Sit_ResetDefaults();
     Upscale_ResetDefaults();
+    MaxDetail_ResetDefaults();
     TwkLog("[tweaks] settings reset to defaults");
 }
 
@@ -217,6 +221,7 @@ static void drawSection(const OmpMenuApi* api, void*) {
     static DrawFn const kCamera[] = { CameraHeight_DrawMenu };
     static DrawFn const kCloth[]  = { ClothMerge_DrawMenu, ClothSim_DrawMenu };
     static DrawFn const kSit[]    = { Sit_DrawMenu };
+    static DrawFn const kGfx[]    = { MaxDetail_DrawMenu };
     #define TWK_GROUP(title, arr) group(title, arr, (int)(sizeof(arr) / sizeof(arr[0])))
     TWK_GROUP("Pop control",    kPop);
     TWK_GROUP("Board & tricks", kBoard);
@@ -226,6 +231,7 @@ static void drawSection(const OmpMenuApi* api, void*) {
     TWK_GROUP("Camera",         kCamera);
     TWK_GROUP("Clothing",       kCloth);
     TWK_GROUP("Sitting",        kSit);
+    TWK_GROUP("Graphics",       kGfx);
     #undef TWK_GROUP
 
     // The same reset the pause menu offers, so neither surface is the only way to get back.
@@ -297,11 +303,17 @@ static const char* const kTwkGrabLen   = "TwkBodyGrabMs";
 static const char* const kTwkGrabDel   = "TwkBodyGrabDelayMs";
 static const char* const kTwkGrabPow   = "TwkBodyGrabPct";
 // "Graphics"
-static const char* const kTwkTaau       = "TwkUpscaleTaau";
 static const char* const kTwkRenderScale = "TwkUpscaleRenderScale";
 static const char* const kTwkFsr         = "TwkUpscaleFsr";
 static const char* const kTwkFsrSharp    = "TwkUpscaleFsrSharp";
 static const char* const kTwkFsr4        = "TwkUpscaleFsr4";
+// "Max detail"
+static const char* const kTwkDetTex      = "TwkDetailTextures";
+static const char* const kTwkDetShadow   = "TwkDetailShadows";
+static const char* const kTwkDetDist     = "TwkDetailDistance";
+static const char* const kTwkDetRefl     = "TwkDetailReflections";
+static const char* const kTwkDetFog      = "TwkDetailFog";
+static const char* const kTwkDetMax      = "TwkDetailMax";
 // "Sitting"
 static const char* const kTwkSit         = "TwkSit";
 static const char* const kTwkSitFloor    = "TwkSitFloor";
@@ -333,7 +345,9 @@ static const char* const kTwkReset    = "TwkResetDefaults";
 
 // An ACTION row on the page: pressed, not adjusted.
 static void pageSelect(const char* key, void*) {
-    if (key && !strcmp(key, kTwkReset)) resetAllDefaults();
+    if (!key) return;
+    if      (!strcmp(key, kTwkReset))  resetAllDefaults();
+    else if (!strcmp(key, kTwkDetMax)) MaxDetail_ApplyPreset();
 }
 
 // A toggle or slider CHANGED. `iv` is the option index, `fv` the slider's value in the units the
@@ -396,11 +410,15 @@ static void pageValue(const char* key, int iv, float fv, void*) {
     else if (!strcmp(key, kTwkGrabLen))   BodyFeel_SetGrabMs(fv);
     else if (!strcmp(key, kTwkGrabDel))   BodyFeel_SetGrabDelayMs(fv);
     else if (!strcmp(key, kTwkGrabPow))   BodyFeel_SetGrabPct(fv);
-    else if (!strcmp(key, kTwkTaau))        Upscale_SetTaauEnabled(iv != 0);
     else if (!strcmp(key, kTwkRenderScale)) Upscale_SetRenderScalePct(fv);
     else if (!strcmp(key, kTwkFsr))         UpscaleFsr_SetEnabled(iv != 0);
     else if (!strcmp(key, kTwkFsrSharp))    UpscaleFsr_SetSharpnessPct(fv);
     else if (!strcmp(key, kTwkFsr4))        UpscaleFsr_SetPreferFsr4(iv != 0);
+    else if (!strcmp(key, kTwkDetTex))      MaxDetail_SetTextures((int)fv);
+    else if (!strcmp(key, kTwkDetShadow))   MaxDetail_SetShadows((int)fv);
+    else if (!strcmp(key, kTwkDetDist))     MaxDetail_SetDistance((int)fv);
+    else if (!strcmp(key, kTwkDetRefl))     MaxDetail_SetReflections((int)fv);
+    else if (!strcmp(key, kTwkDetFog))      MaxDetail_SetFog((int)fv);
     else if (!strcmp(key, kTwkSit))         Sit_SetEnabled(iv != 0);
     else if (!strcmp(key, kTwkSitFloor))    Sit_SetFloorEnabled(iv != 0);
     else if (!strcmp(key, kTwkSitMaxLedge)) Sit_SetMaxLedgeCm(fv);
@@ -486,11 +504,15 @@ static int pageGet(const char* key, int* oi, float* of, void*) {
     else if (!strcmp(key, kTwkGrabLen))   { *of = BodyFeel_GrabMs();                   return 1; }
     else if (!strcmp(key, kTwkGrabDel))   { *of = BodyFeel_GrabDelayMs();              return 1; }
     else if (!strcmp(key, kTwkGrabPow))   { *of = BodyFeel_GrabPct();                  return 1; }
-    else if (!strcmp(key, kTwkTaau))        { *oi = Upscale_TaauEnabled() ? 1 : 0;   return 1; }
     else if (!strcmp(key, kTwkRenderScale)) { *of = Upscale_RenderScalePct();         return 1; }
     else if (!strcmp(key, kTwkFsr))         { *oi = UpscaleFsr_Enabled() ? 1 : 0;      return 1; }
     else if (!strcmp(key, kTwkFsrSharp))    { *of = UpscaleFsr_SharpnessPct();         return 1; }
     else if (!strcmp(key, kTwkFsr4))        { *oi = UpscaleFsr_PreferFsr4() ? 1 : 0;   return 1; }
+    else if (!strcmp(key, kTwkDetTex))      { *of = (float)MaxDetail_Textures();      return 1; }
+    else if (!strcmp(key, kTwkDetShadow))   { *of = (float)MaxDetail_Shadows();       return 1; }
+    else if (!strcmp(key, kTwkDetDist))     { *of = (float)MaxDetail_Distance();      return 1; }
+    else if (!strcmp(key, kTwkDetRefl))     { *of = (float)MaxDetail_Reflections();   return 1; }
+    else if (!strcmp(key, kTwkDetFog))      { *of = (float)MaxDetail_Fog();           return 1; }
     else if (!strcmp(key, kTwkSit))         { *oi = Sit_Enabled() ? 1 : 0;              return 1; }
     else if (!strcmp(key, kTwkSitFloor))    { *oi = Sit_FloorEnabled() ? 1 : 0;         return 1; }
     else if (!strcmp(key, kTwkSitMaxLedge)) { *of = Sit_MaxLedgeCm();                   return 1; }
@@ -533,7 +555,7 @@ static const OmpPageItem2 kTwkRootItems[] = {
     { OMP_ITEM_PAGE, "Camera",         "Camera",          "Make the camera's height follow your skater everywhere" },
     { OMP_ITEM_PAGE, "Clothing",       "Clothing",        "Cloth physics on your shirt and trousers" },
     { OMP_ITEM_PAGE, "Physical animation", "Physical animation", "The reactive body and ragdoll bails: bracing, grabbing what hurt, the landing flail" },
-    { OMP_ITEM_PAGE, "Graphics",       "Graphics",        "Render scale and upscaling" },
+    { OMP_ITEM_PAGE, "Graphics",       "Graphics",        "Upscaling, and quality past the end of the game's own sliders" },
     { OMP_ITEM_PAGE, "Style settings", "Style settings", "How your arms, torso and head carry while riding. Needs Reactive body on." },
     { OMP_ITEM_PAGE, "Sitting",        "Sitting",         "Sit on a ledge or the ground while off the board" },
     // Kept on the front page deliberately: it resets EVERY Session Tweaks setting, not one category.
@@ -704,19 +726,38 @@ static const OmpPageItem2 kTwkPhys2Items[] = {
       "How much the head lags an acceleration",
       nullptr, nullptr, 0.0f, 200.0f, 10.0f },
 };
+// ONE graphics page. The upscaler and its own settings first, then the detail levels, which is the
+// order they are decided in. Temporal upsampling used to be a row of its own; it is not a choice --
+// it is what makes rendering below native produce a full-resolution image -- so it follows the
+// upscaler now and cannot be left in the wrong position.
 static const OmpPageItem2 kTwkGfxItems[] = {
-    { OMP_ITEM_TOGGLE, kTwkTaau,        "Temporal upsampling",
-      "Renders at the scale below and rebuilds full resolution with the engine's temporal upsampler (TAAU)" },
-    { OMP_ITEM_SLIDER, kTwkRenderScale, "  Render scale (%)",
-      "Internal render resolution; 100 is native. Lower is faster and the upsampler fills in the rest",
-      nullptr, nullptr, 50.0f, 100.0f, 5.0f },
     { OMP_ITEM_TOGGLE, kTwkFsr,         "FSR upscaling",
       "AMD FidelityFX Super Resolution in place of the engine's upsampler: FSR 4 on RDNA4 cards, FSR 3.1 elsewhere" },
+    { OMP_ITEM_SLIDER, kTwkRenderScale, "  Render scale (%)",
+      "Internal render resolution; 100 is native. Lower is faster and FSR fills in the rest",
+      nullptr, nullptr, 50.0f, 100.0f, 5.0f },
     { OMP_ITEM_SLIDER, kTwkFsrSharp,    "  FSR sharpness (%)",
       "Sharpening after the upscale; FSR 4 is soft by design, raise this if edges look smooth",
       nullptr, nullptr, 0.0f, 100.0f, 5.0f },
     { OMP_ITEM_TOGGLE, kTwkFsr4,        "  Prefer FSR 4",
       "Use the FSR 4 provider when the GPU and driver offer it; off forces FSR 3.1" },
+    { OMP_ITEM_SLIDER, kTwkDetTex,      "Texture sharpness",
+      "Anisotropic filtering and the streaming pool: ground textures stay sharp along the camera instead of blurring. Costs video memory, not frames",
+      nullptr, nullptr, 0.0f, 3.0f, 1.0f },
+    { OMP_ITEM_SLIDER, kTwkDetShadow,   "Shadows",
+      "Higher shadow resolution, more cascades, further out, and small objects cast too. Costs some frames",
+      nullptr, nullptr, 0.0f, 3.0f, 1.0f },
+    { OMP_ITEM_SLIDER, kTwkDetDist,     "Draw distance (%)",
+      "How far detail is kept before it drops to a lower model or vanishes. 100 is the game's own. The most expensive setting here",
+      nullptr, nullptr, 100.0f, 400.0f, 25.0f },
+    { OMP_ITEM_SLIDER, kTwkDetRefl,     "Reflections",
+      "Sharper, fuller-resolution screen space reflections on wet ground and polished concrete",
+      nullptr, nullptr, 0.0f, 2.0f, 1.0f },
+    { OMP_ITEM_SLIDER, kTwkDetFog,      "Volumetric fog",
+      "A finer fog grid: light shafts get an edge instead of a staircase. Costs memory",
+      nullptr, nullptr, 0.0f, 2.0f, 1.0f },
+    { OMP_ITEM_ACTION, kTwkDetMax,      "Detail settings to maximum",
+      "Every detail setting above to its highest, draw distance to 250%" },
 };
 static const OmpPageItem2 kTwkSitItems[] = {
     { OMP_ITEM_TOGGLE, kTwkSit,         "Sit down",
@@ -857,6 +898,7 @@ void Tweaks_PumpFrame() {
     PopProbe_PumpFrame();            // AFTER grind_pop: its drain feeds PopProbe_OnJump first
     BodyFeel_PumpFrame();            // breathes the physical-animation stiffness (after pop_probe: reads its crouch depth)
     Upscale_PumpFrame();             // render-scale console variables + the FSR health line
+    MaxDetail_PumpFrame();           // ...and the detail variables, held against the settings screen
     Sit_PumpFrame();                 // the sit/stand state machine
     Twk_SetPoseHold(Sit_PoseHeld()); // a seated skeleton travels to other players as a held pose (SessionOpenMP)
     ProxyBodyFeel_PumpFrame();       // the same riding body on remote players' proxies, with THEIR settings (SessionOpenMP bridge)

@@ -18,5 +18,7 @@ void Upscale_ResetDefaults();
 void Upscale_Install();                 // sig-scan + the seam hook; non-fatal if missing
 void Upscale_PumpFrame();               // GAME THREAD: applies the console variables, 1 Hz FSR health line
 // Menu accessors (menu_ext contract).
-bool  Upscale_TaauEnabled();    void Upscale_SetTaauEnabled(bool on);
 float Upscale_RenderScalePct(); void Upscale_SetRenderScalePct(float v);
+// GAME THREAD: run one console command through the engine's own exec, against the local skater as the
+// world context. False = no exec resolved, or nothing to run it against yet (menu, loading).
+bool  Upscale_Console(const char* cmd);

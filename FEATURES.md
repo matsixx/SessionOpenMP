@@ -279,6 +279,13 @@ settles, collides and rolls with sound. It comes back to hand when you stand.
 
 * \[feature] Graphics page (3.19.289): the engine's temporal upsampling (TAAU) and a render-scale slider,
 applied through the console and held against the game's own settings apply.
+* \[feature] Max detail (3.19.356-361): quality settings past the end of the game's own sliders --
+texture sharpness (16x anisotropic filtering and a larger streaming pool), shadows (resolution, cascades,
+distance, and small objects casting), draw distance, ambient occlusion through the engine's better GTAO
+screen space reflections and volumetric fog grid resolution, plus "Detail settings to maximum". They sit
+with the upscaler on one Graphics page.
+Each is independent and defaults to the game's own setting; they are held against the settings screen,
+which re-applies its own scalability groups over the top.
 * \[feature] FSR upscaling (3.19.291-300, off by default): AMD FidelityFX Super Resolution in place of the
 engine's TAA/TAAU through the temporal-upscaler seam -- FSR 4 on RDNA4 through the driver's provider, FSR 3.1.x
 elsewhere, with motion vectors reconstructed from depth for the camera, an RCAS sharpness slider and a

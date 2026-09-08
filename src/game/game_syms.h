@@ -245,6 +245,17 @@ using ActorDestroyFn    = bool  (*)(void* actor, bool netForce, bool shouldModif
 // rebuild, which is the replay-editor crash. See RefreshProxyReplayBones.
 using ReplayRefreshBonesFn = void (*)(void* replayComp);
 using SetPhysAnimEnabledFn = void (*)(void* skater, bool enable);
+// Peer body trim (peer_bodies.cpp): the body-level knobs behind a proxy's physical animation.
+// FBodyInstance::SetInstanceSimulatePhysics takes three bools in 4.26 and two in 4.25; passing three
+// is safe either way, since a Microsoft x64 caller that hands over an argument the callee does not
+// read has simply set a register nobody looks at.
+using BodySetSimulateFn  = void (*)(void* bodyInstance, bool simulate, bool maintainBlend, bool preserveAttach);
+using BodySetResponseFn  = void (*)(void* bodyInstance, uint8_t channel, uint8_t response);
+using BodyUpdateFilterFn = void (*)(void* bodyInstance);
+// FPhysicsCommand_PhysX::ExecuteWrite(const FPhysicsActorHandle&, TFunctionRef<void(const handle&)>).
+// The TFunctionRef is two pointers, thunk first, and is called as thunk(callable, handleRef).
+using PhysExecuteWriteFn = bool (*)(const void* actorHandleRef, const void* functionRef);
+using SetSolverItersFn   = void (*)(const void* actorHandleRef, int count);
 // Proximity voice (voice_audio.cpp). FVector/FRotator are 12-byte structs: MSVC x64 passes them by
 // hidden reference, exactly as the engine's own native was compiled, so declaring them by value
 // here is what makes the call land right.
@@ -440,6 +451,14 @@ struct Syms {
     // none of which a stamped-in proxy takes), which is why a peer has ZERO body physics -- see the
     // paProbe field note. Used to give proxies the game's own body physics.
     SetPhysAnimEnabledFn SetPhysAnimEnabled = nullptr;
+    // Peer body trim (peer_bodies.h): cutting a proxy's physical animation down to what can be seen.
+    // All optional -- without them a peer simply keeps the whole simulated asset, as before.
+    BodySetSimulateFn    BodySetSimulate   = nullptr;
+    BodySetResponseFn    BodySetResponse   = nullptr;
+    BodyUpdateFilterFn   BodyUpdateFilter  = nullptr;
+    PhysExecuteWriteFn   PhysExecuteWrite  = nullptr;
+    SetSolverItersFn     SetSolverPosIters = nullptr;
+    SetSolverItersFn     SetSolverVelIters = nullptr;
     // Proximity voice (voice_audio.cpp): a procedural sound per peer, played by the game's own
     // audio engine from their proxy.
     SCOFn                StaticConstructObject = nullptr;   // objects in the transient package
@@ -514,6 +533,8 @@ bool ProxyRefAt(int i, void** actor, void** board);
 // an FString that is deliberately leaked, so a per-frame caller corrupts the heap. Enumerating fonts
 // once at startup is fine.
 bool ObjectName(const void* obj, char* out, int cap);
+// An FName as ASCII. Exposed for peer_bodies.cpp, which names the bone behind a physics body.
+bool FNameAscii(const void* fnamePtr, char* out, int cap);
 // A skater's mesh component, and the bone count of the skeleton it is drawing.
 void* SkaterMeshOf(void* skaterActor);
 int   SkeletonBoneCount(void* meshComp);
@@ -794,6 +815,11 @@ namespace off {
     constexpr int kBodyBlendWeight      = 0x11c;   // FBodyInstance::PhysicsBlendWeight (0..1)
     constexpr int kBodySimByte          = 0x10;    // FBodyInstance bitfield byte holding bSimulatePhysics
     constexpr int kBodySimBit           = 0;
+    constexpr int kBodyBoneIndex        = 0x1c;    // FBodyInstance::InstanceBoneIndex (int16, into the ref skeleton)
+    constexpr int kBodyPosIters         = 0x74;    // FBodyInstance::PositionSolverIterationCount (uint8)
+    constexpr int kBodyVelIters         = 0x75;    // FBodyInstance::VelocitySolverIterationCount (uint8)
+    constexpr int kBodyResponses        = 0x78;    // CollisionResponses.ResponseToChannels, one byte per channel
+    constexpr int kBodyActorHandle      = 0x120;   // FBodyInstance::ActorHandle (the PhysX actor)
     constexpr int kContainerPage      = 0x2a0;   // _menuPage (UMenuPage*) -- the page the container is
                                                  // showing, which is the page a back action applies to
     // UMenuPage:

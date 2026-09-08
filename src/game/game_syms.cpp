@@ -298,6 +298,22 @@ static const SigEntry kSigs[] = {
     { "AudioStop",             "40 53 48 83 EC 20 F6 81 8A 00 00 00 01 48 8B D9 ?? ?? E8 ?? ?? ?? ?? 48 85 C0 ?? ?? 48 8B 93 D0 07 00 00 48 8B C8 80 A3 8A 00 00 00 FE", false },
     { "AudioPlay",             "48 89 5C 24 08 48 89 7C 24 10 55 48 8B EC 48 81 EC 80 00 00 00 33 C0 F3 0F 11 4D A0 BF FF FF FF FF 48 89 45 B0 48 8D 55 A0", false },
     { "AudioSetVolume",        "40 53 48 81 EC 90 00 00 00 F6 81 8A 00 00 00 01 48 8B D9 0F 29 B4 24 80 00 00 00 0F 28 F1 F3 0F 11 B1 38 02 00 00 C7 81 34 02 00 00 00 00 80 3F", false },
+    // --- PEER BODY TRIM (peer_bodies.cpp). All optional: without them a peer keeps the whole
+    // simulated asset, which is what shipped before.
+    // FBodyInstance::SetInstanceSimulatePhysics       Epic 0x2e57d00 / Steam 0x2e1a760
+    { "BodySetSimulate",       "4C 8B DC 55 53 49 8D 6B A1 48 81 EC A8 00 00 00 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 45 27 4D 89 63 20 48 8B D9 4D 89 6B E8", false },
+    // FBodyInstance::SetResponseToChannel             Epic 0x2e58450 / Steam 0x2e1aeb0
+    { "BodySetResponse",       "40 53 48 83 EC 20 48 8B D9 48 83 C1 78 E8 ?? ?? ?? ?? 84 C0 ?? ?? 48 8B 05 ?? ?? ?? ?? 48 8D 4C 24 30 33 D2 48 89 43 6C", false },
+    // FBodyInstance::UpdatePhysicsFilterData          Epic 0x2e5d730 / Steam 0x2e20190
+    { "BodyUpdateFilter",      "40 53 48 83 EC 30 48 8B 81 F0 00 00 00 48 8B D9 48 85 C0 ?? ?? 66 66 66 0F 1F 84 00 00 00 00 00 48 8B D8 48 8B 80 F0 00 00 00", false },
+    // FPhysicsCommand_PhysX::ExecuteWrite             Epic 0x2e99e80 / Steam 0x2e5c960
+    // The FF 90 58 03 00 00 near the end is call [rax+0x358] = the scene's lockWrite, and it is
+    // deliberately NOT wildcarded: the read twin is byte-identical up to that one displacement.
+    { "PhysExecuteWrite",      "48 89 5C 24 10 57 48 83 EC 20 48 8B F9 48 8B DA 48 8B 09 48 85 C9 ?? ?? 48 8B 01 48 89 74 24 30 ?? ?? ?? 48 8B F0 48 85 C0 ?? ?? 48 8B 00 45 33 C0 33 D2 48 8B CE FF 90 58 03 00 00 48 8B 03 48 8B D7 48 8B 4B 08", false },
+    // FPhysicsInterface_PhysX::SetSolverPositionIterationCount_AssumesLocked  Epic 0x2ea5000 / Steam 0x2e67ae0
+    { "SetSolverPosIters",     "40 57 48 83 EC 20 48 8B 01 8B FA 48 85 C0 ?? ?? 33 C9 48 89 5C 24 38 66 83 78 08 06 8B D9 48 0F 44 D8 48 85 DB ?? ?? 48 8B 03 4C 8D 44 24 30 89 4C 24 40 48 8D 54 24 40 89 4C 24 30 48 8B CB FF 90 ?? ?? ?? ?? 48 8B 03 8B D7 44 8B 44 24 30 48 8B CB", false },
+    // FPhysicsInterface_PhysX::SetSolverVelocityIterationCount_AssumesLocked  Epic 0x2ea5070 / Steam 0x2e67b50
+    { "SetSolverVelIters",     "40 57 48 83 EC 20 48 8B 01 8B FA 48 85 C0 ?? ?? 33 C9 48 89 5C 24 38 66 83 78 08 06 8B D9 48 0F 44 D8 48 85 DB ?? ?? 48 8B 03 4C 8D 44 24 40 89 4C 24 30 48 8D 54 24 30 89 4C 24 40 48 8B CB FF 90 ?? ?? ?? ?? 48 8B 03 44 8B C7 8B 54 24 30 48 8B CB", false },
 };
 static const int kSigN = (int)(sizeof(kSigs) / sizeof(kSigs[0]));
 
@@ -322,6 +338,10 @@ static bool fnameToAscii(const void* fnamePtr, char* out, int cap) {
         out[k] = 0;
         return k > 0;
     } __except (EXCEPTION_EXECUTE_HANDLER) { out[0] = 0; return false; }
+}
+bool FNameAscii(const void* fnamePtr, char* out, int cap) {
+    if (!out || cap <= 0) return false;
+    return fnameToAscii(fnamePtr, out, cap);
 }
 bool ObjectName(const void* obj, char* out, int cap) {
     if (out && cap) out[0] = 0;
@@ -678,6 +698,7 @@ bool ProbePhysAnim(void* sk, PhysAnimProbe* out) {
 }
 #else
 bool ObjectName(const void*, char* o, int c) { if (o && c) o[0] = 0; return false; }
+bool FNameAscii(const void*, char* o, int c)  { if (o && c) o[0] = 0; return false; }
 void* SkaterMeshOf(void*)      { return nullptr; }
 bool  ProbePhysAnim(void*, PhysAnimProbe*) { return false; }
 int   SkeletonBoneCount(void*) { return 0; }
@@ -946,6 +967,12 @@ const Syms& Resolve(void (*logf)(const char*)) {
     g_syms.AudioStop          = (AudioStopFn)       found[i++];
     g_syms.AudioPlay          = (AudioPlayFn)       found[i++];
     g_syms.AudioSetVolume     = (AudioSetVolFn)     found[i++];
+    g_syms.BodySetSimulate    = (BodySetSimulateFn)  found[i++];
+    g_syms.BodySetResponse    = (BodySetResponseFn)  found[i++];
+    g_syms.BodyUpdateFilter   = (BodyUpdateFilterFn) found[i++];
+    g_syms.PhysExecuteWrite   = (PhysExecuteWriteFn) found[i++];
+    g_syms.SetSolverPosIters  = (SetSolverItersFn)   found[i++];
+    g_syms.SetSolverVelIters  = (SetSolverItersFn)   found[i++];
 
     // LOCKSTEP CHECK. The block above is POSITIONAL, and a table entry added without its assignment --
     // or vice versa -- shifts every later symbol onto the wrong address SILENTLY: sigs still resolve

@@ -221,6 +221,9 @@ private:
     uint8_t    animTickState_ = 0xff;     // what we last wrote (0xff = nothing)
     uint64_t   animCheckUs_   = 0;        // projection cadence (~5 Hz per proxy)
     uint64_t   animSeenUs_    = 0;        // last time the proxy projected on screen (hysteresis)
+    int8_t     animOnBoardSeen_ = -1;     // the wire's onBoard as the throttle last saw it (-1 = no sample)
+    uint64_t   animHoldUntilUs_ = 0;      // ...and the window after an edge where culling is refused
+    uint64_t   animFrozenLogMs_ = 0;       // the frozen-on-screen line, rate limited (see the watchdog)
     uint64_t   paProbeMs_     = 0;        // debug::paProbe cadence (2 s per proxy)
     uint64_t   paEnableMs_    = 0;        // syncPhysAnim poll cadence (per proxy)
     uint8_t    lastPushState_ = 0, lastBrakeState_ = 0, lastBailing_ = 0;

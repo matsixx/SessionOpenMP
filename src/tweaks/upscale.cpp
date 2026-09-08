@@ -50,7 +50,6 @@
 
 // ------------------------------------------------------------------ knobs
 static int   g_renderScale = 100;   // RenderScalePct: r.ScreenPercentage (100 = native)
-static int   g_taau        = 1;     // TemporalUpsampling: r.TemporalAA.Upsampling
 static int   g_probe       = 1;     // UpscalerProbe: install the pass-through interface
 static int   g_probeLog    = 0;     // UpscalerProbeLog: bring-up telemetry, off unless something needs diagnosing
 static int   g_applyMs     = 5000;  // UpscalerApplyMs: re-assert cadence for the console variables
@@ -58,7 +57,6 @@ static int   g_applyMs     = 5000;  // UpscalerApplyMs: re-assert cadence for th
 void Upscale_ReadConfig(const char* buf) {
     g_renderScale = TwkIniInt(buf, "RenderScalePct", 100);
     if (g_renderScale < 50) g_renderScale = 50; if (g_renderScale > 100) g_renderScale = 100;
-    g_taau     = TwkIniInt(buf, "TemporalUpsampling", 1) ? 1 : 0;
     g_probe    = TwkIniInt(buf, "UpscalerProbe", 1) ? 1 : 0;
     g_probeLog = TwkIniInt(buf, "UpscalerProbeLog", 0) ? 1 : 0;
     g_applyMs  = TwkIniInt(buf, "UpscalerApplyMs", 5000);
@@ -67,17 +65,14 @@ void Upscale_ReadConfig(const char* buf) {
 }
 void Upscale_SaveConfig(char* buf, size_t cap) {
     TwkIniSetInt(buf, cap, "RenderScalePct",     g_renderScale);
-    TwkIniSetInt(buf, cap, "TemporalUpsampling", g_taau);
     TwkIniSetInt(buf, cap, "UpscalerProbe",      g_probe);
     TwkIniSetInt(buf, cap, "UpscalerProbeLog",   g_probeLog);
     TwkIniSetInt(buf, cap, "UpscalerApplyMs",    g_applyMs);
     UpscaleFsr_SaveConfig(buf, cap);
 }
-void Upscale_ResetDefaults() { g_renderScale = 100; g_taau = 1; UpscaleFsr_ResetDefaults(); }
+void Upscale_ResetDefaults() { g_renderScale = 100; UpscaleFsr_ResetDefaults(); }
 
 static bool g_dirtyApply = true;     // apply on the next pump (load, or a menu change)
-bool  Upscale_TaauEnabled()          { return g_taau != 0; }
-void  Upscale_SetTaauEnabled(bool o) { g_taau = o ? 1 : 0; g_dirtyApply = true; TwkMarkDirty(); }
 float Upscale_RenderScalePct()       { return (float)g_renderScale; }
 void  Upscale_SetRenderScalePct(float v) {
     int p = (int)(v + 0.5f); if (p < 50) p = 50; if (p > 100) p = 100;
@@ -224,23 +219,51 @@ void Upscale_Install() {
     UpscaleFsr_Install();
 }
 
+// Have these console variables been written at all? Once they have, going back to "off" has to
+// write ONE more time to undo the override -- stopping quietly would leave the game running at
+// whatever was last pushed.
+static bool g_scaleOwned = false;
+
 static void Apply(void* sk) {
     char c[64];
-    snprintf(c, sizeof(c), "r.TemporalAA.Upsampling %d", g_taau ? 1 : 0);
+    // NOTHING IS TOUCHED WHILE THE FEATURE IS OFF. These are the game's own console variables and
+    // the video settings screen writes them too: a player who set their resolution scale there had
+    // it silently overwritten every few seconds by this module's default of 100, whether or not they
+    // ever opened the Graphics page. So the scale is only pushed while it IS the one in charge --
+    // the slider moved off native, or the upscaler running (which is what renders below native in
+    // the first place). Turning both back off writes the engine default once and then lets go.
+    const bool wantScale = (g_renderScale != 100) || UpscaleFsr_Enabled();
+    if (!wantScale && !g_scaleOwned) return;
+
+    // Temporal upsampling is not a choice any more: it is what makes rendering below native produce a
+    // full-resolution image, so it follows the upscaler rather than being a switch of its own that
+    // could be left in the wrong position. On means FSR is on; off hands the engine back its own path.
+    const int g_taau = UpscaleFsr_Enabled() ? 1 : 0;
+    const int scale  = wantScale ? g_renderScale : 100;
+    snprintf(c, sizeof(c), "r.TemporalAA.Upsampling %d", g_taau);
     const bool a = Exec(sk, c);
-    snprintf(c, sizeof(c), "r.ScreenPercentage %d", g_renderScale);
+    snprintf(c, sizeof(c), "r.ScreenPercentage %d", scale);
     const bool b = Exec(sk, c);
     // FSR wants 8 jitter phases x (display/render)^2; the engine scales r.TemporalAASamples by that
     // ratio itself under temporal upscaling, so the base value is what changes with FSR on/off.
     const int samples = UpscaleFsr_WantedTaaSamples();
     snprintf(c, sizeof(c), "r.TemporalAASamples %d", samples);
     Exec(sk, c);
+    // Only claimed once a write actually landed, so a failed exec does not leave a release owed.
+    if (a || b) g_scaleOwned = wantScale;
+
     static int lastScale = -1, lastTaau = -1, lastSamples = -1;
-    if (lastScale != g_renderScale || lastTaau != g_taau || lastSamples != samples) {
-        lastScale = g_renderScale; lastTaau = g_taau; lastSamples = samples;
-        TwkLog("[upscale] applied: r.TemporalAA.Upsampling %d, r.ScreenPercentage %d, r.TemporalAASamples %d%s",
-               g_taau, g_renderScale, samples, (a && b) ? "" : " (exec unavailable)");
+    if (lastScale != scale || lastTaau != g_taau || lastSamples != samples) {
+        lastScale = scale; lastTaau = g_taau; lastSamples = samples;
+        TwkLog("[upscale] applied: r.TemporalAA.Upsampling %d, r.ScreenPercentage %d, r.TemporalAASamples %d%s%s",
+               g_taau, scale, samples, wantScale ? "" : " (released -- the game's own setting stands)",
+               (a && b) ? "" : " (exec unavailable)");
     }
+}
+
+bool Upscale_Console(const char* cmd) {
+    void* sk = CatchTweaks_Skater();
+    return sk ? Exec(sk, cmd) : false;
 }
 
 void Upscale_PumpFrame() {

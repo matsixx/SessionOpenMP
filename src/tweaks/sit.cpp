@@ -1315,8 +1315,17 @@ static void __fastcall hkFlip(void* mesh) {
 
 // ------------------------------------------------------------------ the board
 static void* g_boardMoveComp = nullptr;      // whose carry to skip while the board is down
+static bool  g_boardResting = false;         // ...and only while it IS down
+static volatile LONG g_placeSkips = 0;
+// Suppressing the game's own "put the board in your hand" is the single most dangerous thing this
+// module does to the game: a board whose component still thinks it is being carried, that never gets
+// placed, is a board whose Tick works on a hand that was never set up. So the test is deliberately
+// paranoid -- BOTH that this is the component we put down AND that we still believe it is down. A
+// pointer alone is not enough: it can be stale (a release path that returned early, a fault) and, once
+// the object behind it is destroyed, the allocator can hand the same address to a DIFFERENT board,
+// whose carry we would then suppress for the rest of the session.
 static void __fastcall hkPlaceInHand(void* moveComp, void* a, void* b, void* c) {
-    if (moveComp && moveComp == g_boardMoveComp) return;    // ours, and it is sitting on the ground
+    if (moveComp && g_boardResting && moveComp == g_boardMoveComp) { InterlockedIncrement(&g_placeSkips); return; }
     if (g_origPlaceInHand) g_origPlaceInHand(moveComp, a, b, c);
 }
 // While you sit, the board is set down rather than dropped or left floating in your hand. Set down: it
@@ -1327,7 +1336,6 @@ static void __fastcall hkPlaceInHand(void* moveComp, void* a, void* b, void* c) 
 static void* g_board = nullptr, *g_boardComp = nullptr, *g_boardParent = nullptr;
 static uint64_t g_boardSocket = 0;
 static float g_boardRel[9];              // location, rotation and scale, as they were
-static bool  g_boardResting = false;
 static V3    g_boardPut = { 0.0f, 0.0f, 0.0f };   // where we put it, to see whether it stayed
 static int   g_boardWatch = 0;
 static unsigned g_rand = 0;
@@ -1335,7 +1343,7 @@ static float Rand01() { g_rand = g_rand * 1664525u + 1013904223u; return (float)
 static float RandRange(float a, float b) { return a + (b - a) * Rand01(); }
 
 static void RestBoard(void* skater, const V3& seatPoint, const V3& facing, bool ledge, float groundDz) {
-    g_boardResting = false; g_board = nullptr; g_boardComp = nullptr;
+    g_boardResting = false; g_board = nullptr; g_boardComp = nullptr; g_boardMoveComp = nullptr;
     if (!g_boardRest || !g_detach || !g_teleport || !g_setSim || !skater) return;
     __try {
         void* board = twkP(skater, SK_BOARD);
@@ -1385,10 +1393,10 @@ static void RestBoard(void* skater, const V3& seatPoint, const V3& facing, bool 
                (unsigned)*(const unsigned char*)((const uint8_t*)comp + SC_HIDDEN_IN_GAME),
                (unsigned)*(const unsigned char*)((const uint8_t*)comp + SC_MOBILITY),
                moved ? "ok" : "FAILED", w[4], w[5], w[6], at.x, at.y, at.z);
-    } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; g_boardResting = false; }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; g_boardResting = false; g_boardMoveComp = nullptr; }
 }
 static void ReleaseBoard() {
-    if (!g_boardResting || !g_boardComp) { g_boardResting = false; return; }
+    if (!g_boardResting || !g_boardComp) { g_boardResting = false; g_boardMoveComp = nullptr; return; }
     __try {
         if (g_ragOff && g_board)        g_ragOff((uint8_t*)g_board + BD_IFACE);
         else if (g_boardSim && g_board)  g_boardSim(g_board, false, false);
@@ -2330,6 +2338,7 @@ void Sit_Install() {
         return;
     }
     g_ok = true;
+    if (g_placeSkips) TwkLog("[sit] (board carries suppressed so far: %ld)", g_placeSkips);
     if (!g_bail) TwkLog("[sit] Bail sig NOT FOUND -- being skated into will not knock you over");
     if (!g_dropInst) TwkLog("[sit] object dropper site NOT FOUND -- the sit key may fight the prop editor's B");
     TwkLog("[sit] armed: pose seam @ %p, trace @ %p, movement mode @ %p, key %s", g_flipAt, (void*)g_trace, (void*)g_setMode, g_keyName);
