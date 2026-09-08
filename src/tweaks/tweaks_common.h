@@ -154,6 +154,9 @@ int TwkIniInt(const char* text, const char* key, int def);
 // host (solo play) the answer is always "no", which is exactly the old behaviour.
 int  Twk_IsProxy(void* actor);
 void Twk_BindProxyQuery();     // probe for the export; cheap, retried from the pump until found
+// Tell SessionOpenMP (if present) that our skeleton is posed outside the anim graph -- sitting -- so
+// it travels to other players as a held pose. Binds the export lazily; pushes on change only.
+void Twk_SetPoseHold(bool held);
 // As above but silent. Use when PROBING for a key's presence (sentinel default), where the
 // "differs from the built-in default" line would be misleading rather than informative.
 int TwkIniIntQuiet(const char* text, const char* key, int def);

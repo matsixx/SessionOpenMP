@@ -82,6 +82,29 @@ void Twk_BindProxyQuery() {
     }
     if (!g_isProxyLooked) { g_isProxyLooked = true; }
 }
+typedef void (*SetPoseHoldFn)(int);
+static SetPoseHoldFn g_setPoseHold = nullptr;
+static uint64_t      g_setPoseHoldTryMs = 0;
+static int           g_poseHeldSent = -1;
+void Twk_SetPoseHold(bool held) {
+    if (!g_setPoseHold) {
+        const uint64_t ms = GetTickCount64();
+        if (ms - g_setPoseHoldTryMs < 2000) return;
+        g_setPoseHoldTryMs = ms;
+        HMODULE mods[512]; DWORD needed = 0;
+        if (!EnumProcessModules(GetCurrentProcess(), mods, sizeof(mods), &needed)) return;
+        int n = (int)(needed / sizeof(HMODULE)); if (n > 512) n = 512;
+        for (int i = 0; i < n && !g_setPoseHold; i++)
+            g_setPoseHold = (SetPoseHoldFn)GetProcAddress(mods[i], "OmpSession_SetOwnPoseHold");
+        if (!g_setPoseHold) return;
+        TwkLog("[tweaks] pose-hold bridge bound (host: SessionOpenMP) -- sitting travels to other players");
+    }
+    const int v = held ? 1 : 0;
+    if (v == g_poseHeldSent) return;
+    g_poseHeldSent = v;
+    __try { g_setPoseHold(v); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
 int Twk_IsProxy(void* actor) {
     if (!actor || !g_isProxy) return 0;
     __try { return g_isProxy(actor) ? 1 : 0; } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }

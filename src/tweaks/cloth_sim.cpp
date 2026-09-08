@@ -41,6 +41,7 @@
 #include "tweaks_common.h"
 #include "ui/menu_ext.h"
 #include "cloth_sim.h"
+#include "sit.h"          // Sit_NoteReplayTick -- this hook is the only AReplayManager::Tick detour
 #include "cloth_merge.h"
 #include "catch_sound.h"    // CatchSound_ObjName
 #include <string.h>
@@ -2874,6 +2875,7 @@ static const char*  SIG_REPLAY_TICK =
 
 static void hkReplayTick(void* self, float dt) {
     if (g_origReplayTick) g_origReplayTick(self, dt);
+    Sit_NoteReplayTick(self);  // sitting reads the manager's mode: it stands down in a replay
     // After the replay has posed everything for this frame, so we read the pose it just set.
     // NOTE: the shell pump rides InputHandler::Tick, which keeps ticking in the replay editor, so
     // cloth is pumped twice a frame in there. Standing one of them down was tried while chasing a

@@ -46,6 +46,8 @@
 #include "ui/menu_ext.h"
 #include "camera_height.h"
 #include "grind_pop.h"     // GrindPop_NameOfFName -- names the component class in the probe
+#include "sit.h"           // Sit_FirstPersonView -- the seated first-person view this module writes
+#include "foot_place.h"    // FootPlace_AnimInstance -- riding, or walking around
 #include "MinHook.h"
 
 // ------------------------------------------------------------------ measured offsets (PDB-confirmed)
@@ -66,7 +68,11 @@ enum {
     CAM_COMPONENT         = 0x228,  // UCameraComponent*
     // USceneComponent
     COMP_REL_ROT          = 0x128,  // RelativeRotation (FRotator) -- read once for the stock check
+    AN_ON_BOARD           = 0x300,  // USkaterAnimInstance::IsOnBoard -- riding, not walking
     COMP_WORLD_QUAT       = 0x1c0,  // ComponentToWorld.Rotation (FQuat)
+    COMP_WORLD_POS        = 0x1d0,  // ComponentToWorld.Translation
+    COMP_REL_LOC          = 0x11c,  // RelativeLocation (FVector)
+    CAMC_FOV              = 0x1f8,  // UCameraComponent::FieldOfView
     ACTOR_ROOT            = 0x130,  // AActor::RootComponent
 };
 
@@ -81,6 +87,12 @@ static const float kNeverFlat = -100000.0f;
 static const char* SIG_SET_WORLD_ROT =
     "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 50 41 0F B6 F8 49 8B D9 4C 8B C2 48 8B F1 48 8D 54 24 40 E8";
 typedef void (*SetWorldRotFn)(void* comp, const float* quat4, bool sweep, void* hit, unsigned char teleport);
+// USceneComponent::SetWorldLocationAndRotation, the FQuat overload -- (comp, &loc3, &quat4, sweep, hit,
+// teleport). Told from its FRotator twin by what it reads: a 16-byte movups off the rotation argument.
+// Epic 0x2b669f0 / Steam 0x2b29230, 1-hit in both (sigmake).
+static const char* SIG_SET_WORLD_LOCROT =
+    "4C 8B DC 53 55 56 57 41 56 48 81 EC C0 00 00 00 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 84 24 80 00 00 00";
+typedef void (*SetWorldLocRotFn)(void* comp, const float* loc3, const float* quat4, bool sweep, void* hit, unsigned char teleport);
 
 // ASkaterCameraActor::Tick -- Epic 0xf69810 / Steam 0xf29620, 1-hit in both (sigmake).
 // Hooked as the capture point and frame anchor: `this` IS the camera actor, and applying data writes
@@ -94,6 +106,8 @@ static int g_follow      = 0; // CameraFollowHeight    -- no air classifies as "
 static int g_pitchOnDrop = 1; // CameraPitchBeforeDrop -- 1 = stock pitch kept, 0 = we disable it
 static int g_dropDebug = 0;   // CameraDropDebug  -- the game's own drop visualiser, for field rounds
 static float g_pitchDeg = 0;  // CameraPitchDeg   -- extra camera pitch, degrees; positive looks UP
+static int   g_pitchBlendMs = 400;  // CameraPitchBlendMs -- how long the pitch takes to arrive when you
+                                    //   get on the board, and to leave when you step off
 
 // ------------------------------------------------------------------ live state (game thread only)
 static uint8_t* g_hookAt   = nullptr;
@@ -114,7 +128,18 @@ static SetWorldRotFn g_setWorldRot = nullptr;
 static void*    g_pitchComp = nullptr;       // the camera component the stock relative was read from
 static float    g_stockRel[3] = {0,0,0};     // its RelativeRotation (pitch/yaw/roll) before any write
 static int      g_pitchApplied = 0;
+static float    g_pitchW = 0.0f;        // 0 the game's framing .. 1 the slider's, eased across the mount
 static int      g_pitchDead = 0;
+// The seated first-person view's own state and its OWN kill switch.
+static SetWorldLocRotFn g_setWorldLocRot = nullptr;
+static void*    g_fpComp = nullptr;
+static float    g_fpStockRelLoc[3] = {0,0,0}, g_fpStockRelRot[3] = {0,0,0};   // the component under the actor, as we found it
+static float    g_fpStockFov = 0.0f;
+static int      g_fpWrote = 0;
+static int      g_fpDead = 0;
+// The view forward this frame, published for the head look (sit.cpp).
+static float    g_viewFwd[3] = {1,0,0};
+static uint64_t g_viewFwdMs = 0;
 // ---- the pitch PROBE. The slider visibly did nothing in the field, and five mechanisms would all
 // look exactly like that from the outside: the value never reaching the module, a null component, the
 // wrong component, the write being stomped by the game, or the view not reading the component at all.
@@ -206,12 +231,21 @@ static void quatMul(const float a[4], const float b[4], float r[4]) {
     r[3] = a[3]*b[3] - a[0]*b[0] - a[1]*b[1] - a[2]*b[2];
 }
 
+// Riding, as opposed to walking around off the board. An unreadable state counts as NOT riding, so a
+// bad read leaves the camera the game's rather than tilting it somewhere it was not asked to.
+static bool OnBoard() {
+    __try {
+        void* a = FootPlace_AnimInstance();
+        return a && twkB(a, AN_ON_BOARD) > 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
 // The pitch lever, applied AFTER the game's Tick so the actor rotation it composes from is this
 // frame's. The write is ABSOLUTE every frame -- actor rotation (game-owned, never ours) times the
 // component's stock relative times the slider -- so it cannot compound and cannot feed back: nothing
 // we wrote is ever an input. Publishing what an actor has reached instead of what it was told is the
 // bug class this shape exists to avoid.
-static void applyPitch(void* cam) {
+static void applyPitch(void* cam, float dt) {
     if (!g_setWorldRot) return;
     void* comp = twkP(cam, CAM_COMPONENT);
     if (!comp) return;
@@ -227,7 +261,7 @@ static void applyPitch(void* cam) {
         g_stockRel[0] = twkF(comp, COMP_REL_ROT);
         g_stockRel[1] = twkF(comp, COMP_REL_ROT + 4);
         g_stockRel[2] = twkF(comp, COMP_REL_ROT + 8);
-        g_pitchApplied = 0;                          // fresh component: nothing of ours on it yet
+        g_pitchApplied = 0; g_pitchW = 0.0f;         // fresh component: nothing of ours on it yet
         if (g_stockRel[0] != 0 || g_stockRel[1] != 0 || g_stockRel[2] != 0)
             TwkLog("[camh] camera component %p has a NON-IDENTITY stock relative (%.2f %.2f %.2f)"
                    " -- folded into the pitch compose", comp, g_stockRel[0], g_stockRel[1], g_stockRel[2]);
@@ -244,7 +278,22 @@ static void applyPitch(void* cam) {
         }
         g_haveLastWrote = 0;
     }
-    const int want = (g_pitchDeg != 0.0f) ? 1 : 0;
+    // On the board only. Walking around, the camera is the game's -- and the seated first-person view
+    // wants it untouched too (that path skips this one outright).
+    //
+    // The AMOUNT eases rather than switching, or getting on the board snapped the view by the whole
+    // slider in one frame. The game has its own transition machinery for this change of camera
+    // (ASkaterCameraActor::_currentCameraTransitionTime +0x994, _onBoardCameraModeRequested +0x988, a
+    // _defaultTransitionCurve on the camera data) and it does not need to be decoded to be used: the
+    // compose below starts from the ACTOR, which is exactly what that machinery moves, so the game's
+    // own transition runs underneath this one and the two cannot fight. Nothing we write is an input.
+    const float tgt = (g_pitchDeg != 0.0f && OnBoard()) ? 1.0f : 0.0f;
+    if (dt > 0.0f && dt < 0.5f) {
+        const float step = dt / ((g_pitchBlendMs > 30 ? (float)g_pitchBlendMs : 30.0f) * 0.001f);
+        if (g_pitchW < tgt) { g_pitchW += step; if (g_pitchW > tgt) g_pitchW = tgt; }
+        else if (g_pitchW > tgt) { g_pitchW -= step; if (g_pitchW < tgt) g_pitchW = tgt; }
+    } else g_pitchW = tgt;
+    const int want = (g_pitchW > 0.0005f) ? 1 : 0;
     if (!want && !g_pitchApplied) { g_haveLastWrote = 0; return; }   // stock and staying stock
 
     // SURVIVAL CHECK, before this frame's write: the component's rotation right now is whatever the
@@ -272,7 +321,8 @@ static void applyPitch(void* cam) {
     float base[4];   quatMul(actorQ, stockQ, base);
     float out[4];
     if (want) {
-        const float pyr[3] = { g_pitchDeg, 0, 0 };
+        const float w = g_pitchW * g_pitchW * (3.0f - 2.0f * g_pitchW);
+        const float pyr[3] = { g_pitchDeg * w, 0, 0 };
         float pitchQ[4]; quatFromRotator(pyr, pitchQ);
         quatMul(base, pitchQ, out);                  // local pitch, about the camera's own right axis
     } else {
@@ -303,6 +353,73 @@ static void applyPitch(void* cam) {
     }
 }
 
+static void quatRotate(const float q[4], const float v[3], float r[3]) {   // v' = v + w*t + q x t, t = 2 q x v
+    const float tx = 2.0f * (q[1] * v[2] - q[2] * v[1]);
+    const float ty = 2.0f * (q[2] * v[0] - q[0] * v[2]);
+    const float tz = 2.0f * (q[0] * v[1] - q[1] * v[0]);
+    r[0] = v[0] + q[3] * tx + (q[1] * tz - q[2] * ty);
+    r[1] = v[1] + q[3] * ty + (q[2] * tx - q[0] * tz);
+    r[2] = v[2] + q[3] * tz + (q[0] * ty - q[1] * tx);
+}
+
+// The seated first-person view. sit.cpp says where the eyes are and which way they look, with a
+// weight for the dolly in and out; this module owns the component, so it does the writing. The blend
+// runs from the game's OWN view this frame to the eyes -- and the game's own view is the ACTOR (which
+// the game keeps driving, post-Tick so it is current) under the component's stock relative, never the
+// component's current transform, which after our first write is ours. The last write on the way out
+// puts the component back on that stock relative. Returns true while it wrote; the pitch slider then
+// stands aside for the frame.
+static bool applyFirstPerson(void* cam) {
+    if (!g_setWorldLocRot) return false;
+    void* comp = twkP(cam, CAM_COMPONENT);
+    void* root = twkP(cam, ACTOR_ROOT);
+    if (!comp || !root) return false;
+    if (comp != g_fpComp) { g_fpComp = comp; g_fpWrote = 0; }     // a fresh component: nothing of ours on it
+    float eye[3], look[4], w = 0.0f, fov = 0.0f;
+    const bool want = Sit_FirstPersonView(eye, look, &w, &fov) && w > 0.0f;
+    float actorQ[4] = { twkF(root, COMP_WORLD_QUAT),     twkF(root, COMP_WORLD_QUAT + 4),
+                        twkF(root, COMP_WORLD_QUAT + 8), twkF(root, COMP_WORLD_QUAT + 12) };
+    float actorP[3] = { twkF(root, COMP_WORLD_POS), twkF(root, COMP_WORLD_POS + 4), twkF(root, COMP_WORLD_POS + 8) };
+    if (!want) {
+        if (g_fpWrote) {   // one restoring write: back under the actor, on the relative it had when we began
+            float relQ[4]; quatFromRotator(g_fpStockRelRot, relQ);
+            float off[3];  quatRotate(actorQ, g_fpStockRelLoc, off);
+            const float loc[3] = { actorP[0] + off[0], actorP[1] + off[1], actorP[2] + off[2] };
+            float q[4]; quatMul(actorQ, relQ, q);
+            g_setWorldLocRot(comp, loc, q, false, nullptr, 0);
+            if (g_fpStockFov > 0.0f) wrF(comp, CAMC_FOV, g_fpStockFov);
+            g_fpWrote = 0;
+            TwkLog("[camh] first person: camera handed back to the game");
+        }
+        return false;
+    }
+    if (!g_fpWrote) {
+        for (int i = 0; i < 3; i++) { g_fpStockRelLoc[i] = twkF(comp, COMP_REL_LOC + 4 * i); g_fpStockRelRot[i] = twkF(comp, COMP_REL_ROT + 4 * i); }
+        g_fpStockFov = twkF(comp, CAMC_FOV);
+        TwkLog("[camh] first person: camera to the eyes (stock relative (%.1f %.1f %.1f) / (%.1f %.1f %.1f), fov %.1f%s)",
+               g_fpStockRelLoc[0], g_fpStockRelLoc[1], g_fpStockRelLoc[2], g_fpStockRelRot[0], g_fpStockRelRot[1], g_fpStockRelRot[2],
+               g_fpStockFov, fov > 0.0f ? "" : " kept");
+    }
+    // the game's own view this frame, off the actor
+    float relQ[4]; quatFromRotator(g_fpStockRelRot, relQ);
+    float off[3];  quatRotate(actorQ, g_fpStockRelLoc, off);
+    const float gameP[3] = { actorP[0] + off[0], actorP[1] + off[1], actorP[2] + off[2] };
+    float gameQ[4]; quatMul(actorQ, relQ, gameQ);
+    // ...blended toward the eyes: the position straight, the rotation by the shorter way round
+    float loc[3];
+    for (int i = 0; i < 3; i++) loc[i] = gameP[i] + (eye[i] - gameP[i]) * w;
+    float d = 0.0f; for (int i = 0; i < 4; i++) d += gameQ[i] * look[i];
+    const float sg = d < 0.0f ? -1.0f : 1.0f;
+    float q[4]; float n = 0.0f;
+    for (int i = 0; i < 4; i++) { q[i] = gameQ[i] + (look[i] * sg - gameQ[i]) * w; n += q[i] * q[i]; }
+    n = n > 1e-8f ? 1.0f / sqrtf(n) : 1.0f;
+    for (int i = 0; i < 4; i++) q[i] *= n;
+    g_setWorldLocRot(comp, loc, q, false, nullptr, 0);
+    if (fov > 0.0f && g_fpStockFov > 0.0f) wrF(comp, CAMC_FOV, g_fpStockFov + (fov - g_fpStockFov) * w);
+    g_fpWrote = 1;
+    return true;
+}
+
 static void hkCameraTick(void* self, float dt) {
     if (!g_dead) {
         __try { applyFrame(self); }
@@ -312,13 +429,40 @@ static void hkCameraTick(void* self, float dt) {
         }
     }
     ((void(*)(void*, float))g_origTick)(self, dt);
-    if (!g_pitchDead) {
-        __try { applyPitch(self); }
+    bool fp = false;
+    if (!g_fpDead) {
+        __try { fp = applyFirstPerson(self); }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            g_fpDead = 1;
+            TwkLog("[camh] FAULT in the seated first-person view -- off for this run");
+        }
+    }
+    if (!fp && !g_pitchDead) {
+        __try { applyPitch(self, dt); }
         __except (EXCEPTION_EXECUTE_HANDLER) {
             g_pitchDead = 1;
             TwkLog("[camh] FAULT applying camera pitch -- pitch slider off for this run");
         }
     }
+    // where the view looks now that everything that moves it has run
+    __try {
+        void* comp = twkP(self, CAM_COMPONENT);
+        if (comp) {
+            const float q[4] = { twkF(comp, COMP_WORLD_QUAT),     twkF(comp, COMP_WORLD_QUAT + 4),
+                                 twkF(comp, COMP_WORLD_QUAT + 8), twkF(comp, COMP_WORLD_QUAT + 12) };
+            const float x[3] = { 1.0f, 0.0f, 0.0f };
+            float f[3]; quatRotate(q, x, f);
+            if (fabsf(f[0]) <= 1.5f && fabsf(f[1]) <= 1.5f && fabsf(f[2]) <= 1.5f) {
+                g_viewFwd[0] = f[0]; g_viewFwd[1] = f[1]; g_viewFwd[2] = f[2];
+                g_viewFwdMs = GetTickCount64();
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+bool CameraHeight_ViewForward(float out[3]) {
+    if (!g_viewFwdMs || GetTickCount64() - g_viewFwdMs > 250) return false;
+    out[0] = g_viewFwd[0]; out[1] = g_viewFwd[1]; out[2] = g_viewFwd[2];
+    return true;
 }
 
 // ------------------------------------------------------------------ shell surface
@@ -332,6 +476,8 @@ void CameraHeight_Install() {
     }
     g_setWorldRot = (SetWorldRotFn)TwkScanExe(SIG_SET_WORLD_ROT);
     if (!g_setWorldRot) TwkLog("[camh] SetWorldRotation sig NOT FOUND -- pitch slider off, levers still work");
+    g_setWorldLocRot = (SetWorldLocRotFn)TwkScanExe(SIG_SET_WORLD_LOCROT);
+    if (!g_setWorldLocRot) TwkLog("[camh] SetWorldLocationAndRotation sig NOT FOUND -- seated first person off");
     TwkLog("[camh] installed (camera Tick @ %p, followHeight=%d pitchBeforeDrop=%d pitch=%.0f deg)",
            g_hookAt, g_follow, g_pitchOnDrop, g_pitchDeg);
 }
@@ -356,6 +502,7 @@ void CameraHeight_ReadConfig(const char* iniText) {
     g_pitchOnDrop = TwkIniInt(iniText, "CameraPitchBeforeDrop", defPitchOnDrop);
     g_dropDebug   = TwkIniInt(iniText, "CameraDropDebug",       0);
     g_pitchDeg  = (float)TwkIniInt(iniText, "CameraPitchDeg", 0);
+    g_pitchBlendMs = TwkIniInt(iniText, "CameraPitchBlendMs", 400);
     if (g_pitchDeg < -30.0f) g_pitchDeg = -30.0f;
     if (g_pitchDeg >  30.0f) g_pitchDeg =  30.0f;
 }
@@ -364,6 +511,7 @@ void CameraHeight_SaveConfig(char* iniText, size_t cap) {
     TwkIniSetInt(iniText, cap, "CameraPitchBeforeDrop", g_pitchOnDrop);
     TwkIniSetInt(iniText, cap, "CameraDropDebug",       g_dropDebug);
     TwkIniSetInt(iniText, cap, "CameraPitchDeg",   (int)g_pitchDeg);
+    TwkIniSetInt(iniText, cap, "CameraPitchBlendMs", g_pitchBlendMs);
 }
 void CameraHeight_ResetDefaults() {
     g_follow = 0; g_pitchOnDrop = 1; g_dropDebug = 0; g_pitchDeg = 0;
@@ -392,7 +540,7 @@ void CameraHeight_DrawMenu(const OmpMenuApi* api) {
     if (api->Checkbox("Pitch camera before drop", &p)) CameraHeight_SetPitchOnDropEnabled(p);
     api->SameLine(); api->TextDisabled("(stock: tilt down at the edge instead of descending)");
     float pd = g_pitchDeg;
-    if (api->SliderFloat("Pitch (deg, + looks up)", &pd, -30.0f, 30.0f, "%.0f")) CameraHeight_SetPitchDeg(pd);
+    if (api->SliderFloat("Pitch on the board (deg, + looks up)", &pd, -30.0f, 30.0f, "%.0f")) CameraHeight_SetPitchDeg(pd);
     if (api->Checkbox("Draw the game's drop-detection debug", &dbg)) { g_dropDebug = dbg ? 1 : 0; TwkMarkDirty(); }
     if (g_data) {
         char b[160];

@@ -77,6 +77,19 @@ enum { MPBODY_OFF = 0, MPBODY_ON = 1 };
 int  MpPrefs_PeerBodyPhysics();          // MPBODY_* -- default MPBODY_ON
 void MpPrefs_SetPeerBodyPhysics(int on);
 
+// ---- PROXIMITY VOICE CHAT. Off, push-to-talk or open mic; the talk key; how far a voice carries;
+// how loud other players are; how easily open mic opens. Applied every frame by the session (the
+// microphone only runs in a session with other players). Mutes are a separate list (mutelist.h).
+enum { MPVOICE_OFF = 0, MPVOICE_PTT = 1, MPVOICE_OPEN = 2 };
+enum { MPVOICE_KEY_COUNT = 7 };                     // V, B, T, Left Alt, Left Ctrl, Mouse 4, Mouse 5
+enum { MPVOICE_RANGE_MIN = 5, MPVOICE_RANGE_MAX = 100, MPVOICE_VOL_MIN = 0, MPVOICE_VOL_MAX = 200 };
+int  MpPrefs_VoiceMode();            void MpPrefs_SetVoiceMode(int mode);        // default push-to-talk
+int  MpPrefs_VoiceKey();             void MpPrefs_SetVoiceKey(int idx);          // index into the key list, default V
+int  MpPrefs_VoiceRangeM();          void MpPrefs_SetVoiceRangeM(int metres);    // default 25
+int  MpPrefs_VoiceVolume();          void MpPrefs_SetVoiceVolume(int pct);       // default 100
+int  MpPrefs_VoiceSensitivity();     void MpPrefs_SetVoiceSensitivity(int pct);  // default 50
+const char* MpPrefs_VoiceDevice();   void MpPrefs_SetVoiceDevice(const char* id); // a Windows endpoint id; "" = default
+
 // ---- THE LEVEL'S OWN PROPS (the benches and barriers the map ships with, which the dropper can also
 // shove around). A SEPARATE setting from the one above, and OFF by default, deliberately: sharing
 // them is the unfinished half of this feature and it must not be able to destabilise the inventory

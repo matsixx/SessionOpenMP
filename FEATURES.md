@@ -52,6 +52,10 @@ the depth you are crouched to, not a stock pop (1.0.0-rc2).
 remote skater, so peers used to ride as pure animation; they now get the game's own reactive body, and when
 they run Session Tweaks their own riding-body settings travel with them -- a peer carries their arms, torso
 and head on your screen the way they do on theirs. Turn it off in Multiplayer -> Other options.
+* **Sitting is shared** (1.1.0). When someone sits on a ledge with Session Tweaks, everyone watches them sit
+down, hold the pose and stand up again -- their real skeleton, so every style and every future change to the
+pose travels without this end knowing anything about it. Costs almost nothing while they sit still.
+* **Heads turn** (1.1.0): off the board, a player's head follows where they are looking.
 * **You only share a world with people who are in your level.** Players in a different map are not spawned
 into yours; they disappear when they go somewhere else and reappear when they come back (0.7.1b, 0.8.3b).
 
@@ -73,6 +77,11 @@ their skater on yours, with the real surface type and parameters.
 * **Chat**, appearing as a speech bubble over the speaker (0.7.0b), with a **typing indicator** while
 someone is composing (0.9.0b) and notices when players join or leave a session (0.8.3b).
 * **Multiplayer name** of your own, separate from your profile name, with a filter.
+* **Proximity voice chat** (1.1.0), played by the game's own audio engine from the speaker's skater: it
+fades with distance, muffles through walls, picks up the room's reverb and ducks under the game like any
+other sound. Push to talk or open mic, with a noise gate that learns your room; you only hear players in
+your level. Pick your microphone, range and volume in Multiplayer -> Other options -> Voice chat, hear
+yourself to test it, and mute anyone from the Players page -- muting is yours alone and they are never told.
 
 ## The replay editor
 
@@ -254,6 +263,27 @@ page -- looseness, muscle tone, inertia, spread and head lag, all needing Reacti
 session these travel to the other players, so your skater carries itself the same way on their screen.
 * \[feature] Ragdoll self-collision (3.19.228-231): continuous collision on every body, upper arms collide with
 the torso, real shoulder travel; backward-fall brace splays the arms with palms to the ground (3.19.232).
+
+## Off the board
+
+* \[feature] Sitting (3.19.302): press B off the board to sit on the edge of the ledge you are facing or
+standing at, legs over the side with the feet placed for its height, or on the ground when there is nothing to
+sit on. Four styles per place to sit, cycled by tapping the button; hold it to stand. A procedural pose
+solved against the live rig every frame, with an on-screen prompt drawn by the game's own UI.
+* \[feature] The board is set down when you sit (3.19.336-340): rather than floating in a hand that is no
+longer holding it, it is dropped in front of you -- a different spot and lie each time, so off a ledge it can
+tumble past the face and come to rest against it -- and let go with the game's own ragdoll drop, so it
+settles, collides and rolls with sound. It comes back to hand when you stand.
+
+## Graphics
+
+* \[feature] Graphics page (3.19.289): the engine's temporal upsampling (TAAU) and a render-scale slider,
+applied through the console and held against the game's own settings apply.
+* \[feature] FSR upscaling (3.19.291-300, off by default): AMD FidelityFX Super Resolution in place of the
+engine's TAA/TAAU through the temporal-upscaler seam -- FSR 4 on RDNA4 through the driver's provider, FSR 3.1.x
+elsewhere, with motion vectors reconstructed from depth for the camera, an RCAS sharpness slider and a
+"Prefer FSR 4" toggle. Runs in a level only, never in the menu. The AMD runtime ships beside the DLL in
+dlls/fsr; without it the toggle reports its failure in the log and the engine's own upscaling stays.
 
 ## Settings and menus
 

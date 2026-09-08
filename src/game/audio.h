@@ -144,6 +144,11 @@ void  PlayOneShot(const repl::AudioEvent& e, void* actor, void* board, const flo
 void  StopSound(void* comp);
 // True while we are re-issuing a captured sound. Anything that could re-enter the funnel checks it.
 bool  Replaying();
+// A sound WE spawn that is not the game's: raise this around the spawn so the funnel neither
+// suppresses it (a spawn attached to a proxy is otherwise the proxy's own board, muted) nor captures
+// it as one of the local player's sounds to replay to peers. Proximity voice spawns this way.
+void  BeginOwnSpawn();
+void  EndOwnSpawn();
 // Register a live proxy so its OWN anim-notify sounds can be muted (its audio comes off the wire
 // instead). Called every frame from Proxy::AudioApply; entries expire on their own, so a forgotten
 // or destroyed proxy cannot leave a stale pointer behind to be dereferenced.

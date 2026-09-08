@@ -21,6 +21,7 @@
 #include "../transport/transport.h"
 #include "mp_name.h"
 #include "mp_prefs.h"
+#include "../voice/voice_capture.h"    // the microphone's state, for the voice page
 #include "version_tag.h"
 #include <cstdio>
 #include <cstring>
@@ -47,7 +48,7 @@ static volatile LONG g_pending = OVA_NONE;  // same single-slot handoff shape as
 // different row array and re-run it. So the reset signal cannot be the page definition; it is
 // "CreatePageItems ran on the root page and WE did not ask for it" (see g_selfRefresh).
 enum Page { PG_ROOT = 0, PG_MP = 1, PG_BROWSE = 2, PG_PLAYERS = 3, PG_PLAYER = 4, PG_NAMES = 5,
-            PG_OTHER = 6, PG_GUEST0 = 7 };
+            PG_OTHER = 6, PG_VOICE = 7, PG_GUEST0 = 8 };
 static int  g_page        = PG_ROOT;
 // True for pages whose row list is ENTIRELY ours (as opposed to the pause root, where we append to
 // the game's own rows). Only these can safely be left to the engine's own scroll window.
@@ -384,6 +385,31 @@ static uint8_t   g_peerBodyRow[0x90];    // "Peer body physics", on PG_OTHER
 static FTextBlob g_peerBodyOpts[2];
 static uint64_t  g_peerBodyKey = 0;
 static int       g_peerBodyAt  = -1;
+// Voice chat: a page under Other options (five settings), and a mute switch on each player's page.
+static uint8_t   g_voiceOpenRow[0x90];                   // "Voice chat", on PG_OTHER
+static uint64_t  g_voiceOpenKey = 0;
+static uint8_t   g_voiceModeRow[0x90], g_voiceKeyRow[0x90], g_voiceRangeRow[0x90], g_voiceVolRow[0x90], g_voiceSensRow[0x90];
+static FTextBlob g_voiceModeOpts[3], g_voiceKeyOpts[MPVOICE_KEY_COUNT];
+static uint64_t  g_voiceModeKey = 0, g_voiceKeyKey = 0, g_voiceRangeKey = 0, g_voiceVolKey = 0, g_voiceSensKey = 0;
+static int       g_voiceModeAt = -1, g_voiceKeyAt = -1, g_voiceRangeAt = -1, g_voiceVolAt = -1, g_voiceSensAt = -1;
+// The microphone row is built on the PAGE, not with the others: its options are the devices Windows
+// has right now, so it is rebuilt whenever that set changes (a fresh FText per option each time --
+// only on a real change, so nothing accumulates in normal use).
+static uint8_t   g_voiceDevRow[0x90];
+static FTextBlob g_voiceDevOpts[8];
+static uint64_t  g_voiceDevKey = 0;
+static int       g_voiceDevAt = -1, g_voiceDevN = 0, g_voiceDevSel = 0;
+static uint32_t  g_voiceDevSig = 0;
+static char      g_voiceDevIds[8][200];                  // [0] = "" (the default)
+static uint8_t   g_voiceLoopRow[0x90];                   // "Hear yourself" (a test; not saved)
+static FTextBlob g_voiceLoopOpts[2];
+static uint64_t  g_voiceLoopKey = 0;
+static int       g_voiceLoopAt = -1;
+static uint8_t   g_muteRow[0x90];                        // "Voice", on PG_PLAYER: Heard / Muted
+static FTextBlob g_muteOpts[2];
+static uint64_t  g_muteKey = 0;
+static int       g_muteAt = -1;
+static int       g_selPid = -1;                          // the selected player's transport index
 static const int kMpDropAfter = 0;       // beside "Player names", under "Your name"
 // ---- THE LEVEL'S OWN PROPS. Its own row rather than another state on "Dropped objects", because it
 // is a different feature with a different maturity: sharing the map's furniture is unfinished, and
@@ -409,6 +435,7 @@ static uint64_t  g_playersOpenKey = 0;
 static uint64_t  g_playerRowKeys[kMaxLobbyRows];
 static int       g_playerRowCount = 0;
 static char      g_playerRowIds[kMaxLobbyRows][80];
+static int       g_playerRowPids[kMaxLobbyRows];                // transport index per row (mute)
 static char      g_playerRowNames[kMaxLobbyRows][40];
 static uint8_t   g_kickRow[0x90], g_banRow[0x90];
 static uint64_t  g_kickKey = 0, g_banKey = 0;
@@ -738,6 +765,50 @@ static void buildRows() {
                             "own settings. Off saves CPU in a big lobby.",
                             kBodyOpts, 2, &g_peerBodyKey, g_peerBodyOpts))
             g_peerBodyKey = 0;
+        // Voice chat: its page under Other options, its five rows, and the mute switch that lives on
+        // each player's page. Every row fails independently, like everything above.
+        if (!buildRow(g_voiceOpenRow, "OmpVoice", "Voice chat",
+                      "Talk to the players near you: push to talk or open mic, range and volume", &g_voiceOpenKey))
+            g_voiceOpenKey = 0;
+        static const char* kVoiceModeOpts[3] = { "Off", "Push to talk", "Open mic" };
+        if (!buildOptionRow(g_voiceModeRow, "OmpVoiceMode", "Voice chat",
+                            "Off, hold a key to talk, or talk whenever your microphone hears you. "
+                            "Only the players in your level hear you, and only from nearby.",
+                            kVoiceModeOpts, 3, &g_voiceModeKey, g_voiceModeOpts))
+            g_voiceModeKey = 0;
+        static const char* kVoiceKeyOpts[MPVOICE_KEY_COUNT] = { "V", "B", "T", "Left Alt", "Left Ctrl", "Mouse 4", "Mouse 5" };
+        if (!buildOptionRow(g_voiceKeyRow, "OmpVoiceKey", "Push-to-talk key",
+                            "Hold this to talk when voice chat is set to push to talk",
+                            kVoiceKeyOpts, MPVOICE_KEY_COUNT, &g_voiceKeyKey, g_voiceKeyOpts))
+            g_voiceKeyKey = 0;
+        {
+            GuestItem r{};
+            strncpy_s(r.key, "OmpVoiceRange", _TRUNCATE); strncpy_s(r.label, "Voice range", _TRUNCATE);
+            strncpy_s(r.desc, "How far a voice carries, in metres. Voices fade and muffle with distance and behind walls.", _TRUNCATE);
+            r.minValue = (float)MPVOICE_RANGE_MIN; r.maxValue = (float)MPVOICE_RANGE_MAX; r.step = 5.0f;
+            if (!buildSliderRow(g_voiceRangeRow, r, &g_voiceRangeKey)) g_voiceRangeKey = 0;
+            GuestItem v{};
+            strncpy_s(v.key, "OmpVoiceVolume", _TRUNCATE); strncpy_s(v.label, "Voice volume", _TRUNCATE);
+            strncpy_s(v.desc, "How loud other players are, in percent", _TRUNCATE);
+            v.minValue = (float)MPVOICE_VOL_MIN; v.maxValue = (float)MPVOICE_VOL_MAX; v.step = 10.0f;
+            if (!buildSliderRow(g_voiceVolRow, v, &g_voiceVolKey)) g_voiceVolKey = 0;
+            GuestItem sn{};
+            strncpy_s(sn.key, "OmpVoiceSens", _TRUNCATE); strncpy_s(sn.label, "Mic sensitivity", _TRUNCATE);
+            strncpy_s(sn.desc, "How easily your microphone opens, in both modes. Lower needs a louder voice: turn it down if breathing gets through, up if it clips your words.", _TRUNCATE);
+            sn.minValue = 0.0f; sn.maxValue = 100.0f; sn.step = 5.0f;
+            if (!buildSliderRow(g_voiceSensRow, sn, &g_voiceSensKey)) g_voiceSensKey = 0;
+        }
+        static const char* kLoopOpts[2] = { "Off", "On" };
+        if (!buildOptionRow(g_voiceLoopRow, "OmpVoiceLoop", "Hear yourself",
+                            "A test: your own voice, played back from your skater the way others hear it. "
+                            "Works alone. Not saved.",
+                            kLoopOpts, 2, &g_voiceLoopKey, g_voiceLoopOpts))
+            g_voiceLoopKey = 0;
+        static const char* kMuteOpts[2] = { "Heard", "Muted" };
+        if (!buildOptionRow(g_muteRow, "OmpMute", "Voice",
+                            "Muted: you do not hear this player. Only on your end; they are not told.",
+                            kMuteOpts, 2, &g_muteKey, g_muteOpts))
+            g_muteKey = 0;
         static const char* kModeOpts[3] = { "Off", "Off board only", "Always" };
         if (!buildOptionRow(g_nameModeRow, "OmpNameMode", "Show names",
                             "When to show a player's name above their head. Off board only keeps "
@@ -1292,7 +1363,52 @@ static const TArrayHdr* chooseArray(void* page, const TArrayHdr* items, TArrayHd
             *(int32_t*)(g_peerBodyRow + off::kItemMultiStart) = MpPrefs_PeerBodyPhysics();
             g_peerBodyAt = n; add(g_peerBodyRow, true);
         }
+        if (g_voiceOpenKey) add(g_voiceOpenRow, true);
         if (g_privacyKey) { g_privacyAt = n; add(g_privacyRow, true); }
+        add(g_mpRows + (size_t)(kMpRowCount - 1) * off::kItemSize, true);       // the shared Back row
+    } else if (g_page == PG_VOICE) {
+        // Voice chat. Option indices go on the definition (so a row reads right even if the stamp is
+        // skipped) and onto the widgets in stampValues; sliders only ever live on the widget.
+        g_voiceModeAt = g_voiceKeyAt = g_voiceRangeAt = g_voiceVolAt = g_voiceSensAt = -1;
+        if (g_voiceModeKey) {
+            *(int32_t*)(g_voiceModeRow + off::kItemMultiStart) = MpPrefs_VoiceMode();
+            setRowStatus(g_voiceModeRow, MpPrefs_VoiceMode() == MPVOICE_OFF ? "Voice chat is off"
+                : omp::voice::Capture_DeviceOk() ? omp::voice::Capture_DeviceName()
+                : "The microphone opens once you are in a session with other players");
+            g_voiceModeAt = n; add(g_voiceModeRow, true);
+        }
+        if (g_voiceKeyKey)   { *(int32_t*)(g_voiceKeyRow + off::kItemMultiStart) = MpPrefs_VoiceKey(); g_voiceKeyAt = n; add(g_voiceKeyRow, true); }
+        {   // the microphone list, live
+            omp::voice::Capture_RequestDeviceList();
+            char names[8][64]; const char* opts[8];
+            int nOpts = 1; opts[0] = "Default"; g_voiceDevIds[0][0] = 0;
+            uint32_t sig = 17;
+            const int have = omp::voice::Capture_DeviceCount();
+            for (int i = 0; i < have && nOpts < 8; i++) {
+                if (!omp::voice::Capture_DeviceAt(i, names[nOpts], sizeof(names[nOpts]), g_voiceDevIds[nOpts], sizeof(g_voiceDevIds[nOpts]))) break;
+                if (!names[nOpts][0]) strncpy_s(names[nOpts], "Microphone", _TRUNCATE);
+                opts[nOpts] = names[nOpts];
+                for (const char* c = names[nOpts]; *c; c++) sig = sig * 31u + (uint8_t)*c;
+                nOpts++;
+            }
+            g_voiceDevN = nOpts;
+            if (sig != g_voiceDevSig || !g_voiceDevKey) {
+                g_voiceDevSig = sig;
+                if (!buildOptionRow(g_voiceDevRow, "OmpVoiceDev", "Microphone",
+                                    "Which input device to talk through. Default follows Windows' communications device.",
+                                    opts, nOpts, &g_voiceDevKey, g_voiceDevOpts))
+                    g_voiceDevKey = 0;
+            }
+            g_voiceDevSel = 0;
+            for (int i = 1; i < nOpts; i++) if (_stricmp(g_voiceDevIds[i], MpPrefs_VoiceDevice()) == 0) { g_voiceDevSel = i; break; }
+            g_voiceDevAt = -1;
+            if (g_voiceDevKey) { *(int32_t*)(g_voiceDevRow + off::kItemMultiStart) = g_voiceDevSel; g_voiceDevAt = n; add(g_voiceDevRow, true); }
+        }
+        if (g_voiceRangeKey) { g_voiceRangeAt = n; add(g_voiceRangeRow, true); }
+        if (g_voiceVolKey)   { g_voiceVolAt   = n; add(g_voiceVolRow, true); }
+        if (g_voiceSensKey)  { g_voiceSensAt  = n; add(g_voiceSensRow, true); }
+        g_voiceLoopAt = -1;
+        if (g_voiceLoopKey)  { *(int32_t*)(g_voiceLoopRow + off::kItemMultiStart) = omp::session::VoiceLoopback() ? 1 : 0; g_voiceLoopAt = n; add(g_voiceLoopRow, true); }
         add(g_mpRows + (size_t)(kMpRowCount - 1) * off::kItemSize, true);       // the shared Back row
     } else if (g_page == PG_NAMES) {
         // Three settings and a way out. The rows carry their CURRENT values twice over: the option
@@ -1320,6 +1436,7 @@ static const TArrayHdr* chooseArray(void* page, const TArrayHdr* items, TArrayHd
             const int r = g_playerRowCount;
             strncpy_s(g_playerRowIds[r], id, _TRUNCATE);
             strncpy_s(g_playerRowNames[r], who[0] ? who : "(connecting...)", _TRUNCATE);
+            g_playerRowPids[r] = pid;
             // Value column = where they are, the same fact the roster panel reports -- a banned
             // player overrides it, since that is the one thing you came to this page to check.
             char key[48], desc[112], value[64], theirMap[64] = {0}, label[64] = {0};
@@ -1327,9 +1444,10 @@ static const TArrayHdr* chooseArray(void* page, const TArrayHdr* items, TArrayHd
             if (omp::session::PeerMap(i, theirMap, sizeof(theirMap)) && theirMap[0])
                 PrettyMapName(theirMap, label, sizeof(label));
             snprintf(value, sizeof(value), "%s",
-                     Ban_Is(id) ? "BANNED" : (label[0] ? label : (theirMap[0] ? theirMap : " ")));
-            snprintf(desc, sizeof(desc), "%s", hosting ? "Select to kick or ban this player"
-                                                       : "Only the host of a session can remove anyone");
+                     Ban_Is(id) ? "BANNED" : omp::session::VoiceIsMuted(pid) ? "MUTED"
+                                           : (label[0] ? label : (theirMap[0] ? theirMap : " ")));
+            snprintf(desc, sizeof(desc), "%s", hosting ? "Select to mute, kick or ban this player"
+                                                       : "Select to mute this player; only the host can remove anyone");
             uint8_t* row = g_playerRows + (size_t)r * off::kItemSize;
             if (!buildInfoRow(row, key, g_playerRowNames[r], desc, value,
                               &g_playerRowKeys[r], &g_playerOptText[r])) continue;
@@ -1353,6 +1471,11 @@ static const TArrayHdr* chooseArray(void* page, const TArrayHdr* items, TArrayHd
         setRowStatus(g_banRow,  banned ? "Already on your ban list"
                                        : (hosting ? "Remove them and never host them again"
                                                   : "Adds them to your ban list for sessions you host"));
+        g_muteAt = -1;
+        if (g_muteKey) {                 // anyone can mute anyone; it is applied on your end only
+            *(int32_t*)(g_muteRow + off::kItemMultiStart) = omp::session::VoiceIsMuted(g_selPid) ? 1 : 0;
+            g_muteAt = n; add(g_muteRow, true);
+        }
         add(g_kickRow, true);
         add(g_banRow, true);
         add(g_mpRows + (size_t)(kMpRowCount - 1) * off::kItemSize, true);   // Back
@@ -1543,6 +1666,36 @@ static void stampValues(void* page) {
                 S.MenuProgressSetPct(w, pct(MpPrefs_BubbleDistM(), MPBUBBLE_DIST_MIN, MPBUBBLE_DIST_MAX));
         }
         g_nameModeAt = g_nameDistAt = g_bubbleDistAt = -1;   // one shot per build
+    }
+    // The voice page and the player page's mute switch, same argument.
+    if (g_muteAt >= 0 && S.MenuMultiSetIndex) {
+        const TArrayHdr* pw = (const TArrayHdr*)((uint8_t*)page + off::kPageItemWidgets);
+        if (pw->data && g_muteAt < pw->num)
+            if (void* widget = ((void**)pw->data)[g_muteAt])
+                S.MenuMultiSetIndex(widget, omp::session::VoiceIsMuted(g_selPid) ? 1 : 0);
+        g_muteAt = -1;
+    }
+    if (g_voiceModeAt >= 0 || g_voiceKeyAt >= 0 || g_voiceRangeAt >= 0 || g_voiceVolAt >= 0 || g_voiceSensAt >= 0 || g_voiceLoopAt >= 0 || g_voiceDevAt >= 0) {
+        const TArrayHdr* pw = (const TArrayHdr*)((uint8_t*)page + off::kPageItemWidgets);
+        auto widgetAt = [&](int i) -> void* {
+            return (pw->data && i >= 0 && i < pw->num) ? ((void**)pw->data)[i] : nullptr;
+        };
+        auto pct = [](int v, int lo, int hi) {
+            const float f = (hi > lo) ? (float)(v - lo) / (float)(hi - lo) : 0.0f;
+            return f < 0.0f ? 0.0f : (f > 1.0f ? 1.0f : f);
+        };
+        if (S.MenuMultiSetIndex) {
+            if (void* w = widgetAt(g_voiceModeAt)) S.MenuMultiSetIndex(w, MpPrefs_VoiceMode());
+            if (void* w = widgetAt(g_voiceKeyAt))  S.MenuMultiSetIndex(w, MpPrefs_VoiceKey());
+            if (void* w = widgetAt(g_voiceLoopAt)) S.MenuMultiSetIndex(w, omp::session::VoiceLoopback() ? 1 : 0);
+            if (void* w = widgetAt(g_voiceDevAt))  S.MenuMultiSetIndex(w, g_voiceDevSel);
+        }
+        if (S.MenuProgressSetPct) {
+            if (void* w = widgetAt(g_voiceRangeAt)) S.MenuProgressSetPct(w, pct(MpPrefs_VoiceRangeM(), MPVOICE_RANGE_MIN, MPVOICE_RANGE_MAX));
+            if (void* w = widgetAt(g_voiceVolAt))   S.MenuProgressSetPct(w, pct(MpPrefs_VoiceVolume(), MPVOICE_VOL_MIN, MPVOICE_VOL_MAX));
+            if (void* w = widgetAt(g_voiceSensAt))  S.MenuProgressSetPct(w, pct(MpPrefs_VoiceSensitivity(), 0, 100));
+        }
+        g_voiceModeAt = g_voiceKeyAt = g_voiceRangeAt = g_voiceVolAt = g_voiceSensAt = g_voiceLoopAt = g_voiceDevAt = -1;
     }
     if (g_sliderPage < 0) return;
     const int gi = g_sliderPage;
@@ -1906,6 +2059,7 @@ static bool navigateBack(void* page) {
     if (g_page == PG_PLAYER)  { g_page = PG_PLAYERS; queueSwap(page, "Players", false, true); return true; }
     // PG_NAMES now sits under PG_OTHER, so Back from it returns THERE, not to the MP page.
     if (g_page == PG_NAMES) { g_page = PG_OTHER; queueSwap(page, "Other options", false, true); return true; }
+    if (g_page == PG_VOICE) { g_page = PG_OTHER; queueSwap(page, "Other options", false, true); return true; }
     const bool toMp = (g_page == PG_BROWSE || g_page == PG_PLAYERS || g_page == PG_OTHER);
     g_page = toMp ? PG_MP : PG_ROOT;
     if (toMp) g_lastSig = sessionSig();
@@ -1993,9 +2147,15 @@ static bool handleConfirm(void* page, void* params) {
         log("[menu] pause: opened the player-names settings");
         return true;
     }
+    if (g_page == PG_OTHER && g_voiceOpenKey && itemKey == g_voiceOpenKey) {
+        g_page = PG_VOICE;
+        queueSwap(page, "Voice chat", false, true);
+        log("[menu] pause: opened the voice-chat settings");
+        return true;
+    }
     // Every other row on this page is a toggle or a slider: the confirm is the engine acknowledging
     // the row, not a command. Swallow it rather than letting it fall through to the stock chain.
-    if (g_page == PG_NAMES || g_page == PG_OTHER) return true;
+    if (g_page == PG_NAMES || g_page == PG_VOICE || g_page == PG_OTHER) return true;
     if (g_page == PG_MP && itemKey == g_playersOpenKey) {
         g_page = PG_PLAYERS;
         queueSwap(page, "Players", false, true);
@@ -2008,6 +2168,7 @@ static bool handleConfirm(void* page, void* params) {
             // Remember WHO by identity, not by row: the list rebuilds live.
             strncpy_s(g_selPeerId,   g_playerRowIds[r],   _TRUNCATE);
             strncpy_s(g_selPeerName, g_playerRowNames[r], _TRUNCATE);
+            g_selPid = g_playerRowPids[r];
             g_page = PG_PLAYER;
             queueSwap(page, g_selPeerName, false, true);
             return true;
@@ -2195,6 +2356,41 @@ static bool handleValueChange(void* params, bool isSlider) {
         }
         if (g_peerBodyKey && k == g_peerBodyKey && !isSlider) {
             MpPrefs_SetPeerBodyPhysics(*(const int32_t*)((const uint8_t*)params + off::kChangeParamsNew));
+            return true;
+        }
+        if (g_muteKey && k == g_muteKey && !isSlider) {
+            const int idx = *(const int32_t*)((const uint8_t*)params + off::kChangeParamsNew);
+            omp::session::VoiceSetMuted(g_selPid, idx != 0);
+            return true;
+        }
+        if (g_voiceModeKey && k == g_voiceModeKey && !isSlider) {
+            MpPrefs_SetVoiceMode(*(const int32_t*)((const uint8_t*)params + off::kChangeParamsNew));
+            return true;
+        }
+        if (g_voiceKeyKey && k == g_voiceKeyKey && !isSlider) {
+            MpPrefs_SetVoiceKey(*(const int32_t*)((const uint8_t*)params + off::kChangeParamsNew));
+            return true;
+        }
+        if (g_voiceDevKey && k == g_voiceDevKey && !isSlider) {
+            const int idx = *(const int32_t*)((const uint8_t*)params + off::kChangeParamsNew);
+            MpPrefs_SetVoiceDevice((idx <= 0 || idx >= g_voiceDevN) ? "" : g_voiceDevIds[idx]);
+            return true;
+        }
+        if (g_voiceLoopKey && k == g_voiceLoopKey && !isSlider) {
+            omp::session::VoiceSetLoopback(*(const int32_t*)((const uint8_t*)params + off::kChangeParamsNew) != 0);
+            return true;
+        }
+        if (isSlider && (k == g_voiceRangeKey || k == g_voiceVolKey || k == g_voiceSensKey)) {
+            const float pct = *(const float*)((const uint8_t*)params + off::kChangeParamsNew);
+            if (k == g_voiceRangeKey && g_voiceRangeKey) {
+                const float v = MPVOICE_RANGE_MIN + pct * (float)(MPVOICE_RANGE_MAX - MPVOICE_RANGE_MIN);
+                MpPrefs_SetVoiceRangeM((int)(v + 0.5f));
+            } else if (k == g_voiceVolKey && g_voiceVolKey) {
+                const float v = MPVOICE_VOL_MIN + pct * (float)(MPVOICE_VOL_MAX - MPVOICE_VOL_MIN);
+                MpPrefs_SetVoiceVolume((int)(v + 0.5f));
+            } else if (g_voiceSensKey) {
+                MpPrefs_SetVoiceSensitivity((int)(pct * 100.0f + 0.5f));
+            }
             return true;
         }
         if (isSlider && (k == g_nameDistKey || k == g_bubbleDistKey)) {

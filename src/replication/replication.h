@@ -150,6 +150,12 @@ struct State {
     // proxy spawn renders broken with no edge ever seen. Travels value-preserving -- the game's own
     // BreakBoard_Internal takes the value as its argument.
     uint8_t  brokenState = 0;
+    // The sender's HEAD LOOK off the board: SessionTweaks turns the head to look where the camera
+    // looks (yaw + right, pitch + up, degrees off the body's facing), and the receiver turns the
+    // proxy's head the same way. Zero when they are not looking anywhere -- riding, or SEATED: a seated
+    // head rides the pose hold, which carries every bone, so the sender zeroes these there and the
+    // receiver never turns a head twice. Two bytes, always.
+    int8_t   headYaw = 0, headPitch = 0;
     uint16_t animLen = 0; uint8_t anim[320] = {};
     // SessionTweaks' analog crouch: the CrankIn descent clock, in seconds, while the sender is
     // scrubbing it to the stick (see the crouch-visual sync). Negative = not scrubbing -- either no
@@ -310,6 +316,23 @@ struct BodyFeelSet {
 int  PackBodyFeel(const BodyFeelSet& b, uint8_t* out, int cap);
 bool IsBodyFeelPacket(const uint8_t* data, int len);
 bool UnpackBodyFeel(const uint8_t* data, int len, BodyFeelSet& out);
+
+// ---- VOICE: Opus frames, unreliable and frequent (one 20 ms frame per packet while someone
+// talks, ~90 bytes). magic, u16 sequence of the first frame, u8 count, then count x (u8 len, bytes).
+// The sequence counts FRAMES, so a gap is exactly the number of frames lost.
+enum { kVoiceMaxFrames = 4, kVoiceFrameMax = 400 };
+int  PackVoice(uint16_t seq, const uint8_t* const* frames, const int* lens, int n, uint8_t* out, int cap);
+bool IsVoicePacket(const uint8_t* data, int len);
+// The frame count; `frames` point INTO `data`.
+int  UnpackVoice(const uint8_t* data, int len, uint16_t* seqOut, const uint8_t** frames, int* lens, int maxFrames);
+
+// ---- POSE HOLD: "keep my last transported skeleton". Sent while the sender's pose is a HELD one
+// (sitting: quasi-static, so the skeleton itself goes out only when it moves or once a second),
+// at 4 Hz, and as an explicit release on the way out. 6 bytes: magic, u8 hold, u16 ttl ms. Its own
+// packet because both snapshot flag bytes are full; an older peer warns once and plays on.
+int  PackPoseHold(bool hold, uint16_t ttlMs, uint8_t* out, int cap);
+bool IsPoseHoldPacket(const uint8_t* data, int len);
+bool UnpackPoseHold(const uint8_t* data, int len, bool* holdOut, uint16_t* ttlOut);
 
 // ---- CHAT -----------------------------------------------------------------------------------------
 // A third message type on the same transport, routed by magic like the other two. Sent RELIABLE: a

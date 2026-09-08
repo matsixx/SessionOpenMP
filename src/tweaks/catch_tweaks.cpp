@@ -49,6 +49,7 @@
 #include "grind_pop.h"       // FName -> string, to name the key a press arrived on
 #include "pop_probe.h"       // PopProbe_SkaterManualBits -- the skater's manual latch, for the probe
 #include "run_out.h"         // RunOut_BailCalls -- did the game's own catch verdict Bail inside SetCatchOrient
+#include "sit.h"             // Sit_OnInputKey -- the sit key rides this hook
 #include <cmath>
 
 static bool CatchIsGoofy();   // defined with the catch-orient hook, used by the flick log above it
@@ -2479,6 +2480,9 @@ static InputKeyFn g_origInputKey  = nullptr;
 static void*      g_startInputKey = nullptr;
 
 static bool hkInputKey(void* self, void* key, int ev, float amt, bool pad) {
+    // The sit key is decided first: a face button, never a stick, and it only claims a press while
+    // the skater is off the board (sit.cpp). Swallowed press and release so no bound action fires.
+    if (Sit_OnInputKey(key, ev)) return true;
     // IE_Pressed = 0, IE_Released = 1. The sticks' own axis events are the hot path here and are
     // never ours, so the cheapest tests come first.
     if (g_clickCatch && key && (ev == 0 || ev == 1)) {

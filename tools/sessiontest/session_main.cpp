@@ -33,6 +33,7 @@ static int g_sent[64] = {};
 static int g_roster = 0;
 void Send(int peerIdx, const void*, int, bool) { if (peerIdx >= 0 && peerIdx < 64) g_sent[peerIdx]++; }
 int  SendBudget() { return 0; }   // no wire: replay-sync bursts uncapped (and unexercised) here
+Backend Current() { return BK_NONE; }   // no wire: nothing is reliable-on-shm here
 // The dropped-object lane hashes this into its authority key. A fixed answer is right for a headless
 // test: there is no game, so nothing ever adopts or hides a set here.
 const char* MyId() { return "test:self"; }

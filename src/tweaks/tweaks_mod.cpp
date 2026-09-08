@@ -50,14 +50,17 @@
 #include "foot_steer.h"
 #include "grind_pop.h"
 #include "camera_height.h"
+#include "sit.h"
 #include "pop_probe.h"
 #include "body_feel.h"
 #include "proxy_body_feel.h"
+#include "upscale.h"
+#include "upscale_fsr.h"
 #include "MinHook.h"
 #include "ue4ss_abi.h"
 #include "ui/menu_ext.h"
 
-#define TWEAKS_VERSION "3.19.288"
+#define TWEAKS_VERSION "3.19.353"
 #define TWK_WIDEN(x) STR(x)   // STR() prepends L before the macro expands; expand first
 
 // ------------------------------------------------------------------ log (own file, fresh per launch)
@@ -100,6 +103,8 @@ static void saveSettings() {
     PopProbe_SaveConfig(buf, sizeof(buf));
     BodyFeel_SaveConfig(buf, sizeof(buf));
     CameraHeight_SaveConfig(buf, sizeof(buf));
+    Sit_SaveConfig(buf, sizeof(buf));
+    Upscale_SaveConfig(buf, sizeof(buf));
     f = fopen(g_iniPath, "w");
     if (!f) { TwkLog("[tweaks] settings save FAILED (cannot write %s)", g_iniPath); return; }
     fwrite(buf, 1, strlen(buf), f);
@@ -138,6 +143,8 @@ static void readConfig(const char* dir) {
     PopProbe_ReadConfig(buf);
     BodyFeel_ReadConfig(buf);
     CameraHeight_ReadConfig(buf);
+    Sit_ReadConfig(buf);
+    Upscale_ReadConfig(buf);
     // No ini yet: write one holding the defaults just loaded. Without the multiplayer mod there is
     // no menu to change a setting through, so the file IS the interface -- and a file that lists
     // every key at its current value is the only way to discover what can be configured. Writing it
@@ -168,6 +175,8 @@ static void resetAllDefaults() {
     PopProbe_ResetDefaults();
     BodyFeel_ResetDefaults();
     CameraHeight_ResetDefaults();
+    Sit_ResetDefaults();
+    Upscale_ResetDefaults();
     TwkLog("[tweaks] settings reset to defaults");
 }
 
@@ -207,6 +216,7 @@ static void drawSection(const OmpMenuApi* api, void*) {
     static DrawFn const kFeet[]   = { FootPlace_DrawMenu, FootSteer_DrawMenu };
     static DrawFn const kCamera[] = { CameraHeight_DrawMenu };
     static DrawFn const kCloth[]  = { ClothMerge_DrawMenu, ClothSim_DrawMenu };
+    static DrawFn const kSit[]    = { Sit_DrawMenu };
     #define TWK_GROUP(title, arr) group(title, arr, (int)(sizeof(arr) / sizeof(arr[0])))
     TWK_GROUP("Pop control",    kPop);
     TWK_GROUP("Board & tricks", kBoard);
@@ -215,6 +225,7 @@ static void drawSection(const OmpMenuApi* api, void*) {
     TWK_GROUP("Feet",           kFeet);
     TWK_GROUP("Camera",         kCamera);
     TWK_GROUP("Clothing",       kCloth);
+    TWK_GROUP("Sitting",        kSit);
     #undef TWK_GROUP
 
     // The same reset the pause menu offers, so neither surface is the only way to get back.
@@ -285,6 +296,19 @@ static const char* const kTwkFlailPow  = "TwkBodyFlailPct";
 static const char* const kTwkGrabLen   = "TwkBodyGrabMs";
 static const char* const kTwkGrabDel   = "TwkBodyGrabDelayMs";
 static const char* const kTwkGrabPow   = "TwkBodyGrabPct";
+// "Graphics"
+static const char* const kTwkTaau       = "TwkUpscaleTaau";
+static const char* const kTwkRenderScale = "TwkUpscaleRenderScale";
+static const char* const kTwkFsr         = "TwkUpscaleFsr";
+static const char* const kTwkFsrSharp    = "TwkUpscaleFsrSharp";
+static const char* const kTwkFsr4        = "TwkUpscaleFsr4";
+// "Sitting"
+static const char* const kTwkSit         = "TwkSit";
+static const char* const kTwkSitFloor    = "TwkSitFloor";
+static const char* const kTwkSitMaxLedge = "TwkSitMaxLedge";
+static const char* const kTwkSitReach    = "TwkSitReach";
+static const char* const kTwkSitLean     = "TwkSitLean";
+static const char* const kTwkHeadLook    = "TwkHeadLook";
 // "Style settings"
 static const char* const kTwkArmLoose   = "TwkBodyArmLoosePct";
 static const char* const kTwkArmHold    = "TwkBodyArmHoldPct";
@@ -372,6 +396,17 @@ static void pageValue(const char* key, int iv, float fv, void*) {
     else if (!strcmp(key, kTwkGrabLen))   BodyFeel_SetGrabMs(fv);
     else if (!strcmp(key, kTwkGrabDel))   BodyFeel_SetGrabDelayMs(fv);
     else if (!strcmp(key, kTwkGrabPow))   BodyFeel_SetGrabPct(fv);
+    else if (!strcmp(key, kTwkTaau))        Upscale_SetTaauEnabled(iv != 0);
+    else if (!strcmp(key, kTwkRenderScale)) Upscale_SetRenderScalePct(fv);
+    else if (!strcmp(key, kTwkFsr))         UpscaleFsr_SetEnabled(iv != 0);
+    else if (!strcmp(key, kTwkFsrSharp))    UpscaleFsr_SetSharpnessPct(fv);
+    else if (!strcmp(key, kTwkFsr4))        UpscaleFsr_SetPreferFsr4(iv != 0);
+    else if (!strcmp(key, kTwkSit))         Sit_SetEnabled(iv != 0);
+    else if (!strcmp(key, kTwkSitFloor))    Sit_SetFloorEnabled(iv != 0);
+    else if (!strcmp(key, kTwkSitMaxLedge)) Sit_SetMaxLedgeCm(fv);
+    else if (!strcmp(key, kTwkSitReach))    Sit_SetReachCm(fv);
+    else if (!strcmp(key, kTwkSitLean))     Sit_SetLeanDeg(fv);
+    else if (!strcmp(key, kTwkHeadLook))    Sit_SetHeadLook(iv != 0);
     else if (!strcmp(key, kTwkArmLoose))   BodyFeel_SetArmLoosePct(fv);
     else if (!strcmp(key, kTwkArmHold))    BodyFeel_SetArmHoldPct(fv);
     else if (!strcmp(key, kTwkArmDamp))    BodyFeel_SetArmDampPct(fv);
@@ -451,6 +486,17 @@ static int pageGet(const char* key, int* oi, float* of, void*) {
     else if (!strcmp(key, kTwkGrabLen))   { *of = BodyFeel_GrabMs();                   return 1; }
     else if (!strcmp(key, kTwkGrabDel))   { *of = BodyFeel_GrabDelayMs();              return 1; }
     else if (!strcmp(key, kTwkGrabPow))   { *of = BodyFeel_GrabPct();                  return 1; }
+    else if (!strcmp(key, kTwkTaau))        { *oi = Upscale_TaauEnabled() ? 1 : 0;   return 1; }
+    else if (!strcmp(key, kTwkRenderScale)) { *of = Upscale_RenderScalePct();         return 1; }
+    else if (!strcmp(key, kTwkFsr))         { *oi = UpscaleFsr_Enabled() ? 1 : 0;      return 1; }
+    else if (!strcmp(key, kTwkFsrSharp))    { *of = UpscaleFsr_SharpnessPct();         return 1; }
+    else if (!strcmp(key, kTwkFsr4))        { *oi = UpscaleFsr_PreferFsr4() ? 1 : 0;   return 1; }
+    else if (!strcmp(key, kTwkSit))         { *oi = Sit_Enabled() ? 1 : 0;              return 1; }
+    else if (!strcmp(key, kTwkSitFloor))    { *oi = Sit_FloorEnabled() ? 1 : 0;         return 1; }
+    else if (!strcmp(key, kTwkSitMaxLedge)) { *of = Sit_MaxLedgeCm();                   return 1; }
+    else if (!strcmp(key, kTwkSitReach))    { *of = Sit_ReachCm();                      return 1; }
+    else if (!strcmp(key, kTwkSitLean))     { *of = Sit_LeanDeg();                      return 1; }
+    else if (!strcmp(key, kTwkHeadLook))    { *oi = Sit_HeadLook() ? 1 : 0;             return 1; }
     else if (!strcmp(key, kTwkArmLoose))   { *of = BodyFeel_ArmLoosePct();    return 1; }
     else if (!strcmp(key, kTwkArmHold))    { *of = BodyFeel_ArmHoldPct();     return 1; }
     else if (!strcmp(key, kTwkArmDamp))    { *of = BodyFeel_ArmDampPct();     return 1; }
@@ -487,7 +533,9 @@ static const OmpPageItem2 kTwkRootItems[] = {
     { OMP_ITEM_PAGE, "Camera",         "Camera",          "Make the camera's height follow your skater everywhere" },
     { OMP_ITEM_PAGE, "Clothing",       "Clothing",        "Cloth physics on your shirt and trousers" },
     { OMP_ITEM_PAGE, "Physical animation", "Physical animation", "The reactive body and ragdoll bails: bracing, grabbing what hurt, the landing flail" },
+    { OMP_ITEM_PAGE, "Graphics",       "Graphics",        "Render scale and upscaling" },
     { OMP_ITEM_PAGE, "Style settings", "Style settings", "How your arms, torso and head carry while riding. Needs Reactive body on." },
+    { OMP_ITEM_PAGE, "Sitting",        "Sitting",         "Sit on a ledge or the ground while off the board" },
     // Kept on the front page deliberately: it resets EVERY Session Tweaks setting, not one category.
     // Held, like the game's Exit to desktop (step < 0 = the same hold length): a stray press on the
     // last row of the front page must not wipe every setting.
@@ -656,6 +704,37 @@ static const OmpPageItem2 kTwkPhys2Items[] = {
       "How much the head lags an acceleration",
       nullptr, nullptr, 0.0f, 200.0f, 10.0f },
 };
+static const OmpPageItem2 kTwkGfxItems[] = {
+    { OMP_ITEM_TOGGLE, kTwkTaau,        "Temporal upsampling",
+      "Renders at the scale below and rebuilds full resolution with the engine's temporal upsampler (TAAU)" },
+    { OMP_ITEM_SLIDER, kTwkRenderScale, "  Render scale (%)",
+      "Internal render resolution; 100 is native. Lower is faster and the upsampler fills in the rest",
+      nullptr, nullptr, 50.0f, 100.0f, 5.0f },
+    { OMP_ITEM_TOGGLE, kTwkFsr,         "FSR upscaling",
+      "AMD FidelityFX Super Resolution in place of the engine's upsampler: FSR 4 on RDNA4 cards, FSR 3.1 elsewhere" },
+    { OMP_ITEM_SLIDER, kTwkFsrSharp,    "  FSR sharpness (%)",
+      "Sharpening after the upscale; FSR 4 is soft by design, raise this if edges look smooth",
+      nullptr, nullptr, 0.0f, 100.0f, 5.0f },
+    { OMP_ITEM_TOGGLE, kTwkFsr4,        "  Prefer FSR 4",
+      "Use the FSR 4 provider when the GPU and driver offer it; off forces FSR 3.1" },
+};
+static const OmpPageItem2 kTwkSitItems[] = {
+    { OMP_ITEM_TOGGLE, kTwkSit,         "Sit down",
+      "Off the board, press B to sit on the edge of the ledge you are facing or standing at; press it again to stand" },
+    { OMP_ITEM_TOGGLE, kTwkSitFloor,    "  Sit on the ground",
+      "When there is nothing to sit on, sit down where you stand" },
+    { OMP_ITEM_SLIDER, kTwkSitMaxLedge, "  Tallest ledge (cm)",
+      "Ledges taller than this are walls, not seats",
+      nullptr, nullptr, 30.0f, 200.0f, 10.0f },
+    { OMP_ITEM_SLIDER, kTwkSitReach,    "  Reach (cm)",
+      "How far ahead a ledge is looked for",
+      nullptr, nullptr, 40.0f, 200.0f, 10.0f },
+    { OMP_ITEM_SLIDER, kTwkSitLean,     "  Torso lean (deg)",
+      "Extra lean while seated: positive leans forward, negative back",
+      nullptr, nullptr, -25.0f, 25.0f, 1.0f },
+    { OMP_ITEM_TOGGLE, kTwkHeadLook,    "Head follows the camera",
+      "Off the board, the head turns to look where the camera looks -- as far as a neck goes, then it holds, then it comes back" },
+};
 static const OmpPageItem2 kTwkPopItems[] = {
     { OMP_ITEM_TOGGLE, kTwkPop,       "Pop control scheme",
       "Crouch on one stick and pop with the other: how deep you "
@@ -687,8 +766,8 @@ static const OmpPageItem2 kTwkCameraItems[] = {
     // is off. Do not "correct" the apparent inversion in camera_height.cpp; the label is the contract.
     { OMP_ITEM_TOGGLE, kTwkCamPitchDrop, "Pitch camera before drop",
       "Stock behaviour: the camera tilts down at the edge of a drop instead of descending with you" },
-    { OMP_ITEM_SLIDER, kTwkCamPitch, "Pitch (deg)",
-      "Tilts the camera: positive looks up, negative looks down. 0 is the stock camera",
+    { OMP_ITEM_SLIDER, kTwkCamPitch, "Pitch on the board (deg)",
+      "Tilts the camera while you are riding: positive looks up, negative looks down. 0 is the stock camera, and so is walking around",
       nullptr, nullptr, -30.0f, 30.0f, 1.0f },
 };
 // Every page must stay inside the host's cap AND inside the engine's visible window -- the host
@@ -702,7 +781,9 @@ static_assert(sizeof(kTwkRootItems)  / sizeof(kTwkRootItems[0])  <= 13 &&
               sizeof(kTwkClothItems)  / sizeof(kTwkClothItems[0])  <= 13 &&
               sizeof(kTwkPopItems)    / sizeof(kTwkPopItems[0])    <= 13 &&
               sizeof(kTwkPhysItems)   / sizeof(kTwkPhysItems[0])   <= 13 &&
-              sizeof(kTwkPhys2Items)  / sizeof(kTwkPhys2Items[0])  <= 13,
+              sizeof(kTwkPhys2Items)  / sizeof(kTwkPhys2Items[0])  <= 13 &&
+              sizeof(kTwkGfxItems)    / sizeof(kTwkGfxItems[0])    <= 13 &&
+              sizeof(kTwkSitItems)    / sizeof(kTwkSitItems[0])    <= 13,
               "A Session Tweaks page exceeds the engine's visible-row window (14 incl. the Back row "
               "the host appends). Split it into another category page rather than raising this.");
 
@@ -742,7 +823,7 @@ static bool tryRegisterMenu() {
                          (int)(sizeof(kTwkRootItems) / sizeof(kTwkRootItems[0])),
                          &pageSelect, &pageValue, &pageGet, nullptr, nullptr)) {
                     g_pageRegistered = true;
-                    TwkLog("[tweaks] registered the pause-menu page (the front page + 9 category pages)");
+                    TwkLog("[tweaks] registered the pause-menu page (the front page + 11 category pages)");
                 }
                 #define TWK_SUBPAGE(title, arr)                     regp(title, arr, (int)(sizeof(arr) / sizeof(arr[0])),                          &pageSelect, &pageValue, &pageGet, nullptr, nullptr)
                 TWK_SUBPAGE("Pop control",    kTwkPopItems);
@@ -754,6 +835,8 @@ static bool tryRegisterMenu() {
                 TWK_SUBPAGE("Clothing",       kTwkClothItems);
                 TWK_SUBPAGE("Physical animation", kTwkPhysItems);
                 TWK_SUBPAGE("Style settings",     kTwkPhys2Items);
+                TWK_SUBPAGE("Graphics",           kTwkGfxItems);
+                TWK_SUBPAGE("Sitting",            kTwkSitItems);
                 #undef TWK_SUBPAGE
             }
         }
@@ -773,6 +856,9 @@ void Tweaks_PumpFrame() {
     GrindPop_PumpFrame();            // grind-exit pop records: names resolved and logged out here
     PopProbe_PumpFrame();            // AFTER grind_pop: its drain feeds PopProbe_OnJump first
     BodyFeel_PumpFrame();            // breathes the physical-animation stiffness (after pop_probe: reads its crouch depth)
+    Upscale_PumpFrame();             // render-scale console variables + the FSR health line
+    Sit_PumpFrame();                 // the sit/stand state machine
+    Twk_SetPoseHold(Sit_PoseHeld()); // a seated skeleton travels to other players as a held pose (SessionOpenMP)
     ProxyBodyFeel_PumpFrame();       // the same riding body on remote players' proxies, with THEIR settings (SessionOpenMP bridge)
     if (g_dirty && (LONGLONG)GetTickCount64() - g_dirtyMs > 2000) {
         InterlockedExchange(&g_dirty, 0);
@@ -826,6 +912,8 @@ public:
         FootSteer_Install();
         GrindPop_Install();
         CameraHeight_Install();
+        Upscale_Install();
+        Sit_Install();
         RunOut_Install();
         PopProbe_Install();
         // Registration is attempted once now (host usually loaded already; mods.txt order) and

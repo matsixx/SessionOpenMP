@@ -642,6 +642,9 @@ void Proxy::Apply(const repl::State& s, uint64_t nowMs, uint64_t nowUs, void (*l
         __except (EXCEPTION_EXECUTE_HANDLER) {}
     }
 #endif
+    // ---- 4.5c HEAD LOOK. Two bytes kept for SessionTweaks to read back (OmpSession_ProxyHeadLook)
+    // and turn this proxy's head with: it owns the rig knowledge, this side only carries the value.
+    headYaw_ = s.headYaw; headPitch_ = s.headPitch; headOnFoot_ = s.onBoard ? 0 : 1;
     // ---- 4.6 the BRAKE. Multicast-RPC-replicated in the stock game, so an overlay must transport it.
     //          On change: write the state bytes directly (the RPC impls open with a Role==1 gate
     //          written for replicated proxies; ours is Role 3, and the anim graph reads the BYTES) AND

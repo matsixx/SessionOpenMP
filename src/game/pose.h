@@ -141,6 +141,13 @@ Stats GetStats();
 // the pose empty) whenever the driver path should be used instead. Fires ONLY while the local player
 // is scrubbing -- that state is broadcast to everyone, and everyone needs the pose then.
 bool Capture(void* mesh, repl::State& s);
+// A HELD pose: the local player's skeleton is being posed by something outside the anim graph
+// (SessionTweaks' sitting) and must travel. Capture runs while this is set; the session thins the
+// sweeps to "on change + once a second" and sends the OMPS heartbeat so receivers keep the last one.
+void SetLocalHold(bool on);
+// True when this capture happened ONLY because of the hold (not a bail, not a scrub) -- the cases
+// the session may thin.
+bool CapturedForHoldOnly(const repl::State& s);
 // Ungated capture off the pawn, for the packet the session unicasts to a SCRUBBING peer alone. Their
 // replay editor cannot evaluate our drivers, so they get results -- while everyone else keeps the
 // driver lane and never pays for somebody else's replay session.
@@ -155,6 +162,9 @@ bool CaptureFromPawn(void* pawn, repl::State& s);
 bool SetPeerSkeleton(void* mesh, const uint32_t* hashes, int n);
 void SetLogger(void (*logf)(const char*));   // for the throttled stale-pose line; optional
 void Note(void* mesh, const repl::State& s, uint64_t nowMs);
+// A peer's hold heartbeat for this mesh: while it is fresh, a pose-less snapshot does NOT release
+// the transported pose. `hold` false = released now.
+void NoteHold(void* mesh, bool hold, uint32_t ttlMs);
 void Forget(void* mesh);
 // Called from the FinalizeBoneTransform pre-hook for EVERY skeletal mesh in the game; cheap and
 // silent unless the mesh is a proxy we have a fresh pose for.

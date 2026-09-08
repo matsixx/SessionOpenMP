@@ -20,10 +20,37 @@
 #include "../game/spectate.h"
 #include "../game/dropper.h"
 #include "../ui/mp_prefs.h"
+// Voice is built into the mod only (OMP_VOICE): the tools' library build of this file has neither
+// Opus nor the engine-side sound, so the same names collapse to nothing there.
+#ifdef OMP_VOICE
+#include "../game/voice_audio.h"
+#include "../voice/voice_capture.h"
+#include "mutelist.h"
+#include <opus.h>
+#else
+namespace omp { namespace game { namespace voice {
+struct Voice { void* comp = nullptr; void* compActor = nullptr; bool playing = false; };
+inline void ProxyGone(Voice& v) { v.comp = nullptr; v.compActor = nullptr; v.playing = false; }
+inline void Stop(Voice&) {}
+}}}
+#endif
+namespace omp { namespace session {
+// One voice being heard: the engine-side sound, its decoder, where its frame sequence is, and when
+// it last spoke. A peer's lives on their slot; the loopback's ("Hear yourself") on our own skater.
+struct VoiceRx {
+    game::voice::Voice voice;
+    void*    dec = nullptr;              // OpusDecoder*, created on the first frame, kept
+    uint16_t seq = 0;
+    bool     seqValid = false;
+    uint64_t lastUs = 0;                 // last frame: the silence timeout and "talking"
+    bool     seen = false;               // first-frames line printed
+};
+}}
 #ifdef _WIN32
 #define PSAPI_VERSION 2          // K32EnumProcessModules from kernel32 -- no psapi.lib dependency
 #include <windows.h>
 #include <psapi.h>
+#include <cmath>
 #endif
 #include "../replication/replaysync.h"
 #include "../replication/dropsync.h"
@@ -48,6 +75,10 @@ struct Slot {
     // ---- cosmetics: their look, and whether this proxy is currently wearing it.
     repl::CosmeticSet cosmetics;
     repl::BodyFeelSet bodyFeel;          // the peer's SessionTweaks riding-body knobs (ver 0 = none)
+    // proximity voice: the engine-side sound, their decoder, the frame sequence, and the mute
+    VoiceRx     vrx;                     // their voice, as heard here
+    bool        voiceMuted = false, voiceMuteChecked = false;
+    bool        poseHeld = false;        // their OMPS hold, for the one-line edge log
     bool        haveCosmetics = false;
     // Keyed on the ACTOR, never a plain "already dressed" bool: `Proxy::Forget()` drops the actor on a
     // world change while the SLOT survives (same peer), so a bool stays true and the RESPAWNED proxy is
@@ -145,6 +176,14 @@ static uint64_t g_playbackEnteredUs = 0;
 static uint64_t sinceUs(uint64_t now, uint64_t then) { return (now > then) ? (now - then) : 0; }
 
 static Slot   g_slots[kMaxPeers];
+
+// A slot handed to a NEW peer forgets the old one's voice (the decoder object is reused; its state
+// is flushed by the sequence reset on their first frame).
+static void voiceResetPeer(Slot& s) {
+    s.vrx.seqValid = false; s.vrx.lastUs = 0; s.vrx.seen = false;
+    s.voiceMuteChecked = false; s.voiceMuted = false;
+    game::voice::ProxyGone(s.vrx.voice);
+}
 static Config g_cfg;
 static Stats  g_st;
 static void (*g_logf)(const char*) = nullptr;
@@ -251,6 +290,9 @@ void Init(void (*logf)(const char*)) {
     g_logf = logf;
     replaysync::SetSendFn(&Send);
     dropsync::SetSendFn(&Send);
+#ifdef OMP_VOICE
+    voice::Capture_Init(logf);           // the microphone thread; idle until the mode says otherwise
+#endif
 }
 
 // Our dropped-object ids stop meaning what they meant: a world change (every actor died with it), a
@@ -271,7 +313,7 @@ void ResetAll() {
         // does that AND hides them, matching the drop path. This is the LAST code that will ever hold
         // these pointers, so if it does not hide them, nothing will.
         s.proxy.Retire(g_logf);
-        s.proxy.Forget();
+        s.proxy.Forget(); game::voice::ProxyGone(s.vrx.voice);
         s.used = false; n++;
     }
     if (n && g_logf) { char m[120]; snprintf(m, sizeof(m), "[session] reset -- %d peer slot(s) released", n); g_logf(m); }
@@ -287,7 +329,7 @@ void ResetAll() {
 // tearing itself down -- and Retire touches actors, the replay camera and the audio system. Hiding a
 // skater buys nothing in a process that is exiting, so drop the pointers and touch nothing.
 void Shutdown() {
-    for (auto& s : g_slots) { s.proxy.Forget(); s.used = false; }
+    for (auto& s : g_slots) { s.proxy.Forget(); game::voice::ProxyGone(s.vrx.voice); s.used = false; }
 }
 void SetConfig(const Config& c) { g_cfg = c; }
 const Config& GetConfig() { return g_cfg; }
@@ -297,7 +339,7 @@ static Slot* slotFor(int peerIdx, uint64_t nowUs) {
     for (auto& s : g_slots) if (s.used && s.peerIdx == peerIdx) return &s;
     for (auto& s : g_slots) {
         if (s.used) continue;
-        s.stream.Reset(); s.proxy.Forget();          // nothing carries across to a new peer
+        s.stream.Reset(); s.proxy.Forget(); voiceResetPeer(s);          // nothing carries across to a new peer
         s.used = true; s.peerIdx = peerIdx; s.lastPacketUs = nowUs; s.quietHandled = false;
         memset(&s.cosmetics, 0, sizeof(s.cosmetics));   // padding too -- it is memcmp'd for changes
         s.haveCosmetics = false; s.wornForActor = nullptr; s.peerReplaying = false;
@@ -429,6 +471,7 @@ static void applyDropUpdate(Slot& s, const dropsync::Update& up, int peerIdx, ui
     }
 }
 
+static void voiceOnPacket(int peerIdx, const uint8_t* data, int len, uint64_t nowUs);
 void OnPacket(int peerIdx, const uint8_t* data, int len, uint64_t nowUs) {
     if (!g_cfg.enabled) return;
     // Replay-sync protocol traffic (requests for and chunks of a peer's own state history). Checked
@@ -470,6 +513,21 @@ void OnPacket(int peerIdx, const uint8_t* data, int len, uint64_t nowUs) {
     }
     // Several message types share this transport, routed by magic. Cosmetics are rare and large; the
     // 60 Hz snapshot stays small and self-contained.
+    // Voice: the most frequent lane while anyone talks, so it is routed before the rare ones.
+    if (repl::IsVoicePacket(data, len)) { voiceOnPacket(peerIdx, data, len, nowUs); return; }
+    // A peer's pose hold (sitting): keep their last transported skeleton between the sweeps.
+    if (repl::IsPoseHoldPacket(data, len)) {
+        bool hold = false; uint16_t ttl = 0;
+        if (!repl::UnpackPoseHold(data, len, &hold, &ttl)) return;
+        Slot* hs = slotFor(peerIdx, nowUs);
+        if (!hs) return;
+        void* hm = hs->proxy.actor() ? game::SkaterMeshOf(hs->proxy.actor()) : nullptr;
+        if (hm) game::pose::NoteHold(hm, hold, ttl);
+        if (hold != hs->poseHeld && g_logf) { hs->poseHeld = hold; char m[100];
+            snprintf(m, sizeof(m), "[pose] peer %d %s", peerIdx, hold ? "holds their pose (sitting)" : "released their pose");
+            g_logf(m); }
+        return;                                      // NOT a snapshot: no stream push, no liveness
+    }
     // A peer's body-feel settings (their SessionTweaks riding-body knobs). Held on the slot for the
     // tweaks module to read back per proxy; nothing here touches the game.
     if (repl::IsBodyFeelPacket(data, len)) {
@@ -703,6 +761,42 @@ bool IsProxyActor(void* actor) {
 // the publish in Frame ships them. Each proxy's owner's set is read back by actor.
 static repl::BodyFeelSet g_ownBodyFeel;
 static bool              g_ownBodyFeelDirty = false;
+// ---- the pose hold (sitting). SessionTweaks says "my skeleton is posed outside the graph"; the
+// pose lane then captures every tick, Frame thins the sweeps to on-change + 1 Hz, and the OMPS
+// heartbeat below tells receivers to keep the last skeleton in between.
+static bool     g_ownPoseHold = false;
+static int8_t   g_ownHeadYaw = 0, g_ownHeadPitch = 0;   // rides every snapshot; see repl::State::headYaw
+static uint64_t g_holdBeatUs = 0;
+static int      g_holdOffLeft = 0;
+void SetOwnHeadLook(float yawDeg, float pitchDeg) {
+    auto q = [](float d) -> int8_t { if (!(d > -120.f)) d = d < 0.f ? -120.f : 0.f; if (d > 120.f) d = 120.f; return (int8_t)(d < 0.f ? d - 0.5f : d + 0.5f); };
+    g_ownHeadYaw = q(yawDeg); g_ownHeadPitch = q(pitchDeg);
+}
+int ProxyHeadLook(void* actor, float* yawDeg, float* pitchDeg) {
+    if (!actor) return 0;
+    for (auto& s : g_slots) {
+        if (!s.used || s.proxy.actor() != actor) continue;
+        return s.proxy.HeadLook(yawDeg, pitchDeg);   // 1 off the board, 2 riding
+    }
+    return 0;
+}
+void SetOwnPoseHold(bool on) {
+    if (on == g_ownPoseHold) return;
+    g_ownPoseHold = on;
+    game::pose::SetLocalHold(on);
+    if (!on) g_holdOffLeft = 3;                      // the release, said three times against loss
+    if (g_logf) g_logf(on ? "[pose] hold ON: the skeleton travels on change + 1 Hz, receivers keep the last one"
+                          : "[pose] hold off: releasing");
+}
+static void poseHoldSend(bool hold, int nPeers) {
+    uint8_t pkt[16];
+    const int n = repl::PackPoseHold(hold, 600, pkt, sizeof(pkt));
+    if (n <= 0) return;
+    PeerStats ps;
+    for (int i = 0; i < nPeers; i++)
+        if (GetStats(i, &ps) && ps.state != 5) Send(i, pkt, n, Current() == BK_SHM);   // shm: not latest-wins
+}
+
 void SetOwnBodyFeel(const int16_t* v, int n, int ver) {
     if (!v || n <= 0 || ver <= 0) return;
     if (n > 32) n = 32;
@@ -723,6 +817,23 @@ int ProxyActors(void** out, int cap) {
         out[n++] = s.proxy.actor();
     }
     return n;
+}
+int ProxyPeerIndex(void* actor) {
+    if (!actor) return -1;
+    for (auto& s : g_slots) if (s.used && s.proxy.actor() == actor) return s.peerIdx;
+    return -1;
+}
+int ProxyPeerName(void* actor, char* out, int cap) {
+    if (!actor || !out || cap <= 0) return 0;
+    out[0] = 0;
+    for (auto& s : g_slots) {
+        if (!s.used || s.proxy.actor() != actor) continue;
+        if (s.away) return 0;    // hidden in a world they are not in: not something to look at (PeerAt says the same)
+        const char* n = (s.haveCosmetics && s.cosmetics.skaterName[0]) ? s.cosmetics.skaterName : "";
+        strncpy_s(out, (size_t)cap, n, _TRUNCATE);
+        return 1;
+    }
+    return 0;
 }
 int ProxyBodyFeel(void* actor, int16_t* out, int cap, int* verOut) {
     if (!actor || !out || cap <= 0) return 0;
@@ -774,7 +885,7 @@ static bool worldTakesProxies(const char* world) {
 static const uint64_t kWorldSettleMs = 2000;
 
 void ForgetProxies() {
-    for (auto& s : g_slots) if (s.used) { s.proxy.Forget(); s.replayHidden = false; s.away = false; }
+    for (auto& s : g_slots) if (s.used) { s.proxy.Forget(); game::voice::ProxyGone(s.vrx.voice); s.replayHidden = false; s.away = false; }
     g_settleUntilMs = 0;                 // re-armed by Frame, which owns the clock
     g_lastOwnPawn   = nullptr;
     g_ownMap[0]     = 0;
@@ -1390,6 +1501,280 @@ static void dropFrame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, int nPeers,
 // confirmed on a female peer with the floor already standing aside: "before 75 entries (index 0..86)
 // OUTSIDE THE POSE -> after 58 (index 0..57)", two replay entries, three exits, no fault.
 
+#ifdef OMP_VOICE
+// ============================================================================ proximity voice
+// The microphone (voice/voice_capture) encodes on its own thread; here its frames go out, UNRELIABLE,
+// to every peer whose slot says they are in OUR level. On arrival a frame is decoded (Opus, with
+// its own loss concealment for gaps of a few frames) into the peer's ring, and the engine-side
+// sound on their proxy (game/voice_audio) is started on the first frame of a burst and stopped
+// after 1.5 s without one. A muted peer's frames are dropped here, so nothing reaches the engine.
+static float    g_voiceVolume  = 1.0f;
+static uint64_t g_voiceNowUs   = 0;
+static bool     g_voiceSaidOn  = false;
+
+// "then" was at least `gapUs` ago. A packet is stamped when the wire is pumped, which happens AFTER
+// the frame's own timestamp was taken, so a stamp can sit a few microseconds in this frame's future;
+// an unsigned subtraction then wraps to a value that trips every timeout (field: the peer's sound
+// was stopped on the very frame it started, sixty times a second, and nothing was ever heard).
+static inline bool olderThan(uint64_t nowUs, uint64_t thenUs, uint64_t gapUs) {
+    return nowUs > thenUs && nowUs - thenUs > gapUs;
+}
+
+static Slot* slotByPeer(int peerIdx) {
+    for (auto& s : g_slots) if (s.used && s.peerIdx == peerIdx) return &s;
+    return nullptr;
+}
+static bool sameMapAsUs(const Slot& s) {
+    return g_ownMap[0] && s.cosmetics.mapName[0] && _stricmp(s.cosmetics.mapName, g_ownMap) == 0;
+}
+static void voiceRefreshMute(Slot& s) {
+    if (s.voiceMuteChecked) return;
+    const char* id = omp::PeerIdStr(s.peerIdx);
+    if (!id || !*id) return;                     // identity not known yet: check again next time
+    s.voiceMuted = Mute_Is(id); s.voiceMuteChecked = true;
+}
+
+static uint32_t g_voiceTx = 0, g_voiceRx = 0;   // frames, for the 5 s line while anyone talks
+
+// Frames into one voice: decode (the decoder's own concealment for a gap of a few frames), ring,
+// and the engine-side sound started on the first frame of a burst. `who` is the peer index, or -1
+// for our own loopback.
+static void voiceFeed(VoiceRx& r, void* actor, int who, uint16_t seq, const uint8_t* const* frames,
+                      const int* lens, int n, uint64_t nowUs) {
+    if (!r.dec) {
+        int err = 0;
+        r.dec = opus_decoder_create(48000, 1, &err);
+        if (err != OPUS_OK || !r.dec) {
+            r.dec = nullptr;
+            static bool said = false;
+            if (!said && g_logf) { said = true; g_logf("[voice] Opus decoder failed -- nothing can be heard"); }
+            return;
+        }
+    }
+    if (!r.seen && g_logf) { r.seen = true; char m[120];
+        if (who >= 0) snprintf(m, sizeof(m), "[voice] first voice frames from peer %d", who);
+        else          snprintf(m, sizeof(m), "[voice] hear-yourself: first frames looped back");
+        g_logf(m); }
+    OpusDecoder* dec = (OpusDecoder*)r.dec;
+    if (!r.voice.playing || r.voice.compActor != actor) {
+        r.seqValid = false;
+        if (!game::voice::Start(r.voice, actor, g_voiceVolume, g_logf)) {
+            static uint64_t saidUs = 0;
+            if ((!saidUs || olderThan(nowUs, saidUs, 5000000ull)) && g_logf) { saidUs = nowUs; char m[120];
+                snprintf(m, sizeof(m), "[voice] frames from %s arriving but the engine sound could not start (retrying each frame)",
+                         who >= 0 ? "a peer" : "the loopback");
+                g_logf(m); }
+            return;
+        }
+        if (g_logf) { char m[120];
+            if (who >= 0) snprintf(m, sizeof(m), "[voice] peer %d talking (sound attached to their skater)", who);
+            else          snprintf(m, sizeof(m), "[voice] hear-yourself: sound attached to your skater");
+            g_logf(m); }
+    }
+    int16_t pcm[960 * 2];
+    if (r.seqValid) {
+        const int gap = (int)(uint16_t)(seq - r.seq) - 1;
+        if (gap > 0 && gap <= 3) {
+            for (int g = 0; g < gap; g++) {
+                const int got = opus_decode(dec, nullptr, 0, pcm, 960, 0);
+                if (got > 0) r.voice.ring.Write(pcm, got);
+            }
+        } else if (gap > 3 || gap < 0) { r.voice.ring.Clear(); r.voice.primed = false; }
+    }
+    for (int i = 0; i < n; i++) {
+        const int got = opus_decode(dec, frames[i], lens[i], pcm, 960 * 2, 0);
+        if (got > 0) r.voice.ring.Write(pcm, got);
+    }
+    r.seq = (uint16_t)(seq + n - 1); r.seqValid = true;
+    r.lastUs = nowUs;
+    if (who < 0) g_voiceRx += (uint32_t)n;           // the loopback has no arrival; count it here
+}
+
+static void voiceOnPacket(int peerIdx, const uint8_t* data, int len, uint64_t nowUs) {
+    if (!g_cfg.enabled) return;
+    uint16_t seq = 0; const uint8_t* frames[repl::kVoiceMaxFrames]; int lens[repl::kVoiceMaxFrames];
+    const int n = repl::UnpackVoice(data, len, &seq, frames, lens, repl::kVoiceMaxFrames);
+    if (n <= 0) return;
+    Slot* s = slotFor(peerIdx, nowUs);
+    if (!s) return;
+    g_voiceRx += (uint32_t)n;                        // counted here: "received" must not depend on playback
+    voiceRefreshMute(*s);
+    if (s->voiceMuted) return;
+    void* actor = s->proxy.actor();
+    if (!actor || !sameMapAsUs(*s)) {
+        static int said = 0;
+        if (said < 3 && g_logf) { said++; char m[200];
+            snprintf(m, sizeof(m), "[voice] frames from peer %d dropped: %s (their map '%s', ours '%s')", peerIdx,
+                     !actor ? "no proxy yet" : "not in our level", s->cosmetics.mapName, g_ownMap);
+            g_logf(m); }
+        return;
+    }
+    voiceFeed(s->vrx, actor, peerIdx, seq, frames, lens, n, nowUs);
+}
+
+// "Hear yourself": our own frames, decoded and played from our own skater, the way others hear us.
+// Session-only (not saved) -- a test, not a way to play.
+static VoiceRx g_selfRx;
+static void*   g_selfPawn = nullptr;
+static bool    g_voiceLoopback = false;
+void VoiceSetLoopback(bool on) {
+    g_voiceLoopback = on;
+    if (!on) game::voice::Stop(g_selfRx.voice);
+    if (g_logf) g_logf(on ? "[voice] hear-yourself ON" : "[voice] hear-yourself off");
+}
+bool VoiceLoopback() { return g_voiceLoopback; }
+
+static int voiceKeyVk(int idx) {
+#ifdef _WIN32
+    static const int vks[MPVOICE_KEY_COUNT] = { 'V', 'B', 'T', VK_LMENU, VK_LCONTROL, VK_XBUTTON1, VK_XBUTTON2 };
+    return (idx >= 0 && idx < MPVOICE_KEY_COUNT) ? vks[idx] : 'V';
+#else
+    (void)idx; return 0;
+#endif
+}
+static bool talkKeyDown() {
+#ifdef _WIN32
+    HWND fg = GetForegroundWindow();
+    if (!fg) return false;
+    DWORD pid = 0; GetWindowThreadProcessId(fg, &pid);
+    if (pid != GetCurrentProcessId()) return false;     // the key is the game's only while it is focused
+    return (GetAsyncKeyState(voiceKeyVk(MpPrefs_VoiceKey())) & 0x8000) != 0;
+#else
+    return false;
+#endif
+}
+
+static void voiceSend(uint16_t seq, const uint8_t* const* fp, const int* fl, int n, int nPeers) {
+    uint8_t pkt[900];
+    const int len = repl::PackVoice(seq, fp, fl, n, pkt, sizeof(pkt));
+    if (len <= 0) return;
+    g_voiceTx += (uint32_t)n;
+    PeerStats ps;
+    int sent = 0;
+    for (int i = 0; i < nPeers; i++) {
+        if (!GetStats(i, &ps) || ps.state == 5) continue;
+        Slot* s = slotByPeer(i);
+        if (!s || !sameMapAsUs(*s)) continue;         // only the players in OUR level hear us
+        // UNRELIABLE on a real network: a late voice frame is worthless and must not hold up the
+        // ones behind it. RELIABLE on shared memory, where the unreliable path is latest-wins on a
+        // single slot shared with the 60 Hz snapshot -- field: talking lost nearly every frame there.
+        Send(i, pkt, len, Current() == BK_SHM);
+        sent++;
+    }
+    if (sent && !g_voiceSaidOn && g_logf) { g_voiceSaidOn = true; g_logf("[voice] talking -- frames going out to the players in your level"); }
+}
+
+static void voiceFrame(void* ownPawn, uint64_t nowUs, int nPeers, int sendable) {
+    g_voiceNowUs = nowUs;
+    // the settings, pushed every frame (cheap). The microphone runs in a session with others, and
+    // whenever "Hear yourself" is on (a test needs no one else).
+    const int mode = MpPrefs_VoiceMode();
+    const bool inSession = g_cfg.enabled && ownPawn && sendable > 0;
+    const bool micWanted = inSession || (g_voiceLoopback && ownPawn);
+    voice::Capture_SetMode(micWanted ? mode : voice::kOff);
+    voice::Capture_SetSensitivity(MpPrefs_VoiceSensitivity());
+    {   // the chosen microphone, handed over when it changes
+        static char lastDev[200] = {0};
+        const char* dev = MpPrefs_VoiceDevice();
+        if (strcmp(dev, lastDev) != 0) { strncpy_s(lastDev, dev, _TRUNCATE); voice::Capture_SetDevice(dev); }
+    }
+    const bool keyDown = mode == MPVOICE_PTT && micWanted && talkKeyDown();
+    voice::Capture_SetTalkKey(keyDown);
+    {   // the first few edges, so a key that is never seen is visible in the log
+        static bool wasDown = false; static int said = 0;
+        if (keyDown && !wasDown && said < 3 && g_logf) { said++; g_logf("[voice] push-to-talk key down"); }
+        wasDown = keyDown;
+        static bool wasOpen = false; static int saidOpen = 0;
+        const bool open = voice::Capture_Speaking();
+        if (open && !wasOpen && saidOpen < 3 && g_logf) { saidOpen++;
+            g_logf(mode == MPVOICE_PTT ? "[voice] microphone gate open (push to talk)" : "[voice] microphone gate open (open mic)"); }
+        wasOpen = open;
+    }
+    game::voice::SetRange((float)MpPrefs_VoiceRangeM());
+    const float vol = (float)MpPrefs_VoiceVolume() / 100.0f;
+    if (vol != g_voiceVolume) {
+        g_voiceVolume = vol;
+        for (auto& s : g_slots) if (s.used && s.vrx.voice.comp) game::voice::SetVolume(s.vrx.voice, vol);
+        if (g_selfRx.voice.comp) game::voice::SetVolume(g_selfRx.voice, vol);
+    }
+    if (ownPawn != g_selfPawn) { game::voice::ProxyGone(g_selfRx.voice); g_selfRx.seqValid = false; g_selfPawn = ownPawn; }
+    // out: whatever the microphone encoded since last frame, up to two frames per packet -- to the
+    // players in our level, and back to ourselves when the test switch is on
+    if (micWanted && mode != MPVOICE_OFF) {
+        uint8_t fb[2][repl::kVoiceFrameMax]; const uint8_t* fp[2]; int fl[2];
+        uint16_t seq0 = 0; int n = 0;
+        auto flush = [&]() {
+            if (inSession) voiceSend(seq0, fp, fl, n, nPeers);
+            if (g_voiceLoopback && ownPawn) voiceFeed(g_selfRx, ownPawn, -1, seq0, fp, fl, n, nowUs);
+            n = 0;
+        };
+        for (int guard = 0; guard < 8; guard++) {
+            uint16_t sq = 0;
+            const int len = voice::Capture_Pop(fb[n], repl::kVoiceFrameMax, &sq);
+            if (len <= 0) break;
+            if (n == 0) seq0 = sq;
+            fp[n] = fb[n]; fl[n] = len; n++;
+            if (n == 2) flush();
+        }
+        if (n > 0) flush();
+    }
+    // in: a voice that stopped arriving goes quiet; the component stays for the next word
+    for (auto& s : g_slots) {
+        if (!s.used || !s.vrx.voice.playing) continue;
+        if (!s.vrx.lastUs || olderThan(nowUs, s.vrx.lastUs, 1500000ull)) game::voice::Stop(s.vrx.voice);
+    }
+    if (g_selfRx.voice.playing && (!g_selfRx.lastUs || olderThan(nowUs, g_selfRx.lastUs, 1500000ull))) game::voice::Stop(g_selfRx.voice);
+    // the 5 s line while anything moves: sent and received frame counts
+    {
+        static uint64_t lastUs = 0; static uint32_t lastTx = 0, lastRx = 0;
+        if (nowUs - lastUs > 5000000ull) {
+            float lv = 0, fl = 0, th = 0; int op = 0;
+            const bool mic = voice::Capture_GateStats(&lv, &fl, &th, &op);
+            const bool moved = g_voiceTx != lastTx || g_voiceRx != lastRx;
+            if ((moved || (mic && mode == MPVOICE_OPEN)) && g_logf) { char m[200];
+                if (mic) snprintf(m, sizeof(m), "[voice] 5s: mic level %.0f dB, noise floor %.0f dB, gate opens above %.0f dB, open %d%% | sent %u, received %u",
+                                  lv, fl, th, op, g_voiceTx - lastTx, g_voiceRx - lastRx);
+                else     snprintf(m, sizeof(m), "[voice] 5s: sent %u frames, received %u frames", g_voiceTx - lastTx, g_voiceRx - lastRx);
+                g_logf(m); }
+            lastUs = nowUs; lastTx = g_voiceTx; lastRx = g_voiceRx;
+        }
+    }
+}
+
+void VoiceSetMuted(int peerId, bool muted) {
+    Slot* s = slotByPeer(peerId);
+    const char* id = omp::PeerIdStr(peerId);
+    if (s) {
+        s->voiceMuted = muted; s->voiceMuteChecked = true;
+        if (muted) game::voice::Stop(s->vrx.voice);
+    }
+    if (id && *id) {
+        if (muted) Mute_Add(id, s && s->cosmetics.skaterName[0] ? s->cosmetics.skaterName : "?");
+        else       Mute_Remove(id);
+    }
+}
+bool VoiceIsMuted(int peerId) {
+    Slot* s = slotByPeer(peerId);
+    if (s) { voiceRefreshMute(*s); return s->voiceMuted; }
+    const char* id = omp::PeerIdStr(peerId);
+    return id && *id && Mute_Is(id);
+}
+bool VoiceTalking(int peerId) {
+    Slot* s = slotByPeer(peerId);
+    return s && s->vrx.voice.playing && s->vrx.lastUs && !olderThan(g_voiceNowUs, s->vrx.lastUs, 300000ull);
+}
+bool VoiceSelfTalking() { return voice::Capture_Speaking(); }
+#else
+static void voiceOnPacket(int, const uint8_t*, int, uint64_t) {}
+static void voiceFrame(void*, uint64_t, int, int) {}
+void VoiceSetMuted(int, bool) {}
+bool VoiceIsMuted(int) { return false; }
+bool VoiceTalking(int) { return false; }
+bool VoiceSelfTalking() { return false; }
+void VoiceSetLoopback(bool) {}
+bool VoiceLoopback() { return false; }
+#endif
+
 void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
     game::pose::SetLogger(g_logf);           // idempotent; the stale-pose line needs a voice
     if (!g_cfg.enabled) return;
@@ -1477,6 +1862,7 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
     if (ownPawn && gatherOwn && due && sendable > 0) {
         repl::State own;
         if (gatherOwn(ownPawn, own)) {
+            own.headYaw = g_ownHeadYaw; own.headPitch = g_ownHeadPitch;   // SessionTweaks' head look, if any
             g_ownLast = own; g_haveOwn = true;
             // MEASUREMENT (debug::paProbe): the local skater's physical-animation state, in the
             // same shape as the proxies' [paprobe] line.
@@ -1559,6 +1945,30 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
             // which is nineteen frames per refresh of a 95-bone character and reads as a peer stuck
             // in a stuttering animation. The mirror case (serving a scrubbing peer while we skate)
             // already drops them for the same reason; this is the case where WE are the one scrubbing.
+            // A HELD pose (sitting) is quasi-static: a sweep goes out only when the skeleton moved
+            // or once a second; in between the drivers go and the receiver keeps the last skeleton
+            // (the OMPS heartbeat). A sweep, once started, always finishes -- a half-delivered
+            // skeleton never becomes usable on the other side.
+            static bool holdSweeping = false;
+            if (own.poseN && game::pose::CapturedForHoldOnly(own)) {
+                static float lastRot[repl::kPoseMaxBones][4], lastPos[repl::kPoseMaxBones][3];
+                static uint8_t lastN = 0; static uint64_t lastSweepUs = 0;
+                if (!holdSweeping) {
+                    bool changed = own.poseN != lastN;
+                    for (int b = 0; b < own.poseN && !changed; b++) {
+                        float dq = 0.0f, dp = 0.0f;
+                        for (int k = 0; k < 4; k++) dq += fabsf(own.poseRot[b][k] - lastRot[b][k]);
+                        for (int k = 0; k < 3; k++) dp += fabsf(own.posePos[b][k] - lastPos[b][k]);
+                        if (dq > 0.004f || dp > 0.5f) changed = true;   // ~half a degree, half a centimetre
+                    }
+                    const bool keepalive = !lastSweepUs || nowUs - lastSweepUs > 1000000ull;
+                    if (changed || keepalive) {
+                        holdSweeping = true; lastSweepUs = nowUs; lastN = own.poseN;
+                        memcpy(lastRot, own.poseRot, sizeof(float) * 4 * (size_t)own.poseN);
+                        memcpy(lastPos, own.posePos, sizeof(float) * 3 * (size_t)own.poseN);
+                    } else own.poseN = 0;                                // drivers this tick
+                }
+            } else holdSweeping = false;
             if (own.poseN) {
                 own.animLen = 0;
                 // ...and the FEET and HANDS with them, for the same reason and the same 6 bones.
@@ -1577,8 +1987,11 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
             own.poseFirst = (uint8_t)poseCursor;
             int wroteBones = 0;
             const int n = repl::Pack(own, nowUs, pkt, sizeof(pkt), &wroteBones);
-            if (wroteBones > 0)
-                poseCursor = (poseCursor + wroteBones >= own.poseN) ? 0 : poseCursor + wroteBones;
+            if (wroteBones > 0) {
+                const bool wrapped = poseCursor + wroteBones >= own.poseN;
+                poseCursor = wrapped ? 0 : poseCursor + wroteBones;
+                if (wrapped) holdSweeping = false;                       // a held sweep is complete
+            }
             // Retain a FAT copy for the replay-sync ring: drivers + anim blob + our CAPTURED
             // skeleton. The bones are the piece playback cannot live without -- the requester's
             // anim graph cannot evaluate a skater during their local replay (the heap-of-clothes,
@@ -1654,6 +2067,16 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
                 }
             }
         }
+    }
+
+    // ---- 1.3 VOICE: our microphone's frames out to the players in our level, and the silence
+    // timeout on everyone else's.
+    voiceFrame(ownPawn, nowUs, nPeers, sendable);
+    // ---- 1.3b POSE HOLD heartbeat: 4 Hz while our pose is held, and three releases on the way out.
+    if (sendable > 0) {
+        if (g_ownPoseHold) {
+            if (!g_holdBeatUs || nowUs - g_holdBeatUs > 250000ull) { g_holdBeatUs = nowUs; poseHoldSend(true, nPeers); }
+        } else if (g_holdOffLeft > 0) { g_holdOffLeft--; g_holdBeatUs = 0; poseHoldSend(false, nPeers); }
     }
 
     // ---- 1.4 PUBLISH our BODY-FEEL SETTINGS: tiny, its own message type. On change, on a new peer
@@ -1771,7 +2194,7 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
         const bool departed = (s.peerIdx >= 0 && GetStats(s.peerIdx, &ps) && ps.state == 5);
         if (departed || quietForUs > dropUs) {
             s.proxy.Retire(g_logf);     // hide them first -- Forget only drops pointers
-            s.proxy.Forget(); s.used = false;
+            s.proxy.Forget(); game::voice::ProxyGone(s.vrx.voice); s.used = false;
             // Their props leave with them. Nobody else will ever hold these pointers.
             for (auto& d : s.drop) {
                 if (d.actor) game::dropper::DestroyRemote(d.actor, g_logf);

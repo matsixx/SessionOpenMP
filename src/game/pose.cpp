@@ -61,9 +61,21 @@ struct Slot {
     uint8_t  holdN = 0;
     float    holdRot[kPoseMaxBones][4];
     float    holdPos[kPoseMaxBones][3];
+    // The sender's HOLD (OMPS): a pose-less snapshot keeps the transported pose while this is
+    // fresh. The heartbeat has no clock in common with Note's nowMs, so it only arms `holdPing`;
+    // the next snapshot converts that into a deadline in its own clock.
+    bool     holdPing = false;
+    uint32_t holdTtlMs = 0;
+    uint64_t holdUntilMs = 0;
 };
 static Slot g_slots[kSlots];
 static void (*g_logf)(const char*) = nullptr;   // optional; set via SetLogger
+static bool g_localHold = false;                 // SetLocalHold: our pose is a held one (sitting)
+
+void SetLocalHold(bool on) { g_localHold = on; }
+bool CapturedForHoldOnly(const repl::State& s) {
+    return g_localHold && !(g_tun.captureBails && s.bailing) && LocalReplayMode() != g_tun.captureMode;
+}
 
 #ifdef _WIN32
 // ---- the component-space buffer that is CURRENTLY BEING BUILT (the editable one). Before the flip
@@ -168,7 +180,7 @@ bool Capture(void* mesh, State& s) {
     // wait for a bail or a scrub to be discoverable. Capture runs every gather, the dump is one-shot
     // per distinct bone count, so it costs one integer compare per frame after it has fired.
     maybeDumpBones(mesh);
-    if (LocalReplayMode() != g_tun.captureMode && !(g_tun.captureBails && s.bailing)) return false;
+    if (LocalReplayMode() != g_tun.captureMode && !(g_tun.captureBails && s.bailing) && !g_localHold) return false;
     return captureInto(mesh, s);
 }
 
@@ -228,8 +240,12 @@ void Note(void* mesh, const State& s, uint64_t nowMs) {
         // It must NOT release the SLOT: the slot also carries the held pose, and dropping it here
         // would throw away the snapshot on the very frame the peer stops sending -- i.e. always,
         // since a live peer never sends one.
+        // UNLESS the sender is HOLDING (sitting): their skeleton is static, they send it only when
+        // it moves, and the OMPS heartbeat says "keep what you have".
         Slot* sl = slotFor(mesh);
         if (sl) {
+            if (sl->holdPing) { sl->holdUntilMs = nowMs + sl->holdTtlMs; sl->holdPing = false; }
+            if (sl->n && sl->holdUntilMs && nowMs < sl->holdUntilMs) { sl->freshMs = nowMs; return; }
             if (sl->n) g_st.wiped++;      // a completed pose thrown away by a pose-less frame
             sl->n = 0; sl->freshMs = 0;
         }
@@ -272,7 +288,19 @@ void Note(void* mesh, const State& s, uint64_t nowMs) {
 }
 void Forget(void* mesh) {
     Slot* sl = slotFor(mesh);
-    if (sl) { sl->mesh = nullptr; sl->n = 0; sl->freshMs = 0; sl->holdN = 0; }
+    if (sl) { sl->mesh = nullptr; sl->n = 0; sl->freshMs = 0; sl->holdN = 0; sl->holdPing = false; sl->holdUntilMs = 0; }
+}
+void NoteHold(void* mesh, bool hold, uint32_t ttlMs) {
+    if (!g_tun.enabled || !mesh) return;
+    Slot* sl = slotFor(mesh);
+    if (!sl) {
+        if (!hold) return;
+        for (auto& c : g_slots) if (!c.mesh) { sl = &c; break; }
+        if (!sl) return;
+        sl->mesh = mesh; sl->n = 0; sl->freshMs = 0; sl->holdN = 0;
+    }
+    if (hold) { sl->holdPing = true; sl->holdTtlMs = ttlMs; }
+    else      { sl->holdPing = false; sl->holdUntilMs = 0; }   // the next pose-less snapshot releases
 }
 
 void OnFinalizeBones(void* mesh, uint64_t nowMs) {

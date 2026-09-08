@@ -69,7 +69,24 @@ void SetConfig(const Config& c);
 // module hands over its own riding-body settings, and reads back each live proxy and its owner's.
 void SetOwnBodyFeel(const int16_t* v, int n, int ver);
 int  ProxyActors(void** out, int cap);                              // live proxy skater actors
+int  ProxyPeerIndex(void* actor);                                   // the transport peer index behind one, -1 if none
+int  ProxyPeerName(void* actor, char* out, int cap);                // their skater name (a LABEL, may be empty); 0 = not a proxy, or away
+void SetOwnHeadLook(float yawDeg, float pitchDeg);                  // SessionTweaks: where our head looks off the board (0/0 = nowhere)
+int  ProxyHeadLook(void* actor, float* yawDeg, float* pitchDeg);    // a proxy's transported head look; 0 = not a proxy, 1 = off the board, 2 = riding
 int  ProxyBodyFeel(void* actor, int16_t* out, int cap, int* verOut); // 0 = that peer sent none
+
+// ---- proximity voice. Capture and the wire live in session; the sound itself is the game's
+// (game/voice_audio). `peerId` is the transport index, as everywhere; a mute is persisted by the
+// peer's PeerId (mutelist.h) and applied on OUR end only.
+void VoiceSetMuted(int peerId, bool muted);
+bool VoiceIsMuted(int peerId);
+bool VoiceTalking(int peerId);            // a voice frame from them within the last ~300 ms
+bool VoiceSelfTalking();                  // our microphone gate is open right now
+void VoiceSetLoopback(bool on);           // "Hear yourself": our own frames, played from our skater
+// ---- pose hold. SessionTweaks tells us its sitting pose is on the skeleton; that skeleton then
+// travels (thinned to on-change) and peers keep the last one between sweeps.
+void SetOwnPoseHold(bool on);
+bool VoiceLoopback();
 const Config& GetConfig();
 Stats GetStats();
 

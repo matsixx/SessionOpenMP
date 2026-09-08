@@ -47,6 +47,7 @@
 #include "ui/nameplates.h"
 #include "game/game_font.h"
 #include "session/banlist.h"
+#include "session/mutelist.h"
 #include "ui/mp_prefs.h"
 
 #include <cstdio>
@@ -1414,6 +1415,7 @@ public:
         logLine("=== SessionOpenMP loading (UE4SS C++ mod) ===");
         MpName_Init(dir, logLine);   // multiplayer name + word filter (mp_name.h)
         Ban_Init(dir, logLine);     // who this host refuses to play with (banlist.h)
+        Mute_Init(dir, logLine);    // whose voice this player does not hear (mutelist.h)
         MpPrefs_Init(dir, logLine);  // multiplayer preferences (mp_prefs.h) -- must precede any Init
         // Our permanent identity, handed to the transport before any backend starts. EOS ignores it
         // (a ProductUserId already identifies you); the direct-UDP wire has nothing else to go on.
@@ -1530,8 +1532,24 @@ extern "C" {
     // player wants peer body physics at all (Other options).
     OMP_MOD_API void OmpSession_SetOwnBodyFeel(const int16_t* v, int n, int ver) { omp::session::SetOwnBodyFeel(v, n, ver); }
     OMP_MOD_API int  OmpSession_ProxyActors(void** out, int cap) { return omp::session::ProxyActors(out, cap); }
+    // The peer index behind a proxy actor (indices are handed out once and never reused, so it is the
+    // stable "Player N" a tweaks feature can show for someone -- there are no display names on the wire).
+    OMP_MOD_API int  OmpSession_ProxyPeerIndex(void* actor) { return omp::session::ProxyPeerIndex(actor); }
+    // ...and the skater name they chose, the same label the players page and the replay editor show. A
+    // label only (two players can pick the same one; it can be empty until their cosmetics arrive), so
+    // the peer index above stays the identity. 0 for an actor that is not a proxy, or a peer who is AWAY
+    // -- hidden in a world they are not in, which is nothing to look at.
+    OMP_MOD_API int  OmpSession_ProxyPeerName(void* actor, char* out, int cap) { return omp::session::ProxyPeerName(actor, out, cap); }
+    // The head look, both ways: SessionTweaks says where our head is looking off the board (two bytes
+    // on every snapshot), and reads back each proxy's to turn that skater's head the same way on its
+    // own rig (1 = they are off the board and the look applies -- 0/0 being a LEVEL head -- 2 = riding,
+    // nothing applies). This side carries the value and knows nothing about bones.
+    OMP_MOD_API void OmpSession_SetOwnHeadLook(float yawDeg, float pitchDeg) { omp::session::SetOwnHeadLook(yawDeg, pitchDeg); }
+    OMP_MOD_API int  OmpSession_ProxyHeadLook(void* actor, float* yawDeg, float* pitchDeg) { return omp::session::ProxyHeadLook(actor, yawDeg, pitchDeg); }
     OMP_MOD_API int  OmpSession_ProxyBodyFeel(void* actor, int16_t* out, int cap, int* verOut) { return omp::session::ProxyBodyFeel(actor, out, cap, verOut); }
     OMP_MOD_API int  OmpSession_PeerBodyPhysicsOn() { return MpPrefs_PeerBodyPhysics() ? 1 : 0; }
+    // The pose hold: SessionTweaks says its sitting pose is on the local skeleton (or no longer is).
+    OMP_MOD_API void OmpSession_SetOwnPoseHold(int on) { omp::session::SetOwnPoseHold(on != 0); }
     OMP_MOD_API RC::CppUserModBase* start_mod()      { return new SessionOpenMP(); }
     OMP_MOD_API void uninstall_mod(RC::CppUserModBase* mod) { delete mod; }
 }

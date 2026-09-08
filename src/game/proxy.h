@@ -153,6 +153,9 @@ public:
     void Forget();                        // world changed: every actor died with it; drop pointers
 
     void*      actor() const { return actor_; }
+    // The peer's transported head look off the board (degrees: yaw + right, pitch + up; 0/0 = nowhere).
+    // 1 = off the board (the look applies, a 0/0 look is a LEVEL head), 2 = riding (nothing applies).
+    int        HeadLook(float* yawDeg, float* pitchDeg) const { if (yawDeg) *yawDeg = (float)headYaw_; if (pitchDeg) *pitchDeg = (float)headPitch_; return headOnFoot_ ? 1 : 2; }
     ProxyStats stats() const { return st_; }
     // Written by the session each frame from the distance between the LOCAL player and this peer
     // (with hysteresis). Far = the board is stamped, never simulated.
@@ -221,6 +224,8 @@ private:
     uint64_t   paProbeMs_     = 0;        // debug::paProbe cadence (2 s per proxy)
     uint64_t   paEnableMs_    = 0;        // syncPhysAnim poll cadence (per proxy)
     uint8_t    lastPushState_ = 0, lastBrakeState_ = 0, lastBailing_ = 0;
+    int8_t     headYaw_ = 0, headPitch_ = 0;  // the peer's head look off the board, kept for SessionTweaks to read back
+    uint8_t    headOnFoot_ = 0;               // ...and whether they are off the board at all (0/0 alone cannot say)
     uint8_t    lastBroken_ = 0;           // last APPLIED brokenState -- only advances with the board
                                           // linked, so a break arriving before the board link still
                                           // applies once the board is up

@@ -283,6 +283,21 @@ static const SigEntry kSigs[] = {
     // The +0x8c0 virtual call is the gate the setter early-outs on; the +0x711 store (and 0xef / shl 4
     // / or) is the physAnim bit it writes -- the tail displacement 11 07 00 00 is the identity.
     { "SetPhysAnimEnabled",   "48 89 5C 24 08 57 48 83 EC 20 48 8B 01 0F B6 FA 48 8B D9 FF 90 ?? ?? ?? ?? 40 3A C7 ?? ?? 44 0F B6 83 11 07 00 00", false },
+    // ---- proximity voice (voice_audio.cpp). All sigmake, unique in both exes.
+    // StaticConstructObject_Internal (Epic 0x152fef0 / Steam 0x14f1160): 40 bytes matched three
+    // big-frame prologues; the reads of the params struct (Class [rcx], Outer [rcx+8], SetFlags
+    // [rcx+18], Template [rcx+28]) are the identity.
+    { "StaticConstructObject", "48 89 5C 24 10 48 89 74 24 18 55 57 41 54 41 56 41 57 48 8D AC 24 50 FF FF FF 48 81 EC B0 01 00 00 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 85 A8 00 00 00 48 8B 39 4C 8D 25 ?? ?? ?? ?? 4C 8B 79 08 48 8B D9 8B 71 18 4C 8B 71 28", false },
+    // USoundWaveProcedural::GeneratePCMData (Epic 0x2fc81f0 / Steam 0x2f8acd0) -- resolved for its
+    // ADDRESS: the wave's vtable slot holding it is what gets rerouted. The bReset cmpxchg at +0x398
+    // and the AudioBuffer lea at +0x388 are the identity.
+    { "SoundGeneratePCM",      "48 89 54 24 10 53 56 57 41 55 41 56 48 83 EC 50 33 DB 48 8D B1 88 03 00 00 33 C0 45 8B E8 4C 8B F2 48 8B F9 F0 0F B1 99 98 03 00 00", false },
+    // UGameplayStatics::SpawnSoundAttached (Epic 0x2c5c220 / Steam 0x2c1ea00)
+    { "SpawnSoundAttached",    "4C 8B DC 4D 89 43 18 55 53 56 57 41 54 41 56 48 8D 6C 24 98 48 81 EC 68 01 00 00 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 45 30", false },
+    // UAudioComponent::Stop / Play / SetVolumeMultiplier (Epic 0x2af3020 / 0x2aed420 / 0x2af28e0)
+    { "AudioStop",             "40 53 48 83 EC 20 F6 81 8A 00 00 00 01 48 8B D9 ?? ?? E8 ?? ?? ?? ?? 48 85 C0 ?? ?? 48 8B 93 D0 07 00 00 48 8B C8 80 A3 8A 00 00 00 FE", false },
+    { "AudioPlay",             "48 89 5C 24 08 48 89 7C 24 10 55 48 8B EC 48 81 EC 80 00 00 00 33 C0 F3 0F 11 4D A0 BF FF FF FF FF 48 89 45 B0 48 8D 55 A0", false },
+    { "AudioSetVolume",        "40 53 48 81 EC 90 00 00 00 F6 81 8A 00 00 00 01 48 8B D9 0F 29 B4 24 80 00 00 00 0F 28 F1 F3 0F 11 B1 38 02 00 00 C7 81 34 02 00 00 00 00 80 3F", false },
 };
 static const int kSigN = (int)(sizeof(kSigs) / sizeof(kSigs[0]));
 
@@ -925,6 +940,12 @@ const Syms& Resolve(void (*logf)(const char*)) {
     g_syms.ActorDestroy       = (ActorDestroyFn)  found[i++];
     g_syms.ReplayRefreshBones = (ReplayRefreshBonesFn) found[i++];
     g_syms.SetPhysAnimEnabled = (SetPhysAnimEnabledFn) found[i++];
+    g_syms.StaticConstructObject = (SCOFn)          found[i++];
+    g_syms.SoundGeneratePCM   =                     found[i++];   // address only, never called
+    g_syms.SpawnSoundAttached = (SpawnSoundAttachedFn) found[i++];
+    g_syms.AudioStop          = (AudioStopFn)       found[i++];
+    g_syms.AudioPlay          = (AudioPlayFn)       found[i++];
+    g_syms.AudioSetVolume     = (AudioSetVolFn)     found[i++];
 
     // LOCKSTEP CHECK. The block above is POSITIONAL, and a table entry added without its assignment --
     // or vice versa -- shifts every later symbol onto the wrong address SILENTLY: sigs still resolve

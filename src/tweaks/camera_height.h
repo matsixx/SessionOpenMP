@@ -33,3 +33,6 @@ bool CameraHeight_FollowEnabled();      void CameraHeight_SetFollowEnabled(bool 
 // you. The stored sense is the LABEL's sense, not the mod's -- see the polarity note in the .cpp.
 bool CameraHeight_PitchOnDropEnabled(); void CameraHeight_SetPitchOnDropEnabled(bool on);
 float CameraHeight_PitchDeg();          void CameraHeight_SetPitchDeg(float deg);
+// GAME THREAD: which way the camera is looking this frame (the component's forward after everything
+// that moves it), for the head that looks where the camera looks. False = no fresh camera.
+bool  CameraHeight_ViewForward(float out[3]);

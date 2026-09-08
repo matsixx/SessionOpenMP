@@ -88,6 +88,7 @@ static bool codecCheck() {
     s.onBoard = 1; s.grounded = 1; s.bailing = 0;
     s.pushFlags = 0x40; s.pushState = 3; s.brakeState = 2;
     s.pushSpeed = 1.734f;                       // deliberately NOT 1.0 -- see the assertion below
+    s.headYaw = -37; s.headPitch = 22;          // deliberately NOT 0 -- 0 is the neutral AND the fallback
     s.crankOn = 1; s.crankDefOff = 3; s.crankPocket = 0.7351f;
     strcpy_s(s.trickName, "TRICK_RGS_KickFlip");
     // Grind fields. Ratios deliberately NOT 0..1 (the codec must not assume a range, only clamp at
@@ -189,6 +190,7 @@ static bool codecCheck() {
     // rate and every failure path's fallback -- a gate that tested 1.0 would pass on a field that
     // never made it onto the wire at all.
     near1(o.pushSpeed, s.pushSpeed, 0.005f, "pushSpeed");
+    if (o.headYaw != -37 || o.headPitch != 22) { printf("  codec: head look %d/%d\n", (int)o.headYaw, (int)o.headPitch); bad++; }
     if (o.animLen != s.animLen) { printf("  codec: animLen %d != %d\n", o.animLen, s.animLen); bad++; }
     { int off = 0;
       for (int i = 0; i < AnimFieldCount(); i++) {

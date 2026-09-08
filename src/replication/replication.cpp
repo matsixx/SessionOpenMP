@@ -62,12 +62,18 @@ namespace omp { namespace repl {
 //   OMPJ -> CLAIMED by the replay-sync transfer protocol (replaysync.cpp) -- never a snapshot value
 //   OMPK -> board brokenState byte (a peer's board break/repair renders on their proxy)
 //   OMPQ -> CLAIMED by the body-feel settings message (kBodyFeelMagic) -- never a snapshot value
+//   OMPV -> CLAIMED by the voice message (kVoiceMagic) -- never a snapshot value
+//   OMPS -> CLAIMED by the pose-hold heartbeat (kPoseHoldMagic) -- never a snapshot value
 // "OMPR": the size batch. The timestamp shrank to a u32 (0.25 ms units), feet and hands travel
 // body-relative in h16, the crank fields ride only cranked frames, the anim escape mask covers only
 // the fields that can escape, and loop/trick names are interned (sent on change + refresh, cached on
 // the receiver). Every one of these changes the layout, so one letter covers the lot -- an older
 // build rejects the packet outright instead of misreading everything after the first moved byte.
-static const uint32_t kMagic = 0x52504D4Fu; // "OMPR"
+//   OMPT -> head look (two int8 bytes after brokenState: yaw, pitch -- the off-board head turn).
+//           NOT "OMPL": the dropper used that letter and RETIRED it by name (dropsync.cpp), so a
+//           build from that era would route these snapshots into its own dropper and misparse them.
+//           T is the first letter this namespace has never handed out.
+static const uint32_t kMagic = 0x54504D4Fu; // "OMPT"
 
 static bool finite3(const float* v, float lim) {
     for (int i = 0; i < 3; i++) if (!(v[i] > -lim && v[i] < lim)) return false;   // rejects NaN/Inf too
@@ -294,6 +300,7 @@ int Pack(const State& s, uint64_t senderUs, uint8_t* out, int cap, int* poseWrot
     w.u8(f1); w.u8(f2);
     w.u8(s.pushFlags); w.u8(s.pushState); w.u8(s.brakeState); w.u8(s.boardMode);
     w.u8(s.brokenState);
+    w.u8((uint8_t)s.headYaw); w.u8((uint8_t)s.headPitch);
     // PushSpeedMultiplier. h16 is plenty: it is a small animation-rate multiplier around 1.0, and the
     // clamp is what keeps a garbage read from driving the proxy's push animation to an absurd rate.
     w.h16(clampf(s.pushSpeed, 8.f));
@@ -473,6 +480,10 @@ bool Unpack(const uint8_t* d, int len, State& out, uint64_t* senderUs) {
     out.typing    = (f2 & 128) ? 1 : 0;
     out.pushFlags = r.u8(); out.pushState = r.u8(); out.brakeState = r.u8(); out.boardMode = r.u8();
     out.brokenState = r.u8();
+    // A head cannot look further round than this; anything else is corruption, not a look.
+    { const int8_t hy = (int8_t)r.u8(), hp = (int8_t)r.u8();
+      out.headYaw   = (hy > -121 && hy < 121) ? hy : 0;
+      out.headPitch = (hp > -121 && hp < 121) ? hp : 0; }
     out.pushSpeed = r.h16();
     // A push rate of 0 would FREEZE the animation and a negative would run it backwards -- neither is
     // a thing the sender can be in, so a decode that produces one is corruption, not a slow push.
@@ -672,6 +683,70 @@ bool UnpackBodyFeel(const uint8_t* d, int len, BodyFeelSet& out) {
     if (!r.ok) { out = BodyFeelSet{}; return false; }
     out.n = (uint8_t)n;
     return true;
+}
+
+// ---- pose hold
+static const uint32_t kPoseHoldMagic = 0x53504D4Fu;   // "OMPS"
+
+bool IsPoseHoldPacket(const uint8_t* d, int len) {
+    if (!d || len < 4) return false;
+    uint32_t m = 0; memcpy(&m, d, 4);
+    return m == kPoseHoldMagic;
+}
+int PackPoseHold(bool hold, uint16_t ttlMs, uint8_t* out, int cap) {
+    if (!out || cap < 7) return 0;
+    Wr w{out, cap, 0, true};
+    w.u32(kPoseHoldMagic);
+    w.u8(hold ? 1 : 0);
+    w.u16(ttlMs);
+    return w.ok ? w.n : 0;
+}
+bool UnpackPoseHold(const uint8_t* d, int len, bool* holdOut, uint16_t* ttlOut) {
+    if (!IsPoseHoldPacket(d, len) || len < 7) return false;
+    Rd r{d, len, 4, true};
+    const uint8_t h = r.u8();
+    const uint16_t ttl = r.u16();
+    if (!r.ok) return false;
+    if (holdOut) *holdOut = h != 0;
+    if (ttlOut)  *ttlOut = ttl;
+    return true;
+}
+
+// ---- voice
+static const uint32_t kVoiceMagic = 0x56504D4Fu;   // "OMPV"
+
+bool IsVoicePacket(const uint8_t* d, int len) {
+    if (!d || len < 4) return false;
+    uint32_t m = 0; memcpy(&m, d, 4);
+    return m == kVoiceMagic;
+}
+int PackVoice(uint16_t seq, const uint8_t* const* frames, const int* lens, int n, uint8_t* out, int cap) {
+    if (!out || !frames || !lens || n <= 0 || n > kVoiceMaxFrames) return 0;
+    Wr w{out, cap, 0, true};
+    w.u32(kVoiceMagic);
+    w.u16(seq);
+    w.u8((uint8_t)n);
+    for (int i = 0; i < n; i++) {
+        if (lens[i] <= 0 || lens[i] > 255) return 0;
+        w.u8((uint8_t)lens[i]);
+        w.b(frames[i], lens[i]);
+    }
+    return w.ok ? w.n : 0;
+}
+int UnpackVoice(const uint8_t* d, int len, uint16_t* seqOut, const uint8_t** frames, int* lens, int maxFrames) {
+    if (!IsVoicePacket(d, len) || len < 7 || !frames || !lens) return 0;
+    Rd r{d, len, 4, true};
+    const uint16_t seq = r.u16();
+    int n = r.u8();
+    if (n <= 0 || n > kVoiceMaxFrames || n > maxFrames) return 0;
+    for (int i = 0; i < n; i++) {
+        const int l = r.u8();
+        if (!r.ok || l <= 0 || r.n + l > len) return 0;
+        frames[i] = d + r.n; lens[i] = l;
+        r.n += l;
+    }
+    if (seqOut) *seqOut = seq;
+    return n;
 }
 
 // One item: category, variant, instance, then a length-prefixed name. Names are the only variable part,

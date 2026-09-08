@@ -139,7 +139,10 @@ if(EXISTS "${UE4SS_LIB}")
         # in the ImGui block below -- that block is conditional on the vendored sources existing.
         src/ui/mp_prefs.cpp
         src/session/session.cpp
-        src/session/banlist.cpp)
+        src/session/banlist.cpp
+        src/session/mutelist.cpp
+        src/game/voice_audio.cpp
+        src/voice/voice_capture.cpp)
     target_include_directories(omp_mod PRIVATE "${EOS_SDK}/Include")
     target_link_libraries(omp_mod PRIVATE "${UE4SS_LIB}" "${EOS_SDK}/Lib/EOSSDK-Win64-Shipping.lib")
 
@@ -169,6 +172,22 @@ if(EXISTS "${UE4SS_LIB}")
             GIT_TAG        d94c64d32ea37bc4f5ee47d580709f70c6fb6080   # v1.3.4+14
             SOURCE_SUBDIR  do-not-add-this-subdirectory)
         FetchContent_MakeAvailable(minhook)
+        # Opus -- the voice codec (BSD). Built from source here so its objects can be /MD like omp_mod
+        # (the top-level default is /MT for the tools, which cannot link into UE4SS's process).
+        set(OPUS_BUILD_SHARED_LIBRARY OFF CACHE BOOL "" FORCE)
+        set(OPUS_BUILD_TESTING OFF CACHE BOOL "" FORCE)
+        set(OPUS_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
+        set(OPUS_INSTALL_PKG_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
+        set(OPUS_INSTALL_CMAKE_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
+        FetchContent_Declare(opus
+            GIT_REPOSITORY https://github.com/xiph/opus.git
+            GIT_TAG        v1.5.2
+            GIT_SHALLOW    TRUE)
+        FetchContent_MakeAvailable(opus)
+        set_target_properties(opus PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
+        target_include_directories(omp_mod PRIVATE "${opus_SOURCE_DIR}/include")
+        target_link_libraries(omp_mod PRIVATE opus ole32)
+        target_compile_definitions(omp_mod PRIVATE OMP_VOICE=1)   # session.cpp's voice half; the tools' library build has none
         set(MINHOOK_SRC "${minhook_SOURCE_DIR}")
     endif()
 
@@ -249,6 +268,10 @@ if(EXISTS "${UE4SS_LIB}")
             src/tweaks/body_feel.cpp
             src/tweaks/proxy_body_feel.cpp
             src/tweaks/camera_height.cpp
+            src/tweaks/upscale.cpp
+            src/tweaks/upscale_fsr.cpp
+            src/tweaks/sit.cpp
+            src/tweaks/sit_ui.cpp
             ${MINHOOK_SRC}/src/buffer.c
             ${MINHOOK_SRC}/src/hook.c
             ${MINHOOK_SRC}/src/trampoline.c
@@ -258,7 +281,7 @@ if(EXISTS "${UE4SS_LIB}")
             MSVC_RUNTIME_LIBRARY "MultiThreadedDLL"
             RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tweaks")
         target_compile_definitions(tweaks_mod PRIVATE RC_UE4SS_IMPORT UNICODE _UNICODE NOMINMAX)
-        target_include_directories(tweaks_mod PRIVATE src third_party/ue4ss_abi "${MINHOOK_SRC}/include")
+        target_include_directories(tweaks_mod PRIVATE src third_party/ue4ss_abi third_party/ffx-api "${MINHOOK_SRC}/include")
         target_link_libraries(tweaks_mod PRIVATE "${UE4SS_LIB}")
         message(STATUS "tweaks_mod: SessionTweaks UE4SS mod target enabled")
     else()

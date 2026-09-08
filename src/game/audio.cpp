@@ -50,6 +50,8 @@ void SetLocalParts(void* pawn, void* board) { g_pawn = pawn; g_board = board; }
 static thread_local int g_inReplay = 0;
 static thread_local int g_inFunnel = 0;
 bool Replaying() { return g_inReplay != 0; }
+void BeginOwnSpawn() { g_inReplay++; }
+void EndOwnSpawn()   { if (g_inReplay > 0) g_inReplay--; }
 
 // =====================================================================================================
 // capture bookkeeping

@@ -39,6 +39,12 @@ static int      g_bubbleDistM = 35;
 // the session and come straight back.
 static int      g_dropMode    = MPDROP_SHARED;
 static int      g_peerBody    = MPBODY_ON;
+static int      g_voiceMode   = MPVOICE_PTT;
+static int      g_voiceKey    = 0;
+static int      g_voiceRange  = 25;
+static int      g_voiceVol    = 100;
+static int      g_voiceSens   = 50;
+static char     g_voiceDevice[200] = {0};
 // OFF by default: sharing the level's own furniture is unfinished, and the setting exists so it
 // cannot take the working half down with it.
 
@@ -64,6 +70,14 @@ static void saveAll() {
     fprintf(f, "DropMode=%d\n", g_dropMode);
     fprintf(f, "# Other players' body physics on your screen: 0 off, 1 on.\n");
     fprintf(f, "PeerBodyPhysics=%d\n", g_peerBody);
+    fprintf(f, "# Voice chat: 0 off, 1 push to talk, 2 open mic. Key: 0 V, 1 B, 2 T, 3 Left Alt, 4 Left Ctrl, 5 Mouse 4, 6 Mouse 5.\n");
+    fprintf(f, "VoiceMode=%d\n", g_voiceMode);
+    fprintf(f, "VoiceKey=%d\n", g_voiceKey);
+    fprintf(f, "VoiceRangeM=%d\n", g_voiceRange);
+    fprintf(f, "VoiceVolume=%d\n", g_voiceVol);
+    fprintf(f, "VoiceSensitivity=%d\n", g_voiceSens);
+    fprintf(f, "# The microphone: a Windows endpoint id from the Voice chat page; empty = the default device.\n");
+    fprintf(f, "VoiceDevice=%s\n", g_voiceDevice);
     fprintf(f, "# The level's own props (benches, barriers): 0 leave them alone, 1 share them.\n");
     // PeerId is an IDENTITY, not a preference: deleting the line makes this install a different
     // person to everyone who has played with it. Written last, with a warning above it.
@@ -125,6 +139,50 @@ void MpPrefs_SetPeerBodyPhysics(int on) {
     g_peerBody = on;
     saveAll();
     say(on ? "[prefs] peer body physics: on" : "[prefs] peer body physics: off");
+}
+int  MpPrefs_VoiceMode()        { return g_voiceMode; }
+void MpPrefs_SetVoiceMode(int mode) {
+    mode = clampI(mode, MPVOICE_OFF, MPVOICE_OPEN);
+    if (mode == g_voiceMode) return;
+    g_voiceMode = mode;
+    saveAll();
+    say(mode == MPVOICE_OFF ? "[prefs] voice chat: off" : mode == MPVOICE_PTT ? "[prefs] voice chat: push to talk" : "[prefs] voice chat: open mic");
+}
+int  MpPrefs_VoiceKey()         { return g_voiceKey; }
+void MpPrefs_SetVoiceKey(int idx) {
+    idx = clampI(idx, 0, MPVOICE_KEY_COUNT - 1);
+    if (idx == g_voiceKey) return;
+    g_voiceKey = idx;
+    saveAll();
+}
+int  MpPrefs_VoiceRangeM()      { return g_voiceRange; }
+void MpPrefs_SetVoiceRangeM(int metres) {
+    metres = clampI(metres, MPVOICE_RANGE_MIN, MPVOICE_RANGE_MAX);
+    if (metres == g_voiceRange) return;
+    g_voiceRange = metres;
+    saveAll();
+}
+int  MpPrefs_VoiceVolume()      { return g_voiceVol; }
+void MpPrefs_SetVoiceVolume(int pct) {
+    pct = clampI(pct, MPVOICE_VOL_MIN, MPVOICE_VOL_MAX);
+    if (pct == g_voiceVol) return;
+    g_voiceVol = pct;
+    saveAll();
+}
+int  MpPrefs_VoiceSensitivity() { return g_voiceSens; }
+void MpPrefs_SetVoiceSensitivity(int pct) {
+    pct = clampI(pct, 0, 100);
+    if (pct == g_voiceSens) return;
+    g_voiceSens = pct;
+    saveAll();
+}
+const char* MpPrefs_VoiceDevice() { return g_voiceDevice; }
+void MpPrefs_SetVoiceDevice(const char* id) {
+    if (!id) id = "";
+    if (strcmp(id, g_voiceDevice) == 0) return;
+    strncpy_s(g_voiceDevice, id, _TRUNCATE);
+    saveAll();
+    say(g_voiceDevice[0] ? "[prefs] microphone: chosen device" : "[prefs] microphone: the default device");
 }
 int  MpPrefs_SyncSeconds() { return g_syncSeconds; }
 void MpPrefs_SetSyncSeconds(int seconds) {
@@ -192,6 +250,12 @@ void MpPrefs_Init(const char* dir, void (*logf)(const char*)) {
             else if (!_stricmp(key, "BubbleDistM")) g_bubbleDistM = clampI(atoi(val), MPBUBBLE_DIST_MIN, MPBUBBLE_DIST_MAX);
             else if (!_stricmp(key, "DropMode"))    g_dropMode    = clampI(atoi(val), MPDROP_OFF, MPDROP_SHARED);
             else if (!_stricmp(key, "PeerBodyPhysics")) g_peerBody = clampI(atoi(val), MPBODY_OFF, MPBODY_ON);
+            else if (!_stricmp(key, "VoiceMode"))        g_voiceMode  = clampI(atoi(val), MPVOICE_OFF, MPVOICE_OPEN);
+            else if (!_stricmp(key, "VoiceKey"))         g_voiceKey   = clampI(atoi(val), 0, MPVOICE_KEY_COUNT - 1);
+            else if (!_stricmp(key, "VoiceRangeM"))      g_voiceRange = clampI(atoi(val), MPVOICE_RANGE_MIN, MPVOICE_RANGE_MAX);
+            else if (!_stricmp(key, "VoiceVolume"))      g_voiceVol   = clampI(atoi(val), MPVOICE_VOL_MIN, MPVOICE_VOL_MAX);
+            else if (!_stricmp(key, "VoiceSensitivity")) g_voiceSens  = clampI(atoi(val), 0, 100);
+            else if (!_stricmp(key, "VoiceDevice"))      strncpy_s(g_voiceDevice, val, _TRUNCATE);
             else if (!_stricmp(key, "PeerId")) {
                 // Only accept a well-formed one. A truncated or hand-edited id would still "work"
                 // right up until it collided with somebody, which is the worst time to find out.

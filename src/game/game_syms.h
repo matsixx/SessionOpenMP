@@ -245,6 +245,18 @@ using ActorDestroyFn    = bool  (*)(void* actor, bool netForce, bool shouldModif
 // rebuild, which is the replay-editor crash. See RefreshProxyReplayBones.
 using ReplayRefreshBonesFn = void (*)(void* replayComp);
 using SetPhysAnimEnabledFn = void (*)(void* skater, bool enable);
+// Proximity voice (voice_audio.cpp). FVector/FRotator are 12-byte structs: MSVC x64 passes them by
+// hidden reference, exactly as the engine's own native was compiled, so declaring them by value
+// here is what makes the call land right.
+struct FVec3 { float x, y, z; };
+struct FRot3 { float pitch, yaw, roll; };
+using SCOFn                = void* (*)(const void* params);   // StaticConstructObject_Internal(const FStaticConstructObjectParameters&)
+using SpawnSoundAttachedFn = void* (*)(void* sound, void* attachTo, uint64_t attachName, FVec3 loc, FRot3 rot,
+                                       int locType, bool stopWhenDestroyed, float vol, float pitch, float start,
+                                       void* atten, void* conc, bool autoDestroy);
+using AudioPlayFn          = void (*)(void* comp, float startTime);
+using AudioStopFn          = void (*)(void* comp);
+using AudioSetVolFn        = void (*)(void* comp, float vol);
 // UObjectDropperPersistentHandler::Load -- HOOKED, never called. It is the one moment at which the
 // level's own props are still where the MAP put them: Load walks the player's save and moves each
 // prop it names to the saved pose, so anything captured before it runs is the map default and
@@ -428,6 +440,14 @@ struct Syms {
     // none of which a stamped-in proxy takes), which is why a peer has ZERO body physics -- see the
     // paProbe field note. Used to give proxies the game's own body physics.
     SetPhysAnimEnabledFn SetPhysAnimEnabled = nullptr;
+    // Proximity voice (voice_audio.cpp): a procedural sound per peer, played by the game's own
+    // audio engine from their proxy.
+    SCOFn                StaticConstructObject = nullptr;   // objects in the transient package
+    void*                SoundGeneratePCM = nullptr;        // USoundWaveProcedural::GeneratePCMData -- its ADDRESS, for the vtable reroute
+    SpawnSoundAttachedFn SpawnSoundAttached = nullptr;
+    AudioPlayFn          AudioPlay = nullptr;
+    AudioStopFn          AudioStop = nullptr;
+    AudioSetVolFn        AudioSetVolume = nullptr;
     void*             DropperLoad      = nullptr;   // HOOKED, never called directly
     // UObjectDropperPersistentHandler::Save -- HOOKED, never called. THE HARD SAVE GUARD. A prop we
     // spawn for a session is a real dropped object as far as the game is concerned, and the session
