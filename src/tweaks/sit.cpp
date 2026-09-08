@@ -136,6 +136,7 @@ enum {
     RM_MODE       = 0x2a8,   // AReplayManager::_currentReplayMode (EReplayMode); 2 = playback
     SK_BOARD      = 0x568,   // ASkaterCharacterBase::_skateboard
     SK_CAN_BAIL   = 0x649,   // ASkaterCharacterBase::_canBail -- the game's own bail veto
+    DROP_MGR_MODE = 0x490,   // AObjectDropperManager::_currentMode (EObjectDropperModes u8; 0 = closed)
     SC_ATTACH_PARENT = 0xc0, // USceneComponent::AttachParent
     SC_ATTACH_SOCKET = 0xc8, // ...AttachSocketName
     SC_REL_LOC    = 0x11c,   // ...RelativeLocation / RelativeRotation / RelativeScale3D
@@ -167,6 +168,12 @@ static const char* SIG_SET_MODE =
 // detoured and skipped for our skater while seated, and left alone for everyone else.
 static const char* SIG_PLACE_IN_HAND =
     "48 8B C4 48 89 58 10 55 48 8D 68 D8 48 81 EC 20 01 00 00 0F 29 70 E8 0F 29 78 D8 44 0F 29 40 C8";
+// AObjectDropperManager::IsActive -- a two-line accessor whose whole body is "the static _instance,
+// then the byte at +0x490". It is not called: it is scanned for the ADDRESS OF THE STATIC, which is
+// data and so cannot be scanned for directly. Same site the co-op host decodes, and the same reason --
+// but read here too, so the prop editor is known about with SessionOpenMP absent as well.
+static const char* SIG_DROP_ACTIVE_SITE =
+    "48 8B 05 ?? ?? ?? ?? 48 85 C0 ?? ?? C3 80 B8 90 04 00 00 00 0F 95 C0 C3";
 // void ASkaterCharacterBase::Bail(const FString& reason, bool, bool bRagdoll) -- the SMALL overload, the
 // one the game's own callers use. It gates on _canBail itself and synthesizes the bail location, whose
 // last fallback derefs the skater's board link, so it is only called with that link up. Signature from
@@ -225,6 +232,7 @@ static SetModeFn  g_setMode  = nullptr;
 static GetWorldFn g_getWorld = nullptr;
 static TeleportFn g_teleport = nullptr;
 static BailFn     g_bail     = nullptr;
+static void**     g_dropInst = nullptr;   // &AObjectDropperManager::_instance
 static DetachFn   g_detach   = nullptr;
 static AttachFn   g_attach   = nullptr;
 static SetSimFn   g_setSim   = nullptr;
@@ -536,6 +544,7 @@ static LONGLONG g_pressQpc = 0;
 static volatile LONGLONG g_replayQpc = 0;   // when the replay manager last reported its mode
 static volatile LONG g_replayMode = 0;      // ...and what that mode was
 static bool InReplay();                     // defined with the rest of the replay gate below
+static bool InPropEditor();                 // ...and the prop editor, just below it
 static uint64_t g_keyFName = 0, g_fpKeyFName = 0;
 static uint64_t g_notKey[24]; static int g_notKeyN = 0;
 static volatile LONG g_applies = 0;
@@ -1410,6 +1419,20 @@ static bool InReplay() {
     LARGE_INTEGER now, f; QueryPerformanceCounter(&now); QueryPerformanceFrequency(&f);
     return (now.QuadPart - t) < f.QuadPart * 2;    // and the manager is still reporting it
 }
+// The game's PROP EDITOR (the object dropper: LB off the board) has the buttons while it is open --
+// B backs out of it. We were eating that B, exactly as we once ate the replay editor's, and the editor
+// could not be left. Its own mode byte is the signal, the same one the co-op host reads to know you are
+// editing; read directly here so this holds with SessionOpenMP absent too.
+//
+// A THIRD user of B is a fair warning: anything that opens a game UI over the world owns the buttons
+// for as long as it is up. A new one goes here, beside these two, not into the key handler.
+static bool InPropEditor() {
+    if (!g_dropInst) return false;
+    __try {
+        const uint8_t* m = (const uint8_t*)*g_dropInst;
+        return m && *(const uint8_t*)(m + DROP_MGR_MODE) != 0;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; g_dropInst = nullptr; return false; }
+}
 static void StandUp(const char* why);
 void Sit_NoteReplayTick(void* replayManager) {
     if (!replayManager) return;
@@ -1833,6 +1856,7 @@ void Sit_PumpFrame() {
         }
         if (mesh && g_rigOk) g_walkMesh = mesh;
     } else if (g_walkW <= 0.0f) g_walkMesh = nullptr;
+    if (g_sitting && InPropEditor()) StandUp("the prop editor opened");
     if (g_sitting) {
         void* move = g_skater ? twkP(g_skater, CH_MOVE) : nullptr;
         if (!onFoot) StandUp("back on the board");
@@ -2093,7 +2117,7 @@ bool Sit_OnInputKey(const void* key, int ev) {
     if (!g_on || !g_ok || !key || (ev != 0 && ev != 1)) return false;
     const int kind = KeyKind(key);
     if (!kind) return false;
-    if (InReplay()) return false;                                       // the editor's exit button
+    if (InReplay() || InPropEditor()) return false;   // their exit button, not ours
     if (kind == 2) {                                                    // the view key: ours only while seated
         if (!g_sitting || !g_fpOn) return false;
         if (ev == 0) InterlockedExchange(&g_reqView, 1);
@@ -2282,6 +2306,10 @@ void Sit_Install() {
     g_getWorld = (GetWorldFn)TwkScanExe(SIG_GET_WORLD);
     g_teleport = (TeleportFn)TwkScanExe(SIG_TELEPORT);
     g_bail     = (BailFn)TwkScanExe(SIG_BAIL);
+    {   // mov rax, [rip+disp32] -- the operand is at +3, and the displacement is from the END of it
+        const uint8_t* site = TwkScanExe(SIG_DROP_ACTIVE_SITE);
+        if (site) g_dropInst = (void**)(site + 7 + *(const int32_t*)(site + 3));
+    }
     g_placeAt  = TwkScanExe(SIG_PLACE_IN_HAND);
     if (g_placeAt && (MH_CreateHook(g_placeAt, (void*)&hkPlaceInHand, (void**)&g_origPlaceInHand) != MH_OK ||
                       MH_EnableHook(g_placeAt) != MH_OK)) { g_placeAt = nullptr; g_origPlaceInHand = nullptr; }
@@ -2303,6 +2331,7 @@ void Sit_Install() {
     }
     g_ok = true;
     if (!g_bail) TwkLog("[sit] Bail sig NOT FOUND -- being skated into will not knock you over");
+    if (!g_dropInst) TwkLog("[sit] object dropper site NOT FOUND -- the sit key may fight the prop editor's B");
     TwkLog("[sit] armed: pose seam @ %p, trace @ %p, movement mode @ %p, key %s", g_flipAt, (void*)g_trace, (void*)g_setMode, g_keyName);
     TwkLog("[sit] board rest: %s (teleport %s, detach %s, attach %s, physics %s, carry hook %s)",
            g_boardRest && g_teleport && g_detach && g_setSim ? "on" : "unavailable",
