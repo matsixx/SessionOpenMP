@@ -211,6 +211,12 @@ void Proxy::Forget() {
     DropAnimSlot(this);                   // the anim instance died with the world; never post-apply to it
     { void* pm = actor_ ? safePtr(actor_, off::kSkaterMesh) : nullptr;
       if (pm) { pose::Forget(pm); PeerBodiesForget(pm); } }
+    ClearState();
+}
+
+// The field reset both Forget and Destroy end with. Touches nothing outside this object, so it is
+// safe to run after the actor is gone -- which is exactly why Destroy can use it.
+void Proxy::ClearState() {
     // The peer's sounds died with their components. Drop the handles WITHOUT calling Stop -- the
     // objects are gone -- and the audio slots must not survive into a replacement actor either, for
     // the same reason the change-edge caches below are cleared.
@@ -1513,8 +1519,116 @@ void Proxy::SetPresent(bool present, void (*logf)(const char*)) {
     };
     reveal(actor_);
     reveal(OwnBoard());
+    if (!present) QuietAnimForever(logf);
     if (logf) logf(present ? "[proxy] peer is back in our level -- their skater is visible again"
                            : "[proxy] peer is in another level -- their skater is hidden here");
+}
+
+// TAKE A DEPARTED PEER'S SKATER OUT OF THE LEVEL.
+//
+// Retired proxies used to be hidden and kept forever, on the belief that destroying one mid-session
+// crashes the client. That belief was recorded as a verdict with no mechanism, and everything it
+// could plausibly have been has since been fixed or given a teardown of its own: the replay
+// bone-mismatch crash (RefreshProxyReplayBones), the replay camera (spectate::OnActorGone), the pose
+// slots, the anim post-apply registry, the body trim. Leaving them in the level is not free either
+// -- a peer who leaves and rejoins repeatedly stacks up skaters, and that is a real reported frame
+// rate loss that only a map reload clears.
+//
+// ORDER IS THE WHOLE JOB, and it is Forget's order plus the two steps Forget never needed:
+//   1. hand back / switch off everything still running ON the actor, while its pointers are valid
+//   2. unhook every registry that could still write to it (Forget's order: the camera BEFORE the
+//      proxy registry, or it declines to clean up the very actor it exists for)
+//   3. destroy the board first, then the skater -- the board back-links to the skater
+//   4. drop our own pointers
+// The board goes first for the same reason it is checked both ways everywhere else: it is a separate
+// actor holding a link to this one.
+void Proxy::Destroy(void (*logf)(const char*)) {
+    if (!actor_) return;
+    const Syms& S = Get();
+    void* const board = OwnBoard();                 // resolved while the back-link can still be read
+    void* const mesh  = safePtr(actor_, off::kSkaterMesh);
+
+    // ---- 1. quiet it down while it is still a live actor
+    spectate::OnActorGone(actor_, logf);            // the replay camera gets handed back first
+    CrankVisRelease();
+    cvAn_ = nullptr; cvOff_ = 0;
+    AudioStopAll();
+    if (simOn_) StopBoardSim();
+#ifdef _WIN32
+    if (S.SetPhysAnimEnabled) {
+        const int flags = safeByte(actor_, off::kSkaterPhysAnimOn);
+        if (flags >= 0 && (((flags >> 4) & 1) != 0)) {
+            __try { S.SetPhysAnimEnabled(actor_, false); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+    }
+#endif
+    if (mesh) PeerBodiesRestore(mesh, logf);        // hand the trim back while the bodies still exist
+
+    // ---- 2. nothing may write to it from here on
+    DropProxyActor(actor_);
+    DropAnimSlot(this);
+    if (mesh) { pose::Forget(mesh); PeerBodiesForget(mesh); }
+
+    // ---- 3. the actors themselves
+    bool killed = false;
+#ifdef _WIN32
+    if (S.ActorDestroy) {
+        if (board) { __try { S.ActorDestroy(board, false, true); } __except (EXCEPTION_EXECUTE_HANDLER) {} }
+        __try { S.ActorDestroy(actor_, false, true); killed = true; }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+#endif
+    if (logf) {
+        logf(killed ? "[proxy] peer left -- their skater and board removed from the level"
+                    : "[proxy] peer left -- could NOT remove their skater (no ActorDestroy); "
+                      "hiding it instead, and it will cost memory until the next map load");
+    }
+    // A destroy that did not happen must not leave a live skater standing in the world.
+    if (!killed) { Retire(logf); ClearState(); return; }
+
+    // ---- 4. our own pointers
+    ClearState();
+}
+
+// STOP PAYING FOR A SKATER NOBODY WILL EVER SEE AGAIN.
+// A proxy's mesh defaults to VisibilityBasedAnimTickOption 0 = AlwaysTickPoseAndRefreshBones: it
+// evaluates its graph and re-skins all 95 bones every frame whether or not anything is looking at
+// it. That default is right for the local player and ruinous for a HIDDEN one, because nothing
+// updates a hidden proxy again -- so it keeps that setting for as long as the actor lives, at full
+// cost, showing nobody anything. The symptom is unmistakable once seen: frame rate that does not
+// come back when players leave, is unaffected by looking away, and is only cured by reloading the
+// level. Option 3 (OnlyTickPoseWhenRendered) costs nothing on an actor that is never rendered.
+// A peer who LEAVES is destroyed outright now (see Destroy); this covers the two cases where the
+// actor is deliberately kept -- a peer in another level, and a destroy that could not be made.
+void Proxy::QuietAnimForever(void (*logf)(const char*)) {
+    if (!actor_) return;
+#ifdef _WIN32
+    void* mesh = safePtr(actor_, off::kSkaterMesh);
+    if (!mesh) return;
+    __try {
+        uint8_t* opt = (uint8_t*)mesh + off::kMeshAnimTickOption;
+        if (*opt != 3) {
+            *opt = 3;
+            animTickState_ = 3;
+            if (logf) logf("[proxy] their skater will not animate while hidden -- it stays in the "
+                           "level but stops costing a pose every frame");
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    // AND ITS BODY PHYSICS, for exactly the same reason. A peer who leaves while RIDING leaves the
+    // physical-animation rig live -- around twenty dynamic bodies and their motor joints, solved
+    // every physics tick on a skater nobody can see, for as long as the level lasts. Nothing updates
+    // this proxy again, so the per-frame mirror that would normally switch it off never runs. The
+    // game's own setter is the right way to do it: with `false` it always takes the disable branch.
+    const Syms& S = Get();
+    if (S.SetPhysAnimEnabled) {
+        const int flags = safeByte(actor_, off::kSkaterPhysAnimOn);
+        if (flags >= 0 && (((flags >> 4) & 1) != 0)) {
+            __try { S.SetPhysAnimEnabled(actor_, false); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+            if (logf) logf("[proxy] ...and their body physics is switched off with it");
+        }
+    }
+    PeerBodiesRestore(mesh, logf);   // give back anything the trim changed, while the mesh is alive
+#endif
 }
 
 void Proxy::Retire(void (*logf)(const char*)) {
@@ -1528,9 +1642,10 @@ void Proxy::Retire(void (*logf)(const char*)) {
     // HIDING IS PURELY VISUAL -- the components keep their collision. A retired proxy that is only
     // hidden leaves an invisible obstacle exactly where it was standing: you cannot see it, but the
     // camera still collides with the skater's capsule, which reads as the game snagging on nothing.
-    // The actor is never destroyed (destroying one mid-session crashes the client), so its collision
-    // has to be turned off explicitly. Nothing re-uses a retired actor -- a returning peer spawns a
-    // fresh one -- so this is permanent by design.
+    // So its collision has to be turned off explicitly.
+    // This is now the FALLBACK, not the normal path: a departing peer's skater is destroyed (see
+    // Destroy), and Retire is what happens when that could not be done. It is still reached on its
+    // own for a peer in another level, via SetPresent.
     auto retire = [&](void* a) {
         if (!a) return;
 #ifdef _WIN32
@@ -1540,6 +1655,7 @@ void Proxy::Retire(void (*logf)(const char*)) {
     };
     retire(actor_);
     retire(OwnBoard());
+    QuietAnimForever(logf);
     if (logf) logf(S.SetActorCollision
         ? "[proxy] peer left -- their skater and board hidden and decollided"
         : "[proxy] peer left -- their skater and board hidden (no collision symbol: they will still block the camera)");

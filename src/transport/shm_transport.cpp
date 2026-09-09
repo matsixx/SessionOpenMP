@@ -105,13 +105,11 @@ static int peerForSlot(int slot) {
     return g_nPeers++;
 }
 
-bool Init(bool /*forceRelays*/) {
-    if (g_mem) return true;
-    g_map = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(Shared), kMapName);
-    if (!g_map) { Log("[shm] CreateFileMapping failed (%lu)", GetLastError()); return false; }
-    g_mem = (Shared*)MapViewOfFile(g_map, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(Shared));
-    if (!g_mem) { Log("[shm] MapViewOfFile failed (%lu)", GetLastError()); return false; }
-
+// Take a slot in the mailbox. Called at Init and again by LobbyHost, because leaving GIVES THE SLOT
+// BACK -- that is what tells the other clients we are gone, and it means we no longer have one.
+static bool claimSlot() {
+    if (!g_mem) return false;
+    if (g_mine >= 0) return true;
     const LONG pid = (LONG)GetCurrentProcessId();
     for (int i = 0; i < kSlots && g_mine < 0; i++) {
         const LONG prev = InterlockedCompareExchange(&g_mem->owner[i], pid, 0);
@@ -134,6 +132,16 @@ bool Init(bool /*forceRelays*/) {
     snprintf(g_myId, sizeof(g_myId), "shm:%d", g_mine);
     Log("[shm] mailbox ready: slot %d of %d is ours (pid %ld) -- no login, no network", g_mine, kSlots, (long)pid);
     return true;
+}
+
+bool Init(bool /*forceRelays*/) {
+    if (g_mem) return true;
+    g_map = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(Shared), kMapName);
+    if (!g_map) { Log("[shm] CreateFileMapping failed (%lu)", GetLastError()); return false; }
+    g_mem = (Shared*)MapViewOfFile(g_map, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(Shared));
+    if (!g_mem) { Log("[shm] MapViewOfFile failed (%lu)", GetLastError()); return false; }
+
+    return claimSlot();
 }
 
 void Shutdown() {
@@ -276,11 +284,27 @@ bool GetStats(int idx, PeerStats* out) {
 // ---- "lobby": claiming a slot IS joining, so host and join are the same act. The gate exists because
 // two INDEPENDENT solo instances on one PC would otherwise cross-publish over the mailbox and each
 // would spawn a proxy of a player who never agreed to a session.
-bool LobbyHost() { if (!g_mem || g_mine < 0) return false; g_inSession = true; Log("[shm] session OPEN (slot %d)", g_mine); return true; }
+bool LobbyHost() {
+    if (!g_mem) return false;
+    if (!claimSlot()) return false;             // we gave ours back when we left
+    g_inSession = true;
+    Log("[shm] session OPEN (slot %d)", g_mine);
+    return true;
+}
 bool LobbyJoin() { return LobbyHost(); }
 void LobbyLeave() {
     g_inSession = false;
-    if (g_mem && g_mine >= 0) { g_mem->slot[g_mine].seq = 0; g_mem->slot[g_mine].len = 0; }
+    // GIVE THE SLOT BACK. Holding it while still running is what made a deliberate leave look exactly
+    // like a frozen game to everyone else: the other clients watch owner pids, ours stayed alive, and
+    // they had to wait out the full silence timeout before removing our skater. An unowned slot is
+    // read as departed on their very next pump, by code that already existed -- including in older
+    // builds, which is why this needs no new message and no change to the shared layout.
+    if (g_mem && g_mine >= 0) {
+        g_mem->slot[g_mine].seq = 0; g_mem->slot[g_mine].len = 0;
+        InterlockedCompareExchange(&g_mem->owner[g_mine], 0, (LONG)GetCurrentProcessId());
+        Log("[shm] slot %d released -- the other clients see us leave now, not in thirty seconds", g_mine);
+        g_mine = -1;                            // LobbyHost claims again if we come back
+    }
     for (int i = 0; i < g_nPeers; i++) g_peers[i].st.state = 5;
     Log("[shm] session CLOSED");
 }

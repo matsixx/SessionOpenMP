@@ -137,22 +137,36 @@ public:
     // and same justification as PlayAudioEvents: a tap-driven push is a one-shot, and one-shots are
     // lost by Sample(). See repl::Stream::DrainPushStates.
     void PlayPushStates(const uint8_t* states, int n);
-    // Stream went quiet / session ended: stop the board simulating, leave the actor alone. Never
-    // destroy the actor -- destroying a proxy mid-session crashes the client.
+    // Stream went quiet / session ended: stop the board simulating, leave the actor alone. This one
+    // does NOT remove the skater: going quiet is not the same as leaving, and a peer whose packets
+    // stall for a moment must still be standing there when they resume. Destroy() is for a peer who
+    // has actually gone.
     void OnQuiet(void (*logf)(const char*));
     // A peer LEFT (slot released), as opposed to merely going quiet. Hide the actor and stop its board
     // before the pointers are dropped: Forget() only forgets, so without this the abandoned skater
     // stands there frozen while its board -- no longer written by anyone -- rolls off on its own.
     void Retire(void (*logf)(const char*));
+    // Drop this proxy's mesh to OnlyTickPoseWhenRendered permanently. For a skater that is HIDDEN
+    // but kept -- a peer in another level, or the fallback path where a destroy could not be made.
+    // Nothing updates such an actor again, so without this it keeps its default of
+    // AlwaysTickPoseAndRefreshBones and animates and re-skins forever, invisibly.
+    void QuietAnimForever(void (*logf)(const char*));
     // The peer walked into a DIFFERENT level. Their transported coordinates describe a world that is
     // not ours, so driving their proxy with them parks a skater at a meaningless point in yours --
     // hide it and its board, stop the board simulating, and reveal it when they come back. Retire's
-    // treatment without the permanence: a map switch is a round trip, and re-spawning on return
-    // strands one actor per crossing (a proxy actor is never destroyed -- that crashes the client).
-    // Idempotent; a no-op before the actor exists.
+    // treatment without the permanence: a map switch is a round trip, so the actor is KEPT and
+    // revealed on their return rather than destroyed and respawned. Idempotent; a no-op before the
+    // actor exists.
     void SetPresent(bool present, void (*logf)(const char*));
     bool Present() const { return present_; }
+    // A peer LEFT for good: take their skater and board OUT of the level. Everything that could
+    // still reach the actor is handed back or unhooked first, in Forget's order -- see the comment on
+    // the definition. Falls back to Retire (hide + decollide) if the destroy cannot be made.
+    void Destroy(void (*logf)(const char*));
     void Forget();                        // world changed: every actor died with it; drop pointers
+private:
+    void ClearState();                    // the field reset Forget and Destroy share
+public:
 
     void*      actor() const { return actor_; }
     // The peer's transported head look off the board (degrees: yaw + right, pitch + up; 0/0 = nowhere).

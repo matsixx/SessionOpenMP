@@ -311,13 +311,13 @@ static void dropNewGeneration(const char* why) {
 void ResetAll() {
     int n = 0;
     for (auto& s : g_slots) if (s.used) {
-        // RETIRE, not OnQuiet. `Forget` only drops our POINTERS -- the actors keep standing in the
-        // world, so on its own it strands everyone you were skating with in your now single-player
-        // game until the next map load. OnQuiet stops their boards but leaves them visible; Retire
-        // does that AND hides them, matching the drop path. This is the LAST code that will ever hold
-        // these pointers, so if it does not hide them, nothing will.
-        s.proxy.Retire(g_logf);
-        s.proxy.Forget(); game::voice::ProxyGone(s.vrx.voice);
+        // DESTROY, not just Forget. `Forget` only drops our POINTERS -- the actors keep standing in
+        // the world, so on its own it strands everyone you were skating with in your now
+        // single-player game until the next map load. This is the LAST code that will ever hold these
+        // pointers, so if it does not remove them, nothing will. Live world, game thread: the one
+        // place a proxy can be taken out properly. (Shutdown() and ForgetProxies() deliberately do
+        // NOT come here -- a DLL unload and a world change have no actors left to destroy.)
+        s.proxy.Destroy(g_logf); game::voice::ProxyGone(s.vrx.voice);
         s.used = false; n++;
     }
     if (n && g_logf) { char m[120]; snprintf(m, sizeof(m), "[session] reset -- %d peer slot(s) released", n); g_logf(m); }
@@ -2255,8 +2255,8 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
         PeerStats ps{};
         const bool departed = (s.peerIdx >= 0 && GetStats(s.peerIdx, &ps) && ps.state == 5);
         if (departed || quietForUs > dropUs) {
-            s.proxy.Retire(g_logf);     // hide them first -- Forget only drops pointers
-            s.proxy.Forget(); game::voice::ProxyGone(s.vrx.voice); s.used = false;
+            s.proxy.Destroy(g_logf);    // out of the level entirely; Forget only drops pointers
+            game::voice::ProxyGone(s.vrx.voice); s.used = false;
             // Their props leave with them. Nobody else will ever hold these pointers.
             for (auto& d : s.drop) {
                 if (d.actor) game::dropper::DestroyRemote(d.actor, g_logf);
