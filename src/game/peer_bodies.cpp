@@ -25,9 +25,11 @@ constexpr int kMaxBodies = 48;   // a skater PhysicsAsset is about 21; this is t
 
 // The two channels the level is built from. A peer's arm passing through a rail is invisible at the
 // distance another skater is ever watched from; the narrowphase against the level is not.
-constexpr uint8_t kChanWorldStatic  = 0;
-constexpr uint8_t kChanWorldDynamic = 1;
-constexpr uint8_t kRespIgnore       = 0;
+// Passed to a callee that reads them as 32-bit enums -- see BodySetResponseFn. Kept int32_t here so
+// the width is stated at the call site rather than left to an implicit conversion.
+constexpr int32_t kChanWorldStatic  = 0;
+constexpr int32_t kChanWorldDynamic = 1;
+constexpr int32_t kRespIgnore       = 0;
 
 struct TArr { const uint8_t* data; int32_t num; int32_t max; };
 
@@ -118,17 +120,23 @@ bool NameIsLeg(const char* n) {
            strstr(n, "ball")   || strstr(n, "leg");
 }
 
+// 1 = leg, 0 = upper body, -1 = COULD NOT TELL YET. The caller caches anything >= 0 for the life of
+// the trim record and retries -1 on the next pass. That distinction matters: the first pass of a
+// mount can land before the mesh's skeleton is readable, and folding that into "upper body" cached a
+// wrong answer for the whole ride -- the field log shows exactly that, one ride trimming "0 of 21
+// bodies ride the animation" and every later ride getting 4. Unreadable still never makes a body
+// kinematic, so the safe behaviour is unchanged; it just gets another go.
 int8_t ClassifyBody(void* meshComp, const void* bi) {
     char nm[96];
     nm[0] = 0;
     const int16_t bone = *(const int16_t*)((const uint8_t*)bi + off::kBodyBoneIndex);
-    if (bone < 0) return 0;
+    if (bone < 0) return -1;
     const void* skelMesh = *(void* const*)((const uint8_t*)meshComp + off::kMeshSkeletalMesh);
-    if (!skelMesh) return 0;
+    if (!skelMesh) return -1;
     TArr a{};
     memcpy(&a, (const uint8_t*)skelMesh + off::kSkelMeshRefSkeleton + off::kRefSkelFinalBoneInfo, sizeof(a));
-    if (!a.data || bone >= a.num || a.num <= 0 || a.num > 4096) return 0;
-    if (!FNameAscii(a.data + (size_t)bone * off::kMeshBoneInfoStride, nm, sizeof(nm))) return 0;
+    if (!a.data || bone >= a.num || a.num <= 0 || a.num > 4096) return -1;
+    if (!FNameAscii(a.data + (size_t)bone * off::kMeshBoneInfoStride, nm, sizeof(nm))) return -1;
     for (char* c = nm; *c; c++) if (*c >= 'A' && *c <= 'Z') *c += 32;
     return NameIsLeg(nm) ? (int8_t)1 : (int8_t)0;
 }
@@ -148,6 +156,10 @@ void PeerBodiesTrim(void* meshComp, uint64_t nowMs, TrimLogFn logf) {
 
     bool fresh = false, stubborn = false;
     const double t0 = NowMs();
+    // MEASUREMENT: which body, and which of the three writes, was in flight when it died. Read in the
+    // __except below, so both must survive an unwind -- hence volatile.
+    volatile int faultBody = -1, faultStep = 0;
+    unsigned long xcode = 0; void* xaddr = nullptr;
     __try {
         TArr a{};
         memcpy(&a, (const uint8_t*)meshComp + off::kMeshBodies, sizeof(a));
@@ -178,10 +190,13 @@ void PeerBodiesTrim(void* meshComp, uint64_t nowMs, TrimLogFn logf) {
             void* bi = ((void* const*)a.data)[i];
             if (!bi) continue;
             BodyState& st = bs[i];
+            faultBody = i;
+            faultStep = 1;                                   // naming the bone
             if (st.kind < 0) st.kind = ClassifyBody(meshComp, bi);
 
             // 1. the legs ride the animation. Re-asserted on the timer because the blueprint that
             //    drives this skater's body physics is free to put a body back to simulating.
+            faultStep = 2;                                   // holding a leg to the animation
             if (canKin && st.kind == 1) {
                 const uint8_t simByte = *((const uint8_t*)bi + off::kBodySimByte);
                 if ((simByte >> off::kBodySimBit) & 1) {
@@ -194,6 +209,7 @@ void PeerBodiesTrim(void* meshComp, uint64_t nowMs, TrimLogFn logf) {
 
             // 2. the level. Only a body that answers to it at all is changed, and what it answered
             //    with is kept for the restore.
+            faultStep = 3;                                   // dropping the level responses
             if (canResp && !st.didResp) {
                 const uint8_t* rc = (const uint8_t*)bi + off::kBodyResponses;
                 st.respStatic  = rc[kChanWorldStatic];
@@ -209,6 +225,7 @@ void PeerBodiesTrim(void* meshComp, uint64_t nowMs, TrimLogFn logf) {
 
             // 3. the solver. Divided down rather than set to a number, so a body the asset author
             //    deliberately made cheap or expensive keeps its relative weight, with a floor of 2.
+            faultStep = 4;                                   // pushing solver iterations
             if (canIter && !st.didIters) {
                 uint8_t* pi = (uint8_t*)bi + off::kBodyPosIters;
                 st.posIters = *pi;
@@ -226,11 +243,29 @@ void PeerBodiesTrim(void* meshComp, uint64_t nowMs, TrimLogFn logf) {
         t->kin = kin; t->hits = hits; t->iters = iters;
         stubborn = t->reasserts > 40 && !t->saidStubborn;
         if (stubborn) t->saidStubborn = true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
+    } __except (xcode = GetExceptionCode(),
+                xaddr = (GetExceptionInformation())->ExceptionRecord->ExceptionAddress,
+                EXCEPTION_EXECUTE_HANDLER) {
         // The record is KEPT so the restore can still undo whatever was written before the fault.
         // Backing the re-check well off stops a mesh that faults every pass from doing it at 2 Hz.
         t->recheckMs = nowMs + 5000;
-        if (logf) logf("[proxy] body trim FAULTED -- what was changed stays restorable");
+        // NAME IT. "FAULTED" alone survived a whole release saying nothing: the trim has been dying
+        // on the first pass of every mount and backing off longer than a ride lasts, so the feature
+        // has never actually applied in the field. The exe-relative offset goes straight into
+        // `pdbsym.py addr` and comes back as a function name.
+        if (logf) {
+            const uint8_t* base = (const uint8_t*)GetModuleHandleW(nullptr);
+            static const char* kStep[5] = { "before the loop", "naming the bone",
+                                            "holding a leg kinematic", "dropping level responses",
+                                            "pushing solver iterations" };
+            const int fs = (faultStep >= 0 && faultStep <= 4) ? (int)faultStep : 0;
+            char m[260];
+            snprintf(m, sizeof(m), "[proxy] body trim FAULTED at body %d/%d, %s -- code=0x%08lX "
+                                   "at=%p (exe+0x%llX). What was changed stays restorable.",
+                     (int)faultBody, t->num, kStep[fs], xcode, xaddr,
+                     (unsigned long long)((const uint8_t*)xaddr - base));
+            logf(m);
+        }
         return;
     }
 

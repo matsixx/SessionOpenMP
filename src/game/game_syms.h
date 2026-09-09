@@ -261,7 +261,14 @@ using BoardRefreshVisFn = void (*)(void* boardActor);
 // is safe either way, since a Microsoft x64 caller that hands over an argument the callee does not
 // read has simply set a register nobody looks at.
 using BodySetSimulateFn  = void (*)(void* bodyInstance, bool simulate, bool maintainBlend, bool preserveAttach);
-using BodySetResponseFn  = void (*)(void* bodyInstance, uint8_t channel, uint8_t response);
+// ECollisionChannel and ECollisionResponse are plain C++ enums, so they are THIRTY-TWO BITS on the
+// wire, and FCollisionResponse::SetResponse reads them as such -- `movsxd rbp, edx` sign-extends the
+// whole register and indexes a global table with it, and `cmp eax, r8d` compares all 32 bits. These
+// were declared uint8_t, which only obliges the compiler to write the low byte: channel 0 came out
+// clean because it is materialised as `xor edx,edx`, but channel 1 as `mov dl,1` left whatever was
+// already in the upper 24 bits, and the table index went wild. That is the access violation the peer
+// body trim died on at every mount since it shipped. Never narrow a parameter the callee reads wide.
+using BodySetResponseFn  = void (*)(void* bodyInstance, int32_t channel, int32_t response);
 using BodyUpdateFilterFn = void (*)(void* bodyInstance);
 // FPhysicsCommand_PhysX::ExecuteWrite(const FPhysicsActorHandle&, TFunctionRef<void(const handle&)>).
 // The TFunctionRef is two pointers, thunk first, and is called as thunk(callable, handleRef).
