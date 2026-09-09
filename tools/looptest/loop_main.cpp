@@ -100,6 +100,16 @@ static bool codecCheck() {
     // 1 (the only value the game currently sends) -- the byte must travel value-preserving.
     s.brokenState = 2;
     s.boardSim = 1;                             // a board loose on the ground, not one under an arm
+    // The physics overlay: three bones, deliberately NOT bones 0..2, since the wire carries the
+    // sender's own index and a receiver maps it by name.
+    s.povN = 3;
+    for (int i = 0; i < 3; i++) {
+        s.povBone[i] = (uint8_t)(11 + i * 7);
+        s.povRot[i][0] = 0.f; s.povRot[i][1] = 0.f;
+        s.povRot[i][2] = (i == 1) ? 0.7071068f : 0.f;
+        s.povRot[i][3] = (i == 1) ? 0.7071068f : 1.f;
+        s.povPos[i][0] = 3.5f + i;  s.povPos[i][1] = -12.25f - i;  s.povPos[i][2] = 40.f + i * 2;
+    }
     // anim blob: field-table-shaped, adversarial values -- zeros, ratios, a big magnitude that MUST
     // escape to f32, negatives, and byte fields.
     { int off = 0, i = 0;
@@ -185,6 +195,12 @@ static bool codecCheck() {
     if (o.boardMode != 9) { printf("  codec: boardMode %d\n", o.boardMode); bad++; }
     if (o.brokenState != 2) { printf("  codec: brokenState %d\n", o.brokenState); bad++; }
     if (o.boardSim != 1) { printf("  codec: boardSim %d\n", o.boardSim); bad++; }
+    if (o.povN != 3) { printf("  codec: povN %d\n", (int)o.povN); bad++; }
+    else for (int i = 0; i < 3; i++) {
+        if (o.povBone[i] != s.povBone[i]) { printf("  codec: povBone[%d] %d\n", i, (int)o.povBone[i]); bad++; }
+        qNear(o.povRot[i], s.povRot[i], "povRot");
+        for (int c = 0; c < 3; c++) near1(o.povPos[i][c], s.povPos[i][c], 0.15f, "povPos");
+    }
 
     // A BOARD THAT HAS ROLLED AWAY. The deck used to travel only as a body-relative h16 delta clamped
     // to 20 m, on the reasoning that a board further than that from its rider was garbage anyway --
@@ -211,6 +227,30 @@ static bool codecCheck() {
         State ro;
         if (rn <= 0 || !Unpack(fb, rn, ro, nullptr)) { printf("  codec: ridden-board pack/unpack failed\n"); bad++; }
         else if (rn >= fn) { printf("  codec: ridden board is not cheaper (%d >= %d)\n", rn, fn); bad++; }
+    }
+
+    // THE OVERLAY'S INTERPOLATION RULE. The set of bones physics is moving turns over as the game
+    // hands weight from one body to another, so two snapshots do not always describe the same bones.
+    // Same set: blend. DIFFERENT set: step, because bone A's physics pose must never be blended
+    // toward bone B's -- that is a skeleton being torn between two unrelated targets.
+    {
+        State a{}, b{}, o2{};
+        a.deckQuat[3] = 1.f; b.deckQuat[3] = 1.f;
+        a.povN = b.povN = 2;
+        for (int i = 0; i < 2; i++) {
+            a.povBone[i] = b.povBone[i] = (uint8_t)(20 + i);
+            a.povRot[i][3] = b.povRot[i][3] = 1.f;
+            a.povPos[i][0] = 0.f;   b.povPos[i][0] = 10.f;
+        }
+        InterpStates(a, b, 0.5f, o2);
+        for (int i = 0; i < 2; i++)
+            near1(o2.povPos[i][0], 5.0f, 0.001f, "overlay blends a matching set");
+
+        b.povBone[1] = 99;                       // the set turned over between the two snapshots
+        State o3{};
+        InterpStates(a, b, 0.5f, o3);
+        for (int i = 0; i < 2; i++)
+            near1(o3.povPos[i][0], 0.0f, 0.001f, "overlay STEPS when the set changes");
     }
     if (o.crankDefOff != 3 || !o.crankOn) { printf("  codec: crank fields\n"); bad++; }
     near1(o.crankPocket, s.crankPocket, 0.001f, "crankPocket");
@@ -1502,6 +1542,84 @@ static bool internCheck() {
     return ok;
 }
 
+// ---- THE VERSIONED SNAPSHOT HEADER ------------------------------------------------------------
+// The rule this gate holds to (replication.cpp, "THE VERSION RULE"): a different MAJOR is rejected,
+// a different MINOR is not. The second half is the part worth testing, because it is the part that
+// is easy to lose: the whole reason the version exists is that peers one minor apart keep seeing
+// each other, and nothing else in the suite would notice that regressing to a hard compare.
+static bool wireVersionCheck() {
+    printf("\nwire version header\n");
+    bool ok = true;
+    State s{};
+    s.bodyPosOk = 1; s.bodyPos[0] = 100.f; s.bodyPos[1] = -200.f; s.bodyPos[2] = 30.f;
+    s.deckPos[0] = 110.f; s.deckPos[1] = -190.f; s.deckPos[2] = 20.f;
+    s.deckQuat[0] = 0.f; s.deckQuat[1] = 0.f; s.deckQuat[2] = 0.f; s.deckQuat[3] = 1.f;
+    s.onBoard = 1; s.grounded = 1;
+
+    uint8_t pkt[2048];
+    const int n = Pack(s, 1234567, pkt, sizeof(pkt));
+    if (n <= 0) { printf("  pack FAILED\n"); return false; }
+
+    // The header is where the rule says it is: magic, then major, then minor.
+    const bool hdr = pkt[0] == 'O' && pkt[1] == 'M' && pkt[2] == 'P' && pkt[3] == 'Z'
+                  && pkt[4] == kWireMajor && pkt[5] == kWireMinor;
+    printf("  header is OMPZ + v%u.%u                              %s\n",
+           kWireMajor, kWireMinor, hdr ? "PASS" : "FAIL");
+    if (!hdr) ok = false;
+
+    State r{};
+    if (!Unpack(pkt, n, r, nullptr)) { printf("  own packet rejected                                FAIL\n"); return false; }
+
+    // A MAJOR this build does not know must be refused outright -- the fixed layout may have moved
+    // under it, and parsing on regardless is the misparse the magic was always there to stop.
+    { uint8_t bad[2048]; memcpy(bad, pkt, n); bad[4] = (uint8_t)(kWireMajor + 1);
+      State d{};
+      const bool refused = !Unpack(bad, n, d, nullptr);
+      printf("  a newer MAJOR is refused                           %s\n", refused ? "PASS" : "FAIL");
+      if (!refused) ok = false; }
+
+    // A newer MINOR must still parse, and parse to the SAME state: a minor only ever appends, so
+    // everything this build reads sits exactly where it did.
+    { uint8_t nxt[2048]; memcpy(nxt, pkt, n); nxt[5] = (uint8_t)(kWireMinor + 3);
+      State d{};
+      const bool parsed = Unpack(nxt, n, d, nullptr);
+      const bool same = parsed && d.onBoard == r.onBoard && d.grounded == r.grounded
+                     && fabsf(d.deckPos[0] - r.deckPos[0]) < 0.5f
+                     && fabsf(d.bodyPos[1] - r.bodyPos[1]) < 0.5f;
+      printf("  a newer MINOR still parses, identically            %s\n", same ? "PASS" : "FAIL");
+      if (!same) ok = false; }
+
+    // ...including the bytes such a sender would have appended. This is the forward-compatibility
+    // promise in its literal form: unknown trailing data is ignored, not treated as corruption.
+    { uint8_t ext[2048]; memcpy(ext, pkt, n); ext[5] = (uint8_t)(kWireMinor + 1);
+      for (int i = 0; i < 24; i++) ext[n + i] = (uint8_t)(0xA5 + i);
+      State d{};
+      const bool parsed = Unpack(ext, n + 24, d, nullptr);
+      const bool same = parsed && d.onBoard == r.onBoard
+                     && fabsf(d.deckPos[2] - r.deckPos[2]) < 0.5f;
+      printf("  appended bytes from a newer MINOR are ignored      %s\n", same ? "PASS" : "FAIL");
+      if (!same) ok = false; }
+
+    // And the peek, which is what turns a refusal into a sentence naming who has to update.
+    { uint8_t maj = 0, min = 0;
+      const bool good = PeekWire(pkt, n, &maj, &min) == kWireOk
+                     && maj == kWireMajor && min == kWireMinor;
+      uint8_t skew[2048]; memcpy(skew, pkt, n); skew[4] = (uint8_t)(kWireMajor + 2);
+      uint8_t sm = 0, sn = 0;
+      const bool skewed = PeekWire(skew, n, &sm, &sn) == kWireMajorSkew && sm == (uint8_t)(kWireMajor + 2);
+      // A pre-OMPZ build's snapshot: same namespace, the previous letter, no version bytes at all.
+      uint8_t old[2048]; memcpy(old, pkt, n); old[3] = 'Y';
+      const bool older = PeekWire(old, n, nullptr, nullptr) == kWireOtherMagic;
+      const uint8_t junk[8] = { 1, 2, 3, 4, 5, 6, 7, 8 };
+      const bool foreign = PeekWire(junk, 8, nullptr, nullptr) == kWireForeign
+                        && PeekWire(pkt, 5, nullptr, nullptr) == kWireForeign;
+      const bool all = good && skewed && older && foreign;
+      printf("  peek reports ok / major skew / older / foreign     %s\n", all ? "PASS" : "FAIL");
+      if (!all) ok = false; }
+
+    return ok;
+}
+
 int main(int argc, char**) {
     const bool dbg = argc > 1;                      // any arg = per-second clock internals, clean profile
     printf("SessionOpenMP replication loop test\n");
@@ -1515,6 +1633,7 @@ int main(int argc, char**) {
     if (!poseSliceCheck()) { printf("\nPOSE SLICE FAIL\n"); return 1; }
     if (!skelPrintCheck()) { printf("\nSKEL PRINT FAIL\n"); return 1; }
     if (!internCheck()) { printf("\nINTERN FAIL\n"); return 1; }
+    if (!wireVersionCheck()) { printf("\nWIRE VERSION FAIL\n"); return 1; }
     printf("%-13s %8s %8s %8s %6s %7s %7s %7s %7s\n",
            "profile", "outEwma", "outMax", "delay", "alpha", "starve", "resync", "extrap", "verdict");
     bool allPass = true;

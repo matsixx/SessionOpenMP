@@ -1112,6 +1112,17 @@ void Proxy::Apply(const repl::State& s, uint64_t nowMs, uint64_t nowUs, void (*l
             // physics to react to anyway. With the throttle off that byte is 0xff, so that half of
             // the gate goes inert rather than wrong. Coming back into view re-enables it within a
             // frame, and the setter is idempotent, so this costs one compare while it holds.
+            // MIRRORS THE GAME'S OWN CONDITION, which was read out of the setter rather than guessed:
+            //     if (enable && moveComp && moveComp[+0xe20]) BroadcastEnablePhysicalAnimation()
+            //     else                                        BroadcastDisablePhysicalAnimation()
+            // The +0x711 bit is a red herring -- it is written either way, and the BROADCAST is what
+            // applies or removes the profile. The enable branch needs the movement component's
+            // on-board byte, so the game NEVER has body physics off the board; a local skater walking
+            // probes as the bit SET with zero bodies simulating, which is why single player looks
+            // like it has none there.
+            // Keeping the profile across a dismount to avoid the rebuild was tried twice and reverted
+            // both times -- see the changelog. The transition cost is what the game itself pays on
+            // every mount; it only hurts here because it is paid per PEER.
             const bool worthIt = nearLocal_ && animTickState_ != 3;
             const bool want = g_tun.syncPhysAnim && s.onBoard && !s.bailing && worthIt;
             const int flags = safeByte(actor_, off::kSkaterPhysAnimOn);   // bit 0x10 = physAnim

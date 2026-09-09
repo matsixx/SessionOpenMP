@@ -382,7 +382,7 @@ static FTextBlob g_dropOpts[3];
 static uint64_t  g_dropKey = 0;
 static int       g_dropAt  = -1;         // widget index within the LAST build; -1 = not on this page
 static uint8_t   g_peerBodyRow[0x90];    // "Peer body physics", on PG_OTHER
-static FTextBlob g_peerBodyOpts[2];
+static FTextBlob g_peerBodyOpts[3];
 static uint64_t  g_peerBodyKey = 0;
 static int       g_peerBodyAt  = -1;
 // Voice chat: a page under Other options (five settings), and a mute switch on each player's page.
@@ -759,11 +759,11 @@ static void buildRows() {
                             kDropOpts, 3, &g_dropKey, g_dropOpts))
             g_dropKey = 0;
         // Peer body physics: the same shape, the same independence.
-        static const char* kBodyOpts[2] = { "Off", "On" };
+        static const char* kBodyOpts[3] = { "Off", "Light", "Full" };
         if (!buildOptionRow(g_peerBodyRow, "OmpPeerBody", "Peer body physics",
-                            "Other players' bodies react with physics on your screen, using their "
-                            "own settings. Off saves CPU in a big lobby.",
-                            kBodyOpts, 2, &g_peerBodyKey, g_peerBodyOpts))
+                            "VERY HEAVY: your machine simulates a full body for EVERY other player, "
+                            "so a big lobby costs a lot of frame rate. Light cuts what cannot be seen.",
+                            kBodyOpts, 3, &g_peerBodyKey, g_peerBodyOpts))
             g_peerBodyKey = 0;
         // Voice chat: its page under Other options, its five rows, and the mute switch that lives on
         // each player's page. Every row fails independently, like everything above.

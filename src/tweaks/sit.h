@@ -27,6 +27,9 @@ bool Sit_OnInputKey(const void* fkey, int ev);
 // From cloth_sim's AReplayManager::Tick detour (only one detour may exist on it): the replay editor
 // is up, so sitting stands down and lets go of the key.
 void Sit_NoteReplayTick(void* replayManager);   // the AReplayManager whose Tick this is
+// GAME THREAD, from any hook that keeps ticking when ours does not: if the sit pump has stalled, the
+// on-screen prompt is hidden. Cheap, and safe to call from anything on the game thread.
+void Sit_WatchdogTick();
 bool Sit_PoseHeld();                         // the sit pose is on the skeleton right now (seated, or blending either way)
 // GAME THREAD, for the camera module: the seated first-person view -- the eyes (world), the look (world
 // FQuat), the dolly weight 0..1 and the wanted FOV (0 = the game's). False = the camera is the game's.

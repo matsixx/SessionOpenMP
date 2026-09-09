@@ -26,3 +26,7 @@ struct SitPromptEntry { const char* label; char button; float ring; };
 // dropped rather than touched. Up to six entries.
 void SitUI_PumpFrame(void* skater, bool show, const SitPromptEntry* entries, int count);
 const char* SitUI_Status();
+// GAME THREAD: collapse every row NOW, without waiting for the next pump. The pump rides
+// InputHandler::Tick, which the replay and prop editors stop -- so the bar has to be hidden from
+// whatever is still ticking, or it stays on screen for as long as the editor is open.
+void SitUI_HideNow();

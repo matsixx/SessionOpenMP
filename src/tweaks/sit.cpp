@@ -69,6 +69,9 @@ static int   g_blendMs   = 450;     // SitBlendMs: sit-down / stand-up time
 static int   g_holdMs    = 320;     // SitHoldMs: how long the key must be held to stand up
 static int   g_styleMs   = 260;     // SitStyleBlendMs: how long one sitting style takes to become the next
 static int   g_debug     = 0;       // SitDebug: one chain dump per sit
+static int   g_promptLog = 0;      // SitPromptLog: 1/s line proving the pump still reaches the prompt
+static volatile LONGLONG g_pumpMs = 0;   // when the sit pump last ran: the watchdog's whole input
+static uint64_t g_modeWatchUntil = 0;    // ...and until when a stolen movement mode is watched for
 static int   g_boardRest = 1;      // SitBoardRest: set the board down beside you and let it settle
 static float g_boardOut  = 46.0f;  // SitBoardOutCm: how far out from the hip it lands
 static float g_boardDrop = 9.0f;   // SitBoardDropCm: how far above the surface it is let go
@@ -105,6 +108,7 @@ static int   g_headLook    = 1;     // HeadFollowsCamera: off the board, the hea
 static float g_holdBand    = 35.0f; // HeadLookHoldDeg: past the limit the head holds at it this much further round, then returns to the front
 static float g_camLookRate = 8.0f;  // HeadLookRate: how fast the head follows the camera (1/s) -- a head, not a turret
 static float g_watchRange  = 3000.0f; // SitWatchRangeCm: a player further off than this is not followed
+static float g_watchDead   = 13.0f;   // SitWatchDeadZoneDeg: how far they may drift before the head moves
 static int   g_bailOnHit   = 1;     // SitBailOnHit: another skater running into you knocks you over
 static float g_hitRadius   = 75.0f; // SitHitRadiusCm: how close their capsule has to get
 static float g_hitRise     = 130.0f;// SitHitRiseCm: ...and how far above or below you it may be
@@ -484,6 +488,7 @@ static Peer  g_peers[16]; static int g_nPeers = 0;
 static void* g_curWatch = nullptr;   // whom the auto attention is on
 static float g_dwell = 0.0f, g_attnClock = 0.0f, g_outOfReachS = 0.0f;
 static bool  g_watchInRange = false;
+static void* g_watchAimed = nullptr;  // the peer the gaze was last aimed AT (a switch re-aims once)
 typedef int (*ProxyListFn)(void**, int);
 typedef int (*ProxyIdxFn)(void*);
 typedef int (*ProxyNameFn)(void*, char*, int);
@@ -1442,7 +1447,19 @@ static bool InPropEditor() {
     } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; g_dropInst = nullptr; return false; }
 }
 static void StandUp(const char* why);
+// THE WATCHDOG. `Tweaks_PumpFrame` rides InputHandler::Tick, and the replay editor and the object
+// dropper both stop it -- measured: 3.6 s of an open replay editor with not one pump line, the prompt
+// left exactly as the last pump had it, which is visible. Nothing in the sit module can fix that from
+// inside the pump, because the pump is what is missing. So anything else that still ticks calls this,
+// and a prompt whose owner has gone quiet is taken off the screen.
+void Sit_WatchdogTick() {
+    const LONGLONG now = (LONGLONG)GetTickCount64();
+    const LONGLONG last = g_pumpMs;
+    if (!last || now - last < 200) return;      // the pump is alive; it owns the prompt
+    SitUI_HideNow();
+}
 void Sit_NoteReplayTick(void* replayManager) {
+    Sit_WatchdogTick();                          // this tick survives the replay editor; the pump does not
     if (!replayManager) return;
     LONG mode = 0;
     __try { mode = *(const unsigned char*)((const unsigned char*)replayManager + RM_MODE); }
@@ -1450,8 +1467,19 @@ void Sit_NoteReplayTick(void* replayManager) {
     LARGE_INTEGER t; QueryPerformanceCounter(&t);
     g_replayQpc = t.QuadPart;
     const LONG was = InterlockedExchange(&g_replayMode, mode);
-    if (was != mode) TwkLog("[sit] replay mode %ld -> %ld%s", was, mode, mode == 2 ? " (playback: sitting stands down)" : "");
-    if (mode == 2 && (g_sitting || g_anyA > 0.0f)) { StandUp("the replay editor opened"); g_alpha = 0.0f; HistReset(0.0f); }
+    if (was != mode) TwkLog("[sit] replay mode %ld -> %ld%s", was, mode,
+                            mode == 2 ? " (playback: sitting stands down)"
+                                      : mode > 0 ? "  <-- NOTE THIS VALUE if a replay screen is open" : "");
+    if (mode == 2 && (g_sitting || g_anyA > 0.0f)) {
+        StandUp("the replay editor opened"); g_alpha = 0.0f; HistReset(0.0f);
+        // THE REPLAY EDITOR PUTS OUR OWN MOVEMENT MODE BACK ON THE WAY OUT. It snapshots the player as
+        // it opens and restores that snapshot when it closes -- and if you were seated at the time, the
+        // snapshot holds the MOVE_None we set to keep the capsule still. Standing up restores the real
+        // mode immediately, then the editor's restore quietly overwrites it, and you come back unable to
+        // move with the legs walking on the spot (field: movement read 0/0 for seconds after exiting).
+        // So the restore is WATCHED for a while rather than done once.
+        g_modeWatchUntil = GetTickCount64() + 8000;
+    }
 }
 static bool OnFoot(void* sk) {
     void* ai = FootPlace_AnimInstance();
@@ -1465,6 +1493,9 @@ static void StandUp(const char* why) {
     ReleaseBoard();
     void* move = g_skater ? twkP(g_skater, CH_MOVE) : nullptr;
     if (move && g_setMode) { __try { g_setMode(move, g_savedMode, g_savedCustom); } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; } }
+    // Hide the bar HERE, not on the next pump. Standing up is often the editors' doing, and by then
+    // the pump has already stopped -- leaving the prompt frozen on screen for the whole editor session.
+    SitUI_HideNow();
     snprintf(g_last, sizeof(g_last), "standing (%s)", why);
     TwkLog("[sit] standing up: %s", why);
 }
@@ -1831,6 +1862,7 @@ bool Sit_FirstPersonView(float eye[3], float look[4], float* weight, float* fov)
 }
 
 void Sit_PumpFrame() {
+    InterlockedExchange64(&g_pumpMs, (LONGLONG)GetTickCount64());
     static uint64_t last = 0;
     const uint64_t now = GetTickCount64();
     float dt = last ? (float)(now - last) * 0.001f : 0.016f;
@@ -1838,6 +1870,29 @@ void Sit_PumpFrame() {
     if (dt > 0.1f) dt = 0.1f;
     void* sk = CatchTweaks_Skater();
     const bool onFoot = OnFoot(sk);
+    // Did the movement mode we handed back actually stay handed back? Only armed by the replay editor,
+    // which is the one thing seen to put ours back (see Sit_NoteReplayTick), and only while we are NOT
+    // seated -- so it can never fight a live sit, and it stops watching the moment the mode is sane.
+    if (g_modeWatchUntil && sk && !g_sitting) {
+        const uint64_t nowMs = GetTickCount64();
+        if (nowMs > g_modeWatchUntil) g_modeWatchUntil = 0;
+        else {
+            __try {
+                void* move = twkP(sk, CH_MOVE);
+                if (move && g_setMode) {
+                    const int mm = twkB(move, MOVE_MODE);
+                    if (mm != 0) g_modeWatchUntil = 0;              // the game has it: nothing to repair
+                    else {
+                        const uint8_t want = g_savedMode ? g_savedMode : 1;   // 1 = MOVE_Walking
+                        g_setMode(move, want, g_savedCustom);
+                        TwkLog("[sit] the replay editor left the movement at None -- put back to %d/%d",
+                               (int)want, (int)g_savedCustom);
+                        g_modeWatchUntil = 0;
+                    }
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; g_modeWatchUntil = 0; }
+        }
+    }
     // the skater's facing, and the mesh the off-board head look rides (its rig, and its head's axes)
     if (sk) {
         __try {
@@ -1946,10 +2001,33 @@ void Sit_PumpFrame() {
             g_watchInRange = inRange;
             if (inRange) {
                 float y, pch; AnglesTo(sub(add(tgt->pos, v3(0.0f, 0.0f, 55.0f)), g_eyeW), g_faceW, &y, &pch);
-                ClampLook(y, pch, &g_lookYaw, &g_lookPitch);
+                float cy = 0.0f, cp = 0.0f;
+                ClampLook(y, pch, &cy, &cp);      // neck limits and the give-up hysteresis, unchanged
+                // WATCHING SOMEONE IS NOT TRACKING THEM. Aiming the head exactly at a skater every
+                // frame is a turret, not a person: the head never stops moving, and because the gaze
+                // is pinned to them they end up almost still on screen while the whole world sweeps
+                // past behind. That is the one arrangement that makes the small timing error in a
+                // transported position visible -- the eye measures them against a moving reference
+                // and reads it as the other player lagging, when nothing about their sync changed.
+                // So the gaze HOLDS while they move around inside a cone, and re-aims only when they
+                // actually leave it, to the RIM rather than the middle so it settles instead of
+                // snapping to a fresh lock. The head then moves the way a watching head does, and a
+                // steady frame hides the error exactly as it is hidden when nobody is being watched.
+                const float dy = cy - g_lookYaw, dp = cp - g_lookPitch;
+                const float off = sqrtf(dy * dy + dp * dp);
+                if (g_lookLost || g_watchDead <= 0.0f || tgt->actor != g_watchAimed) {
+                    // the give-up recentre, the dead zone switched off, and a DELIBERATE change of
+                    // target all want the gaze to go where it is told, now.
+                    g_lookYaw = cy; g_lookPitch = cp;
+                } else if (off > g_watchDead) {
+                    const float k = (off - g_watchDead) / off;
+                    g_lookYaw   += dy * k;
+                    g_lookPitch += dp * k;
+                }                                  // ...else hold. That hold is the whole point.
+                g_watchAimed = tgt->actor;
                 g_outOfReachS = g_lookLost ? g_outOfReachS + dt : 0.0f;
                 if (g_lookLost && g_watch == WATCH_AUTO && g_outOfReachS > 2.5f) { g_dwell = 0.0f; g_outOfReachS = 0.0f; }   // out of sight: look for someone else
-            } else { g_lookYaw = 0.0f; g_lookPitch = 0.0f; }
+            } else { g_lookYaw = 0.0f; g_lookPitch = 0.0f; g_watchAimed = nullptr; }
             rate = 6.0f;
         } else { g_lookYaw = 0.0f; g_lookPitch = 0.0f; }
         const float k = 1.0f - expf(-dt * rate);
@@ -2062,7 +2140,38 @@ void Sit_PumpFrame() {
         if (g_fpOn && g_fp) entries[ne++] = { wl, 'R', 0.0f };
         if (g_fpOn) entries[ne++] = { "First person view", 'A', 0.0f };
         entries[ne++] = { "Hold to stand up", 'B', held };
-        SitUI_PumpFrame(sk, g_on && g_ok && g_sitting && !InReplay(), entries, ne);
+        // ...and never while an editor owns the screen: they take the pawn away, which used to
+        // strand the bar, and the prop editor can be opened without the sit ever being told.
+        {   // NAME THE STATES. Both gates read false while the editors were up, and the reason is that
+            // nobody has ever measured what value either one sets: the replay MODE sits at 1 for all of
+            // normal play (that is recording), and the dropper's mode was only ever assumed to be
+            // non-zero while editing. So both are reported on CHANGE, unconditionally -- one repro that
+            // opens each editor names both numbers and the gates stop being guesses.
+            static int lastDrop = -1;
+            int dm = -1; void* di = nullptr;
+            if (g_dropInst) {
+                __try { di = *g_dropInst; dm = di ? *(const uint8_t*)((const uint8_t*)di + DROP_MGR_MODE) : -1; }
+                __except (EXCEPTION_EXECUTE_HANDLER) { dm = -2; }
+            }
+            if (dm != lastDrop) {
+                TwkLog("[sit] object dropper mode %d -> %d (manager %p)%s", lastDrop, dm, di,
+                       dm > 0 ? "  <-- THE PROP EDITOR IS OPEN AT THIS VALUE" : "");
+                lastDrop = dm;
+            }
+        }
+        const bool showBar = g_on && g_ok && g_sitting && !InReplay() && !InPropEditor();
+        SitUI_PumpFrame(sk, showBar, entries, ne);
+        {   // Did the pump reach here at all? If the bar is stuck on screen and this line STOPS while an
+            // editor is open, nothing is hiding it because nothing is running: Tweaks_PumpFrame rides
+            // InputHandler::Tick, which an editor can stop.
+            static uint64_t lastPl = 0;
+            const uint64_t nowPl = GetTickCount64();
+            if (g_promptLog && nowPl - lastPl > 1000) {
+                lastPl = nowPl;
+                TwkLog("[sit] prompt: sk=%p sitting=%d replay=%d prop=%d -> show=%d",
+                       sk, g_sitting, InReplay() ? 1 : 0, InPropEditor() ? 1 : 0, showBar ? 1 : 0);
+            }
+        }
     }
     // The board's movement mode, whenever it changes. This is how the value the GAME uses when it drops
     // a board of its own gets named: do that once and the number is in the log.
@@ -2183,6 +2292,7 @@ void Sit_ReadConfig(const char* buf) {
     g_holdMs   = TwkIniInt(buf, "SitHoldMs", 320);
     g_styleMs  = TwkIniInt(buf, "SitStyleBlendMs", 260);
     g_debug    = TwkIniInt(buf, "SitDebug", 0) ? 1 : 0;
+    g_promptLog = TwkIniInt(buf, "SitPromptLog", 0) ? 1 : 0;
     g_boardRest = TwkIniInt(buf, "SitBoardRest", 1) ? 1 : 0;
     g_boardOut  = (float)TwkIniInt(buf, "SitBoardOutCm", 46);
     g_boardDrop = (float)TwkIniInt(buf, "SitBoardDropCm", 9);
@@ -2212,6 +2322,7 @@ void Sit_ReadConfig(const char* buf) {
     g_holdBand    = (float)TwkIniInt(buf, "HeadLookHoldDeg", 35);
     g_camLookRate = (float)TwkIniInt(buf, "HeadLookRate", 8);
     g_watchRange  = (float)TwkIniInt(buf, "SitWatchRangeCm", 3000);
+    g_watchDead   = (float)TwkIniInt(buf, "SitWatchDeadZoneDeg", 13);
     g_bailOnHit   = TwkIniInt(buf, "SitBailOnHit", 1) ? 1 : 0;
     g_hitRadius   = (float)TwkIniInt(buf, "SitHitRadiusCm", 75);
     g_hitRise     = (float)TwkIniInt(buf, "SitHitRiseCm", 130);
@@ -2236,6 +2347,7 @@ void Sit_SaveConfig(char* buf, size_t cap) {
     TwkIniSetInt(buf, cap, "SitHoldMs",        g_holdMs);
     TwkIniSetInt(buf, cap, "SitStyleBlendMs",  g_styleMs);
     TwkIniSetInt(buf, cap, "SitDebug",         g_debug);
+    TwkIniSetInt(buf, cap, "SitPromptLog",     g_promptLog);
     TwkIniSetInt(buf, cap, "SitBoardRest",     g_boardRest);
     TwkIniSetInt(buf, cap, "SitBoardOutCm",    (int)g_boardOut);
     TwkIniSetInt(buf, cap, "SitBoardDropCm",   (int)g_boardDrop);
@@ -2265,6 +2377,7 @@ void Sit_SaveConfig(char* buf, size_t cap) {
     TwkIniSetInt(buf, cap, "HeadLookHoldDeg",  (int)g_holdBand);
     TwkIniSetInt(buf, cap, "HeadLookRate",     (int)g_camLookRate);
     TwkIniSetInt(buf, cap, "SitWatchRangeCm",  (int)g_watchRange);
+    TwkIniSetInt(buf, cap, "SitWatchDeadZoneDeg", (int)g_watchDead);
     TwkIniSetInt(buf, cap, "SitBailOnHit",     g_bailOnHit);
     TwkIniSetInt(buf, cap, "SitHitRadiusCm",   (int)g_hitRadius);
     TwkIniSetInt(buf, cap, "SitHitRiseCm",     (int)g_hitRise);

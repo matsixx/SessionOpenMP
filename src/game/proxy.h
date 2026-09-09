@@ -178,9 +178,11 @@ public:
     static const uint64_t kVisualSettleMs = 1500;
     bool VisualsSettled(uint64_t nowMs) const { return actor_ && (nowMs - bornMs_) > kVisualSettleMs; }
     void MarkVisualsRefreshed() { refreshed_ = true; }   // our dress WAS the rebuild, with the right data
+    // Public so a peer's board WEAR can be written onto the right actor -- ownership-checked, so a
+    // caller can never be handed a board that belongs to somebody else.
+    void* OwnBoard() const;               // board ONLY if `board+0x4d8` links back to us
 
 private:
-    void* OwnBoard() const;               // board ONLY if `board+0x4d8` links back to us
     bool  VelocityDrive(const repl::State& s, uint64_t nowUs);
     void  StampBoard(const repl::State& s);
     void  StopBoardSim();

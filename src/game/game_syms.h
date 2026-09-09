@@ -245,6 +245,17 @@ using ActorDestroyFn    = bool  (*)(void* actor, bool netForce, bool shouldModif
 // rebuild, which is the replay-editor crash. See RefreshProxyReplayBones.
 using ReplayRefreshBonesFn = void (*)(void* replayComp);
 using SetPhysAnimEnabledFn = void (*)(void* skater, bool enable);
+// BOARD WEAR (cosmetics.cpp). The game writes wear and dirt onto the board's dynamic materials in
+// ASkateboardEx::UpdateWearAndDirtOnContact; these are the two calls that ending does.
+//   GetMaterialParameterNamesFromContactPart(out /*24 B: dirt FName, wear FName, spare*/, part)
+//   SetScalarParameterValue(mid, FName /*by value in rdx*/, value /*xmm2, the THIRD slot*/)
+// A name the material does not have is a harmless no-op, which is what lets a proxy's materials be
+// written without knowing which of them the game considers the deck.
+using MatParamNamesFn = void (*)(void* out24, uint8_t contactPart);
+using SetScalarParamFn = void (*)(void* mid, uint64_t nameFName, float value);
+// ASkateboardEx::RefreshVisuals(board). Takes the board actor; reads the peer's items off the game
+// instance's profile, so it only means anything inside the cosmetics borrow window.
+using BoardRefreshVisFn = void (*)(void* boardActor);
 // Peer body trim (peer_bodies.cpp): the body-level knobs behind a proxy's physical animation.
 // FBodyInstance::SetInstanceSimulatePhysics takes three bools in 4.26 and two in 4.25; passing three
 // is safe either way, since a Microsoft x64 caller that hands over an argument the callee does not
@@ -451,6 +462,9 @@ struct Syms {
     // none of which a stamped-in proxy takes), which is why a peer has ZERO body physics -- see the
     // paProbe field note. Used to give proxies the game's own body physics.
     SetPhysAnimEnabledFn SetPhysAnimEnabled = nullptr;
+    MatParamNamesFn      MatParamNames    = nullptr;   // board wear: the parameter names per contact part
+    SetScalarParamFn     SetScalarParam   = nullptr;   // ...and the write onto a dynamic material
+    BoardRefreshVisFn    BoardRefreshVisuals = nullptr; // ...and what builds that material table
     // Peer body trim (peer_bodies.h): cutting a proxy's physical animation down to what can be seen.
     // All optional -- without them a peer simply keeps the whole simulated asset, as before.
     BodySetSimulateFn    BodySetSimulate   = nullptr;
@@ -589,6 +603,12 @@ bool  RefreshProxyReplayBones(void* proxyActor, void (*logf)(const char*));
 // the wrong bones the moment either side wears something the other does not.
 // Cached, because resolving ~95 FNames is not something to do per frame.
 int   SkeletonBoneHashes(void* meshComp, uint32_t* out, int cap);
+// Each bone's PARENT index (-1 for the root), straight out of FMeshBoneInfo. The physics overlay
+// needs it on both ends: a bone travels relative to its parent, never in component space.
+int   SkeletonBoneParents(void* meshComp, int16_t* out, int cap);
+// One bone's name, for diagnostics. Allocates an FString through the engine and leaks it, exactly as
+// every other name read here does -- so call it from one-shot logging, never per frame.
+bool  SkeletonBoneName(void* meshComp, int idx, char* out, int cap);
 bool LocalSkaterName(void* pawn, char* out, int cap);   // gi -> FSkaterInstance::SkaterName
 bool LocalMapName(void* pawn, char* out, int cap);      // the UWorld object's own name
 // ---- pretty map labels. The internal level name is what travels, but it is a long asset name and
@@ -973,6 +993,34 @@ namespace off {
     // padded to 40, + the two hash ints = 48. NOT read out of an instruction like the others, so the
     // walker VALIDATES each key FString before trusting it and bails out loudly if the layout is wrong.
     constexpr int kColorElemStride    = 0x30;
+    // WEAR AND TEAR. Same FCustomizationInventoryItemInstanceAttributes the three above index into --
+    // SockHeightIndex at 0xf0 and CustomColorAttribute at 0xf8 are its members, so these two maps sit
+    // at the base. The game writes them in ASkateboardEx::UpdateWearAndDirtOnContact and
+    // UpdateDirtOverTime, keyed by contact part, and pushes the result onto the board's dynamic
+    // materials with SetScalarParameterValue.
+    constexpr int kInstDirtRatio      = 0x000;   //   ::DirtRatio  TMap<int,float>
+    constexpr int kInstWearRatio      = 0x050;   //   ::WearRatio  TMap<int,float>
+    // TSetElement<TTuple<int,float>> = 8 B pair + HashNextId + HashIndex. BELIEVED, not proven by a
+    // symbol: the reader validates every key and value and refuses the map if they do not look like
+    // contact parts and 0..1 ratios, so a wrong stride reads as "no wear" rather than as garbage.
+    constexpr int kRatioElemStride    = 0x10;
+    constexpr int kMeshOverrideMats   = 0x450;   // UMeshComponent::OverrideMaterials (TArray<UMaterialInterface*>)
+    // THE BOARD'S OWN MATERIAL TABLE, disassembled out of UpdateWearAndDirtOnContact. Not
+    // OverrideMaterials: that array is empty unless a component's materials were explicitly
+    // overridden, which is why writing through it reached ZERO materials in the field.
+    // ASkateboardEx+0x6e0 is a TSet with the same shape the cosmetics walker already handles (data,
+    // num, allocation bits), keyed by a category id, elements 0xd0 apart. Each element holds an
+    // array of GROUPS, and a group pairs the contact parts it covers with the dynamic materials that
+    // render them -- which is exactly what the game itself iterates to push wear onto a board.
+    constexpr int kBoardMatSet        = 0x6e0;   // the TSet base
+    constexpr int kBoardMatElemStride = 0xd0;
+    constexpr int kBoardMatGroups     = 0xb8;    //   element -> TArray<Group> (data, num at +0xc0)
+    constexpr int kBoardMatGroupNum   = 0xc0;
+    constexpr int kBoardGroupStride   = 0x28;
+    constexpr int kBoardGroupParts    = 0x00;    //   group -> TArray<int32> contact parts (num at +0x08)
+    constexpr int kBoardGroupPartNum  = 0x08;
+    constexpr int kBoardGroupMats     = 0x18;    //   group -> TArray<UMaterialInstanceDynamic*> (num at +0x20)
+    constexpr int kBoardGroupMatNum   = 0x20;
     constexpr int kColorValueOff      = 0x10;    // the value inside the element (after the FString key)
     constexpr int kColorEnabledOff    = 0x00;    //   IsEnabled (uint8)
     constexpr int kColorRgbaOff       = 0x04;    //   FLinearColor (4 floats)

@@ -387,12 +387,65 @@ static bool colorKeyOf(uint8_t* elem, char* out, int cap) {
         return k > 0;
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
-static void readInstanceAttribs(void* inst, repl::CosmeticItem& out, void (*logf)(const char*)) {
+// ---- WEAR AND TEAR, read off one item instance. A ratio map is TMap<int,float> keyed by contact
+// part: the deck's nose, tail and middle each carry their own wear, and dirt is tracked the same way.
+// EVERY key and value is validated, because the element stride is a belief about a template layout
+// rather than something a symbol proved -- a wrong stride then reads as "this item has no wear",
+// which is the old behaviour, instead of as nonsense written onto somebody's board.
+// Returns how many entries it read; `logOne` prints the first item it finds so the belief can be
+// checked against a board that is visibly scuffed.
+static int readRatioMap(void* inst, int off, uint8_t* keysOut, uint8_t* valsOut, int cap) {
+    if (!inst || cap <= 0) return 0;
+    MapWalk w;
+    if (!mapOpen((uint8_t*)inst + off, w)) return 0;
+    int n = 0;
+    __try {
+        for (int k = 0; k < w.num && n < cap; k++) {
+            if (!mapAlive(w, k)) continue;
+            const uint8_t* e = w.data + (size_t)k * off::kRatioElemStride;
+            const int32_t key = *(const int32_t*)e;
+            const float   val = *(const float*)(e + 4);
+            // A contact part is a small enum and a ratio is 0..1. Anything else means the stride is
+            // wrong, and half a map is worse than none.
+            if (key < 0 || key > 63) return 0;
+            if (!(val >= 0.f && val <= 1.f)) return 0;
+            keysOut[n] = (uint8_t)key;
+            valsOut[n] = (uint8_t)(val * 255.f + 0.5f);
+            n++;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+    return n;
+}
+
+static void readInstanceAttribs(void* inst, repl::CosmeticItem& out, void (*logf)(const char*),
+                                repl::WearSet* wearOut = nullptr) {
     if (!inst) return;
     __try {
         out.instVariant = *(int32_t*)((uint8_t*)inst + off::kInstVariantId);
         out.sockHeight  = *(uint8_t*)((uint8_t*)inst + off::kInstSockHeight);
     } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    // WEAR AND TEAR, when the caller wants it (the BOARD walk does; clothing does not -- most
+    // garments have no wear effect authored at all, so it would be bytes for nothing). Dirt and wear
+    // are separate maps over the same contact parts, so they are merged into one entry per part.
+    if (wearOut && wearOut->n < (uint8_t)(sizeof(wearOut->e) / sizeof(wearOut->e[0]))) {
+        uint8_t dk[16], dv[16], wk[16], wv[16];
+        const int nd = readRatioMap(inst, off::kInstDirtRatio, dk, dv, 16);
+        const int nw = readRatioMap(inst, off::kInstWearRatio, wk, wv, 16);
+        const int cap = (int)(sizeof(wearOut->e) / sizeof(wearOut->e[0]));
+        for (int i = 0; i < nd && wearOut->n < cap; i++) {
+            repl::WearEntry& e = wearOut->e[wearOut->n++];
+            e.cat = out.cat; e.part = dk[i]; e.dirt = dv[i]; e.wear = 0;
+            for (int k = 0; k < nw; k++) if (wk[k] == dk[i]) { e.wear = wv[k]; break; }
+        }
+        // ...and any part that wears without getting dirty.
+        for (int k = 0; k < nw && wearOut->n < cap; k++) {
+            bool seen = false;
+            for (int i = 0; i < nd && !seen; i++) seen = (dk[i] == wk[k]);
+            if (seen) continue;
+            repl::WearEntry& e = wearOut->e[wearOut->n++];
+            e.cat = out.cat; e.part = wk[k]; e.dirt = 0; e.wear = wv[k];
+        }
+    }
     MapWalk w;
     if (!mapOpen((uint8_t*)inst + off::kInstColorOverrides, w)) return;
     const int cap = (int)(sizeof(out.colors)/sizeof(out.colors[0]));
@@ -475,7 +528,7 @@ static void restoreInstance(const SavedInstance& sv) {
 
 // ---- gather ------------------------------------------------------------------------------------------
 static bool readMapInto(void* map, repl::CosmeticItem* dst, int cap, uint8_t& count,
-                        void* ownPawn, void (*logf)(const char*)) {
+                        void* ownPawn, void (*logf)(const char*), repl::WearSet* wearOut = nullptr) {
     count = 0;
     MapWalk w;
     if (!mapOpen(map, w)) return false;
@@ -501,13 +554,143 @@ static bool readMapInto(void* map, repl::CosmeticItem* dst, int cap, uint8_t& co
         // own-look change detector forever (an extra "item" appearing after every dress).
         if (!it.name[0]) continue;
         // the attributes that decide how it LOOKS live on the inventory instance, not the profile
-        readInstanceAttribs(instanceFor(ownPawn, e + kElemValue, it.inst), it, logf);
+        readInstanceAttribs(instanceFor(ownPawn, e + kElemValue, it.inst), it, logf, wearOut);
         dst[count++] = it;
     }
     return true;
 }
 
-bool GatherOwnCosmetics(void* ownPawn, repl::CosmeticSet& out, void (*logf)(const char*)) {
+// ---- APPLY A PEER'S BOARD WEAR ------------------------------------------------------------------
+// Straight onto the proxy board's dynamic materials, which is exactly where the game itself puts it
+// (ASkateboardEx::UpdateWearAndDirtOnContact ends at SetScalarParameterValue). Deliberately NOT
+// through the dress path: that route works by temporarily wearing a peer's items on the LOCAL
+// profile, so writing wear there could leave a peer's scuffs on this player's own board -- and
+// nothing here writes profile data at all.
+// Nothing else drives these parameters on a proxy, so a value written once holds until the next
+// update. A parameter a material does not have is a no-op, which is what makes it safe to offer
+// every material on the board rather than needing to know which one is the deck.
+// The same table on OUR OWN board, counted once. If the local board has groups and a proxy's has
+// none, the table is built by something a proxy never runs and the materials must be reached another
+// way; if NEITHER has any, the offset belief is simply wrong. One line settles which.
+void ProbeLocalBoardMaterials(void* boardActor, void (*logf)(const char*)) {
+#ifdef _WIN32
+    if (!boardActor || !logf) return;
+    static bool said = false;
+    if (said) return;
+    MapWalk mw;
+    if (!mapOpen((uint8_t*)boardActor + off::kBoardMatSet, mw)) {
+        said = true; logf("[wear] OUR board: the material set did not read at all (offset is wrong)");
+        return;
+    }
+    int live = 0, groups = 0, mats = 0;
+    __try {
+        for (int k = 0; k < mw.num; k++) {
+            if (!mapAlive(mw, k)) continue;
+            live++;
+            const uint8_t* elem = mw.data + (size_t)k * off::kBoardMatElemStride;
+            const uint8_t* garr = *(const uint8_t* const*)(elem + off::kBoardMatGroups);
+            const int ng = *(const int*)(elem + off::kBoardMatGroupNum);
+            if (!garr || ng <= 0 || ng > 64) continue;
+            groups += ng;
+            for (int g = 0; g < ng; g++) {
+                const uint8_t* grp = garr + (size_t)g * off::kBoardGroupStride;
+                const int nm = *(const int*)(grp + off::kBoardGroupMatNum);
+                if (nm > 0 && nm <= 64) mats += nm;
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        said = true; logf("[wear] OUR board: the material set FAULTED while walking (offset is wrong)");
+        return;
+    }
+    said = true;
+    char m[190];
+    snprintf(m, sizeof(m), "[wear] OUR board: set=%d element(s), %d live, %d group(s), %d material(s)",
+             mw.num, live, groups, mats);
+    logf(m);
+#endif
+}
+
+void ApplyPeerWear(void* boardActor, const repl::WearSet& w, void (*logf)(const char*)) {
+    const Syms& S = Get();
+    if (!boardActor || !w.n || !S.SetScalarParam || !S.MatParamNames) return;
+#ifdef _WIN32
+    // The parameter names per contact part, resolved once and cached: the game keys them off the
+    // part, and a board has only a handful.
+    struct PartNames { uint64_t dirt, wear; bool got; };
+    static PartNames names[64] = {};
+    int wrote = 0, groups = 0;
+    // THE BOARD'S OWN MATERIAL TABLE (see kBoardMatSet). Walked exactly as the game walks it in
+    // UpdateWearAndDirtOnContact: every element, every group, and a group's materials are the ones
+    // that render the contact parts it lists. The first attempt used UMeshComponent::OverrideMaterials
+    // instead and reached zero materials, because that array is empty unless something overrode them.
+    MapWalk mw;
+    if (!mapOpen((uint8_t*)boardActor + off::kBoardMatSet, mw)) return;
+    __try {
+        for (int k = 0; k < mw.num; k++) {
+            if (!mapAlive(mw, k)) continue;
+            const uint8_t* elem = mw.data + (size_t)k * off::kBoardMatElemStride;
+            const uint8_t* garr = *(const uint8_t* const*)(elem + off::kBoardMatGroups);
+            const int ng = *(const int*)(elem + off::kBoardMatGroupNum);
+            if (!garr || ng <= 0 || ng > 64) continue;
+            for (int g = 0; g < ng; g++) {
+                const uint8_t* grp = garr + (size_t)g * off::kBoardGroupStride;
+                const int32_t* parts = *(const int32_t* const*)(grp + off::kBoardGroupParts);
+                const int np = *(const int*)(grp + off::kBoardGroupPartNum);
+                void* const* mats = *(void* const* const*)(grp + off::kBoardGroupMats);
+                const int nm = *(const int*)(grp + off::kBoardGroupMatNum);
+                if (!parts || np <= 0 || np > 64 || !mats || nm <= 0 || nm > 64) continue;
+                groups++;
+                for (int i = 0; i < w.n && i < 24; i++) {
+                    const uint8_t part = w.e[i].part;
+                    if (part >= 64) continue;
+                    bool covers = false;
+                    for (int q = 0; q < np && !covers; q++) covers = (parts[q] == (int32_t)part);
+                    if (!covers) continue;                 // these materials do not render this part
+                    if (!names[part].got) {
+                        uint8_t out24[24] = {};
+                        S.MatParamNames(out24, part);
+                        memcpy(&names[part].dirt, out24 + 0, 8);
+                        memcpy(&names[part].wear, out24 + 8, 8);
+                        names[part].got = true;
+                    }
+                    for (int m = 0; m < nm; m++) {
+                        void* mid = mats[m];
+                        // It MUST be a dynamic instance: SetScalarParameterValue belongs to
+                        // UMaterialInstanceDynamic, and calling it on a plain material writes through
+                        // the wrong object layout. That crashed a client before this check existed.
+                        if (!mid || !IsObjectOfClass(mid, "MaterialInstanceDynamic")) continue;
+                        if (names[part].dirt) { S.SetScalarParam(mid, names[part].dirt, w.e[i].dirt / 255.f); wrote++; }
+                        if (names[part].wear) { S.SetScalarParam(mid, names[part].wear, w.e[i].wear / 255.f); wrote++; }
+                    }
+                }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    if (logf) {
+        // Once per (board, result). Not once per BOARD: the first apply of a session runs before the
+        // dress has built the material table, so a board-only gate would print that empty attempt and
+        // then stay silent for the one that actually wrote.
+        static void* saidFor = nullptr;
+        static int   saidGroups = -1;
+        if (saidFor != boardActor || saidGroups != groups) {
+            saidFor = boardActor; saidGroups = groups;
+            char m[190];
+            snprintf(m, sizeof(m), "[wear] %d entry(s) -> %d parameter write(s) across %d material "
+                                   "group(s) on a peer's board (set holds %d element(s))",
+                     (int)w.n, wrote, groups, mw.num);
+            logf(m);
+        }
+    }
+#endif
+}
+
+bool GatherOwnCosmetics(void* ownPawn, repl::CosmeticSet& out, void (*logf)(const char*),
+                        repl::WearSet* wearOut) {
+    // memset, not `= WearSet{}`, for the reason spelled out below for CosmeticSet: the sender decides
+    // "did my wear change?" with memcmp, and each 8-byte WearEntry carries a padding byte that
+    // aggregate initialisation does not cover. Garbage there reports a change every frame and
+    // publishes the set at 60 Hz instead of when a ratio actually moves.
+    if (wearOut) memset(wearOut, 0, sizeof(*wearOut));
     // memset, not `= CosmeticSet{}`: the caller decides "did my look change?" with memcmp, and value
     // initialisation says nothing about PADDING bytes, so stack garbage there makes every check report
     // a change and re-publish forever. Zeroing the whole object makes the comparison mean what it says.
@@ -528,9 +711,15 @@ bool GatherOwnCosmetics(void* ownPawn, repl::CosmeticSet& out, void (*logf)(cons
     { void* vd = rdPtr(inst, off::kSkInstVisualDef);
       if (vd) fnameToString((uint8_t*)vd + off::kObjNamePrivate, out.visualDef, sizeof(out.visualDef)); }
 
+    // What our OWN board's material table holds -- the reference a proxy's is measured against.
+    if (logf) { void* bd = rdPtr(ownPawn, off::kSkaterBoard); if (bd) ProbeLocalBoardMaterials(bd, logf); }
+
     uint8_t* prof = inst + off::kSkInstProfile;
     const bool okC = readMapInto(prof + off::kProfCharItems,  out.chr, 24, out.nChar, ownPawn, logf);
-    const bool okB = readMapInto(prof + off::kProfBoardItems, out.brd, 16, out.nBoard, ownPawn, logf);
+    // Wear is gathered from the BOARD walk only: the deck, the griptape, the trucks and the wheels
+    // each carry their own, and clothing wear is a feature the game never finished.
+    const bool okB = readMapInto(prof + off::kProfBoardItems, out.brd, 16, out.nBoard, ownPawn, logf,
+                                 wearOut);
     out.modDigest = LocalModDigest();
 
     // SELF-CHECK, once: the walk is the one part of this feature built on a memory layout, so it says
@@ -873,6 +1062,33 @@ bool DressProxy(void* proxyActor, const repl::CosmeticSet& c, int* unresolved, v
             logf(m);
         }
     }
+    // ---- AND THE BOARD. ASkaterCharacterBase::RefreshVisuals rebuilds the CHARACTER; the board has
+    // its own, and nothing on a proxy ever calls it -- so a peer's board kept the deck, wheels, grip
+    // and, most visibly, the scuffs of whatever the local player was riding when the proxy spawned.
+    // (That is exactly the reported "everyone's board matches mine at join, and updates to mine again
+    // if I rejoin".) It reads the same borrowed profile the character rebuild just read, so it belongs
+    // here, inside the borrow, and nowhere else. It also builds the contact-part -> dynamic-material
+    // table the wear apply writes through, which on a proxy was simply empty.
+    if (ok && S.BoardRefreshVisuals) {
+        // The board is only ours if BOTH links agree: proxy+0x568 can point at the LOCAL player's
+        // board, and refreshing THAT would redress the player in a peer's deck.
+        void* bd = rdPtr(proxyActor, off::kSkaterBoard);
+        if (bd && rdPtr(bd, off::kBoardSkater) == proxyActor) {
+            __try { S.BoardRefreshVisuals(bd); }
+            __except (xcode = GetExceptionCode(),
+                      xaddr = (GetExceptionInformation())->ExceptionRecord->ExceptionAddress,
+                      EXCEPTION_EXECUTE_HANDLER) {
+                if (logf) {
+                    const uint8_t* base = (const uint8_t*)GetModuleHandleW(nullptr);
+                    char m[220];
+                    snprintf(m, sizeof(m), "[cosmetics] board RefreshVisuals FAULTED code=0x%08lX"
+                                           " at=%p (exe+0x%llX) -- their board keeps its old look",
+                             xcode, xaddr, (unsigned long long)((const uint8_t*)xaddr - base));
+                    logf(m);
+                }
+            }
+        }
+    }
     // A faulting rebuild with a peer body def in play needs ONE discriminating probe before the item
     // bisect: put the LOCAL body back and refresh again with the peer's items still worn. Clean now =>
     // the BODY DEFINITION is the fault (named, item bisect skipped); still faulting => the body is
@@ -987,7 +1203,7 @@ uint64_t LocalModDigest() {
 }
 
 #else
-bool GatherOwnCosmetics(void*, repl::CosmeticSet&, void (*)(const char*)) { return false; }
+bool GatherOwnCosmetics(void*, repl::CosmeticSet&, void (*)(const char*), repl::WearSet*) { return false; }
 bool DressProxy(void*, const repl::CosmeticSet&, int*, void (*)(const char*)) { return false; }
 uint64_t LocalModDigest() { return 0; }
 #endif

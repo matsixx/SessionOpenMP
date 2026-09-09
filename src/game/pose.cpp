@@ -303,6 +303,30 @@ void NoteHold(void* mesh, bool hold, uint32_t ttlMs) {
     else      { sl->holdPing = false; sl->holdUntilMs = 0; }   // the next pose-less snapshot releases
 }
 
+// Our bone index -> the SENDER's, by NAME. Two players' merged skeletons agree on names and on
+// nothing else, so this is the only mapping that survives either of them wearing something the other
+// is not. Rebuilt when the mesh or the peer's fingerprint changes; -1 means "they have no bone of
+// this name", which is exactly what a garment of ours they are not wearing should get.
+// Extracted from the pose-stamp branch it used to live inside. It stays a function rather than going
+// back inline because the map is a property of the SLOT, not of the stamp: anything that needs to
+// name a peer's bones needs it built, and an ordinary riding frame never reaches the stamp.
+static void EnsureBoneMap(Slot* sl, void* mesh) {
+    if (!g_tun.skeletonSync || !g_tun.nameKeyedBones || !sl->peerN) return;
+    if (sl->mapReady && sl->mapBuiltFor == mesh && sl->mapPeerN == sl->peerN) return;
+    uint32_t localHash[kPoseMaxBones];
+    const int ln = game::SkeletonBoneHashes(mesh, localHash, kPoseMaxBones);
+    if (ln <= 0) return;
+    int mapped = 0;
+    for (int b = 0; b < kPoseMaxBones; b++) sl->map[b] = -1;
+    for (int b = 0; b < ln && b < kPoseMaxBones; b++) {
+        for (int r = 0; r < (int)sl->peerN; r++)
+            if (sl->peerHash[r] == localHash[b]) { sl->map[b] = (int16_t)r; mapped++; break; }
+    }
+    sl->mapReady = true; sl->mapBuiltFor = mesh; sl->mapPeerN = sl->peerN;
+    g_st.mappedBones = (uint8_t)(mapped > 255 ? 255 : mapped);
+    g_st.unmappedBones = (uint8_t)((ln - mapped) > 255 ? 255 : (ln - mapped));
+}
+
 void OnFinalizeBones(void* mesh, uint64_t nowMs) {
     if (!g_tun.enabled || !mesh) return;
     Slot* sl = slotFor(mesh);
@@ -372,22 +396,7 @@ void OnFinalizeBones(void* mesh, uint64_t nowMs) {
         // bone of the same name. Two players' merged skeletons agree on names and on nothing else,
         // so this is the only mapping that stays correct when either side is wearing something the
         // other is not -- including a garment the bone floor has substituted.
-        if (g_tun.skeletonSync && g_tun.nameKeyedBones && sl->peerN &&
-            (!sl->mapReady || sl->mapBuiltFor != mesh || sl->mapPeerN != sl->peerN)) {
-            uint32_t localHash[kPoseMaxBones];
-            const int ln = game::SkeletonBoneHashes(mesh, localHash, kPoseMaxBones);
-            if (ln > 0) {
-                int mapped = 0;
-                for (int b = 0; b < kPoseMaxBones; b++) sl->map[b] = -1;
-                for (int b = 0; b < ln && b < kPoseMaxBones; b++) {
-                    for (int r = 0; r < (int)sl->peerN; r++)
-                        if (sl->peerHash[r] == localHash[b]) { sl->map[b] = (int16_t)r; mapped++; break; }
-                }
-                sl->mapReady = true; sl->mapBuiltFor = mesh; sl->mapPeerN = sl->peerN;
-                g_st.mappedBones = (uint8_t)(mapped > 255 ? 255 : mapped);
-                g_st.unmappedBones = (uint8_t)((ln - mapped) > 255 ? 255 : (ln - mapped));
-            }
-        }
+        EnsureBoneMap(sl, mesh);
         if (g_tun.skeletonSync && g_tun.nameKeyedBones && sl->mapReady && sl->mapBuiltFor == mesh &&
             g_st.mappedBones > 0) {
             __try {
@@ -422,6 +431,7 @@ void OnFinalizeBones(void* mesh, uint64_t nowMs) {
         } __except (EXCEPTION_EXECUTE_HANDLER) { g_st.faults++; }
         return;
     }
+
     if (!g_tun.holdInLocalReplay) return;
 
     // ---- 2. Normal play: the proxy's own graph just finished this pose. Remember it.

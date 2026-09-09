@@ -67,6 +67,22 @@ MeshTrim* SlotFor(void* mesh, bool claim) {
 
 int SlotIndex(const MeshTrim* t) { return (int)(t - &g_trim[0]); }
 
+// ---- what this actually costs, measured -----------------------------------------------------------
+// A trim or a restore is CHEAP while it holds -- two reads and out -- but the first pass on a mesh
+// writes every body, and UpdatePhysicsFilterData rebuilds shape filter data in the scene. That pass
+// runs again on every physical-animation edge, which in a busy lobby means every time anyone steps on
+// or off a board or bails. Several peers doing that at once is exactly the shape of a frame spike, so
+// the cost is timed rather than argued about: anything over the threshold says so, with what it was
+// doing and how many bodies it wrote.
+double NowMs() {
+    static LARGE_INTEGER f{};
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    LARGE_INTEGER t; QueryPerformanceCounter(&t);
+    return (double)t.QuadPart * 1000.0 / (double)f.QuadPart;
+}
+float slowPassMs = 1.5f;      // report a pass that took longer than this
+long  g_slowPasses = 0;       // ...and how many there have been, for the line itself
+
 // ---- the solver counts -------------------------------------------------------------------------
 // PositionSolverIterationCount lives on the FBodyInstance, but the number the simulation actually
 // uses lives on the PhysX actor, and pushing it there is an "AssumesLocked" call. The engine's own
@@ -131,6 +147,7 @@ void PeerBodiesTrim(void* meshComp, uint64_t nowMs, TrimLogFn logf) {
     if (!t) return;
 
     bool fresh = false, stubborn = false;
+    const double t0 = NowMs();
     __try {
         TArr a{};
         memcpy(&a, (const uint8_t*)meshComp + off::kMeshBodies, sizeof(a));
@@ -140,6 +157,8 @@ void PeerBodiesTrim(void* meshComp, uint64_t nowMs, TrimLogFn logf) {
         // to bodies that no longer exist, so it is DROPPED rather than restored -- writing through
         // those pointers is exactly the crash this check exists to avoid.
         if (t->active && (t->bodiesData != a.data || t->num != a.num)) { *t = MeshTrim{}; }
+        // Stepping on or off the board changes WHICH bodies should simulate, so it must not wait for
+        // the timer -- that would leave up to half a second of flop on every dismount.
         if (t->active && nowMs < t->recheckMs) return;   // the cheap path: two reads and out
 
         BodyState* bs = g_body[SlotIndex(t)];
@@ -215,11 +234,19 @@ void PeerBodiesTrim(void* meshComp, uint64_t nowMs, TrimLogFn logf) {
         return;
     }
 
+    const double tookMs = NowMs() - t0;
     if (fresh && logf) {
-        char m[180];
+        char m[200];
         snprintf(m, sizeof(m), "[proxy] body trim: %d of %d bodies ride the animation, "
-                               "%d stop hitting the level, %d solve at 1/%d",
-                 t->kin, t->num, t->hits, t->iters, trimPeerIterDiv);
+                               "%d stop hitting the level, %d solve at 1/%d (%.2f ms)",
+                 t->kin, t->num, t->hits, t->iters, trimPeerIterDiv, tookMs);
+        logf(m);
+    }
+    if (tookMs > slowPassMs && logf) {
+        char m[160];
+        snprintf(m, sizeof(m), "[proxy] body trim pass took %.2f ms (%d bodies, %s) -- slow pass #%ld",
+                 tookMs, t->num, fresh ? "first pass on this mesh" : "re-assert",
+                 ++g_slowPasses);
         logf(m);
     }
     // Said once per peer. The trim is not holding: something on the game side is switching those
@@ -232,6 +259,7 @@ void PeerBodiesRestore(void* meshComp, TrimLogFn logf) {
     MeshTrim* t = SlotFor(meshComp, false);
     if (!t) return;
     const Syms& S = Get();
+    const double t0 = NowMs();
     __try {
         TArr a{};
         memcpy(&a, (const uint8_t*)meshComp + off::kMeshBodies, sizeof(a));
@@ -258,7 +286,17 @@ void PeerBodiesRestore(void* meshComp, TrimLogFn logf) {
             }
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    if (logf) logf("[proxy] body trim lifted -- the whole asset is simulated again");
+    const double tookMs = NowMs() - t0;
+    if (logf) {
+        char m[160];
+        snprintf(m, sizeof(m), "[proxy] body trim lifted -- the whole asset is simulated again (%.2f ms)", tookMs);
+        logf(m);
+        if (tookMs > slowPassMs) {
+            snprintf(m, sizeof(m), "[proxy] body trim RESTORE took %.2f ms (%d bodies) -- slow pass #%ld",
+                     tookMs, t->num, ++g_slowPasses);
+            logf(m);
+        }
+    }
     *t = MeshTrim{};
 }
 

@@ -38,7 +38,14 @@ static int      g_bubbleDistM = 35;
 // looking at the same spot, and it takes nothing away permanently -- your own props are hidden for
 // the session and come straight back.
 static int      g_dropMode    = MPDROP_SHARED;
-static int      g_peerBody    = MPBODY_ON;
+// OFF by default. This is the most expensive thing the mod can ask of a CPU -- every observer
+// simulates every peer, so a lobby of N pays N*N -- and it is a look, not a feature anyone needs.
+static int      g_peerBody    = MPBODY_OFF;
+// A DEFAULT ONLY REACHES A FRESH INSTALL. Everyone already running has PeerBodyPhysics saved as ON
+// from when it shipped that way, and would keep paying for it forever. This stamp is written once;
+// a prefs file without it gets the setting forced OFF exactly one time, after which the player's own
+// choice is theirs again. Turning it back on and restarting keeps it on.
+static bool     g_peerBodyOffDone = false;
 static int      g_voiceMode   = MPVOICE_PTT;
 static int      g_voiceKey    = 0;
 static int      g_voiceRange  = 25;
@@ -68,8 +75,10 @@ static void saveAll() {
     fprintf(f, "BubbleDistM=%d\n", g_bubbleDistM);
     fprintf(f, "# Dropped objects: 0 off, 1 only what is placed during the session, 2 share one set.\n");
     fprintf(f, "DropMode=%d\n", g_dropMode);
-    fprintf(f, "# Other players' body physics on your screen: 0 off, 1 on.\n");
+    fprintf(f, "# Other players' body physics on your screen: 0 off, 1 light, 2 full. VERY heavy --\n");
+    fprintf(f, "# your machine simulates a whole body for every other player in the session.\n");
     fprintf(f, "PeerBodyPhysics=%d\n", g_peerBody);
+    fprintf(f, "PeerBodyDefaultedOff=%d\n", g_peerBodyOffDone ? 1 : 0);
     fprintf(f, "# Voice chat: 0 off, 1 push to talk, 2 open mic. Key: 0 V, 1 B, 2 T, 3 Left Alt, 4 Left Ctrl, 5 Mouse 4, 6 Mouse 5.\n");
     fprintf(f, "VoiceMode=%d\n", g_voiceMode);
     fprintf(f, "VoiceKey=%d\n", g_voiceKey);
@@ -134,7 +143,7 @@ void MpPrefs_SetDropMode(int mode) {
 }
 int  MpPrefs_PeerBodyPhysics() { return g_peerBody; }
 void MpPrefs_SetPeerBodyPhysics(int on) {
-    on = clampI(on, MPBODY_OFF, MPBODY_ON);
+    on = clampI(on, MPBODY_OFF, MPBODY_FULL);
     if (on == g_peerBody) return;
     g_peerBody = on;
     saveAll();
@@ -249,7 +258,8 @@ void MpPrefs_Init(const char* dir, void (*logf)(const char*)) {
             else if (!_stricmp(key, "NameDistM"))   g_nameDistM   = clampI(atoi(val), MPNAME_DIST_MIN, MPNAME_DIST_MAX);
             else if (!_stricmp(key, "BubbleDistM")) g_bubbleDistM = clampI(atoi(val), MPBUBBLE_DIST_MIN, MPBUBBLE_DIST_MAX);
             else if (!_stricmp(key, "DropMode"))    g_dropMode    = clampI(atoi(val), MPDROP_OFF, MPDROP_SHARED);
-            else if (!_stricmp(key, "PeerBodyPhysics")) g_peerBody = clampI(atoi(val), MPBODY_OFF, MPBODY_ON);
+            else if (!_stricmp(key, "PeerBodyPhysics")) g_peerBody = clampI(atoi(val), MPBODY_OFF, MPBODY_FULL);
+            else if (!_stricmp(key, "PeerBodyDefaultedOff")) g_peerBodyOffDone = atoi(val) != 0;
             else if (!_stricmp(key, "VoiceMode"))        g_voiceMode  = clampI(atoi(val), MPVOICE_OFF, MPVOICE_OPEN);
             else if (!_stricmp(key, "VoiceKey"))         g_voiceKey   = clampI(atoi(val), 0, MPVOICE_KEY_COUNT - 1);
             else if (!_stricmp(key, "VoiceRangeM"))      g_voiceRange = clampI(atoi(val), MPVOICE_RANGE_MIN, MPVOICE_RANGE_MAX);
@@ -271,6 +281,18 @@ void MpPrefs_Init(const char* dir, void (*logf)(const char*)) {
     if (!g_peerId[0]) {                            // first run, or a stored identity that failed the check
         makePeerId(g_peerId);
         saveAll();
+    }
+    // The one-time forced OFF (see g_peerBodyOffDone). After the whole file is parsed, so no later
+    // line can undo it, and saved immediately so it happens exactly once -- the player's own choice
+    // is theirs again from here.
+    if (!g_peerBodyOffDone) {
+        const int was = g_peerBody;
+        g_peerBody = MPBODY_OFF;
+        g_peerBodyOffDone = true;
+        saveAll();
+        if (was != MPBODY_OFF)
+            say("[prefs] peer body physics turned OFF: it costs a whole body simulation per player. "
+                "Multiplayer -> Other options turns it back on.");
     }
     char m[192];
     snprintf(m, sizeof(m), "[prefs] hide my address: %s | peer id %s",

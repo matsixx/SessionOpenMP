@@ -73,8 +73,16 @@ void MpPrefs_SetDropMode(int mode);
 // animation), and, when they run SessionTweaks, their riding-body settings re-run on their proxy.
 // Costs ~21 simulated bodies per visible peer. Default on. The loader pushes it into the proxy tuning
 // every frame; the tweaks module asks through the bridge.
-enum { MPBODY_OFF = 0, MPBODY_ON = 1 };
-int  MpPrefs_PeerBodyPhysics();          // MPBODY_* -- default MPBODY_ON
+// LIGHT keeps the value 1 that "On" had, so an existing prefs file reads back unchanged. FULL is the
+// game's own body physics with nothing trimmed away -- the A/B against the trim, and the fallback if
+// the trim ever turns out to cost more than it saves.
+// A fourth tier, SYNCED, transported the owner's own physics result so nobody had to simulate anyone.
+// It was built and it FAILED in the field -- see the changelog. The bones and the mapping were proven
+// correct and the values were coherent, but a subset of someone's bones will not compose onto a
+// differently-posed skeleton: the arms hung off the receiver's shoulder and drooped. Removed rather
+// than left switchable, because a broken option is worse than no option.
+enum { MPBODY_OFF = 0, MPBODY_LIGHT = 1, MPBODY_FULL = 2, MPBODY_ON = MPBODY_LIGHT };
+int  MpPrefs_PeerBodyPhysics();          // MPBODY_* -- default MPBODY_OFF
 void MpPrefs_SetPeerBodyPhysics(int on);
 
 // ---- PROXIMITY VOICE CHAT. Off, push-to-talk or open mic; the talk key; how far a voice carries;

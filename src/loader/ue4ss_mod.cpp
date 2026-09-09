@@ -49,6 +49,7 @@
 #include "session/banlist.h"
 #include "session/mutelist.h"
 #include "ui/mp_prefs.h"
+#include "game/peer_bodies.h"      // the trim knobs the Peer body physics tier drives
 
 #include <cstdio>
 #include <cstring>
@@ -648,7 +649,17 @@ static void publishNameplates() {
     T.maxDistCm       = (float)MpPrefs_NameDistM()   * 100.0f;
     T.bubbleMaxDistCm = (float)MpPrefs_BubbleDistM() * 100.0f;
     // Peer body physics (Other options): the same push-every-frame rule.
-    omp::game::Proxy::Tuning().syncPhysAnim = MpPrefs_PeerBodyPhysics() != 0;
+    {
+        // OFF = no physical animation on proxies at all. LIGHT = the game's physics with the parts
+        // that cannot be seen trimmed away. FULL = the game's own, untrimmed -- the A/B, and what to
+        // fall back to if the trim ever costs more than it saves.
+        const int tier = MpPrefs_PeerBodyPhysics();
+        omp::game::Proxy::Tuning().syncPhysAnim = tier != MPBODY_OFF;
+        const bool light = (tier == MPBODY_LIGHT);
+        omp::game::trimPeerLegs      = light;
+        omp::game::trimPeerWorldHits = light;
+        omp::game::trimPeerIterDiv   = light ? 2 : 1;
+    }
     int vw = 0, vh = 0;
     g_npNoName = g_npOffScreen = 0;
     // A permanent early-out announces itself once: without these two symbols there is no projection

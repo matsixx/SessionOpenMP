@@ -83,6 +83,19 @@ struct AudioEvent {                    // a one-shot
 // unbounded skeleton. Rotations are smallest-three (4 B) and component-space positions f16 (6 B), so a
 // full skeleton is ~700 B -- affordable precisely because it is sent only while someone is scrubbing.
 constexpr int kPoseMaxBones = 96;
+// THE PHYSICS OVERLAY -- BUILT, FIELD-FAILED, AND RETIRED. The idea was to stop every observer
+// re-simulating every peer by transporting the OWNER's result instead: the few bones their own body
+// physics moved. The lane worked end to end -- the log proved the right bones (pelvis, both arm
+// chains), a perfect name mapping, and physically coherent values (0 cm at the shoulder, 13 at the
+// elbow, 23 at the hand) -- but the arms still came out drooping and elongated. Three anchorings
+// were tried: component space, parent-relative, and pelvis-anchored. All three failed the same way.
+// The premise is what is wrong: a SUBSET of someone's bones does not compose onto a differently-posed
+// skeleton. The receiver's spine and clavicle never sit exactly where the sender's do, and the error
+// compounds down the arm.
+// The fields and the codec REMAIN, carrying a single zero byte, deliberately: removing them changes
+// the snapshot layout, which by the rule at the top of replication.cpp costs a magic letter, and Z is
+// the only one left. The offline test still round-trips them, so a revival starts from working code.
+constexpr int kPovMaxBones = 12;
 
 // One instant of a remote skater.
 struct State {
@@ -230,10 +243,35 @@ struct State {
                                 // indices, not packed from zero
     float   poseRot[kPoseMaxBones][4];
     float   posePos[kPoseMaxBones][3];
+    // The physics overlay (kPovMaxBones above). povBone holds the SENDER'S bone index, which is not
+    // portable on its own -- two merged skeletons agree on bone NAMES and on nothing else -- so the
+    // receiver maps it through the same name fingerprint the pose lane already carries.
+    uint8_t povN = 0;
+    uint8_t povBone[kPovMaxBones] = {};
+    float   povRot[kPovMaxBones][4] = {};
+    float   povPos[kPovMaxBones][3] = {};
 };
 
-// Wire <-> State. Pack stamps the sender clock; Unpack validates (magic, finiteness, unit quat) --
-// P2P input is untrusted even when today's only sender is a friend.
+// ---- SNAPSHOT WIRE VERSION ------------------------------------------------------------------------
+// The two bytes behind the magic. See the version rule at the top of replication.cpp: MAJOR is the
+// fixed layout and a reader rejects a different one; MINOR counts APPENDED fields and a reader gates
+// each on `minor >= N`, so peers one minor apart still see each other. Append and bump the minor
+// wherever it is possible; bump the major only when a field has to move.
+constexpr uint8_t kWireMajor = 1;
+constexpr uint8_t kWireMinor = 0;
+
+// What a snapshot that would not parse actually was. Lets the reject path say who needs to update
+// instead of leaving a peer silently invisible.
+enum WirePeek : uint8_t {
+    kWireOk         = 0,   // ours, and this build can read it
+    kWireForeign    = 1,   // not a snapshot at all (or too short to be one)
+    kWireOtherMagic = 2,   // an "OMP?" message with a different letter -- a pre-OMPZ build's snapshot
+    kWireMajorSkew  = 3,   // ours, but a major this build cannot parse (major/minor are filled in)
+};
+WirePeek PeekWire(const uint8_t* data, int len, uint8_t* major, uint8_t* minor);
+
+// Wire <-> State. Pack stamps the sender clock; Unpack validates (magic, version, finiteness, unit
+// quat) -- P2P input is untrusted even when today's only sender is a friend.
 // `poseWrote`, when given, reports how many bones of the pose this packet actually carried, so the
 // caller can advance its own slice cursor. Callers with a big cap (the replay ring) take the whole
 // skeleton in one go and simply pass null.
@@ -302,7 +340,29 @@ struct CosmeticSet {
 // receiver merges by section. Two 0.1 Hz packets is nothing, and neither section can starve the other.
 // Within a section the packer still fills what fits and reports what it wrote -- a dropped slot
 // renders as that slot's default, never a corrupt packet.
-enum CosmeticSection : uint8_t { kCosClothing = 0, kCosBoard = 1 };
+// BOARD WEAR AND TEAR. Grinding and sliding scuff a board, and the game keeps that as two ratio maps
+// per item instance keyed by contact part (the deck's nose, middle and tail each wear separately, and
+// so does the griptape). It was never transported, so a peer's board rendered with whatever wear the
+// LOCAL profile happened to carry when they were dressed -- everyone looked like your board, frozen at
+// the moment you joined. Keyed by the item's CATEGORY, not by list position, so it survives a peer
+// changing one part of their setup.
+struct WearEntry {
+    int32_t cat  = 0;      // which board item -- the same key CosmeticItem::cat uses
+    uint8_t part = 0;      // contact part (the ratio map's key)
+    uint8_t dirt = 0;      // ratio quantised to a byte: nobody can see finer than that on a deck
+    uint8_t wear = 0;
+};
+struct WearSet {
+    uint8_t   n = 0;
+    WearEntry e[24];
+};
+
+// kCosWear rides the COSMETICS magic as a third section rather than claiming a magic letter of its
+// own -- only Z is left in the namespace, and wear is not worth it. It is sent on its own cadence,
+// because wear creeps constantly and must not drag a whole wardrobe across every time it moves.
+enum CosmeticSection : uint8_t { kCosClothing = 0, kCosBoard = 1, kCosWear = 2 };
+int  PackWear(const WearSet& w, uint8_t* out, int cap);
+bool UnpackWear(const uint8_t* data, int len, WearSet& out);
 int  PackCosmetics(const CosmeticSet& c, uint8_t section, uint8_t* out, int cap);
 // `sectionOut` says which half arrived; the caller merges it into its view of that peer.
 bool UnpackCosmetics(const uint8_t* data, int len, CosmeticSet& out, uint8_t* sectionOut);

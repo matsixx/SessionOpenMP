@@ -74,6 +74,8 @@ struct Slot {
     bool        quietHandled = false;
     // ---- cosmetics: their look, and whether this proxy is currently wearing it.
     repl::CosmeticSet cosmetics;
+    repl::WearSet     wear;               // their board's scuffs; applied to the proxy's materials
+    bool              haveWear = false;
     repl::BodyFeelSet bodyFeel;          // the peer's SessionTweaks riding-body knobs (ver 0 = none)
     // proximity voice: the engine-side sound, their decoder, the frame sequence, and the mute
     VoiceRx     vrx;                     // their voice, as heard here
@@ -85,6 +87,7 @@ struct Slot {
     // never dressed -- it keeps the look a fresh skater is built from, i.e. the LOCAL player's. A
     // different actor has by definition not been dressed, so every respawn re-dresses by construction.
     void*       wornForActor = nullptr;  // null = needs dressing (new set, respawn, world change)
+    void*       wearAppliedFor = nullptr; // the board their wear was last written onto
     // ---- chat: the last message id seen from this peer, so a redelivery cannot print twice.
     uint32_t    lastChatId = 0;
     bool        haveChatId = false;
@@ -344,6 +347,7 @@ static Slot* slotFor(int peerIdx, uint64_t nowUs) {
         s.used = true; s.peerIdx = peerIdx; s.lastPacketUs = nowUs; s.quietHandled = false;
         memset(&s.cosmetics, 0, sizeof(s.cosmetics));   // padding too -- it is memcmp'd for changes
         s.haveCosmetics = false; s.wornForActor = nullptr; s.peerReplaying = false;
+        s.wear = repl::WearSet{}; s.haveWear = false; s.wearAppliedFor = nullptr;
         s.peerTyping = false;
         s.rejectedSpoken = false; s.unvouchedSpoken = false;
         s.replayHidden = false; s.boardNear = true; s.deckNear = true; s.replayConcealedActor = nullptr;
@@ -545,6 +549,17 @@ void OnPacket(int peerIdx, const uint8_t* data, int len, uint64_t nowUs) {
         return;                                      // NOT a snapshot: no stream push, no liveness
     }
     if (repl::IsCosmeticsPacket(data, len)) {
+        // The wear section shares the cosmetics magic but nothing else: it carries no items, must not
+        // go through the merge, and must NOT trigger a re-dress -- re-merging a character to move a
+        // scuff is orders of magnitude more work than the scuff is worth. It is applied straight onto
+        // the proxy's materials instead.
+        if (len >= 5 && data[4] == repl::kCosWear) {
+            repl::WearSet wset;
+            if (!repl::UnpackWear(data, len, wset)) return;
+            Slot* ws = slotFor(peerIdx, nowUs);
+            if (ws) { ws->wear = wset; ws->haveWear = true; ws->wearAppliedFor = nullptr; }
+            return;
+        }
         repl::CosmeticSet c; uint8_t section = 0;
         if (!repl::UnpackCosmetics(data, len, c, &section)) return;
         Slot* cs = slotFor(peerIdx, nowUs);
@@ -627,11 +642,31 @@ void OnPacket(int peerIdx, const uint8_t* data, int len, uint64_t nowUs) {
         if (bad && !bad->rejectedSpoken) {
             bad->rejectedSpoken = true;
             if (g_logf) {
-                char m[200];
-                snprintf(m, sizeof(m),
-                         "[session] peer %d sent %d byte(s) this build cannot read -- almost certainly a "
-                         "different SessionOpenMP version. One of you needs to update; until then you "
-                         "will not see each other.", peerIdx, len);
+                // Say WHICH WAY the skew runs where the packet can tell us. A pre-OMPZ build's
+                // snapshot carries a different magic letter and no version at all, so it can only be
+                // named as older; from OMPZ on the major is right there in the packet and the
+                // comparison is exact. Guessing is worse than saying nothing here -- "update" aimed
+                // at the wrong person is a bug report.
+                uint8_t major = 0, minor = 0;
+                const repl::WirePeek why = repl::PeekWire(data, len, &major, &minor);
+                char m[260];
+                if (why == repl::kWireOtherMagic) {
+                    snprintf(m, sizeof(m),
+                             "[session] peer %d is on an OLDER SessionOpenMP than this one (their "
+                             "snapshots predate the versioned wire). They need to update; until then "
+                             "you will not see each other.", peerIdx);
+                } else if (why == repl::kWireMajorSkew) {
+                    snprintf(m, sizeof(m),
+                             "[session] peer %d speaks snapshot wire v%u.%u, this build speaks v%u.%u "
+                             "-- %s needs to update; until then you will not see each other.",
+                             peerIdx, major, minor, repl::kWireMajor, repl::kWireMinor,
+                             major > repl::kWireMajor ? "you" : "they");
+                } else {
+                    snprintf(m, sizeof(m),
+                             "[session] peer %d sent %d byte(s) this build cannot read -- almost "
+                             "certainly a different SessionOpenMP version. One of you needs to "
+                             "update; until then you will not see each other.", peerIdx, len);
+                }
                 g_logf(m);
             }
             if (g_cfg.onVersionMismatch) g_cfg.onVersionMismatch(peerIdx);
@@ -2147,7 +2182,33 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
                 }
             }
             repl::CosmeticSet own;
-            if (game::GatherOwnCosmetics(ownPawn, own, g_logf)) {
+            repl::WearSet ownWear;
+            if (game::GatherOwnCosmetics(ownPawn, own, g_logf, &ownWear)) {
+                // WEAR ON ITS OWN BEAT. It creeps constantly, so folding it into the look comparison
+                // would turn a lane that is silent most of the time into one publishing a wardrobe
+                // twice a second. Quantised to bytes first, so "changed" means a byte moved -- every
+                // few seconds while grinding, never while standing still -- and it rides a slower
+                // heartbeat than the look does because arriving late costs nothing.
+                static uint64_t lastWearSendUs = 0;
+                static repl::WearSet lastWear;
+                static bool haveLastWear = false;
+                const bool wearChanged = !haveLastWear || lastWear.n != ownWear.n ||
+                                         memcmp(lastWear.e, ownWear.e,
+                                                sizeof(repl::WearEntry) * (size_t)ownWear.n) != 0;
+                const bool wearBeat = !lastWearSendUs || sinceUs(nowUs, lastWearSendUs) > 15000000ull;
+                if (ownWear.n && (wearChanged || wearBeat || g_cosResend)) {
+                    uint8_t pkt[256];
+                    const int n = repl::PackWear(ownWear, pkt, sizeof(pkt));
+                    if (n > 0) {
+                        PeerStats ps;
+                        for (int i = 0; i < nPeers; i++)
+                            if (GetStats(i, &ps) && ps.state != 5) Send(i, pkt, n, true);
+                        // memcpy, not assignment: the comparison above reads the padding bytes, so
+                        // the remembered copy has to carry them verbatim.
+                        memcpy(&lastWear, &ownWear, sizeof(lastWear));
+                        haveLastWear = true; lastWearSendUs = nowUs;
+                    }
+                }
                 const bool changed = !haveLast || memcmp(&own, &lastSent, sizeof(own)) != 0;
                 const bool heartbeat = !lastCosSendUs || sinceUs(nowUs, lastCosSendUs) > 10000000ull;
                 if (changed || heartbeat || g_cosResend) {
@@ -2439,6 +2500,17 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
                 if (game::pose::SetPeerSkeleton(pmesh, s.skel.hash, s.skel.n)) s.skelFedFor = pmesh;
             }
         }
+        // THEIR BOARD'S SCUFFS. Applied once per (board, update) rather than per frame: it is a
+        // material write, and nothing on a proxy drives these parameters back. A fresh dress clears
+        // the stamp, because dressing rebuilds the materials with OUR wear baked in -- which is the
+        // bug this fixes, everyone's board frozen at whatever the local player's looked like on join.
+        if (s.haveWear && s.wear.n && s.proxy.actor()) {
+            void* bd = s.proxy.OwnBoard();
+            if (bd && bd != s.wearAppliedFor) {
+                s.wearAppliedFor = bd;
+                game::ApplyPeerWear(bd, s.wear, g_logf);
+            }
+        }
         if (s.haveCosmetics && s.proxy.actor() && s.proxy.actor() != s.wornForActor
             && s.proxy.VisualsSettled(nowMs)) {
             s.wornForActor = s.proxy.actor();             // one attempt per look PER ACTOR: no storm,
@@ -2448,6 +2520,8 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
             game::DressProxy(s.proxy.actor(), s.cosmetics, &unresolved, g_logf);   // re-syncs the
                                                           // replay bone cache itself; no floor needed
             s.proxy.MarkVisualsRefreshed();
+            s.wearAppliedFor = nullptr;                   // a fresh dress rebuilt the materials with
+                                                          // OUR wear on them: theirs goes back on
             // DIVERGENCE, the honest version: unresolved items are attributable exactly (they are
             // wearing something we do not have installed); a differing mod digest means shared item
             // NAMES may still resolve to different art on each screen, which names alone can never

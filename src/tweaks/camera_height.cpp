@@ -421,6 +421,9 @@ static bool applyFirstPerson(void* cam) {
 }
 
 static void hkCameraTick(void* self, float dt) {
+    // The camera actor keeps ticking when the input handler does not (the object dropper's prop editor,
+    // menus), so it is where the sitting prompt finds out that its own pump has stopped.
+    Sit_WatchdogTick();
     if (!g_dead) {
         __try { applyFrame(self); }
         __except (EXCEPTION_EXECUTE_HANDLER) {

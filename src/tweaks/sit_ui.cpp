@@ -193,6 +193,8 @@ static int   g_nRows = 0, g_laidOut = 0;    // widgets built (the pool), and the
 static void* g_builtFor = nullptr;
 static float g_vpW = 0.0f, g_vpH = 0.0f, g_vpScaleV = 1.0f;
 static int   g_faults = 0, g_tries = 0, g_scanned = 0, g_reported = 0, g_glyphSaid = 0, g_frame = 0;
+static int   g_gateLog = 0;          // SitPromptGateLog: 1/s line saying what the bar was told and what it is
+static uint64_t g_gateMs = 0;
 static char  g_status[128] = "idle";
 
 static void Widen(const char* a, wchar_t* w, int cap) {
@@ -467,8 +469,11 @@ static bool BuildRow(int i, int count, void* skater, void* pc) {
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; r.w = nullptr; return false; }
 }
-static void ShowRow(Row& r, bool on) {
-    if (!r.w || r.shown == on || !g_setVis) return;
+// `force` re-issues the visibility even when we believe it is already right. Our cached `shown` is only
+// as good as the assumption that nothing ELSE writes these widgets -- and a bar that stayed on screen
+// in the replay and prop editors says something might. Cheap to re-assert now and then.
+static void ShowRow(Row& r, bool on, bool force = false) {
+    if (!r.w || (r.shown == on && !force) || !g_setVis) return;
     r.shown = on;
     __try { g_setVis(r.w, on ? VIS_HITTEST_INVISIBLE : VIS_COLLAPSED); }
     __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; r.w = nullptr; }
@@ -483,11 +488,20 @@ void SitUI_PumpFrame(void* skater, bool show, const SitPromptEntry* entries, int
     // built on top -- entering first person (3 -> 4 rows) stacked the bar on itself every time, and
     // standing up could not hide what it had forgotten. The pool grows to the largest count ever asked
     // for and is stacked again for the current one; rows past the count collapse.
-    if (skater != g_builtFor) {
+    // A NULL skater is NOT a new level -- it is the replay editor or the prop editor taking the pawn
+    // away for as long as it is open. Treating it as one dropped every widget reference while the
+    // widgets were still VISIBLE in the viewport (the same orphaning as the count-change bug above, by
+    // another road), and the early return below then meant nothing ever hid them: the bar stayed on
+    // screen for the whole editor session. So hide them and KEEP them -- only a different, NON-NULL
+    // skater means the level that made them is gone.
+    if (skater && skater != g_builtFor) {
         for (int i = 0; i < MAX_ROWS; i++) g_rows[i].w = nullptr;
         g_nRows = 0; g_builtFor = nullptr; g_reported = 0; g_laidOut = 0; g_tries = 0;
     }
-    if (!skater) return;
+    if (!skater) {
+        for (int i = 0; i < g_nRows; i++) ShowRow(g_rows[i], false, true);
+        return;
+    }
     if (g_nRows < count && show && count > 0) {
         if (!g_rowClass) LoadByPath();
         // The scan also finds the settings object the icon table lives on, which no ini path can
@@ -545,15 +559,33 @@ void SitUI_PumpFrame(void* skater, bool show, const SitPromptEntry* entries, int
             } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; }
         }
     }
-    for (int i = 0; i < g_nRows; i++) ShowRow(g_rows[i], show && i < count);
+    // Re-assert about twice a second, so a hide that something else undid does not stick.
+    const bool force = (g_frame % 30) == 0;
+    for (int i = 0; i < g_nRows; i++) ShowRow(g_rows[i], show && i < count, force);
+    if (g_gateLog && g_nRows) {
+        const uint64_t ms = GetTickCount64();
+        if (ms - g_gateMs > 1000) {
+            g_gateMs = ms;
+            unsigned vis = 255;
+            __try { vis = *(const unsigned char*)((const uint8_t*)g_rows[0].w + UW_VIS); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { }
+            TwkLog("[situi] gate: show=%d rows=%d count=%d row0 shown=%d engineVis=%u",
+                   show ? 1 : 0, g_nRows, count, g_rows[0].shown ? 1 : 0, vis);
+        }
+    }
 }
 
+void SitUI_HideNow() {
+    if (!g_ok || !g_on) return;
+    for (int i = 0; i < g_nRows; i++) ShowRow(g_rows[i], false, true);
+}
 const char* SitUI_Status() { return g_status; }
 
 void SitUI_ReadConfig(const char* buf) {
     g_on       = TwkIniInt(buf, "SitPromptEnabled", 1) ? 1 : 0;
     g_zOrder   = TwkIniInt(buf, "SitPromptZ", 500);
     g_holdRing = TwkIniInt(buf, "SitPromptHoldRing", 1) ? 1 : 0;
+    g_gateLog  = TwkIniInt(buf, "SitPromptGateLog", 0) ? 1 : 0;
     TwkIniStr(buf, "SitPromptRowPath",  g_rowPath,  sizeof(g_rowPath),  "");
     TwkIniStr(buf, "SitPromptRowMatch", g_rowMatch, sizeof(g_rowMatch), "UIGamePadButton");
     g_barRight  = (float)TwkIniInt(buf, "SitBarRight", 72);
@@ -566,6 +598,7 @@ void SitUI_SaveConfig(char* buf, size_t cap) {
     TwkIniSetInt(buf, cap, "SitPromptEnabled",  g_on);
     TwkIniSetInt(buf, cap, "SitPromptZ",        g_zOrder);
     TwkIniSetInt(buf, cap, "SitPromptHoldRing", g_holdRing);
+    TwkIniSetInt(buf, cap, "SitPromptGateLog",  g_gateLog);
     TwkIniSetStr(buf, cap, "SitPromptRowPath",  g_rowPath);
     TwkIniSetStr(buf, cap, "SitPromptRowMatch", g_rowMatch);
     TwkIniSetInt(buf, cap, "SitBarRight",  (int)g_barRight);

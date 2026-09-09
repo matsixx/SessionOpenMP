@@ -79,7 +79,26 @@ namespace omp { namespace repl {
 //   OMPX -> boardSim moved AHEAD of the deck, because the deck's own encoding now depends on it: a
 //           loose board travels as an ABSOLUTE world position, a ridden one keeps the body-relative
 //           h16 delta. See the deck block in Pack for why 20 m stopped being a safe assumption.
-static const uint32_t kMagic = 0x58504D4Fu; // "OMPX"
+//   OMPY -> the PHYSICS OVERLAY, ahead of the pose slice. The lane is RETIRED (see replication.h):
+//           it now carries one zero byte, kept exactly so retiring it did not cost another letter.
+//           Y and Z are the last two this namespace has; the next wire change wants a version field.
+//   OMPZ -> THE LAST LETTER, and it is spent on not needing letters again. The snapshot now carries
+//           a two-byte VERSION right behind the magic, and this alphabet is closed for snapshots.
+//
+// THE VERSION RULE, from OMPZ on. Two bytes: MAJOR then MINOR.
+//   * MAJOR describes the FIXED layout -- everything a reader parses positionally. Move, resize or
+//     remove any existing field and the major goes up. A reader REJECTS a different major, which is
+//     exactly what a magic bump used to do, except the number never runs out.
+//   * MINOR describes APPENDED fields only, added after everything a previous minor wrote. It goes
+//     up by one per addition, and a reader gates each such field on `minor >= N`. That gate is what
+//     makes the compatibility work in BOTH directions: a newer sender's extra bytes are simply never
+//     read by an older build, and an older sender's missing bytes are never reached for by a newer
+//     one. Peers on adjacent minors keep seeing each other, which is the whole point -- a mismatch
+//     used to mean an invisible player.
+//   * So: append and bump the MINOR whenever it is possible; bump the MAJOR only when it is not.
+// The cost is two bytes on a packet of several hundred. The thing it buys is that "one of you needs
+// to update or you will not see each other" stops being the answer to every future wire change.
+static const uint32_t kMagic = 0x5A504D4Fu; // "OMPZ"
 
 static bool finite3(const float* v, float lim) {
     for (int i = 0; i < 3; i++) if (!(v[i] > -lim && v[i] < lim)) return false;   // rejects NaN/Inf too
@@ -292,6 +311,7 @@ int Pack(const State& s, uint64_t senderUs, uint8_t* out, int cap, int* poseWrot
     if (s.animLen > sizeof(s.anim)) return 0;
     Wr w{out, cap, 0, true};
     w.u32(kMagic);
+    w.u8(kWireMajor); w.u8(kWireMinor);
     // 0.25 ms units in a u32: 4 bytes saved per packet against the old u64 microseconds, with
     // precision far inside the ~16 ms snapshot spacing the playback clock interpolates across.
     w.u32((uint32_t)(senderUs / 250ull));
@@ -419,6 +439,18 @@ int Pack(const State& s, uint64_t senderUs, uint8_t* out, int cap, int* poseWrot
         }
         w.b(present, mb); w.b(esc, mb); w.b(payload, pn);
     }
+    // ---- THE PHYSICS OVERLAY (retired -- see replication.h). Nothing fills these any more, so this
+    // writes a single zero. It is kept rather than deleted because deleting it moves the snapshot
+    // layout, and that costs a magic letter we cannot spare.
+    {
+        const int povN = (s.poseN || s.povN > kPovMaxBones) ? 0 : s.povN;
+        w.u8((uint8_t)povN);
+        for (int i = 0; i < povN; i++) {
+            w.u8(s.povBone[i]);                                   // the SENDER's bone index
+            w.u32(qPack(s.povRot[i]));
+            for (int c = 0; c < 3; c++) w.h16(clampf(s.povPos[i][c], 1000.f));
+        }
+    }
     // ---- THE POSE LANE. Written before audio because a peer's SKELETON matters more than their
     // sounds when both compete for the same packet -- and ALL OR NOTHING: half a skeleton is not a
     // degraded pose, it is a scrambled one.
@@ -476,9 +508,16 @@ int Pack(const State& s, uint64_t senderUs, uint8_t* out, int cap, int* poseWrot
 }
 
 bool Unpack(const uint8_t* d, int len, State& out, uint64_t* senderUs) {
-    if (!d || len < 4) return false;
+    if (!d || len < 6) return false;
     Rd r{d, len, 0, true};
     if (r.u32() != kMagic) return false;
+    // A different MAJOR means the fixed layout moved: nothing after this byte is parseable, and
+    // guessing at it is exactly the misparse the magic exists to prevent.
+    if (r.u8() != kWireMajor) return false;
+    // A different MINOR is fine in both directions. Nothing gates on it yet because no appended
+    // field exists; the first one reads `if (wireMinor >= N) ...` at the very END of this function.
+    const uint8_t wireMinor = r.u8();
+    (void)wireMinor;
     const uint64_t su = (uint64_t)r.u32() * 250ull;   // 0.25 ms units back to microseconds
     const uint8_t f1 = r.u8(), f2 = r.u8();
     out = State{};
@@ -582,6 +621,20 @@ bool Unpack(const uint8_t* d, int len, State& out, uint64_t* senderUs) {
         }
         out.animLen = (uint16_t)off;
     }
+    // ---- THE PHYSICS OVERLAY (written ahead of the pose slice -- see Pack).
+    {
+        const int n = r.u8();
+        if (n > kPovMaxBones) return false;                // hostile/other-build packet
+        for (int i = 0; i < n; i++) {
+            out.povBone[i] = r.u8();
+            qUnpack(r.u32(), out.povRot[i]);
+            for (int c = 0; c < 3; c++) out.povPos[i][c] = r.h16();
+            // Same treatment the pose lane gives a bad bone: neutralise it and keep reading. An
+            // early return here would leave the reader mid-stream and every field after it garbage.
+            if (!finite3(out.povPos[i], 1e5f)) { out.povPos[i][0] = out.povPos[i][1] = out.povPos[i][2] = 0; }
+        }
+        out.povN = (uint8_t)n;
+    }
     // ---- THE POSE LANE.
     {
         const int total = r.u8();
@@ -664,10 +717,62 @@ bool Unpack(const uint8_t* d, int len, State& out, uint64_t* senderUs) {
 // of rejecting them. See the magic lineage at the top of the file for the claimed letters.
 static const uint32_t kCosMagic = 0x47504D4Fu;   // "OMPG"
 
+// Why a snapshot was refused, in enough detail to tell the player who has to update. A rejected
+// packet is the one failure this mod cannot show any other way: the lobby join and the P2P link both
+// succeed regardless of build, so the only symptom is a peer who is never there.
+WirePeek PeekWire(const uint8_t* d, int len, uint8_t* major, uint8_t* minor) {
+    if (major) *major = 0;
+    if (minor) *minor = 0;
+    if (!d || len < 4) return kWireForeign;
+    uint32_t m = 0; memcpy(&m, d, 4);
+    if (m != kMagic) {
+        // The magic is little-endian ASCII, so d[0..2] is the namespace and d[3] the letter. Any
+        // other letter is one of this project's own messages -- a pre-OMPZ snapshot from an older
+        // build, or another lane entirely (chat, voice, cosmetics), which the caller has already
+        // routed past by the time it asks.
+        return (d[0] == 'O' && d[1] == 'M' && d[2] == 'P') ? kWireOtherMagic : kWireForeign;
+    }
+    if (len < 6) return kWireForeign;
+    if (major) *major = d[4];
+    if (minor) *minor = d[5];
+    return d[4] == kWireMajor ? kWireOk : kWireMajorSkew;
+}
+
 bool IsCosmeticsPacket(const uint8_t* d, int len) {
     if (!d || len < 4) return false;
     uint32_t m = 0; memcpy(&m, d, 4);
     return m == kCosMagic;
+}
+
+// ---- board wear: the cosmetics magic, the kCosWear section byte, a count, then count x 7 bytes.
+// Same framing as the other two sections, so IsCosmeticsPacket routes it and the receiver dispatches
+// on the section byte it already reads.
+int PackWear(const WearSet& s, uint8_t* out, int cap) {
+    const int n = s.n > 24 ? 24 : (int)s.n;
+    if (!out || cap < 6 + n * 7) return 0;
+    Wr w{out, cap, 0, true};
+    w.u32(kCosMagic);
+    w.u8(kCosWear);
+    w.u8((uint8_t)n);
+    for (int i = 0; i < n; i++) {
+        w.u32((uint32_t)s.e[i].cat);
+        w.u8(s.e[i].part); w.u8(s.e[i].dirt); w.u8(s.e[i].wear);
+    }
+    return w.ok ? w.n : 0;
+}
+bool UnpackWear(const uint8_t* d, int len, WearSet& out) {
+    if (!IsCosmeticsPacket(d, len) || len < 6) return false;
+    out = WearSet{};
+    Rd r{d, len, 4, true};
+    if (r.u8() != kCosWear) return false;
+    int n = r.u8(); if (n > 24) n = 24;
+    for (int i = 0; i < n; i++) {
+        out.e[i].cat  = (int32_t)r.u32();
+        out.e[i].part = r.u8(); out.e[i].dirt = r.u8(); out.e[i].wear = r.u8();
+    }
+    if (!r.ok) { out = WearSet{}; return false; }
+    out.n = (uint8_t)n;
+    return true;
 }
 
 // ---- body-feel settings: magic, version, count, then count x int16. Opaque values; the order is
@@ -1106,6 +1211,22 @@ void InterpStates(const State& a, const State& b, float t, State& out) {
             // rotators STEP (out = a already), for the same reason as the feet above: rotLerp routes
             // through the quatToRot/rotToQuat pair, which is NOT self-inverse and flips the pose at
             // the poles. No euler round-trip on an interpolation path, ever.
+        }
+        // The physics overlay, blended only when both snapshots moved the SAME bones. The set turns
+        // over as the blueprint hands weight from one body to another, and a bone in one snapshot but
+        // not the other has no partner to blend against -- so a changed set STEPS (out is already a
+        // copy of A), which is right: the alternative is blending a bone's physics pose toward a
+        // different bone's.
+        if (a.povN && a.povN == b.povN) {
+            bool sameSet = true;
+            for (int i = 0; i < a.povN && i < kPovMaxBones; i++)
+                if (a.povBone[i] != b.povBone[i]) { sameSet = false; break; }
+            if (sameSet) {
+                for (int i = 0; i < a.povN && i < kPovMaxBones; i++) {
+                    qLerp(a.povRot[i], b.povRot[i], t, out.povRot[i]);
+                    lerp3(a.povPos[i], b.povPos[i], t, out.povPos[i]);
+                }
+            }
         }
         if (a.artOk && b.artOk) {
             qLerp(a.truckB, b.truckB, t, out.truckB);

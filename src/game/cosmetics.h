@@ -25,7 +25,17 @@ namespace omp { namespace game {
 // Read the LOCAL player's look. Enumerates the profile's two TMaps read-only -- a wrong layout
 // assumption can only mis-read, never corrupt, and the first call logs what it found so a bad walk is
 // obvious immediately instead of shipping silently wrong cosmetics.
-bool GatherOwnCosmetics(void* ownPawn, repl::CosmeticSet& out, void (*logf)(const char*));
+// One-shot: what OUR board's material table actually holds. Tells a wrong offset apart from a table
+// a proxy never builds -- the two need opposite fixes.
+void ProbeLocalBoardMaterials(void* boardActor, void (*logf)(const char*));
+
+// A peer's board wear, written onto their proxy board's own materials. Touches no profile data.
+void ApplyPeerWear(void* boardActor, const repl::WearSet& w, void (*logf)(const char*));
+
+// `wearOut`, when given, also collects the BOARD's wear and dirt -- see repl::WearSet. Optional
+// because only the publish path wants it; every other caller just needs the look.
+bool GatherOwnCosmetics(void* ownPawn, repl::CosmeticSet& out, void (*logf)(const char*),
+                        repl::WearSet* wearOut = nullptr);
 
 // Dress a proxy in a peer's look: borrow the global profile, RefreshVisuals(proxy), restore.
 // Item names resolve through StaticFindObject -- an item we do not have installed resolves to null and

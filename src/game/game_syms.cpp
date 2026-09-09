@@ -298,6 +298,18 @@ static const SigEntry kSigs[] = {
     { "AudioStop",             "40 53 48 83 EC 20 F6 81 8A 00 00 00 01 48 8B D9 ?? ?? E8 ?? ?? ?? ?? 48 85 C0 ?? ?? 48 8B 93 D0 07 00 00 48 8B C8 80 A3 8A 00 00 00 FE", false },
     { "AudioPlay",             "48 89 5C 24 08 48 89 7C 24 10 55 48 8B EC 48 81 EC 80 00 00 00 33 C0 F3 0F 11 4D A0 BF FF FF FF FF 48 89 45 B0 48 8D 55 A0", false },
     { "AudioSetVolume",        "40 53 48 81 EC 90 00 00 00 F6 81 8A 00 00 00 01 48 8B D9 0F 29 B4 24 80 00 00 00 0F 28 F1 F3 0F 11 B1 38 02 00 00 C7 81 34 02 00 00 00 00 80 3F", false },
+    // --- BOARD WEAR. Optional: without them a peer's board simply keeps the look it was dressed with.
+    // ACharacterCustomization::GetMaterialParameterNamesFromContactPart  Epic 0x1027170 / Steam 0xfe72e0
+    // SHORT on purpose (24 B): past that the two builds diverge on a displacement sigmake does not
+    // wildcard, and a longer pattern matched Epic and NOTHING on Steam. Verified unique in both.
+    { "MatParamNames",         "33 C0 4C 8B C1 48 89 01 48 89 41 08 48 89 41 10 0F B6 C2 83 F8 0E ?? ??", false },
+    // UMaterialInstanceDynamic::SetScalarParameterValue                  Epic 0x2d5ee20 / Steam 0x2d21690
+    { "SetScalarParam",        "48 83 EC 38 48 89 54 24 20 48 8D 54 24 20 C6 44 24 28 02 C7 44 24 2C FF FF FF FF E8 ?? ?? ?? ?? 48 83 C4 38 C3 CC CC CC", false },
+    // ASkateboardEx::RefreshVisuals                                      Epic 0xf96f80 / Steam 0xf56d90
+    // The board's OWN visual rebuild. It is what builds _customizationItemContactPartsRef (+0x6e0),
+    // the contact-part -> dynamic-material table the two calls above write through -- and a proxy
+    // never runs it on its own, which is why a peer's board had no materials to scuff at all.
+    { "BoardRefreshVisuals",   "40 57 48 83 EC 20 48 8B 3D ?? ?? ?? ?? 48 85 FF ?? ?? 48 89 5C 24 30 48 8D 99 80 02 00 00 48 8B 03 48 8B CB FF 90 F8 00 00 00", false },
     // --- PEER BODY TRIM (peer_bodies.cpp). All optional: without them a peer keeps the whole
     // simulated asset, which is what shipped before.
     // FBodyInstance::SetInstanceSimulatePhysics       Epic 0x2e57d00 / Steam 0x2e1a760
@@ -363,6 +375,39 @@ void* SkaterMeshOf(void* skaterActor) {
 struct BoneHashCache { void* mesh; int32_t num; int n; uint32_t hash[96]; };
 static BoneHashCache g_boneCache[4];
 static int g_boneCacheNext = 0;
+
+bool SkeletonBoneName(void* meshComp, int idx, char* out, int cap) {
+    if (out && cap > 0) out[0] = 0;
+    if (!meshComp || !out || cap <= 0 || idx < 0) return false;
+    __try {
+        void* skelMesh = *(void**)((uint8_t*)meshComp + off::kMeshSkeletalMesh);
+        if (!skelMesh) return false;
+        const uint8_t* refSkel = (const uint8_t*)skelMesh + off::kSkelMeshRefSkeleton;
+        struct TArr { const uint8_t* data; int32_t num; int32_t max; } a{};
+        memcpy(&a, refSkel + off::kRefSkelFinalBoneInfo, sizeof(a));
+        if (!a.data || idx >= a.num || a.num <= 0 || a.num > 4096) return false;
+        return fnameToAscii(a.data + (size_t)idx * off::kMeshBoneInfoStride, out, cap);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
+// FMeshBoneInfo is { FName Name; int32 ParentIndex; } -- the parent sits at +8 of the 12-byte stride.
+int SkeletonBoneParents(void* meshComp, int16_t* out, int cap) {
+    if (!meshComp || !out || cap <= 0) return 0;
+    __try {
+        void* skelMesh = *(void**)((uint8_t*)meshComp + off::kMeshSkeletalMesh);
+        if (!skelMesh) return 0;
+        const uint8_t* refSkel = (const uint8_t*)skelMesh + off::kSkelMeshRefSkeleton;
+        struct TArr { const uint8_t* data; int32_t num; int32_t max; } a{};
+        memcpy(&a, refSkel + off::kRefSkelFinalBoneInfo, sizeof(a));
+        if (!a.data || a.num <= 0 || a.num > 4096 || a.max < a.num) return 0;
+        const int n = a.num < cap ? a.num : cap;
+        for (int i = 0; i < n; i++) {
+            const int32_t p = *(const int32_t*)(a.data + (size_t)i * off::kMeshBoneInfoStride + 8);
+            out[i] = (p >= 0 && p < n) ? (int16_t)p : (int16_t)-1;
+        }
+        return n;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return 0; }
+}
 
 int SkeletonBoneHashes(void* meshComp, uint32_t* out, int cap) {
     if (!meshComp || !out || cap <= 0) return 0;
@@ -707,6 +752,8 @@ bool FNameAscii(const void*, char* o, int c)  { if (o && c) o[0] = 0; return fal
 void* SkaterMeshOf(void*)      { return nullptr; }
 bool  ProbePhysAnim(void*, PhysAnimProbe*) { return false; }
 int   SkeletonBoneCount(void*) { return 0; }
+int   SkeletonBoneParents(void*, int16_t*, int) { return 0; }
+bool  SkeletonBoneName(void*, int, char* o, int c) { if (o && c) o[0] = 0; return false; }
 int   SkeletonBoneHashes(void*, uint32_t*, int) { return 0; }
 bool LocalSkaterName(void*, char* o, int c) { if (o && c) o[0] = 0; return false; }
 bool LocalMapName(void*, char* o, int c)    { if (o && c) o[0] = 0; return false; }
@@ -796,73 +843,82 @@ const Syms& Resolve(void (*logf)(const char*)) {
     }
     // bind (order matches the table)
     int i = 0;
-    // THIS BLOCK IS POSITIONAL: `found[]` is indexed in kSigs ORDER, so inserting a table entry
-    // without inserting its assignment here silently shifts every symbol after it onto the wrong
-    // address. Keep the two lists in lockstep; the readiness check below catches mistakes.
-    g_syms.SpawnActor         = (SpawnActorFn)      found[i++];
-    g_syms.GetWorld           = (GetWorldFn)        found[i++];
-    g_syms.GetGameInstance    = (GetGameInstFn)     found[i++];
-    g_syms.GetCustomizationItem = (GetCustomItemFn) found[i++];
-    g_syms.SoftPathTryLoad    = (TryLoadFn)         found[i++];
-    g_syms.SetActorHidden     = (SetHiddenFn)       found[i++];
-    g_syms.SetActorCollision  = (SetCollisionFn)    found[i++];
-    g_syms.SetActorTick       = (SetActorTickFn)    found[i++];
-    g_syms.SetReplicates      = (SetReplicatesFn)   found[i++];
-    g_syms.SetActorLocRot     = (SetActorLocRotFn)  found[i++];
-    g_syms.SetWorldRotQuat    = (SetWorldRotQFn)    found[i++];
-    g_syms.RefreshVisuals     = (RefreshVisualsFn)  found[i++];
-    g_syms.IsLocallyControlled= (IsLocallyCtrlFn)   found[i++];
-    g_syms.BoardTeleport      = (BoardTeleportFn)   found[i++];
-    g_syms.BoardSetRot        = (BoardSetRotFn)     found[i++];
-    g_syms.SetSimulatePhysics = (SetSimPhysFn)      found[i++];
-    g_syms.CompSetSimPhys     = (CompSetSimPhysFn)  found[i++];
-    g_syms.BoardSetLinVel     = (BoardSetLinVelFn)  found[i++];
-    g_syms.Bail               = (BailFn)            found[i++];
-    g_syms.ResetRagDoll       = (ResetRagDollFn)    found[i++];
-    g_syms.SaveFootTrans      = (SaveFootTransFn)   found[i++];
-    g_syms.AllowPausing       =                     found[i++];   // patched, never called
-    g_syms.EngineTick         =                     found[i++];   // hooked, never called directly
-    g_syms.StaticFindObject   = (SFOFn)             found[i++];
-    g_syms.RenameObj          =                     found[i++];   // hooked, never called directly
-    g_syms.AnimUpdate         =                     found[i++];   // hooked, never called directly
-    g_syms.SetPushState       = (SetPushStateFn)    found[i++];
-    g_syms.StartBraking       = (BrakeRpcFn)        found[i++];
-    g_syms.StopBraking        = (BrakeRpcFn)        found[i++];
-    g_syms.FNameToString      = (FNameToStringFn)   found[i++];
-    g_syms.SndSpawnAtLoc      = (SpawnSndAtLocFn)   found[i++];
-    g_syms.SndSpawnAttached   = (SpawnSndAttFn)     found[i++];
-    g_syms.GsSpawnAtLoc       = (SpawnSndAtLocFn)   found[i++];
-    g_syms.GsSpawnAttached    = (SpawnSndAttFn)     found[i++];
-    g_syms.AcSetIntParam      = (AcSetIntFn)        found[i++];
-    g_syms.AcSetPitch         = (AcSetFloatFn)      found[i++];
-    g_syms.AcSetVolume        = (AcSetFloatFn)      found[i++];
-    g_syms.NotifyPlaySound    =                     found[i++];   // range marker, never called
-    g_syms.FNameCtor          = (FNameCtorFn)       found[i++];
-    g_syms.SkaterReplayMode   =                     found[i++];   // hooked, never called directly
-    g_syms.GetConcHandles     = (GetConcHandlesFn)  found[i++];
-    g_syms.ReplayMgrInstance  = (GetReplayMgrFn)    found[i++];
-    g_syms.ReplayCamSetType   = (SetCamTypeFn)      found[i++];
-    g_syms.CamReplaying       =                     found[i++];   // hooked, never called directly
-    g_syms.FloatTrackReplaying =                    found[i++];   // hooked, never called directly
-    g_syms.MeshFinalizeBones  =                     found[i++];   // hooked, never called directly
-    g_syms.MenuCreateItems    =                     found[i++];   // hooked, never called directly
-    g_syms.MenuSelConfirmed   =                     found[i++];   // hooked, never called directly
-    g_syms.MenuBackAction     =                     found[i++];   // hooked, never called directly
-    g_syms.MenuRefreshItems   = (MenuRefreshFn)     found[i++];
-    g_syms.MenuSetTitle       = (MenuSetTitleFn)    found[i++];
-    g_syms.MenuSetSelIndex    = (MenuSetSelIdxFn)   found[i++];
-    g_syms.MenuMultiChanged   =                     found[i++];   // hooked, never called directly
-    g_syms.MenuProgressChanged=                     found[i++];   // hooked, never called directly
-    g_syms.MenuProgressSetPct = (MenuProgSetPctFn)  found[i++];
-    g_syms.PauseMenuShown     = (PauseShownFn)      found[i++];
-    g_syms.MenuMultiSetIndex  = (MenuMultiSetIdxFn) found[i++];
-    g_syms.PopupCreate        = (PopupCreateFn)     found[i++];
-    g_syms.GetSubsystem       = (GetSubsystemFn)    found[i++];
-    g_syms.PopupParamsDtor    = (PopupDtorFn)       found[i++];
+    // THIS BLOCK IS POSITIONAL: `found[]` is indexed in kSigs ORDER, so a table entry inserted
+    // somewhere other than where its assignment sits shifts every later symbol onto the wrong
+    // address -- and nothing downstream notices, because every sig still resolves 1-hit. It happened:
+    // two entries added ahead of AudioSetVolume in the table but after it here left the board-wear
+    // write calling an audio volume setter and the voice volume call writing over an audio
+    // component. So each line NAMES the table entry it expects, and a mismatch stops the binding
+    // dead at that point instead of quietly scrambling the rest.
+    const char* takeBad = nullptr;
+    auto take = [&](const char* want) -> void* {
+        if (i >= kSigN || strcmp(kSigs[i].name, want) != 0) { if (!takeBad) takeBad = want; return nullptr; }
+        return found[i++];
+    };
+    g_syms.SpawnActor         = (SpawnActorFn)      take("SpawnActor");
+    g_syms.GetWorld           = (GetWorldFn)        take("GetWorld");
+    g_syms.GetGameInstance    = (GetGameInstFn)     take("GetGameInstance");
+    g_syms.GetCustomizationItem = (GetCustomItemFn) take("GetCustomizationItem");
+    g_syms.SoftPathTryLoad    = (TryLoadFn)         take("SoftPathTryLoad");
+    g_syms.SetActorHidden     = (SetHiddenFn)       take("SetActorHidden");
+    g_syms.SetActorCollision  = (SetCollisionFn)    take("SetActorCollision");
+    g_syms.SetActorTick       = (SetActorTickFn)    take("SetActorTick");
+    g_syms.SetReplicates      = (SetReplicatesFn)   take("SetReplicates");
+    g_syms.SetActorLocRot     = (SetActorLocRotFn)  take("SetActorLocRot");
+    g_syms.SetWorldRotQuat    = (SetWorldRotQFn)    take("SetWorldRotQuat");
+    g_syms.RefreshVisuals     = (RefreshVisualsFn)  take("RefreshVisuals");
+    g_syms.IsLocallyControlled= (IsLocallyCtrlFn)   take("IsLocallyControlled");
+    g_syms.BoardTeleport      = (BoardTeleportFn)   take("BoardTeleport");
+    g_syms.BoardSetRot        = (BoardSetRotFn)     take("BoardSetRot");
+    g_syms.SetSimulatePhysics = (SetSimPhysFn)      take("SetSimulatePhysics");
+    g_syms.CompSetSimPhys     = (CompSetSimPhysFn)  take("CompSetSimPhys");
+    g_syms.BoardSetLinVel     = (BoardSetLinVelFn)  take("BoardSetLinVel");
+    g_syms.Bail               = (BailFn)            take("Bail");
+    g_syms.ResetRagDoll       = (ResetRagDollFn)    take("ResetRagDoll");
+    g_syms.SaveFootTrans      = (SaveFootTransFn)   take("SaveFootTrans");
+    g_syms.AllowPausing       =                     take("AllowPausing");   // patched, never called
+    g_syms.EngineTick         =                     take("EngineTick");   // hooked, never called directly
+    g_syms.StaticFindObject   = (SFOFn)             take("StaticFindObject");
+    g_syms.RenameObj          =                     take("RenameObj");   // hooked, never called directly
+    g_syms.AnimUpdate         =                     take("AnimUpdate");   // hooked, never called directly
+    g_syms.SetPushState       = (SetPushStateFn)    take("SetPushState");
+    g_syms.StartBraking       = (BrakeRpcFn)        take("StartBraking");
+    g_syms.StopBraking        = (BrakeRpcFn)        take("StopBraking");
+    g_syms.FNameToString      = (FNameToStringFn)   take("FNameToString");
+    g_syms.SndSpawnAtLoc      = (SpawnSndAtLocFn)   take("SndSpawnAtLoc");
+    g_syms.SndSpawnAttached   = (SpawnSndAttFn)     take("SndSpawnAttached");
+    g_syms.GsSpawnAtLoc       = (SpawnSndAtLocFn)   take("GsSpawnAtLoc");
+    g_syms.GsSpawnAttached    = (SpawnSndAttFn)     take("GsSpawnAttached");
+    g_syms.AcSetIntParam      = (AcSetIntFn)        take("AcSetIntParam");
+    g_syms.AcSetPitch         = (AcSetFloatFn)      take("AcSetPitch");
+    g_syms.AcSetVolume        = (AcSetFloatFn)      take("AcSetVolume");
+    g_syms.NotifyPlaySound    =                     take("NotifyPlaySound");   // range marker, never called
+    g_syms.FNameCtor          = (FNameCtorFn)       take("FNameCtor");
+    g_syms.SkaterReplayMode   =                     take("SkaterReplayMode");   // hooked, never called directly
+    g_syms.GetConcHandles     = (GetConcHandlesFn)  take("GetConcHandles");
+    g_syms.ReplayMgrInstance  = (GetReplayMgrFn)    take("ReplayMgrInstance");
+    g_syms.ReplayCamSetType   = (SetCamTypeFn)      take("ReplayCamSetType");
+    g_syms.CamReplaying       =                     take("CamReplaying");   // hooked, never called directly
+    g_syms.FloatTrackReplaying =                    take("FloatTrackReplaying");   // hooked, never called directly
+    g_syms.MeshFinalizeBones  =                     take("MeshFinalizeBones");   // hooked, never called directly
+    g_syms.MenuCreateItems    =                     take("MenuCreateItems");   // hooked, never called directly
+    g_syms.MenuSelConfirmed   =                     take("MenuSelConfirmed");   // hooked, never called directly
+    g_syms.MenuBackAction     =                     take("MenuBackAction");   // hooked, never called directly
+    g_syms.MenuRefreshItems   = (MenuRefreshFn)     take("MenuRefreshItems");
+    g_syms.MenuSetTitle       = (MenuSetTitleFn)    take("MenuSetTitle");
+    g_syms.MenuSetSelIndex    = (MenuSetSelIdxFn)   take("MenuSetSelIndex");
+    g_syms.MenuMultiChanged   =                     take("MenuMultiChanged");   // hooked, never called directly
+    g_syms.MenuProgressChanged=                     take("MenuProgressChanged");   // hooked, never called directly
+    g_syms.MenuProgressSetPct = (MenuProgSetPctFn)  take("MenuProgressSetPct");
+    g_syms.PauseMenuShown     = (PauseShownFn)      take("PauseMenuShown");
+    g_syms.MenuMultiSetIndex  = (MenuMultiSetIdxFn) take("MenuMultiSetIndex");
+    g_syms.PopupCreate        = (PopupCreateFn)     take("PopupCreate");
+    g_syms.GetSubsystem       = (GetSubsystemFn)    take("GetSubsystem");
+    g_syms.PopupParamsDtor    = (PopupDtorFn)       take("PopupParamsDtor");
     // The popup manager's UClass, decoded from a call site exactly like FText::FromName below.
     {
         const int clsIdx = i;
-        const uint8_t* site = (const uint8_t*)found[i++];
+        const uint8_t* site = (const uint8_t*)take("PopupClassSite");
         Pat sp;
         if (site && parsePat(kSigs[clsIdx].sig, sp) && sp.n >= 5) {
             const uint8_t* call = site + sp.n - 5;
@@ -877,18 +933,18 @@ const Syms& Resolve(void (*logf)(const char*)) {
                  g_syms.PopupMgrClass ? (void*)((uint8_t*)g_syms.PopupMgrClass - base) : nullptr);
         say(m);
     }
-    g_syms.GameVersion        =                     found[i++];   // hooked, never called directly
-    g_syms.IntroUiRange       =                     found[i++];   // range marker, never called
-    g_syms.PauseInitRange     =                     found[i++];   // range marker, never called
-    g_syms.MemMalloc          = (MemMallocFn)       found[i++];
-    g_syms.MemFree            = (MemFreeFn)         found[i++];
+    g_syms.GameVersion        =                     take("GameVersion");   // hooked, never called directly
+    g_syms.IntroUiRange       =                     take("IntroUiRange");   // range marker, never called
+    g_syms.PauseInitRange     =                     take("PauseInitRange");   // range marker, never called
+    g_syms.MemMalloc          = (MemMallocFn)       take("MemMalloc");
+    g_syms.MemFree            = (MemFreeFn)         take("MemFree");
     // The one entry whose match is NOT the target function: MenuTextSite is a CALL SITE, so the symbol
     // is the target of the `E8 rel32` in its last five bytes. Decoding beats a body sig here because
     // FText::FromName has an exact byte twin (see the table comment). The opcode must actually BE an
     // E8 -- if the pattern ever matches something else, no address is taken at all.
     {
         const int siteIdx = i;
-        const uint8_t* site = (const uint8_t*)found[i++];
+        const uint8_t* site = (const uint8_t*)take("MenuTextSite");
         // Length comes from re-parsing the entry's OWN sig, never a hardcoded 61: lengthening the
         // pattern later would otherwise silently decode the wrong five bytes.
         Pat sp;
@@ -907,15 +963,15 @@ const Syms& Resolve(void (*logf)(const char*)) {
     }
     // Appended AFTER the MenuTextSite block on purpose: that block consumes its own slot with
     // `found[i++]`, so the positional run continues here and the table stays append-only.
-    g_syms.ProjectToScreen    = (ProjectToScreenFn) found[i++];
-    g_syms.GetViewportSize    = (ViewportSizeFn)    found[i++];
-    g_syms.BreakBoardInternal = (BreakBoardIntFn)   found[i++];
-    g_syms.RebuildBrokenBoard = (RebuildBoardFn)    found[i++];
+    g_syms.ProjectToScreen    = (ProjectToScreenFn) take("ProjectToScreen");
+    g_syms.GetViewportSize    = (ViewportSizeFn)    take("GetViewportSize");
+    g_syms.BreakBoardInternal = (BreakBoardIntFn)   take("BreakBoardInternal");
+    g_syms.RebuildBrokenBoard = (RebuildBoardFn)    take("RebuildBrokenBoard");
     // ProfileEmplaceSite is a CALL SITE like MenuTextSite: the symbol is the E8 target in its last
     // five bytes. Same guard -- if the last opcode is not an E8, no address is taken at all.
     {
         const int siteIdx = i;
-        const uint8_t* site = (const uint8_t*)found[i++];
+        const uint8_t* site = (const uint8_t*)take("ProfileEmplaceSite");
         Pat sp;
         if (site && parsePat(kSigs[siteIdx].sig, sp) && sp.n >= 5) {
             const uint8_t* call = site + sp.n - 5;
@@ -930,14 +986,14 @@ const Syms& Resolve(void (*logf)(const char*)) {
                  g_syms.ProfileEmplace ? (void*)((uint8_t*)g_syms.ProfileEmplace - base) : nullptr);
         say(m);
     }
-    g_syms.PopulateMarkerInfo = found[i++];
+    g_syms.PopulateMarkerInfo = take("PopulateMarkerInfo");
     // The dropper singleton: two DATA-REFERENCE SITES, each `mov rax,[rip+disp32]` (48 8B 05) as its
     // first instruction, so the global is at site + 7 + disp. Both are decoded and must AGREE -- one
     // site could match the wrong three-instruction accessor in a future build and still look fine on
     // its own; two that disagree say so out loud and neither is used.
     {
-        const uint8_t* siteA = (const uint8_t*)found[i++];   // IsActive
-        const uint8_t* siteB = (const uint8_t*)found[i++];   // GetObjectsDatabase
+        const uint8_t* siteA = (const uint8_t*)take("DropperActiveSite");   // IsActive
+        const uint8_t* siteB = (const uint8_t*)take("DropperDbSite");   // GetObjectsDatabase
         auto decodeRip = [](const uint8_t* p) -> void** {
             if (!p || p[0] != 0x48 || p[1] != 0x8B || p[2] != 0x05) return nullptr;
             int32_t disp = 0; memcpy(&disp, p + 3, 4);
@@ -958,38 +1014,42 @@ const Syms& Resolve(void (*logf)(const char*)) {
         }
         say(m);
     }
-    g_syms.DropperObjInfoById = (ObjInfoByIdFn)   found[i++];
-    g_syms.DropperPickableOf  = (PickableOfFn)    found[i++];
-    g_syms.DropperLoad        =                     found[i++];   // hooked, never called directly
-    g_syms.DropperSave        =                     found[i++];   // hooked, never called directly
-    g_syms.ActorSetLocation   =                     found[i++];   // hooked, never called directly
-    g_syms.ActorDestroy       = (ActorDestroyFn)  found[i++];
-    g_syms.ReplayRefreshBones = (ReplayRefreshBonesFn) found[i++];
-    g_syms.SetPhysAnimEnabled = (SetPhysAnimEnabledFn) found[i++];
-    g_syms.StaticConstructObject = (SCOFn)          found[i++];
-    g_syms.SoundGeneratePCM   =                     found[i++];   // address only, never called
-    g_syms.SpawnSoundAttached = (SpawnSoundAttachedFn) found[i++];
-    g_syms.AudioStop          = (AudioStopFn)       found[i++];
-    g_syms.AudioPlay          = (AudioPlayFn)       found[i++];
-    g_syms.AudioSetVolume     = (AudioSetVolFn)     found[i++];
-    g_syms.BodySetSimulate    = (BodySetSimulateFn)  found[i++];
-    g_syms.BodySetResponse    = (BodySetResponseFn)  found[i++];
-    g_syms.BodyUpdateFilter   = (BodyUpdateFilterFn) found[i++];
-    g_syms.PhysExecuteWrite   = (PhysExecuteWriteFn) found[i++];
-    g_syms.SetSolverPosIters  = (SetSolverItersFn)   found[i++];
-    g_syms.SetSolverVelIters  = (SetSolverItersFn)   found[i++];
+    g_syms.DropperObjInfoById = (ObjInfoByIdFn)   take("DropperObjInfoById");
+    g_syms.DropperPickableOf  = (PickableOfFn)    take("DropperPickableOf");
+    g_syms.DropperLoad        =                     take("DropperLoad");   // hooked, never called directly
+    g_syms.DropperSave        =                     take("DropperSave");   // hooked, never called directly
+    g_syms.ActorSetLocation   =                     take("ActorSetLocation");   // hooked, never called directly
+    g_syms.ActorDestroy       = (ActorDestroyFn)  take("ActorDestroy");
+    g_syms.ReplayRefreshBones = (ReplayRefreshBonesFn) take("ReplayRefreshBones");
+    g_syms.SetPhysAnimEnabled = (SetPhysAnimEnabledFn) take("SetPhysAnimEnabled");
+    g_syms.StaticConstructObject = (SCOFn)          take("StaticConstructObject");
+    g_syms.SoundGeneratePCM   =                     take("SoundGeneratePCM");   // address only, never called
+    g_syms.SpawnSoundAttached = (SpawnSoundAttachedFn) take("SpawnSoundAttached");
+    g_syms.AudioStop          = (AudioStopFn)       take("AudioStop");
+    g_syms.AudioPlay          = (AudioPlayFn)       take("AudioPlay");
+    g_syms.AudioSetVolume     = (AudioSetVolFn)     take("AudioSetVolume");
+    g_syms.MatParamNames      = (MatParamNamesFn)   take("MatParamNames");
+    g_syms.SetScalarParam     = (SetScalarParamFn)  take("SetScalarParam");
+    g_syms.BoardRefreshVisuals = (BoardRefreshVisFn) take("BoardRefreshVisuals");
+    g_syms.BodySetSimulate    = (BodySetSimulateFn)  take("BodySetSimulate");
+    g_syms.BodySetResponse    = (BodySetResponseFn)  take("BodySetResponse");
+    g_syms.BodyUpdateFilter   = (BodyUpdateFilterFn) take("BodyUpdateFilter");
+    g_syms.PhysExecuteWrite   = (PhysExecuteWriteFn) take("PhysExecuteWrite");
+    g_syms.SetSolverPosIters  = (SetSolverItersFn)   take("SetSolverPosIters");
+    g_syms.SetSolverVelIters  = (SetSolverItersFn)   take("SetSolverVelIters");
 
     // LOCKSTEP CHECK. The block above is POSITIONAL, and a table entry added without its assignment --
     // or vice versa -- shifts every later symbol onto the wrong address SILENTLY: sigs still resolve
     // 1-hit, symcheck still passes, and the mod hooks whatever happens to sit at the shifted index.
-    // `i` has consumed exactly one slot per assignment, so comparing it to kSigN catches the whole
-    // class of mistake in one line, loudly, at startup.
-    if (i != kSigN) {
-        char mm[220];
+    // `i` has consumed exactly one slot per assignment, so comparing it to kSigN catches a missing or
+    // extra assignment; `takeBad` names the first line whose expected entry was not the one the table
+    // had there, which is the reordering case. Either way it is loud, at startup, before anything runs.
+    if (i != kSigN || takeBad) {
+        char mm[260];
         snprintf(mm, sizeof(mm),
-                 "[sym] *** SIG TABLE/BINDING MISMATCH: %d assignments for %d table entries -- every"
-                 " symbol after the gap is bound to the WRONG address. Fix before trusting anything.",
-                 i, kSigN);
+                 "[sym] *** SIG TABLE/BINDING MISMATCH: %d assignments for %d table entries%s%s -- every"
+                 " symbol from there on is bound to the WRONG address. Fix before trusting anything.",
+                 i, kSigN, takeBad ? ", first bad: " : "", takeBad ? takeBad : "");
         say(mm);
     }
 
