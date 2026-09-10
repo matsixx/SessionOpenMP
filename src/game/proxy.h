@@ -180,6 +180,9 @@ public:
     // editor, or WE are (a grace skater cannot hit anyone either). Skater and board both; the board
     // is STAMPED while set, because a simulating body with no collision falls through the floor.
     void       SetNoCollide(bool nc, void (*logf)(const char*));
+private:
+    void       ApplyNoCollide(void (*logf)(const char*));   // (re)apply the current noCollide_ to a present actor
+public:
     // The BOARD's own distance, kept apart from the skater's. A board that has been set down is no
     // longer near its owner: it rolls. One that has rolled over to you has to be a real rigid body
     // even though its owner is far off, and a distant owner must still not be paying for body

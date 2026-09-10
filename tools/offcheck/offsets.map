@@ -613,6 +613,7 @@ kActorInstComps                AActor::InstanceComponents
 kPaMeshComp                    UPhysicalAnimationComponent::SkeletalMeshComponent
 kMeshBodies                    USkeletalMeshComponent::Bodies
 kBodyBlendWeight               FBodyInstance::PhysicsBlendWeight
+kBodyObjectType                FBodyInstance::ObjectType
 kBodySimByte                   -   # a bitfield byte (bSimulatePhysics bit 0); the PDB names the bit, not the byte
 kBodySimBit                    -
 kBodyBoneIndex                 FBodyInstance::InstanceBoneIndex

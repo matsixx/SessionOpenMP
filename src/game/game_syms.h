@@ -878,6 +878,7 @@ namespace off {
     constexpr int kBodyBoneIndex        = 0x1c;    // FBodyInstance::InstanceBoneIndex (int16, into the ref skeleton)
     constexpr int kBodyPosIters         = 0x74;    // FBodyInstance::PositionSolverIterationCount (uint8)
     constexpr int kBodyVelIters         = 0x75;    // FBodyInstance::VelocitySolverIterationCount (uint8)
+    constexpr int kBodyObjectType       = 0x1e;    // FBodyInstance::ObjectType (ECollisionChannel byte)
     constexpr int kBodyResponses        = 0x78;    // CollisionResponses.ResponseToChannels, one byte per channel
     constexpr int kBodyActorHandle      = 0x120;   // FBodyInstance::ActorHandle (the PhysX actor)
     constexpr int kContainerPage      = 0x2a0;   // _menuPage (UMenuPage*) -- the page the container is

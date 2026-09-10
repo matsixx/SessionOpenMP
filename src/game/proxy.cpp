@@ -17,6 +17,7 @@
 #include "audio.h"
 #include "pose.h"
 #include "peer_bodies.h"       // what a peer's physical animation is actually allowed to cost
+#include "peer_nocollide.h"    // a proxy that ignores skaters WITHOUT switching its collision off
 #include "spectate.h"          // hand the replay camera back before this actor's pointer dies
 #include "../replication/anim_fields.h"
 
@@ -210,7 +211,7 @@ void Proxy::Forget() {
     DropProxyActor(actor_);               // no longer one of ours -- drop it before the pointer dies
     DropAnimSlot(this);                   // the anim instance died with the world; never post-apply to it
     { void* pm = actor_ ? safePtr(actor_, off::kSkaterMesh) : nullptr;
-      if (pm) { pose::Forget(pm); PeerBodiesForget(pm); } }
+      if (pm) { pose::Forget(pm); PeerBodiesForget(pm); PeerNoCollideForget(pm); } }
     ClearState();
 }
 
@@ -1169,6 +1170,14 @@ void Proxy::Apply(const repl::State& s, uint64_t nowMs, uint64_t nowUs, void (*l
             }
         }
 
+        // RE-ASSERT the skater-ignore every frame while it is on, for the same reason the trim is:
+        // SetNoCollide fires ONCE on the grace edge, and on a peer's respawn the proxy's mesh does
+        // not exist yet at that instant, so the one-shot apply wrote nothing and the fresh skater
+        // kept full collision -- you could run into a just-respawned peer and fall. The apply is
+        // decided by state per channel, so once it holds this is a handful of reads and out, and a
+        // response the game writes back is caught rather than waited out.
+        if (actor_ && noCollide_) ApplyNoCollide(logf);
+
         // MEASUREMENT (debug::paProbe): is the game's physical animation live on this proxy? Same
         // line shape as the LOCAL one session::Frame prints, so the two compare in one log.
         if (debug::Get().paProbe && nowMs >= paProbeMs_) {
@@ -1501,21 +1510,36 @@ void Proxy::PlayPushStates(const uint8_t* states, int n) {
     }
 }
 
+// The SKATER keeps its collision and ignores other skaters instead (peer_nocollide.cpp). 1.1.6
+// switched its collision OFF here, and the engine forces a collision-less body to kinematic -- so
+// every proxy's body physics died whenever the local player sat at a marker in grace. The BOARD is
+// a plain actor that is stamped while no-collide, so its collision can simply go; its body instance
+// is still handed over so the channel a board arrives on is read, not assumed.
+void Proxy::ApplyNoCollide(void (*logf)(const char*)) {
+    if (!actor_ || !present_) return;
+#ifdef _WIN32
+    void* mesh   = safePtr(actor_, off::kSkaterMesh);
+    void* root   = safePtr(actor_, off::kActorRootComp);
+    void* cap    = root ? (void*)((uint8_t*)root + off::kCompBodyInstance) : nullptr;
+    void* bd     = OwnBoard();
+    void* bdRoot = bd ? safePtr(bd, off::kActorRootComp) : nullptr;
+    void* bdBody = bdRoot ? (void*)((uint8_t*)bdRoot + off::kCompBodyInstance) : nullptr;
+    if (noCollide_) PeerNoCollideApply(mesh, cap, bdBody, logf);
+    else            PeerNoCollideRestore(mesh, cap, logf);
+    const Syms& S = Get();
+    if (S.SetActorCollision && bd) {
+        __try { S.SetActorCollision(bd, !noCollide_); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+#else
+    (void)logf;
+#endif
+}
+
 void Proxy::SetNoCollide(bool nc, void (*logf)(const char*)) {
     if (nc == noCollide_) return;
     noCollide_ = nc;
-    if (!actor_ || !present_) return;                // an absent actor is already decollided
-    const Syms& S = Get();
     if (nc && simOn_) StopBoardSim();                // stamped from here on (see Apply)
-#ifdef _WIN32
-    if (S.SetActorCollision) {
-        void* bd = OwnBoard();
-        __try { S.SetActorCollision(actor_, !nc); if (bd) S.SetActorCollision(bd, !nc); }
-        __except (EXCEPTION_EXECUTE_HANDLER) {}
-    }
-#endif
-    if (logf) logf(nc ? "[proxy] their collision is off (spawn grace / replay editor)"
-                      : "[proxy] their collision is back");
+    ApplyNoCollide(logf);
 }
 
 void Proxy::SetPresent(bool present, void (*logf)(const char*)) {
@@ -1527,15 +1551,16 @@ void Proxy::SetPresent(bool present, void (*logf)(const char*)) {
     if (!present) { AudioStopAll(); if (simOn_) StopBoardSim(); }
     // Hiding is purely visual -- the collision stays -- so an actor that is only hidden leaves an
     // invisible obstacle where it stood (the departed-peer lesson). Collision follows visibility.
-    auto reveal = [&](void* a) {
+    auto reveal = [&](void* a, bool collide) {
         if (!a) return;
 #ifdef _WIN32
         if (S.SetActorHidden)    { __try { S.SetActorHidden(a, !present); }   __except (EXCEPTION_EXECUTE_HANDLER) {} }
-        if (S.SetActorCollision) { __try { S.SetActorCollision(a, present && !noCollide_); } __except (EXCEPTION_EXECUTE_HANDLER) {} }
+        if (S.SetActorCollision) { __try { S.SetActorCollision(a, collide); } __except (EXCEPTION_EXECUTE_HANDLER) {} }
 #endif
     };
-    reveal(actor_);
-    reveal(OwnBoard());
+    reveal(actor_, present);                         // the skater's collision is never switched off
+    reveal(OwnBoard(), present && !noCollide_);      // for no-collide: it ignores skaters instead
+    if (present && noCollide_) ApplyNoCollide(logf); // SetNoCollide could not reach an absent actor
     if (!present) QuietAnimForever(logf);
     if (logf) logf(present ? "[proxy] peer is back in our level -- their skater is visible again"
                            : "[proxy] peer is in another level -- their skater is hidden here");
@@ -1580,11 +1605,13 @@ void Proxy::Destroy(void (*logf)(const char*)) {
     }
 #endif
     if (mesh) PeerBodiesRestore(mesh, logf);        // hand the trim back while the bodies still exist
+    if (mesh) { void* root = safePtr(actor_, off::kActorRootComp);
+                PeerNoCollideRestore(mesh, root ? (void*)((uint8_t*)root + off::kCompBodyInstance) : nullptr, logf); }
 
     // ---- 2. nothing may write to it from here on
     DropProxyActor(actor_);
     DropAnimSlot(this);
-    if (mesh) { pose::Forget(mesh); PeerBodiesForget(mesh); }
+    if (mesh) { pose::Forget(mesh); PeerBodiesForget(mesh); PeerNoCollideForget(mesh); }
 
     // ---- 3. the actors themselves
     bool killed = false;
