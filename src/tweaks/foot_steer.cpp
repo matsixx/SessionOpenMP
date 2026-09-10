@@ -128,6 +128,16 @@ static float g_flickVeto  = 10.0f;  // FootSteerFlickVeto (tenths) -- stick unit
                                     // flick. flip_speed maps real flicks over 15..50 on this measure;
                                     // a deliberate steer push runs 1-5. Set from probe data.
 static int   g_blankMs    = 250;    // FootSteerBlankMs -- refractory after a flick or a catch
+// DWELL BEATS SPEED. The flick veto reads the stick's PATH speed over a 0.2 s window and re-arms the
+// blank on every frame that reads high -- so a quick re-position (scoop left, then pull straight
+// down) looked exactly like a catch flick: ~200 ms of re-arming while the window still held the move,
+// then the blank, with the target ZEROED throughout, and only then the chase. Half a second on a
+// 1.4 s air. Field: "the foot doesn't move right away to where you want it". A stick that has STOPPED
+// somewhere non-zero is a steer however fast it got there; a flick returns to centre and settles at
+// nothing. So a settled stick cancels the blank and keeps it cancelled. Held-after-the-flick is
+// untouched: it settles at the rim, which is what it always did.
+static int   g_settleMs   = 60;     // FootSteerSettleMs -- still this long at a non-zero place = a steer
+static float g_settleEps  = 0.06f;  // FootSteerSettleEps (hundredths) -- "still" = moved less than this
 static int   g_catchVeto  = 1;      // FootSteerCatchVeto -- a registered catch is what plants the feet
                                     // on the deck, so steering yields to it. The probe logs how long
                                     // the catch flags stay set, which is what says whether this is
@@ -202,6 +212,10 @@ void FootSteer_ReadConfig(const char* buf) {
     g_deadzone   = (float)TwkIniInt(buf, "FootSteerDeadzone", 0) / 100.0f;
     g_flickVeto  = (float)TwkIniInt(buf, "FootSteerFlickVeto", 100) / 10.0f;
     g_blankMs    = TwkIniInt(buf, "FootSteerBlankMs", 250);
+    g_settleMs   = TwkIniInt(buf, "FootSteerSettleMs", 60);
+    g_settleEps  = (float)TwkIniInt(buf, "FootSteerSettleEps", 6) / 100.0f;
+    if (g_settleMs < 0) g_settleMs = 0; else if (g_settleMs > 1000) g_settleMs = 1000;
+    if (g_settleEps < 0.0f) g_settleEps = 0.0f; else if (g_settleEps > 0.5f) g_settleEps = 0.5f;
     g_catchVeto  = TwkIniInt(buf, "FootSteerCatchVeto", 1);
     g_frame      = TwkIniInt(buf, "FootSteerFrame", 0);
     g_liftCm     = (float)TwkIniInt(buf, "FootSteerReturnLiftCm", 6);
@@ -231,10 +245,10 @@ void FootSteer_ReadConfig(const char* buf) {
     TwkLog("[steer] config: FootSteer=%d Probe=%d ProbeAxis=%d ProbeCm=%d ReachCm=%.0f "
            "ResponseMs=%.0f ReturnMs=%.0f Deadzone=%.2f FlickVeto=%.1f BlankMs=%d CatchVeto=%d "
            "Frame=%d AxisX=%d AxisY=%d TwistDeg=%.0f TwistAxis=%d SwitchInvert=%d FollowIK=%d "
-           "(air only)",
+           "SettleMs=%d SettleEps=%.2f (air only)",
            g_on, g_probe, g_probeAxis, g_probeCm, g_reachCm, g_responseMs, g_returnMs,
            g_deadzone, g_flickVeto, g_blankMs, g_catchVeto, g_frame, g_axisX, g_axisY,
-           g_twistDeg, g_twistAxis, g_switchInv, g_followIK);
+           g_twistDeg, g_twistAxis, g_switchInv, g_followIK, g_settleMs, g_settleEps);
 }
 
 void FootSteer_SaveConfig(char* buf, size_t cap) {
@@ -248,6 +262,8 @@ void FootSteer_SaveConfig(char* buf, size_t cap) {
     TwkIniSetInt(buf, cap, "FootSteerDeadzone",    (int)(g_deadzone * 100.0f + 0.5f));
     TwkIniSetInt(buf, cap, "FootSteerFlickVeto",   (int)(g_flickVeto * 10.0f + 0.5f));
     TwkIniSetInt(buf, cap, "FootSteerBlankMs",     g_blankMs);
+    TwkIniSetInt(buf, cap, "FootSteerSettleMs",    g_settleMs);
+    TwkIniSetInt(buf, cap, "FootSteerSettleEps",   (int)(g_settleEps * 100.0f + 0.5f));
     TwkIniSetInt(buf, cap, "FootSteerCatchVeto",   g_catchVeto);
     TwkIniSetInt(buf, cap, "FootSteerFrame",       g_frame);
     TwkIniSetInt(buf, cap, "FootSteerReturnLiftCm",   (int)g_liftCm);
@@ -285,6 +301,10 @@ struct Foot {
     // taken from it. Cleared whenever the steer grows again, so only an actual return arcs.
     float  retFrom;
     float  lift;
+    // Settle tracking: where the stick last was, and how long it has stayed there.
+    float  lastX, lastY;
+    float  settledS;
+    int    settleCancels;   // blanks cancelled by a settled stick this air -- for the summary
 };
 static Foot   g_footL = {}, g_footR = {};
 static float  g_ease = 0.0f;        // armed ramp; also what eases the offset out on a landing
@@ -342,6 +362,7 @@ static void dumpSamples() {
     int nSwitch = 0, nCatchS = 0, nCatchL = 0, nCatchR = 0;
     float deckMin = 9e9f, deckMax = -9e9f;   // the board's travel relative to you: a bone shows here
     float liftMax = 0.0f, liftEndL = 0.0f, liftEndR = 0.0f;   // the arc's peak, and what was left
+    float steerEndL = 0.0f, steerEndR = 0.0f;                  // ...and whether the return had ARRIVED
                                                               // standing at the last airborne sample
     for (int i = 0; i < g_nBuf; i++) {
         const Sample& s = g_buf[i];
@@ -359,6 +380,8 @@ static void dumpSamples() {
         if (s.gapR > gapMax) gapMax = s.gapR;
         if (s.liftL > liftMax) liftMax = s.liftL;  if (s.liftR > liftMax) liftMax = s.liftR;
         liftEndL = s.liftL; liftEndR = s.liftR;
+        steerEndL = sqrtf(s.sL[0] * s.sL[0] + s.sL[1] * s.sL[1] + s.sL[2] * s.sL[2]);
+        steerEndR = sqrtf(s.sR[0] * s.sR[0] + s.sR[1] * s.sR[1] + s.sR[2] * s.sR[2]);
         if (s.deckX > -9000.0f) {
             if (s.deckX < deckMin) deckMin = s.deckX;
             if (s.deckX > deckMax) deckMax = s.deckX;
@@ -378,7 +401,15 @@ static void dumpSamples() {
            (nCatchS > 0 && nCatchL == 0 && nCatchR == 0) ? "  <-- STATE ONLY, VETO CANNOT FIRE" : "",
            nSwitch, deckMin, deckMax, (deckMax > 8.0f) ? "  <-- THE GAME'S BONE FIRED" : "",
            liftMax, liftEndL, liftEndR,
-           (liftEndL > 0.05f || liftEndR > 0.05f) ? "  <-- RESIDUAL LIFT HELD THROUGH THE AIR" : "");
+           // A residual is a lift still standing AFTER the return arrived. A lift mid-arc at the
+           // last airborne sample is a return still in flight -- the old tag fired on that and cried
+           // wolf on every catch-then-land.
+           ((liftEndL > 0.2f && steerEndL < 2.0f) || (liftEndR > 0.2f && steerEndR < 2.0f))
+               ? "  <-- RESIDUAL LIFT HELD THROUGH THE AIR" : "");
+    if (g_footL.settleCancels || g_footR.settleCancels)
+        TwkLog("[steer]   settled stick cancelled a flick blank: L %d, R %d time(s) (dwell %d ms)",
+               g_footL.settleCancels, g_footR.settleCancels, g_settleMs);
+    g_footL.settleCancels = 0; g_footR.settleCancels = 0;
     // A decimated trace rather than everything: the shape over the stretch is what is being read,
     // and 250 lines per trick would bury it.
     const int want = 12;
@@ -421,11 +452,25 @@ static bool updateFoot(Foot& F, bool rightStick, bool armed, bool catchNow, floa
             tx = sx / m * k; ty = sy / m * k;
         }
     }
+    // Has the stick stopped somewhere? Measured on the RAW stick, before the deadzone, so a
+    // deadzone of 0 (the shipped value) does not make "still at centre" look like "still at a place".
+    {
+        const float mvx = sx - F.lastX, mvy = sy - F.lastY;
+        const float mv  = sqrtf(mvx * mvx + mvy * mvy);
+        if (mv > g_settleEps) F.settledS = 0.0f; else F.settledS += dt;
+        F.lastX = sx; F.lastY = sy;
+    }
+    const float rawMag = sqrtf(sx * sx + sy * sy);
+    const bool settledAway = have && armed && (F.settledS >= (float)g_settleMs * 0.001f)
+                             && (rawMag > g_deadzone + 0.15f);   // settled AT A PLACE, not at centre
     // A measured flick is the catch, not a steer. Zero the target and hold it through a refractory
-    // window so the rest of the flick cannot leak in behind the rate limiter.
+    // window so the rest of the flick cannot leak in behind the rate limiter -- unless the stick has
+    // already come to rest somewhere: then the fast move WAS the steer, and blanking it is the
+    // half-second of nothing the field reported. A catch veto is never overridden by this.
     float spd = 0.0f, peak = 0.0f;
-    if (ScoopSpeed_FlickMeasure(rightStick, 0.20f, &spd, &peak, nullptr) && spd >= g_flickVeto)
+    if (!settledAway && ScoopSpeed_FlickMeasure(rightStick, 0.20f, &spd, &peak, nullptr) && spd >= g_flickVeto)
         F.blankUntil = now + (double)g_blankMs / 1000.0;
+    if (settledAway && !catchNow && now < F.blankUntil) { F.blankUntil = 0.0; F.settleCancels++; }
     if (catchNow) F.blankUntil = now + (double)g_blankMs / 1000.0;
     const bool blanked = now < F.blankUntil;
     if (blanked) { tx = 0.0f; ty = 0.0f; }
@@ -442,7 +487,11 @@ static bool updateFoot(Foot& F, bool rightStick, bool armed, bool catchNow, floa
         // (no discontinuity when it starts, none when it lands) and widest halfway, which is exactly
         // where the straight line would be deepest inside the board.
         const bool returning = tgtMag < curMag;
-        if (!returning) { F.retFrom = 0.0f; F.lift = 0.0f; }
+        // THE ARC IS FOR A STICK-DRIVEN RETURN ONLY. A return the catch veto or a flick blank caused
+        // is the foot going to the DECK, and bumping it up on the way (field: 4 cm at the catch,
+        // exactly as it should be planting) fights the one moment the game owns. Those go straight.
+        const bool arcOk = returning && !blanked;
+        if (!arcOk) { F.retFrom = 0.0f; if (F.lift > 0.0f) { F.lift -= F.lift * dt * 20.0f; if (F.lift < 0.01f) F.lift = 0.0f; } }
         else if (F.retFrom <= 0.0f) F.retFrom = curMag;
         const float rate = returning ? (1000.0f / g_returnMs) : (1000.0f / g_responseMs);
         const float step = rate * dt;
@@ -458,7 +507,7 @@ static bool updateFoot(Foot& F, bool rightStick, bool armed, bool catchNow, floa
         // few cm above the deck all the way down and sat on it the moment the board touched --
         // exactly the lifetime of an armed steer. Random per catch, because it depends on where the
         // last step happened to land inside the bump.
-        if (returning) {
+        if (arcOk) {
             const float newMag = sqrtf(F.s[0] * F.s[0] + F.s[1] * F.s[1]);
             if (newMag <= 1e-4f) { F.lift = 0.0f; F.retFrom = 0.0f; }     // home: the arc is over
             else {
@@ -958,8 +1007,11 @@ void FootSteer_ResetDefaults() {
     // These must track the field-tuned values at the top of the file. They drifted once already:
     // the statics were updated when each number was settled in the headset and these were not, so
     // "Reset to defaults" would have quietly restored the pre-tuning feel.
-    g_reachCm = 30.0f; g_responseMs = 300.0f; g_returnMs = 150.0f;
-    g_deadzone = 0.05f; g_flickVeto = 10.0f; g_blankMs = 250; g_catchVeto = 1;
+    // Same numbers as ReadConfig's fallbacks -- they had drifted apart a THIRD time (30/300/5 here
+    // against 40/250/0 there), so "Reset to defaults" changed the feel. ReadConfig is the truth.
+    g_reachCm = 40.0f; g_responseMs = 250.0f; g_returnMs = 150.0f;
+    g_deadzone = 0.0f; g_flickVeto = 10.0f; g_blankMs = 250; g_catchVeto = 1;
+    g_settleMs = 60; g_settleEps = 0.06f;
     g_frame = 0; g_axisX = 1; g_axisY = 0; g_liftCm = 6.0f; g_liftAxis = 2;
     g_twistDeg = 5.0f; g_twistAxis = 4; g_switchInv = 3; g_followIK = 1;
     TwkMarkDirty();
