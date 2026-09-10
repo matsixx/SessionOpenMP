@@ -256,6 +256,8 @@ using SetScalarParamFn = void (*)(void* mid, uint64_t nameFName, float value);
 // ASkateboardEx::RefreshVisuals(board). Takes the board actor; reads the peer's items off the game
 // instance's profile, so it only means anything inside the cosmetics borrow window.
 using BoardRefreshVisFn = void (*)(void* boardActor);
+// UWidget::SetIsEnabled(bool). Greys the widget and blocks its input; the row stays on the page.
+using WidgetSetEnabledFn = void (*)(void* widget, bool enabled);
 // Peer body trim (peer_bodies.cpp): the body-level knobs behind a proxy's physical animation.
 // FBodyInstance::SetInstanceSimulatePhysics takes three bools in 4.26 and two in 4.25; passing three
 // is safe either way, since a Microsoft x64 caller that hands over an argument the callee does not
@@ -472,6 +474,8 @@ struct Syms {
     MatParamNamesFn      MatParamNames    = nullptr;   // board wear: the parameter names per contact part
     SetScalarParamFn     SetScalarParam   = nullptr;   // ...and the write onto a dynamic material
     BoardRefreshVisFn    BoardRefreshVisuals = nullptr; // ...and what builds that material table
+    void*                GotoMarkerUpdate   = nullptr;  // the marker-return seam grace.cpp pre-hooks
+    WidgetSetEnabledFn   WidgetSetEnabled = nullptr;    // grey a menu row out (UWidget::SetIsEnabled)
     // Peer body trim (peer_bodies.h): cutting a proxy's physical animation down to what can be seen.
     // All optional -- without them a peer simply keeps the whole simulated asset, as before.
     BodySetSimulateFn    BodySetSimulate   = nullptr;
@@ -688,6 +692,27 @@ namespace off {
     constexpr int kRefSkelFinalBoneInfo = 0x20;
     constexpr int kMeshBoneInfoStride   = 12;    // FMeshBoneInfo { FName Name; int32 ParentIndex; }
     constexpr int kSkaterMoveComp     = 0x550;   // -> USkaterMovementComponent
+    // THE MARKER RETURN, which is how the game itself puts a skater somewhere. ASkaterCharacter::Tick
+    // calls UpdatePendingGotoMarker every frame; it early-outs unless bit 0 of +0xb30 is set, and
+    // otherwise does the WHOLE job -- skater and board placed, rotations, velocity and state reset.
+    // So "teleport properly" is: fill the info, set the flag, let the game's own tick do it.
+    constexpr int kSkaterPendingMarker   = 0xac0;  // FSessionPlayerMarkerInfo (kMarkerInfoSize bytes)
+    constexpr int kSkaterGotoMarkerFlag  = 0xb30;  // _isGotoMarkerPending (bit 0)
+    // ASkaterCharacterBase::_wasJustSpawned: 1 from PostInitCharacter until the FIRST physical-
+    // animation enable (the first mount). Long-lived, so grace.cpp can poll it without a race.
+    constexpr int kSkaterWasJustSpawned  = 0x64a;
+    // ...and that struct's fields (PDB).
+    constexpr int kMkIsSet          = 0x00;
+    constexpr int kMkIsOnBoard      = 0x01;
+    constexpr int kMkBoardReversed  = 0x02;
+    constexpr int kMkFootPosition   = 0x03;
+    constexpr int kMkSkaterLoc      = 0x04;   // FVector
+    constexpr int kMkSkaterRot      = 0x10;   // FQuat
+    constexpr int kMkBoardLoc       = 0x20;   // FVector
+    constexpr int kMkBoardRot       = 0x30;   // FQuat
+    constexpr int kMkControlRot     = 0x40;   // FRotator (pitch, yaw, roll)
+    constexpr int kMkCameraBoomRot  = 0x4c;   // FRotator
+    constexpr int kMkMoveDirection  = 0x58;   // FVector
     constexpr int kSkaterBoard        = 0x568;   // -> ASkateboardEx   (ownership MUST be back-link checked)
     constexpr int kBoardSkater        = 0x4d8;   // ASkateboardEx -> owning skater (the back-link)
     constexpr int kMoveOnBoard        = 0xe20;   // USkaterMovementComponent::bOnBoard

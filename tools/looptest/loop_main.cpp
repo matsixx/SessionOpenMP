@@ -159,7 +159,10 @@ static bool codecCheck() {
         e.rel[0] = 11.f * i; e.rel[1] = -55.5f; e.rel[2] = 2.25f;
         e.vol = 1.25f; e.pitch = 0.875f; e.start = 0.5f; e.ageMs = (uint16_t)(37 + i * 400);
     }
-    uint8_t pkt[1024];
+    // Headroom for the appended trailer (minor >= 1). This check is about FIDELITY -- every field
+    // round-trips exactly -- so it must not sit on the bare 1 KB ceiling, where a maximal packet
+    // rightly drops its last audio event to fit the trailer. The ceiling itself is poseSliceCheck's.
+    uint8_t pkt[1024 + 8];
     const int n = Pack(s, 123456789ull, pkt, sizeof(pkt));
     if (n <= 0) { printf("  codec: Pack failed\n"); return false; }
     State o; uint64_t su = 0;
@@ -1616,6 +1619,18 @@ static bool wireVersionCheck() {
       const bool all = good && skewed && older && foreign;
       printf("  peek reports ok / major skew / older / foreign     %s\n", all ? "PASS" : "FAIL");
       if (!all) ok = false; }
+
+    // THE FIRST APPENDED FIELD, and the promise made for it: it round-trips, and a packet from a
+    // minor-0 sender -- which has no such byte -- parses with the field at its default instead of
+    // reading one byte past its own end.
+    { State g = s; g.grace = 1;
+      uint8_t gp[2048]; const int gn = Pack(g, 1234567, gp, sizeof(gp));
+      State rt{}; const bool round = gn > 0 && Unpack(gp, gn, rt, nullptr) && rt.grace == 1;
+      uint8_t old[2048]; memcpy(old, gp, (size_t)(gn - 1)); old[5] = 0;   // minor 0: the byte is not there
+      State ro{}; const bool older = Unpack(old, gn - 1, ro, nullptr) && ro.grace == 0;
+      const bool both = round && older;
+      printf("  grace round-trips; a minor-0 packet reads grace 0     %s\n", both ? "PASS" : "FAIL");
+      if (!both) ok = false; }
 
     return ok;
 }

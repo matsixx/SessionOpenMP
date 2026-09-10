@@ -223,7 +223,7 @@ void Proxy::ClearState() {
     for (auto& l : audioLoops_) { l.slot = 0; l.comp = nullptr; }
     actor_ = nullptr; world_ = nullptr; tries_ = 0; lastTryMs_ = 0;
     refreshed_ = repOff_ = boardRepOff_ = tickOff_ = boardHidden_ = simOn_ = boardLogged_ = false;
-    nearLocal_ = true; boardNear_ = true; present_ = true;
+    nearLocal_ = true; boardNear_ = true; present_ = true; noCollide_ = false;
     animTickSaved_ = 0xff; animTickState_ = 0xff; animCheckUs_ = 0; animSeenUs_ = 0;
     animOnBoardSeen_ = -1; animHoldUntilUs_ = 0; animFrozenLogMs_ = 0;
     lastBailing_ = 0;
@@ -924,7 +924,7 @@ void Proxy::Apply(const repl::State& s, uint64_t nowMs, uint64_t nowUs, void (*l
             // made it unhittable: the stamp turns simulation OFF, and a non-simulating deck has no
             // body for another skater to stall on, so it could be shoved around by depenetration but
             // never ridden. Driven, it is the same live rigid body a bailed board already is.
-            const bool loose = s.boardSim && g_tun.looseBoardSim && boardNear_ && g_tun.velocityDrive;
+            const bool loose = s.boardSim && g_tun.looseBoardSim && boardNear_ && !noCollide_ && g_tun.velocityDrive;
             if (!loose || !VelocityDrive(s, nowUs)) {
                 StampBoard(s);
                 st_.carryStamps++;
@@ -966,7 +966,7 @@ void Proxy::Apply(const repl::State& s, uint64_t nowMs, uint64_t nowUs, void (*l
         // range, and the session's distance gate (with hysteresis) turns the sim back on before the
         // local player can reach it. Fewer live rigid bodies, and the whole velocity-drive PhysX
         // call chain skipped for everyone out of reach.
-        if (!boardNear_) { if (simOn_) StopBoardSim(); StampBoard(s); }
+        if (!boardNear_ || noCollide_) { if (simOn_) StopBoardSim(); StampBoard(s); }
         else if (handHeld) { st_.carryStamps++; StampBoard(s); }
         else if (!g_tun.velocityDrive || airborne) { if (airborne) st_.airSkips++; StampBoard(s); }
         else if (!VelocityDrive(s, nowUs)) StampBoard(s);
@@ -1501,6 +1501,23 @@ void Proxy::PlayPushStates(const uint8_t* states, int n) {
     }
 }
 
+void Proxy::SetNoCollide(bool nc, void (*logf)(const char*)) {
+    if (nc == noCollide_) return;
+    noCollide_ = nc;
+    if (!actor_ || !present_) return;                // an absent actor is already decollided
+    const Syms& S = Get();
+    if (nc && simOn_) StopBoardSim();                // stamped from here on (see Apply)
+#ifdef _WIN32
+    if (S.SetActorCollision) {
+        void* bd = OwnBoard();
+        __try { S.SetActorCollision(actor_, !nc); if (bd) S.SetActorCollision(bd, !nc); }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+#endif
+    if (logf) logf(nc ? "[proxy] their collision is off (spawn grace / replay editor)"
+                      : "[proxy] their collision is back");
+}
+
 void Proxy::SetPresent(bool present, void (*logf)(const char*)) {
     if (!actor_ || present == present_) return;
     present_ = present;
@@ -1514,7 +1531,7 @@ void Proxy::SetPresent(bool present, void (*logf)(const char*)) {
         if (!a) return;
 #ifdef _WIN32
         if (S.SetActorHidden)    { __try { S.SetActorHidden(a, !present); }   __except (EXCEPTION_EXECUTE_HANDLER) {} }
-        if (S.SetActorCollision) { __try { S.SetActorCollision(a, present); } __except (EXCEPTION_EXECUTE_HANDLER) {} }
+        if (S.SetActorCollision) { __try { S.SetActorCollision(a, present && !noCollide_); } __except (EXCEPTION_EXECUTE_HANDLER) {} }
 #endif
     };
     reveal(actor_);

@@ -310,6 +310,14 @@ static const SigEntry kSigs[] = {
     // the contact-part -> dynamic-material table the two calls above write through -- and a proxy
     // never runs it on its own, which is why a peer's board had no materials to scuff at all.
     { "BoardRefreshVisuals",   "40 57 48 83 EC 20 48 8B 3D ?? ?? ?? ?? 48 85 FF ?? ?? 48 89 5C 24 30 48 8D 99 80 02 00 00 48 8B 03 48 8B CB FF 90 F8 00 00 00", false },
+    // ASkaterCharacter::UpdatePendingGotoMarker                          Epic 0x100d2a0 / Steam 0xfcd0d0
+    // HOOKED (grace.cpp), never called: a pre-hook reads _isGotoMarkerPending on entry, before this
+    // same call consumes it -- the one place a marker return can be seen without racing the tick.
+    { "GotoMarkerUpdate",      "48 8B C4 55 56 48 8D 68 A8 48 81 EC 48 01 00 00 F6 81 30 0B 00 00 01 48 8B F1 0F 84 ?? ?? ?? ?? F6 81 10 07 00 00 02", false },
+    // UWidget::SetIsEnabled                                              Epic 0x27b7a20 / Steam 0x2779db0
+    // Greys a menu row and refuses its input -- how "Teleport to them" says no when there is nowhere
+    // to go. Optional: without it the row still declines in its status text.
+    { "WidgetSetEnabled",      "40 53 48 83 EC 60 44 0F B6 81 B4 00 00 00 0F B6 C2 41 80 E0 FB C0 E0 02 44 0A C0 4C 89 AC 24 88 00 00 00", false },
     // --- PEER BODY TRIM (peer_bodies.cpp). All optional: without them a peer keeps the whole
     // simulated asset, which is what shipped before.
     // FBodyInstance::SetInstanceSimulatePhysics       Epic 0x2e57d00 / Steam 0x2e1a760
@@ -1031,6 +1039,8 @@ const Syms& Resolve(void (*logf)(const char*)) {
     g_syms.MatParamNames      = (MatParamNamesFn)   take("MatParamNames");
     g_syms.SetScalarParam     = (SetScalarParamFn)  take("SetScalarParam");
     g_syms.BoardRefreshVisuals = (BoardRefreshVisFn) take("BoardRefreshVisuals");
+    g_syms.GotoMarkerUpdate   =                     take("GotoMarkerUpdate");     // hooked, never called
+    g_syms.WidgetSetEnabled   = (WidgetSetEnabledFn) take("WidgetSetEnabled");
     g_syms.BodySetSimulate    = (BodySetSimulateFn)  take("BodySetSimulate");
     g_syms.BodySetResponse    = (BodySetResponseFn)  take("BodySetResponse");
     g_syms.BodyUpdateFilter   = (BodyUpdateFilterFn) take("BodyUpdateFilter");

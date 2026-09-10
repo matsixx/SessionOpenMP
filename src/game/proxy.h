@@ -176,6 +176,10 @@ public:
     // Written by the session each frame from the distance between the LOCAL player and this peer
     // (with hysteresis). Far = the board is stamped, never simulated.
     void       SetNearLocal(bool near) { nearLocal_ = near; }
+    // This peer must not collide with anything right now -- they are in spawn grace, in the replay
+    // editor, or WE are (a grace skater cannot hit anyone either). Skater and board both; the board
+    // is STAMPED while set, because a simulating body with no collision falls through the floor.
+    void       SetNoCollide(bool nc, void (*logf)(const char*));
     // The BOARD's own distance, kept apart from the skater's. A board that has been set down is no
     // longer near its owner: it rolls. One that has rolled over to you has to be a real rigid body
     // even though its owner is far off, and a distant owner must still not be paying for body
@@ -233,6 +237,7 @@ private:
     bool       refreshed_ = false, repOff_ = false, boardRepOff_ = false, tickOff_ = false;
     bool       boardHidden_ = false, simOn_ = false, boardLogged_ = false;
     bool       present_ = true;           // false = concealed because the peer is in another level
+    bool       noCollide_ = false;        // see SetNoCollide
     bool       nearLocal_ = true;         // default near: sim until the session has measured
     bool       boardNear_ = true;         // ...and the same for the board, measured to the DECK
     // The offscreen anim throttle's driver state. The engine's own visibility flag proved capable

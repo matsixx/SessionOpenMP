@@ -96,6 +96,13 @@ namespace omp { namespace repl {
 //     one. Peers on adjacent minors keep seeing each other, which is the whole point -- a mismatch
 //     used to mean an invisible player.
 //   * So: append and bump the MINOR whenever it is possible; bump the MAJOR only when it is not.
+//   * AND RESERVE THE BYTES. The appended trailer is written after the audio section, so both the
+//     pose slice and the audio sizing subtract kTrailBytes -- otherwise a packet whose audio fills
+//     the cap exactly leaves no room for the trailer and the WHOLE packet fails. The codec gate
+//     caught that on minor 1's first run; it is the easy mistake here, not the version arithmetic.
+//
+// MINOR LINEAGE, so an appended field's introducing version is never guesswork:
+//   1.1 -> `grace` (spawn / marker-return collision grace, one flags byte; bit 0 used, 1-7 spare)
 // The cost is two bytes on a packet of several hundred. The thing it buys is that "one of you needs
 // to update or you will not see each other" stops being the answer to every future wire change.
 static const uint32_t kMagic = 0x5A504D4Fu; // "OMPZ"
@@ -304,6 +311,11 @@ static void limbRead(Rd& r, uint8_t mode, float* p, const float* body) {
     }
 }
 
+// Bytes written AFTER the audio section -- the appended fields of minor >= 1. Both the pose slice and
+// the audio sizing reserve them, or a cap that the audio fills exactly leaves no room for the
+// trailer and the whole packet fails, which is what the codec gate caught the first time.
+static const int kTrailBytes = 1;   // minor 1: the grace flags byte
+
 int Pack(const State& s, uint64_t senderUs, uint8_t* out, int cap, int* poseWrote) {
     if (poseWrote) *poseWrote = 0;
     // A packet without a valid board pose never ships; Unpack enforces the same gate on arrival.
@@ -467,7 +479,7 @@ int Pack(const State& s, uint64_t senderUs, uint8_t* out, int cap, int* poseWrot
         // lands exactly on a slice boundary packs the pose flush to the cap and the audio counts
         // overflow by two -- the whole packet then fails. Found by probe: caps 502/512/522 (every
         // extra bone) all returned 0 while their neighbours passed.
-        const int room  = w.ok ? (cap - w.n - 3 - 2) : 0;
+        const int room  = w.ok ? (cap - w.n - 3 - 2 - kTrailBytes) : 0;
         const int fit   = room > 0 ? room / (4 + 3 * 2) : 0;
         if (total > 0 && fit > 0) {
             const int first = (s.poseFirst < total) ? s.poseFirst : 0;
@@ -487,7 +499,7 @@ int Pack(const State& s, uint64_t senderUs, uint8_t* out, int cap, int* poseWrot
     // in what is left, so an overfull frame drops trailing SOUNDS and the skater still moves. Without
     // an explicit budget one section silently eats the other's, and the loser vanishes with no error.
     {
-        const int room = w.ok ? (cap - w.n - 2) : 0;      // -2 for the two count bytes
+        const int room = w.ok ? (cap - w.n - 2 - kTrailBytes) : 0;   // -2 for the two count bytes, and the trailer
         int used = 0, nl = 0, ne = 0;
         for (int i = 0; i < s.nLoops && i < kAudioMaxLoops; i++) {
             const int sz = audioLoopSize(s.loops[i]);
@@ -504,6 +516,8 @@ int Pack(const State& s, uint64_t senderUs, uint8_t* out, int cap, int* poseWrot
         w.u8((uint8_t)ne);
         for (int i = 0; i < ne; i++) audioWriteEvent(w, s.events[i]);
     }
+    // ---- APPENDED, minor 1: after everything a minor-0 reader parses, so it never reaches this.
+    w.u8((uint8_t)(s.grace ? 1 : 0));
     return w.ok ? w.n : 0;
 }
 
@@ -514,10 +528,9 @@ bool Unpack(const uint8_t* d, int len, State& out, uint64_t* senderUs) {
     // A different MAJOR means the fixed layout moved: nothing after this byte is parseable, and
     // guessing at it is exactly the misparse the magic exists to prevent.
     if (r.u8() != kWireMajor) return false;
-    // A different MINOR is fine in both directions. Nothing gates on it yet because no appended
-    // field exists; the first one reads `if (wireMinor >= N) ...` at the very END of this function.
+    // A different MINOR is fine in both directions: every appended field is read at the END of this
+    // function, gated on `wireMinor >= N`, so an older sender's missing bytes are never reached for.
     const uint8_t wireMinor = r.u8();
-    (void)wireMinor;
     const uint64_t su = (uint64_t)r.u32() * 250ull;   // 0.25 ms units back to microseconds
     const uint8_t f1 = r.u8(), f2 = r.u8();
     out = State{};
@@ -695,6 +708,8 @@ bool Unpack(const uint8_t* d, int len, State& out, uint64_t* senderUs) {
         }
         out.nEvents = (uint8_t)ne;
     }
+    // ---- APPENDED FIELDS, each gated on the minor that introduced it.
+    if (wireMinor >= 1) out.grace = (uint8_t)(r.u8() & 1);
     if (!r.ok) return false;
     // Post-decode discipline: no packet field is an index or a pointer, and poses are range-checked,
     // so a hostile or corrupt packet can at worst move a proxy, never corrupt local state.

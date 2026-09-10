@@ -78,6 +78,14 @@ int  ProxyBodyFeel(void* actor, int16_t* out, int cap, int* verOut); // 0 = that
 // ---- proximity voice. Capture and the wire live in session; the sound itself is the game's
 // (game/voice_audio). `peerId` is the transport index, as everywhere; a mute is persisted by the
 // peer's PeerId (mutelist.h) and applied on OUR end only.
+// Go to where a peer is standing. REQUEST, not an action: the menu row that asks for this runs on
+// the game's UI path, and putting a skater somewhere belongs on the session's own frame, which owns
+// the pawn and every proxy. Honoured on the next frame, or dropped with a log line saying why.
+void RequestTeleportTo(int peerId);
+// Is this peer in OUR level with a skater standing in it? What decides whether teleporting to them
+// can do anything, so the row can say so instead of declining silently.
+bool PeerIsHere(int peerId);
+
 void VoiceSetMuted(int peerId, bool muted);
 bool VoiceIsMuted(int peerId);
 bool VoiceTalking(int peerId);            // a voice frame from them within the last ~300 ms

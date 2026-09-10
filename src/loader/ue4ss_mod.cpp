@@ -32,6 +32,7 @@
 #include "game/gather.h"
 #include "game/proxy.h"
 #include "game/audio.h"
+#include "game/grace.h"
 #include "game/pose.h"
 #include "game/spectate.h"
 #include "game/dropper.h"
@@ -790,6 +791,7 @@ static void GameThreadFrame() {
     // path EVERY sound in the game takes, and the standing rule is that the mod is fully inert until
     // a session exists. Idempotent, so the repeated call costs a bool test.
     game::audio::Install(&logLine);
+    game::grace::Install(&logLine);          // the marker-return pre-hook (spawn grace)
 
     // pawn validity: re-checked every run, so a level change or possession swap cannot leave a freed
     // pointer in use.

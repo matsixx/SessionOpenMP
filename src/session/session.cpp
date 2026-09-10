@@ -16,6 +16,8 @@
 #include "../game/game_syms.h"
 #include "../game/cosmetics.h"
 #include "../game/audio.h"
+#include "../game/teleport.h"
+#include "../game/grace.h"
 #include "../game/pose.h"
 #include "../game/spectate.h"
 #include "../game/dropper.h"
@@ -1811,7 +1813,35 @@ void VoiceSetLoopback(bool) {}
 bool VoiceLoopback() { return false; }
 #endif
 
+// -1 = nothing asked for. Written by the menu, drained by Frame.
+static volatile long g_teleportTo = -1;
+// The LOCAL skater is in spawn grace or the replay editor: no proxy may collide with them this frame.
+static bool g_ownNoCollide = false;
+void RequestTeleportTo(int peerId) { InterlockedExchange(&g_teleportTo, (long)peerId); }
+
+bool PeerIsHere(int peerId) {
+    for (auto& s : g_slots)
+        if (s.used && s.peerIdx == peerId && s.proxy.actor() && s.proxy.Present()) return true;
+    return false;
+}
+
 void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
+    // ---- go to a peer, if the menu asked. Taken exactly once whether it works or not: a request
+    // that could not be honoured must not sit there and fire when they next come into range.
+    {
+        const long want = InterlockedExchange(&g_teleportTo, -1);
+        if (want >= 0) {
+            bool done = false;
+            for (auto& s : g_slots) {
+                if (!s.used || s.peerIdx != (int)want || !s.proxy.actor()) continue;
+                done = game::TeleportLocalToProxy(ownPawn, s.proxy.actor(), s.proxy.OwnBoard(),
+                                                  s.proxy.stats().onBoard, g_logf);
+                break;
+            }
+            if (!done && g_logf)
+                g_logf("[teleport] that player is not in your level right now -- nothing moved");
+        }
+    }
     game::pose::SetLogger(g_logf);           // idempotent; the stale-pose line needs a voice
     if (!g_cfg.enabled) return;
     // (The re-dress-everyone-when-OUR-bone-count-changes block lived here. It existed only so the
@@ -1899,6 +1929,12 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
         repl::State own;
         if (gatherOwn(ownPawn, own)) {
             own.headYaw = g_ownHeadYaw; own.headPitch = g_ownHeadPitch;   // SessionTweaks' head look, if any
+            // SPAWN GRACE, decided here because this is where the push state is fresh, and published
+            // as the first appended wire field. Locally it also means every proxy stops colliding
+            // (below): a grace skater cannot hit anyone, and nobody can hit them.
+            game::grace::Tick(ownPawn, nowMs, own.pushState, g_logf);
+            own.grace = game::grace::Active() ? 1 : 0;
+            g_ownNoCollide = (own.grace != 0) || own.replaying;
             g_ownLast = own; g_haveOwn = true;
             // MEASUREMENT (debug::paProbe): the local skater's physical-animation state, in the
             // same shape as the proxies' [paprobe] line.
@@ -2469,6 +2505,9 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
             // there the spawn ITSELF is the damage, whatever the timing.
             if (!s.proxy.EnsureSpawned(ownPawn, out, nowMs, g_logf)) continue;
         }
+        // Nobody collides with a skater in grace or in the replay editor, and a grace skater collides
+        // with nobody. Their reasons travel (grace, replaying); ours is local.
+        s.proxy.SetNoCollide((out.grace != 0) || out.replaying || g_ownNoCollide, g_logf);
         s.proxy.Apply(out, nowMs, nowUs, g_logf);
         // Release the peer's one-shot sounds whose moment the playback clock has now reached. AFTER
         // Apply so they are placed against this frame's body pose, and drained from the stream's own

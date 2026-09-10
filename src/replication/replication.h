@@ -206,6 +206,14 @@ struct State {
     AudioLoop  loops[kAudioMaxLoops];
     AudioEvent events[kAudioMaxEvents];
 
+    // ==== APPENDED FIELDS (minor >= 1) ==================================================================
+    // SPAWN GRACE: the sender has just spawned or returned to a marker and has not pushed yet (plus
+    // a short delay after). Observers drop this skater's collision, board included, while it is set.
+    // Only the owner can know this -- it ends on THEIR push -- so it travels rather than being
+    // guessed. Bit 0 of a flags byte; bits 1-7 are spare for later minors, which a reader of this
+    // minor ignores by construction.
+    uint8_t    grace = 0;
+
     // ==== THE POSE LANE ==============================================================================
     // Component-space bone transforms, sent when the receiver's own anim graph cannot produce the
     // pose. There are TWO such cases and they are mirror images, both measured:
@@ -258,7 +266,8 @@ struct State {
 // each on `minor >= N`, so peers one minor apart still see each other. Append and bump the minor
 // wherever it is possible; bump the major only when a field has to move.
 constexpr uint8_t kWireMajor = 1;
-constexpr uint8_t kWireMinor = 0;
+// 1.1: `grace` appended -- the first field added under the version rule rather than a magic letter.
+constexpr uint8_t kWireMinor = 1;
 
 // What a snapshot that would not parse actually was. Lets the reject path say who needs to update
 // instead of leaving a peer silently invisible.

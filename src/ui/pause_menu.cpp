@@ -439,6 +439,9 @@ static int       g_playerRowPids[kMaxLobbyRows];                // transport ind
 static char      g_playerRowNames[kMaxLobbyRows][40];
 static uint8_t   g_kickRow[0x90], g_banRow[0x90];
 static uint64_t  g_kickKey = 0, g_banKey = 0;
+static uint8_t   g_tpRow[0x90];          // "Teleport to them", on PG_PLAYER
+static uint64_t  g_tpKey = 0;
+static int       g_tpAt  = -1;           // widget index within the last build; -1 = not on this page
 static char      g_selPeerId[80] = {0}, g_selPeerName[40] = {0};
 static volatile LONG g_havePeerAction = 0;
 static char      g_actPeerId[80] = {0}, g_actPeerName[40] = {0};
@@ -628,7 +631,6 @@ static volatile LONG g_spectatePending = kSpecNoPending;   // a PEER ID, posted 
 // before the game thread runs.
 static uint8_t   g_viewRow[0x90];
 static uint64_t  g_viewKey = 0;
-static FTextBlob g_viewOpts[2];
 // ---- "Synced replay length", sitting with Look At and Sync Replay because that is the feature it
 // belongs to. A MultiOption, not a slider: both its neighbours are, this page injects a fixed row
 // count onto a NATIVE page and has no path to stamp a progress bar's current value onto its widget
@@ -648,7 +650,6 @@ static int syncLenIndexFromPrefs() {
     for (int i = 0; i < kSyncLenCount; i++) if (kSyncLenSecs[i] == want) { best = i; break; }
     return best;
 }
-static int       g_viewSel = 0;                            // display only, rebuilt with the page
 static volatile LONG g_viewPending = kSpecNoPending;
 
 static uint32_t g_tmplPlatforms  = 0xFFFFFFFFu;
@@ -848,21 +849,14 @@ static void buildRows() {
             log("[menu] could not build the replay Look At row -- skipped");
         }
         // The view row fails independently: no Look At page, no view row, but never the reverse.
-        if (g_replayPageKey &&
-            buildRow(g_viewRow, "OmpPeerReplay", "Sync Replay",
-                     "Fetch the Look At player's own replay data and show their skater in your "
-                     "replay. Lasts until you leave the editor.", &g_viewKey)) {
-            const FTextBlob* offT = cachedText("Off");
-            const FTextBlob* onT  = cachedText("On");
-            if (offT && onT) {
-                g_viewOpts[0] = *offT; g_viewOpts[1] = *onT;
-                *(g_viewRow + off::kItemType) = 2;                       // MultiOption
-                *(void**)  (g_viewRow + off::kItemMultiTexts)        = g_viewOpts;
-                *(int32_t*)(g_viewRow + off::kItemMultiTexts + 0x08) = 2;
-                *(int32_t*)(g_viewRow + off::kItemMultiTexts + 0x0c) = 2;
-                *(int32_t*)(g_viewRow + off::kItemMultiStart)        = 0;
-            } else g_viewKey = 0;
-        } else g_viewKey = 0;
+        // A PRESS, not an Off/On switch. It was a two-way toggle, and that confused: "On" read as a
+        // setting that persists, when it is a one-shot fetch that lasts until the editor closes.
+        // Pressing it fetches; leaving the editor ends it, as the text says.
+        if (!(g_replayPageKey &&
+              buildRow(g_viewRow, "OmpPeerReplay", "Sync Replay",
+                       "Press to fetch the Look At player's own replay data and show their skater "
+                       "in your replay. Lasts until you leave the editor.", &g_viewKey)))
+            g_viewKey = 0;
         // The length row fails independently too: losing it must not cost the page its other rows.
         if (g_replayPageKey &&
             buildRow(g_syncLenRow, "OmpSyncLen", "Synced replay length",
@@ -883,6 +877,10 @@ static void buildRows() {
             } else g_syncLenKey = 0;
         } else g_syncLenKey = 0;
     }
+    // Teleport is not moderation, so it builds on its own: if it fails, kick and ban still work.
+    if (!buildRow(g_tpRow, "OmpTeleport", "Teleport to them",
+                  "Go to where they are standing, on your end only", &g_tpKey))
+        g_tpKey = 0;
     if (!buildRow(g_playersOpenRow, "OmpPlayers", "Players",
                   "Kick or ban someone from the game you are hosting", &g_playersOpenKey) ||
         !buildRow(g_kickRow, "OmpKick", "Kick from this session",
@@ -1239,23 +1237,30 @@ static const TArrayHdr* chooseArray(void* page, const TArrayHdr* items, TArrayHd
                    (const uint8_t*)items->data + (size_t)i * off::kItemSize, off::kItemSize);
         memcpy(out2 + (size_t)items->num * off::kItemSize, g_spectateRow, off::kItemSize);
         stampTemplate(out2 + (size_t)items->num * off::kItemSize);
-        if (g_viewKey) {
-            // The row shows the CURRENT Look At player's state, re-read at build time -- opening the
-            // menu is when "what am I looking at" gets refreshed, same as the roster above.
-            g_viewSel = (g_spectateSelPeer >= 0 &&
-                         omp::session::PeerReplaySyncState(g_spectateSelPeer) != 0) ? 1 : 0;
-            *(int32_t*)(g_viewRow + off::kItemMultiStart) = g_viewSel;
-            memcpy(out2 + (size_t)(items->num + 1) * off::kItemSize, g_viewRow, off::kItemSize);
-            stampTemplate(out2 + (size_t)(items->num + 1) * off::kItemSize);
-        }
+        // Order: Look At, then how far back to fetch, then the fetch itself -- the setting sits
+        // with the thing it configures, above the button that uses it.
+        int at = items->num + 1;
         if (g_syncLenKey) {
             // Re-read at build time like the rows above: opening the menu is when a setting should
             // show what it actually is.
             g_syncLenSel = syncLenIndexFromPrefs();
             *(int32_t*)(g_syncLenRow + off::kItemMultiStart) = g_syncLenSel;
-            const int at = items->num + 1 + (g_viewKey ? 1 : 0);
             memcpy(out2 + (size_t)at * off::kItemSize, g_syncLenRow, off::kItemSize);
             stampTemplate(out2 + (size_t)at * off::kItemSize);
+            at++;
+        }
+        if (g_viewKey) {
+            // The footer names what a press will DO for the current Look At player, re-read at
+            // build time like the rows above -- a button that toggles must say which way.
+            const bool synced = g_spectateSelPeer >= 0 &&
+                                omp::session::PeerReplaySyncState(g_spectateSelPeer) != 0;
+            setRowStatus(g_viewRow, synced
+                ? "Press to stop showing their skater in your replay"
+                : "Press to fetch their replay data and show their skater in your replay. "
+                  "Lasts until you leave the editor.");
+            memcpy(out2 + (size_t)at * off::kItemSize, g_viewRow, off::kItemSize);
+            stampTemplate(out2 + (size_t)at * off::kItemSize);
+            at++;
         }
         ours->data = out2; ours->num = items->num + extra; ours->max = ours->num;
         return ours;
@@ -1471,10 +1476,18 @@ static const TArrayHdr* chooseArray(void* page, const TArrayHdr* items, TArrayHd
         setRowStatus(g_banRow,  banned ? "Already on your ban list"
                                        : (hosting ? "Remove them and never host them again"
                                                   : "Adds them to your ban list for sessions you host"));
-        g_muteAt = -1;
+        g_muteAt = -1; g_tpAt = -1;
         if (g_muteKey) {                 // anyone can mute anyone; it is applied on your end only
             *(int32_t*)(g_muteRow + off::kItemMultiStart) = omp::session::VoiceIsMuted(g_selPid) ? 1 : 0;
             g_muteAt = n; add(g_muteRow, true);
+        }
+        if (g_tpKey) {
+            // The row is GREYED OUT when there is nowhere to go (stampValues disables the widget
+            // once it exists) and the status says why, so it never reads as a broken button.
+            const bool here = omp::session::PeerIsHere(g_selPid);
+            setRowStatus(g_tpRow, here ? "Go to where they are standing"
+                                       : "They are on a different map right now");
+            g_tpAt = n; add(g_tpRow, true);
         }
         add(g_kickRow, true);
         add(g_banRow, true);
@@ -1674,6 +1687,16 @@ static void stampValues(void* page) {
             if (void* widget = ((void**)pw->data)[g_muteAt])
                 S.MenuMultiSetIndex(widget, omp::session::VoiceIsMuted(g_selPid) ? 1 : 0);
         g_muteAt = -1;
+    }
+    // The teleport row: greyed out unless that player is in our level. A definition has no enabled
+    // flag, so this can only be done on the WIDGET, after the page is built -- same argument as the
+    // switches above.
+    if (g_tpAt >= 0 && S.WidgetSetEnabled) {
+        const TArrayHdr* pw = (const TArrayHdr*)((uint8_t*)page + off::kPageItemWidgets);
+        if (pw->data && g_tpAt < pw->num)
+            if (void* widget = ((void**)pw->data)[g_tpAt])
+                S.WidgetSetEnabled(widget, omp::session::PeerIsHere(g_selPid));
+        g_tpAt = -1;
     }
     if (g_voiceModeAt >= 0 || g_voiceKeyAt >= 0 || g_voiceRangeAt >= 0 || g_voiceVolAt >= 0 || g_voiceSensAt >= 0 || g_voiceLoopAt >= 0 || g_voiceDevAt >= 0) {
         const TArrayHdr* pw = (const TArrayHdr*)((uint8_t*)page + off::kPageItemWidgets);
@@ -2075,6 +2098,20 @@ static bool handleConfirm(void* page, void* params) {
     const uint64_t itemKey = *(const uint64_t*)((const uint8_t*)params + off::kSelParamsItem + off::kItemKey);
     if (!itemKey) return false;
 
+    // Sync Replay, on the game's replay-editor page. By key alone, ahead of every page-based branch:
+    // that page is not one of ours, so g_page is whatever it was last and must not be consulted.
+    if (g_viewKey && itemKey == g_viewKey) {
+        if (g_spectateSelPeer < 0) {
+            log("[menu] pick a player in Look At first -- Sync Replay applies to them");
+            return true;
+        }
+        // One button, read against the state it is about to change: not synced -> fetch them,
+        // already synced -> stop. No switch to leave in a state that has stopped being true.
+        const bool on = omp::session::PeerReplaySyncState(g_spectateSelPeer) == 0;
+        InterlockedExchange(&g_viewPending, (LONG)((g_spectateSelPeer << 1) | (on ? 1 : 0)));
+        return true;
+    }
+
     if (g_page == PG_ROOT) {
         if (itemKey == g_rootRowKey && PauseMenu_Tuning().subPage) {
             g_page = PG_MP;
@@ -2176,6 +2213,21 @@ static bool handleConfirm(void* page, void* params) {
         return true;
     }
     if (g_page == PG_PLAYER) {
+        if (g_tpKey && itemKey == g_tpKey) {
+            if (!omp::session::PeerIsHere(g_selPid)) {
+                log("[menu] pause: teleport refused -- they are on a different map");
+                return true;
+            }
+            // A REQUEST, not the move itself: this runs on the game's menu path, and putting a
+            // skater somewhere belongs on the session frame that owns the pawn.
+            omp::session::RequestTeleportTo(g_selPid);
+            char m[200];
+            snprintf(m, sizeof(m), "[menu] pause: teleport to '%s'", g_selPeerName);
+            log(m);
+            g_page = PG_PLAYERS;
+            queueSwap(page, "Players", false, true);
+            return true;
+        }
         const bool kick = (itemKey == g_kickKey), ban = (itemKey == g_banKey);
         if (kick || ban) {
             strncpy_s(g_actPeerId,   g_selPeerId,   _TRUNCATE);
@@ -2405,17 +2457,6 @@ static bool handleValueChange(void* params, bool isSlider) {
                 const float v = MPBUBBLE_DIST_MIN + pct * (float)(MPBUBBLE_DIST_MAX - MPBUBBLE_DIST_MIN);
                 MpPrefs_SetBubbleDistM((int)(v + 0.5f));
             }
-            return true;
-        }
-        if (g_viewKey && k == g_viewKey && !isSlider) {
-            const int idx = *(const int32_t*)((const uint8_t*)params + off::kChangeParamsNew);
-            if (idx == g_viewSel) return true;               // engine echo of the current value
-            g_viewSel = idx;
-            if (g_spectateSelPeer < 0) {
-                log("[menu] pick a player in Look At first -- Sync Replay applies to them");
-                return true;
-            }
-            InterlockedExchange(&g_viewPending, (LONG)((g_spectateSelPeer << 1) | (idx ? 1 : 0)));
             return true;
         }
         if (g_spectateKey && k == g_spectateKey && !isSlider) {
