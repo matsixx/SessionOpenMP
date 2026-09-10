@@ -487,10 +487,13 @@ static bool updateFoot(Foot& F, bool rightStick, bool armed, bool catchNow, floa
         // (no discontinuity when it starts, none when it lands) and widest halfway, which is exactly
         // where the straight line would be deepest inside the board.
         const bool returning = tgtMag < curMag;
-        // THE ARC IS FOR A STICK-DRIVEN RETURN ONLY. A return the catch veto or a flick blank caused
-        // is the foot going to the DECK, and bumping it up on the way (field: 4 cm at the catch,
-        // exactly as it should be planting) fights the one moment the game owns. Those go straight.
-        const bool arcOk = returning && !blanked;
+        // THE ARC IS FOR EVERY RETURN, the vetoed ones included. 3.19.368 limited it to stick-driven
+        // returns on a misread of one log line: a lift of 0.70 right after a catch was taken for the
+        // foot being bumped up while it should be planting. It was the opposite -- the catch veto
+        // retiring a foot held out past the tail is exactly the return the arc exists for, over the
+        // deck's edge instead of through it, and the user noticed the foot dragging within a day.
+        // A veto still ends the arc the moment the foot is home, as it always did.
+        const bool arcOk = returning;
         if (!arcOk) { F.retFrom = 0.0f; if (F.lift > 0.0f) { F.lift -= F.lift * dt * 20.0f; if (F.lift < 0.01f) F.lift = 0.0f; } }
         else if (F.retFrom <= 0.0f) F.retFrom = curMag;
         const float rate = returning ? (1000.0f / g_returnMs) : (1000.0f / g_responseMs);
