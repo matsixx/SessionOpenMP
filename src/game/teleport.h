@@ -29,8 +29,8 @@
 
 namespace omp { namespace game {
 
-// How far BEHIND the target to land, in centimetres. Arriving exactly inside somebody shoves them
-// (until the spawn collision grace lands, at which point this can honestly go to zero).
+// How far BEHIND the target to land, in centimetres. Arriving exactly inside somebody shoves them,
+// and there is deliberately no arrival grace to hide behind (1.1.8 withdrew it), so this stays real.
 extern float teleportBehindCm;
 
 // Put the local skater where this proxy is standing. `proxyBoard` may be null -- an off-board peer's

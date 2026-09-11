@@ -17,12 +17,11 @@
 #include "audio.h"
 #include "pose.h"
 #include "peer_bodies.h"       // what a peer's physical animation is actually allowed to cost
-#include "peer_nocollide.h"    // a proxy that ignores skaters WITHOUT switching its collision off
 #include "spectate.h"          // hand the replay camera back before this actor's pointer dies
 #include "../replication/anim_fields.h"
 
 namespace omp { namespace game {
-static void StoreAnimForPostPass(Proxy* owner, void* ai, const repl::State& s, uint64_t nowMs);
+static void StoreAnimForPostPass(Proxy* owner, void* ai, const repl::State& s, uint64_t nowMs, uint8_t trickPulse, uint8_t animReset);
 static void DropAnimSlot(Proxy* owner);
 }}
 #include <cstring>
@@ -211,7 +210,7 @@ void Proxy::Forget() {
     DropProxyActor(actor_);               // no longer one of ours -- drop it before the pointer dies
     DropAnimSlot(this);                   // the anim instance died with the world; never post-apply to it
     { void* pm = actor_ ? safePtr(actor_, off::kSkaterMesh) : nullptr;
-      if (pm) { pose::Forget(pm); PeerBodiesForget(pm); PeerNoCollideForget(pm); } }
+      if (pm) { pose::Forget(pm); PeerBodiesForget(pm); } }
     ClearState();
 }
 
@@ -232,6 +231,8 @@ void Proxy::ClearState() {
     // change-edge caches too: a REPLACEMENT actor must get every write again even when the wire value
     // never changed across the world change (a matching cache would skip its first def/state write).
     lastPushState_ = lastBrakeState_ = 0; lastCrankOn_ = 0; lastCrankIdx_ = 0xfffe;
+    lastStampOk_ = false;                 // a replacement actor's first stamp is never a "jump"
+    lastPaSerial_ = 0; ownerPa_ = true; paPulseUntilMs_ = 0;
     memset(lastTrickName_, 0, sizeof(lastTrickName_)); memset(lastGrindName_, 0, sizeof(lastGrindName_));
     trickDef_ = nullptr;
     st_.alive = false; st_.boardOwned = false;
@@ -264,6 +265,10 @@ struct AnimSlot {
     uint16_t len = 0;
     uint64_t freshMs = 0;
     uint8_t  blob[320];
+    // the TRICK PULSE (trick_pulse.h): an IsTrickPending write owed AFTER the blob, consumed there
+    uint8_t  trickPulse = 0;
+    // the ANIMATION RESET (proxy.cpp 4.7c): a ResetSkater write owed AFTER the blob, consumed there
+    uint8_t  animReset = 0;
     // the foot sockets: raw world, written after the blob in the post-pass
     uint8_t  feetOk = 0;
     float    lFootPos[3], lFootRot[3], rFootPos[3], rFootRot[3];
@@ -285,13 +290,15 @@ struct AnimSlot {
 };
 static AnimSlot g_animSlots[kAnimSlots];
 
-static void StoreAnimForPostPass(Proxy* owner, void* ai, const repl::State& s, uint64_t nowMs) {
+static void StoreAnimForPostPass(Proxy* owner, void* ai, const repl::State& s, uint64_t nowMs, uint8_t trickPulse, uint8_t animReset) {
     if (!owner || !ai || !s.animLen || s.animLen > sizeof(AnimSlot::blob)) return;
     AnimSlot* mine = nullptr;
     for (auto& s : g_animSlots) if (s.owner == owner) { mine = &s; break; }
     if (!mine) for (auto& s : g_animSlots) if (!s.owner) { mine = &s; break; }
     if (!mine) return;
     mine->owner = owner; mine->ai = ai; mine->len = s.animLen; mine->freshMs = nowMs;
+    mine->trickPulse |= trickPulse;       // OR: a pulse must survive until the post-pass consumes it
+    mine->animReset  |= animReset;
     memcpy(mine->blob, s.anim, s.animLen);
     mine->feetOk = (uint8_t)(s.feetOk && s.feetWorld);
     mine->handOk = (uint8_t)(s.handOk && s.handWorld);
@@ -373,6 +380,15 @@ void AnimPostApply(void* ai) {
                 memcpy((uint8_t*)ai + off::kAnimRFootLoc, s.rFootPos, 12);
                 memcpy((uint8_t*)ai + off::kAnimRFootRot, s.rFootRot, 12);
             }
+            // ---- the TRICK PULSE, after the blob: IsTrickPending (0x310) IS a blob field, carrying the
+            // sender's sampled value -- always 0, the pulse is consumed within the sender's own frame --
+            // so the blob would erase a write made any earlier. Last writer before this frame's graph
+            // update, which is exactly where the owner's SetTrick leaves it. Consumed here.
+            if (s.trickPulse) { *((uint8_t*)ai + off::kAnimIsTrickPending) = 1; s.trickPulse = 0; }
+            // ---- the ANIMATION RESET (4.7c), same seam: NativeUpdateAnimation has just copied the
+            // proxy skater's (never set) _pendingAnimationReset over ResetSkater; write it now, before
+            // this update's graph reads it, and that same copy clears it next update.
+            if (s.animReset) { *((uint8_t*)ai + off::kAnimResetSkater) = 1; s.animReset = 0; }
             // ---- the on/off-board TRANSITION POSE SAVE. The graph's mount/dismount transition blends
             // FROM a pose buffer (anim+0x5c0) that only gameplay code fills (ApplyToggleOnBoard/
             // DoBoardPickup -- input paths a proxy never runs), so without this a proxy's transition
@@ -692,8 +708,9 @@ void Proxy::Apply(const repl::State& s, uint64_t nowMs, uint64_t nowUs, void (*l
     // ---- 5. the BODY: position + rotation, both transported, written every frame.
     //         SetActorLocRot here is the FQuat overload -- FOUR floats. A 3-float rotator normalises to
     //         (0,1,0,0) = upside down on every machine.
-    //         ETeleportType MUST be 0 (None): 1 means "do not derive velocity", which leaves
-    //         CharacterMovement->Velocity at zero so the locomotion blend plays IDLE while the body slides.
+    //         ETeleportType is 0 (None) on every ORDINARY frame: 1 means "do not derive velocity",
+    //         which leaves CharacterMovement->Velocity at zero so the locomotion blend plays IDLE while
+    //         the body slides. The one exception is a teleport-sized jump, below.
     if (S.SetActorLocRot && s.bodyPosOk) {
         // The TRANSPORTED capsule quat, applied RAW. NO CONVERSION MAY EVER SIT IN THIS PATH: a
         // euler->quat rebuild is not the inverse of the sender's extraction at yaw ~ +/-180 (a yaw-180
@@ -701,8 +718,29 @@ void Proxy::Apply(const repl::State& s, uint64_t nowMs, uint64_t nowUs, void (*l
         // upside down at random.
         static const float kIdent[4] = {0,0,0,1};
         const float* q = s.bodyRotOk ? s.bodyQuat : kIdent;
+        // ---- a TELEPORT-SIZED JUMP (a marker return, a respawn, a join) is stamped as a physics
+        //      TELEPORT: there is no motion to derive a velocity from, and the bodies and their
+        //      kinematic targets snap with the root instead of being flung across the map. Body physics
+        //      around it is NOT decided here -- it follows the owner's own off/on (4.7c, the mirror
+        //      below), which is what the game does and which also covers a return to a marker too near
+        //      to register as a jump. The interpolation lerps a jump across one snapshot interval, so
+        //      this fires on two or three consecutive frames; each is the same safe move.
+        int teleport = 0;
+        if (lastStampOk_) {
+            const float dx = s.bodyPos[0] - lastStampPos_[0], dy = s.bodyPos[1] - lastStampPos_[1],
+                        dz = s.bodyPos[2] - lastStampPos_[2];
+            const float d2 = dx*dx + dy*dy + dz*dz;
+            if (d2 > g_tun.teleportJumpCm * g_tun.teleportJumpCm) {
+                teleport = 1;
+                if (logf) { static int n = 0; if (++n <= 8) {
+                    char m[120];
+                    snprintf(m, sizeof(m), "[proxy] teleport-sized jump (%.1f m): stamped as a physics teleport", sqrtf(d2) / 100.f);
+                    logf(m); } }
+            }
+        }
+        memcpy(lastStampPos_, s.bodyPos, sizeof(lastStampPos_)); lastStampOk_ = true;
 #ifdef _WIN32
-        __try { S.SetActorLocRot(actor_, s.bodyPos, q, false, nullptr, 0); }
+        __try { S.SetActorLocRot(actor_, s.bodyPos, q, false, nullptr, teleport); }
         __except (EXCEPTION_EXECUTE_HANDLER) {}
 #endif
     }
@@ -799,6 +837,51 @@ void Proxy::Apply(const repl::State& s, uint64_t nowMs, uint64_t nowUs, void (*l
                                            : def ? "RESOLVED" : (s.trickName[0] ? "NOT FOUND" : "cleared"));
             logf(m); } }
     }
+    // ---- 4.7b the TRICK SERIAL: "they flicked", once per SetTrick, same def or not. The game's own
+    //          path for a remote skater (MulticastRPCSetTrick_Implementation) sets IsTrickPending on
+    //          the observer's anim instance so ITS graph takes Idle Skate -> Street Trick State; the
+    //          overlay has no RPC, so this is that path. The pulse is written in the anim post-pass
+    //          AFTER the blob (trick_pulse.h says why), which is what trickPulse_ hands over. The
+    //          first snapshot seeds the serial without firing -- a peer mid-trick when we arrive is
+    //          not a flick we saw. Only with a resolved def: the T-pose gates stay in charge.
+    if (!trickSerialSeen_) { trickSerialSeen_ = true; lastTrickSerial_ = s.trickSerial; }
+    else if (s.trickSerial != lastTrickSerial_) {
+        lastTrickSerial_ = s.trickSerial;
+        if (trickDef_) {
+            trickPulse_ = 1;
+            if (logf) { static int n = 0; if (++n <= 8)
+                logf("[proxy] their trick started -> IsTrickPending pulse, so our graph enters the trick state"); }
+        }
+    }
+    // ---- 4.7c the owner's BODY-PHYSICS state (pa_state.h): every change is an edge the PA mirror
+    //          below follows; a zero byte is an older peer not saying, and ownerPa_ stays true.
+    //          THE PULSE: a marker return disables and re-enables INSIDE ONE CALL (GotoMarker; the
+    //          field log has both broadcasts in the same millisecond), so the sampled state reads ON
+    //          and only the count moves -- by two. Their blueprint still unbinds on the disable and
+    //          rebinds 100 ms after the enable, which is the window the pose snap and the move land
+    //          in on kinematic bodies. Replay it: off for paPulseMs, then the mirror re-enables.
+    if (s.paSerial && s.paSerial != lastPaSerial_) {
+        const bool first = (lastPaSerial_ == 0);
+        const int  n = first ? 0 : ((((int)s.paSerial >> 2) - ((int)lastPaSerial_ >> 2)) & 0x3f);
+        lastPaSerial_ = s.paSerial;
+        ownerPa_ = (s.paSerial & 0x02) != 0;
+        if (!first && n >= 2 && ownerPa_) {
+            paPulseUntilMs_ = nowMs + g_tun.paPulseMs;
+            // ...AND THEIR ANIMATION RESET. UpdatePendingGotoMarker sets the skater's
+            // _pendingAnimationReset; NativeUpdateAnimation copies it into the anim's ResetSkater every
+            // update (on proxies too) and the graph returns to the marker's rest pose -- which is why a
+            // return mid-push stops the push dead on the owner. The skater flag is cleared by the
+            // skater's Tick, which a proxy does not run, so the ANIM flag is written instead: in the
+            // post-pass after the copy, and the copy clears it next update. One frame, like theirs.
+            animReset_ = 1;
+            if (logf) { static int k = 0; if (++k <= 8) {
+                char m[200];
+                snprintf(m, sizeof(m), "[proxy] their body physics went off and on inside one frame (marker return"
+                                       " / teleport, %d broadcasts) -> off here for %u ms, and their animation reset",
+                         n, (unsigned)g_tun.paPulseMs);
+                logf(m); } }
+        }
+    }
 
     // ---- 4.9 the GRIND DEF, the trick-def pattern verbatim. The grind upper-body pose is a blend
     //          space USkaterAnimInstance::GetGrindBlendSpace fetches THROUGH the skater's
@@ -872,7 +955,8 @@ void Proxy::Apply(const repl::State& s, uint64_t nowMs, uint64_t nowUs, void (*l
     if (s.animLen) {
         void* pmesh = safePtr(actor_, off::kSkaterMesh);
         void* ai = pmesh ? safePtr(pmesh, off::kMeshAnimInstance) : nullptr;
-        if (ai) StoreAnimForPostPass(this, ai, s, nowMs);
+        if (ai) { const uint8_t tp = trickPulse_, ar = animReset_; trickPulse_ = 0; animReset_ = 0;
+                  StoreAnimForPostPass(this, ai, s, nowMs, tp, ar); }
     }
     // ---- 6.6 board-link visibility: distinguishes "never LINKED" from "linked but mis-driven", the
     //          two halves of a board that is not showing up on the observer.
@@ -1131,18 +1215,28 @@ void Proxy::Apply(const repl::State& s, uint64_t nowMs, uint64_t nowUs, void (*l
             // both times -- see the changelog. The transition cost is what the game itself pays on
             // every mount; it only hurts here because it is paid per PEER.
             const bool worthIt = nearLocal_ && animTickState_ != 3;
-            const bool want = g_tun.syncPhysAnim && s.onBoard && !s.bailing && worthIt;
+            // ...AND the OWNER's own state (4.7c): off exactly when theirs is -- a marker return, a
+            // teleport, a pickup -- for as long as theirs is. The game holds it off ~100 ms around a
+            // marker return, which is why the guard below is armed only when the setter REFUSED: a
+            // legitimate off-then-on 100 ms apart must not be stretched to 500.
+            const bool pulsed = nowMs < paPulseUntilMs_;                 // 4.7c: their same-frame off/on
+            const bool want = g_tun.syncPhysAnim && ownerPa_ && !pulsed && s.onBoard && !s.bailing && worthIt;
             const int flags = safeByte(actor_, off::kSkaterPhysAnimOn);   // bit 0x10 = physAnim
             if (flags >= 0 && (((flags >> 4) & 1) != 0) != want) {
-                paEnableMs_ = nowMs + 500;
 #ifdef _WIN32
                 __try { S.SetPhysAnimEnabled(actor_, want); } __except (EXCEPTION_EXECUTE_HANDLER) {}
 #endif
-                if (logf) { char m[120];
-                    snprintf(m, sizeof(m), "[proxy] physical animation %s (%s)", want ? "ON" : "OFF",
+                const int after = safeByte(actor_, off::kSkaterPhysAnimOn);
+                const bool took = after >= 0 && ((((after >> 4) & 1) != 0) == want);
+                paEnableMs_ = took ? nowMs : nowMs + 500;
+                if (logf) { char m[140];
+                    snprintf(m, sizeof(m), "[proxy] physical animation %s (%s)%s", want ? "ON" : "OFF",
                              !g_tun.syncPhysAnim ? "peer body physics off" : s.bailing ? "bail" :
+                             pulsed ? "theirs went off and on: marker return / teleport" :
+                             !ownerPa_ ? "theirs is off" :
                              !s.onBoard ? "off-board" : !nearLocal_ ? "too far to see" :
-                             animTickState_ == 3 ? "off screen" : "on-board");
+                             animTickState_ == 3 ? "off screen" : "on-board",
+                             took ? "" : " -- the setter refused, retry in 500 ms");
                     logf(m); }
             }
         }
@@ -1169,14 +1263,6 @@ void Proxy::Apply(const repl::State& s, uint64_t nowMs, uint64_t nowUs, void (*l
                 else        PeerBodiesRestore(trimMesh, logf);
             }
         }
-
-        // RE-ASSERT the skater-ignore every frame while it is on, for the same reason the trim is:
-        // SetNoCollide fires ONCE on the grace edge, and on a peer's respawn the proxy's mesh does
-        // not exist yet at that instant, so the one-shot apply wrote nothing and the fresh skater
-        // kept full collision -- you could run into a just-respawned peer and fall. The apply is
-        // decided by state per channel, so once it holds this is a handful of reads and out, and a
-        // response the game writes back is caught rather than waited out.
-        if (actor_ && noCollide_) ApplyNoCollide(logf);
 
         // MEASUREMENT (debug::paProbe): is the game's physical animation live on this proxy? Same
         // line shape as the LOCAL one session::Frame prints, so the two compare in one log.
@@ -1510,36 +1596,31 @@ void Proxy::PlayPushStates(const uint8_t* states, int n) {
     }
 }
 
-// The SKATER keeps its collision and ignores other skaters instead (peer_nocollide.cpp). 1.1.6
-// switched its collision OFF here, and the engine forces a collision-less body to kinematic -- so
-// every proxy's body physics died whenever the local player sat at a marker in grace. The BOARD is
-// a plain actor that is stamped while no-collide, so its collision can simply go; its body instance
-// is still handed over so the channel a board arrives on is read, not assumed.
-void Proxy::ApplyNoCollide(void (*logf)(const char*)) {
-    if (!actor_ || !present_) return;
-#ifdef _WIN32
-    void* mesh   = safePtr(actor_, off::kSkaterMesh);
-    void* root   = safePtr(actor_, off::kActorRootComp);
-    void* cap    = root ? (void*)((uint8_t*)root + off::kCompBodyInstance) : nullptr;
-    void* bd     = OwnBoard();
-    void* bdRoot = bd ? safePtr(bd, off::kActorRootComp) : nullptr;
-    void* bdBody = bdRoot ? (void*)((uint8_t*)bdRoot + off::kCompBodyInstance) : nullptr;
-    if (noCollide_) PeerNoCollideApply(mesh, cap, bdBody, logf);
-    else            PeerNoCollideRestore(mesh, cap, logf);
-    const Syms& S = Get();
-    if (S.SetActorCollision && bd) {
-        __try { S.SetActorCollision(bd, !noCollide_); } __except (EXCEPTION_EXECUTE_HANDLER) {}
-    }
-#else
-    (void)logf;
-#endif
-}
-
+// A skater who is in the replay editor collides with nothing, and nothing collides with them --
+// the one no-collide this mod does. (1.1.6 and 1.1.7 also decollided a fresh arrival, first this way and
+// then by channel responses; three field rounds could not make that hold on this rig and it was
+// withdrawn in 1.1.8 -- the changelog has the account.) Done the plain way, SetActorEnableCollision
+// on skater and board, which has a known cost: dropping the mesh out of physics participation makes
+// the engine recreate its physics state (FBodyInstance::SetCollisionEnabled ->
+// UActorComponent::RecreatePhysicsState), so their body physics is off for as long as this holds and
+// comes back on the restore (field: a peer's torso looseness reappeared the moment collision did).
+// Acceptable for a skater parked in the editor -- and exactly why this must never be applied to
+// someone who is skating.
 void Proxy::SetNoCollide(bool nc, void (*logf)(const char*)) {
     if (nc == noCollide_) return;
     noCollide_ = nc;
+    if (!actor_ || !present_) return;                // an absent actor is already decollided
+    const Syms& S = Get();
     if (nc && simOn_) StopBoardSim();                // stamped from here on (see Apply)
-    ApplyNoCollide(logf);
+#ifdef _WIN32
+    if (S.SetActorCollision) {
+        void* bd = OwnBoard();
+        __try { S.SetActorCollision(actor_, !nc); if (bd) S.SetActorCollision(bd, !nc); }
+        __except (EXCEPTION_EXECUTE_HANDLER) {}
+    }
+#endif
+    if (logf) logf(nc ? "[proxy] their collision is off (replay editor)"
+                      : "[proxy] their collision is back");
 }
 
 void Proxy::SetPresent(bool present, void (*logf)(const char*)) {
@@ -1551,16 +1632,15 @@ void Proxy::SetPresent(bool present, void (*logf)(const char*)) {
     if (!present) { AudioStopAll(); if (simOn_) StopBoardSim(); }
     // Hiding is purely visual -- the collision stays -- so an actor that is only hidden leaves an
     // invisible obstacle where it stood (the departed-peer lesson). Collision follows visibility.
-    auto reveal = [&](void* a, bool collide) {
+    auto reveal = [&](void* a) {
         if (!a) return;
 #ifdef _WIN32
         if (S.SetActorHidden)    { __try { S.SetActorHidden(a, !present); }   __except (EXCEPTION_EXECUTE_HANDLER) {} }
-        if (S.SetActorCollision) { __try { S.SetActorCollision(a, collide); } __except (EXCEPTION_EXECUTE_HANDLER) {} }
+        if (S.SetActorCollision) { __try { S.SetActorCollision(a, present && !noCollide_); } __except (EXCEPTION_EXECUTE_HANDLER) {} }
 #endif
     };
-    reveal(actor_, present);                         // the skater's collision is never switched off
-    reveal(OwnBoard(), present && !noCollide_);      // for no-collide: it ignores skaters instead
-    if (present && noCollide_) ApplyNoCollide(logf); // SetNoCollide could not reach an absent actor
+    reveal(actor_);
+    reveal(OwnBoard());
     if (!present) QuietAnimForever(logf);
     if (logf) logf(present ? "[proxy] peer is back in our level -- their skater is visible again"
                            : "[proxy] peer is in another level -- their skater is hidden here");
@@ -1605,13 +1685,11 @@ void Proxy::Destroy(void (*logf)(const char*)) {
     }
 #endif
     if (mesh) PeerBodiesRestore(mesh, logf);        // hand the trim back while the bodies still exist
-    if (mesh) { void* root = safePtr(actor_, off::kActorRootComp);
-                PeerNoCollideRestore(mesh, root ? (void*)((uint8_t*)root + off::kCompBodyInstance) : nullptr, logf); }
 
     // ---- 2. nothing may write to it from here on
     DropProxyActor(actor_);
     DropAnimSlot(this);
-    if (mesh) { pose::Forget(mesh); PeerBodiesForget(mesh); PeerNoCollideForget(mesh); }
+    if (mesh) { pose::Forget(mesh); PeerBodiesForget(mesh); }
 
     // ---- 3. the actors themselves
     bool killed = false;

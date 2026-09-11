@@ -20,6 +20,8 @@
 #include "../debug.h"
 #include "game_syms.h"
 #include "pose.h"
+#include "trick_pulse.h"
+#include "pa_state.h"
 #include "../replication/anim_fields.h"
 #include <cstring>
 #include <cstdio>
@@ -231,6 +233,14 @@ bool GatherOwnState(void* pawn, repl::State& out) {
             }
         }
         memcpy(out.trickName, cached, sizeof(out.trickName));
+        // ---- the TRICK SERIAL (trick_pulse.h). The name above changes only when the DEF changes, and
+        // four kickflips in a row are four SetTrick calls on one def; the serial counts the calls.
+        omp::game::trick::NoteOwnPawn(pawn);
+        out.trickSerial = omp::game::trick::OwnSerial();
+        // ---- the owner's BODY-PHYSICS state (pa_state.h): off around a marker return the way the game
+        // does it, so the observer's copy is too.
+        omp::game::pa::NoteOwnPawn(pawn);
+        out.paSerial = omp::game::pa::OwnPaSerial();
 
         // ---- the GRIND def's name, the trickName pattern verbatim: _currentGrindDef, falling back to
         // _targetGrindDef (GetGrindBlendSpace itself prefers current while grinding, target otherwise,

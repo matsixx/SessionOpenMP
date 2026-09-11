@@ -310,10 +310,13 @@ static const SigEntry kSigs[] = {
     // the contact-part -> dynamic-material table the two calls above write through -- and a proxy
     // never runs it on its own, which is why a peer's board had no materials to scuff at all.
     { "BoardRefreshVisuals",   "40 57 48 83 EC 20 48 8B 3D ?? ?? ?? ?? 48 85 FF ?? ?? 48 89 5C 24 30 48 8D 99 80 02 00 00 48 8B 03 48 8B CB FF 90 F8 00 00 00", false },
-    // ASkaterCharacter::UpdatePendingGotoMarker                          Epic 0x100d2a0 / Steam 0xfcd0d0
-    // HOOKED (grace.cpp), never called: a pre-hook reads _isGotoMarkerPending on entry, before this
-    // same call consumes it -- the one place a marker return can be seen without racing the tick.
-    { "GotoMarkerUpdate",      "48 8B C4 55 56 48 8D 68 A8 48 81 EC 48 01 00 00 F6 81 30 0B 00 00 01 48 8B F1 0F 84 ?? ?? ?? ?? F6 81 10 07 00 00 02", false },
+    // ASkaterCharacterBase::SetTrick                                       Epic 0x1006d90 / Steam 0xfc6bc0
+    // HOOKED (trick_pulse.cpp), never called: the owner's flick, counted for the wire.
+    { "SetTrick",              "48 8B C4 53 56 48 81 EC 98 00 00 00 F6 81 10 07 00 00 04 48 8B F2 0F 29 70 D8 48 8B D9 0F 29 78 C8 0F 28 F2 0F 28 FB 0F 85 ?? ?? ?? ??", false },
+    // ASkaterCharacterBase::BroadcastDisablePhysicalAnimation / ...Enable...    Epic 0xfec390 / Steam 0xfac1c0
+    // HOOKED (pa_state.cpp), never called: the owner's body-physics lifecycle, counted for the wire.
+    { "BcastPaDisable",        "48 89 5C 24 10 57 48 83 EC 20 48 83 B9 40 05 00 00 00 48 8B F9 ?? ?? 48 8B 01 48 89 74 24 30 FF 90 ?? ?? ?? ?? 48 8B B0 80 01 00 00", false },
+    { "BcastPaEnable",         "40 55 53 48 8D 6C 24 B1 48 81 EC C8 00 00 00 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 45 27 48 8B 01 48 8B D9 FF 90 ?? ?? ?? ??", false },
     // UWidget::SetIsEnabled                                              Epic 0x27b7a20 / Steam 0x2779db0
     // Greys a menu row and refuses its input -- how "Teleport to them" says no when there is nowhere
     // to go. Optional: without it the row still declines in its status text.
@@ -1039,7 +1042,9 @@ const Syms& Resolve(void (*logf)(const char*)) {
     g_syms.MatParamNames      = (MatParamNamesFn)   take("MatParamNames");
     g_syms.SetScalarParam     = (SetScalarParamFn)  take("SetScalarParam");
     g_syms.BoardRefreshVisuals = (BoardRefreshVisFn) take("BoardRefreshVisuals");
-    g_syms.GotoMarkerUpdate   =                     take("GotoMarkerUpdate");     // hooked, never called
+    g_syms.SetTrick           =                     take("SetTrick");             // hooked, never called
+    g_syms.BcastPaDisable     =                     take("BcastPaDisable");       // hooked, never called
+    g_syms.BcastPaEnable      =                     take("BcastPaEnable");        // hooked, never called
     g_syms.WidgetSetEnabled   = (WidgetSetEnabledFn) take("WidgetSetEnabled");
     g_syms.BodySetSimulate    = (BodySetSimulateFn)  take("BodySetSimulate");
     g_syms.BodySetResponse    = (BodySetResponseFn)  take("BodySetResponse");
