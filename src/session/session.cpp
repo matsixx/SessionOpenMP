@@ -17,7 +17,6 @@
 #include "../game/cosmetics.h"
 #include "../game/audio.h"
 #include "../game/teleport.h"
-#include "../game/grace.h"
 #include "../game/pose.h"
 #include "../game/spectate.h"
 #include "../game/dropper.h"
@@ -1815,7 +1814,7 @@ bool VoiceLoopback() { return false; }
 
 // -1 = nothing asked for. Written by the menu, drained by Frame.
 static volatile long g_teleportTo = -1;
-// The LOCAL skater is in spawn grace or the replay editor: no proxy may collide with them this frame.
+// The LOCAL skater is in the replay editor: no proxy may collide with them this frame.
 static bool g_ownNoCollide = false;
 void RequestTeleportTo(int peerId) { InterlockedExchange(&g_teleportTo, (long)peerId); }
 
@@ -1929,12 +1928,9 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
         repl::State own;
         if (gatherOwn(ownPawn, own)) {
             own.headYaw = g_ownHeadYaw; own.headPitch = g_ownHeadPitch;   // SessionTweaks' head look, if any
-            // SPAWN GRACE, decided here because this is where the push state is fresh, and published
-            // as the first appended wire field. Locally it also means every proxy stops colliding
-            // (below): a grace skater cannot hit anyone, and nobody can hit them.
-            game::grace::Tick(ownPawn, nowMs, own.pushState, g_logf);
-            own.grace = game::grace::Active() ? 1 : 0;
-            g_ownNoCollide = (own.grace != 0) || own.replaying;
+            // In the replay editor nobody may shove us, so every proxy stops colliding (below).
+            // (1.1.6 and 1.1.7 also decided a spawn / marker-return grace here; withdrawn in 1.1.8.)
+            g_ownNoCollide = own.replaying;
             g_ownLast = own; g_haveOwn = true;
             // MEASUREMENT (debug::paProbe): the local skater's physical-animation state, in the
             // same shape as the proxies' [paprobe] line.
@@ -2505,9 +2501,9 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
             // there the spawn ITSELF is the damage, whatever the timing.
             if (!s.proxy.EnsureSpawned(ownPawn, out, nowMs, g_logf)) continue;
         }
-        // Nobody collides with a skater in grace or in the replay editor, and a grace skater collides
-        // with nobody. Their reasons travel (grace, replaying); ours is local.
-        s.proxy.SetNoCollide((out.grace != 0) || out.replaying || g_ownNoCollide, g_logf);
+        // Nobody collides with a skater who is in the replay editor, and a skater in the editor
+        // collides with nobody. Their reason travels (replaying); ours is local.
+        s.proxy.SetNoCollide(out.replaying || g_ownNoCollide, g_logf);
         s.proxy.Apply(out, nowMs, nowUs, g_logf);
         // Release the peer's one-shot sounds whose moment the playback clock has now reached. AFTER
         // Apply so they are placed against this frame's body pose, and drained from the stream's own

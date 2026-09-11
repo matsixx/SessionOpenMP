@@ -1623,13 +1623,24 @@ static bool wireVersionCheck() {
     // THE FIRST APPENDED FIELD, and the promise made for it: it round-trips, and a packet from a
     // minor-0 sender -- which has no such byte -- parses with the field at its default instead of
     // reading one byte past its own end.
-    { State g = s; g.grace = 1;
+    { State g = s; g.spare1 = 1;
       uint8_t gp[2048]; const int gn = Pack(g, 1234567, gp, sizeof(gp));
-      State rt{}; const bool round = gn > 0 && Unpack(gp, gn, rt, nullptr) && rt.grace == 1;
+      State rt{}; const bool round = gn > 0 && Unpack(gp, gn, rt, nullptr) && rt.spare1 == 1;
       uint8_t old[2048]; memcpy(old, gp, (size_t)(gn - 1)); old[5] = 0;   // minor 0: the byte is not there
-      State ro{}; const bool older = Unpack(old, gn - 1, ro, nullptr) && ro.grace == 0;
+      State ro{}; const bool older = Unpack(old, gn - 1, ro, nullptr) && ro.spare1 == 0;
       const bool both = round && older;
-      printf("  grace round-trips; a minor-0 packet reads grace 0     %s\n", both ? "PASS" : "FAIL");
+      printf("  minor-1 byte round-trips; a minor-0 packet reads it 0  %s\n", both ? "PASS" : "FAIL");
+      if (!both) ok = false; }
+
+    // THE SECOND: minor 2's two bytes, the trick serial and the owner's PA state. Both round-trip; a
+    // minor-1 packet has neither and reads 0 for both (0 = "not said", so the receiver keeps its own).
+    { State g = s; g.trickSerial = 77; g.paSerial = 0x57;
+      uint8_t gp[2048]; const int gn = Pack(g, 1234567, gp, sizeof(gp));
+      State rt{}; const bool round = gn > 0 && Unpack(gp, gn, rt, nullptr) && rt.trickSerial == 77 && rt.paSerial == 0x57;
+      uint8_t old[2048]; memcpy(old, gp, (size_t)(gn - 2)); old[5] = 1;   // minor 1: the bytes are not there
+      State ro{}; const bool older = Unpack(old, gn - 2, ro, nullptr) && ro.trickSerial == 0 && ro.paSerial == 0;
+      const bool both = round && older;
+      printf("  minor-2 bytes round-trip; a minor-1 packet reads both 0    %s\n", both ? "PASS" : "FAIL");
       if (!both) ok = false; }
 
     return ok;

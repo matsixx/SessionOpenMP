@@ -30,6 +30,13 @@ struct ProxyTuning {
     bool  velocityDrive   = true;         // false = teleport stamp only
     bool  driveGroundedOnly = true;       // airborne/trick frames use the stamp: a flip outruns the chase
     float driveSnapCm     = 120.0f;       // beyond this: teleport (join/respawn), not drive
+    // The SKATER's own jump threshold, per frame: a marker return, respawn or join moves the root
+    // metres in one frame, and the game switches body physics off around exactly that move.
+    float teleportJumpCm  = 250.0f;
+    // How long a peer's body physics stays off when their game switched it off AND on inside one frame
+    // (a marker return). Their own blueprint rebinds 100 ms after the enable broadcast -- measured on
+    // six consecutive returns -- so this is that window.
+    uint32_t paPulseMs    = 100;
     // NOTE: a peer's board CAN wedge against yours and be pushed around -- the velocity chase loses
     // to a solid contact below driveSnapCm. An automatic "stamp out of the trap" escape was built and
     // REMOVED on purpose: board-to-board contact is wanted, players do deliberate things with it, and
@@ -176,13 +183,10 @@ public:
     // Written by the session each frame from the distance between the LOCAL player and this peer
     // (with hysteresis). Far = the board is stamped, never simulated.
     void       SetNearLocal(bool near) { nearLocal_ = near; }
-    // This peer must not collide with anything right now -- they are in spawn grace, in the replay
-    // editor, or WE are (a grace skater cannot hit anyone either). Skater and board both; the board
-    // is STAMPED while set, because a simulating body with no collision falls through the floor.
+    // This peer must not collide with anything right now -- they are in the replay editor, or WE
+    // are (a skater in the editor cannot be shoved either). Skater and board both; the board is
+    // STAMPED while set, because a simulating body with no collision falls through the floor.
     void       SetNoCollide(bool nc, void (*logf)(const char*));
-private:
-    void       ApplyNoCollide(void (*logf)(const char*));   // (re)apply the current noCollide_ to a present actor
-public:
     // The BOARD's own distance, kept apart from the skater's. A board that has been set down is no
     // longer near its owner: it rolls. One that has rolled over to you has to be a real rigid body
     // even though its owner is far off, and a distant owner must still not be paying for body
@@ -266,6 +270,21 @@ private:
                                           // applies once the board is up
     char       lastTrickName_[48] = {}, lastGrindName_[48] = {};
     void*      trickDef_ = nullptr;       // the RESOLVED trick def on OUR side
+    // The TRICK SERIAL (trick_pulse.h): the owner's SetTrick count. An edge here is "they flicked",
+    // even for the same def twice; it fires the game's own remote-skater pulse (Apply, 4.7b).
+    uint8_t    lastTrickSerial_ = 0;
+    bool       trickSerialSeen_ = false;  // the first snapshot seeds the serial, never fires
+    uint8_t    trickPulse_ = 0;           // one IsTrickPending write owed to the anim post-pass
+    uint8_t    animReset_ = 0;            // one ResetSkater write owed to the anim post-pass (4.7c)
+    // The owner's BODY-PHYSICS state (pa_state.h), true until a packet says otherwise: an older peer
+    // never says, and keeps the on-board/bailing guess this mirror has always made.
+    uint8_t    lastPaSerial_ = 0;
+    bool       ownerPa_ = true;
+    uint64_t   paPulseUntilMs_ = 0;       // a same-frame off/on of theirs, replayed as a window (4.7c)
+    // Where the root was stamped last frame: a jump past teleportJumpCm is a marker return / respawn
+    // (see the stamp in Apply). Invalid until the first stamp on this actor.
+    float      lastStampPos_[3] = {0, 0, 0};
+    bool       lastStampOk_ = false;
     uint16_t   lastCrankIdx_ = 0xfffe;    // crank edge probes (0xfffe = "never seen", so the first
     uint8_t    lastCrankOn_ = 0;          // def-idx line prints even when the wire says none/0xffff)
     // The peer's live sounds, keyed by THEIR slot id -- stable for as long as the sound lives on

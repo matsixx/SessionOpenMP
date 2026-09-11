@@ -474,7 +474,9 @@ struct Syms {
     MatParamNamesFn      MatParamNames    = nullptr;   // board wear: the parameter names per contact part
     SetScalarParamFn     SetScalarParam   = nullptr;   // ...and the write onto a dynamic material
     BoardRefreshVisFn    BoardRefreshVisuals = nullptr; // ...and what builds that material table
-    void*                GotoMarkerUpdate   = nullptr;  // the marker-return seam grace.cpp pre-hooks
+    void*                SetTrick = nullptr;           // the flick seam trick_pulse.cpp hooks
+    void*                BcastPaDisable = nullptr;     // the body-physics lifecycle pa_state.cpp hooks
+    void*                BcastPaEnable  = nullptr;
     WidgetSetEnabledFn   WidgetSetEnabled = nullptr;    // grey a menu row out (UWidget::SetIsEnabled)
     // Peer body trim (peer_bodies.h): cutting a proxy's physical animation down to what can be seen.
     // All optional -- without them a peer simply keeps the whole simulated asset, as before.
@@ -690,6 +692,7 @@ namespace off {
     constexpr int kMeshSkeletalMesh     = 0x480;
     constexpr int kSkelMeshRefSkeleton  = 0x1b0;
     constexpr int kRefSkelFinalBoneInfo = 0x20;
+    constexpr int kRefSkelFinalBonePose = 0x30;  // TArray<FTransform>, parent-relative bind pose (PDB)
     constexpr int kMeshBoneInfoStride   = 12;    // FMeshBoneInfo { FName Name; int32 ParentIndex; }
     constexpr int kSkaterMoveComp     = 0x550;   // -> USkaterMovementComponent
     // THE MARKER RETURN, which is how the game itself puts a skater somewhere. ASkaterCharacter::Tick
@@ -698,9 +701,6 @@ namespace off {
     // So "teleport properly" is: fill the info, set the flag, let the game's own tick do it.
     constexpr int kSkaterPendingMarker   = 0xac0;  // FSessionPlayerMarkerInfo (kMarkerInfoSize bytes)
     constexpr int kSkaterGotoMarkerFlag  = 0xb30;  // _isGotoMarkerPending (bit 0)
-    // ASkaterCharacterBase::_wasJustSpawned: 1 from PostInitCharacter until the FIRST physical-
-    // animation enable (the first mount). Long-lived, so grace.cpp can poll it without a race.
-    constexpr int kSkaterWasJustSpawned  = 0x64a;
     // ...and that struct's fields (PDB).
     constexpr int kMkIsSet          = 0x00;
     constexpr int kMkIsOnBoard      = 0x01;
@@ -791,6 +791,8 @@ namespace off {
     // anim-instance gate assets, for the ANIMGATE diagnostic
     constexpr int kAnimCrankBS        = 0x4a8;   // CrankLoopBlendSpace (gates the crouch fields)
     constexpr int kAnimFlipTrick      = 0x4c8;   // FlipTrick (gates the trick ratios)
+    constexpr int kAnimIsTrickPending = 0x310;   // IsTrickPending -- the one-frame pulse a flick leaves (trick_pulse.h)
+    constexpr int kAnimResetSkater    = 0x59e;   // ResetSkater -- the graph reset a marker return leaves (proxy.cpp 4.7c)
     constexpr int kAnimRevertBS       = 0x4e0;   // RevertBlendSpace
     constexpr int kObjNamePrivate     = 0x18;    // UObjectBase::NamePrivate (FName)
     // USkeletalMeshComponent, for the replay-driver probe (PDB): the bitfield byte carrying
@@ -878,7 +880,6 @@ namespace off {
     constexpr int kBodyBoneIndex        = 0x1c;    // FBodyInstance::InstanceBoneIndex (int16, into the ref skeleton)
     constexpr int kBodyPosIters         = 0x74;    // FBodyInstance::PositionSolverIterationCount (uint8)
     constexpr int kBodyVelIters         = 0x75;    // FBodyInstance::VelocitySolverIterationCount (uint8)
-    constexpr int kBodyObjectType       = 0x1e;    // FBodyInstance::ObjectType (ECollisionChannel byte)
     constexpr int kBodyResponses        = 0x78;    // CollisionResponses.ResponseToChannels, one byte per channel
     constexpr int kBodyActorHandle      = 0x120;   // FBodyInstance::ActorHandle (the PhysX actor)
     constexpr int kContainerPage      = 0x2a0;   // _menuPage (UMenuPage*) -- the page the container is

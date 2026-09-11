@@ -206,13 +206,20 @@ struct State {
     AudioLoop  loops[kAudioMaxLoops];
     AudioEvent events[kAudioMaxEvents];
 
-    // ==== APPENDED FIELDS (minor >= 1) ==================================================================
-    // SPAWN GRACE: the sender has just spawned or returned to a marker and has not pushed yet (plus
-    // a short delay after). Observers drop this skater's collision, board included, while it is set.
-    // Only the owner can know this -- it ends on THEIR push -- so it travels rather than being
-    // guessed. Bit 0 of a flags byte; bits 1-7 are spare for later minors, which a reader of this
-    // minor ignores by construction.
-    uint8_t    grace = 0;
+    // ---- APPENDED, minor 1 (1.1.6): a spawn / marker-return collision-grace flag, bit 0. The
+    // feature was WITHDRAWN in 1.1.8; the byte stays so the layout does not move, and is always
+    // sent as 0. A 1.1.6 or 1.1.7 peer still reads bit 0 as its grace flag, so bit 0 must stay 0 for as
+    // long as such peers exist. Bits 1-7 remain spare for later minors.
+    uint8_t    spare1 = 0;
+    // ---- APPENDED, minor 2 (1.1.8): the TRICK SERIAL, the owner's SetTrick count (trick_pulse.h).
+    // A flick sets IsTrickPending for ONE frame and the graph consumes it; sampled once a frame it
+    // reads 0 forever, so it cannot travel as a field. The count of flicks can. A minor-1 reader does
+    // not see this byte and a proxy of theirs starts no trick -- which is what every build so far does.
+    uint8_t    trickSerial = 0;
+    // ---- APPENDED, minor 2 (1.1.8), second byte: the owner's PHYSICAL-ANIMATION state (pa_state.h).
+    // Bit 0 valid, bit 1 enabled, bits 2-7 a change count. 0 = the sender did not say (a minor-1
+    // packet), and the receiver keeps its own judgement.
+    uint8_t    paSerial = 0;
 
     // ==== THE POSE LANE ==============================================================================
     // Component-space bone transforms, sent when the receiver's own anim graph cannot produce the
@@ -266,8 +273,11 @@ struct State {
 // each on `minor >= N`, so peers one minor apart still see each other. Append and bump the minor
 // wherever it is possible; bump the major only when a field has to move.
 constexpr uint8_t kWireMajor = 1;
-// 1.1: `grace` appended -- the first field added under the version rule rather than a magic letter.
-constexpr uint8_t kWireMinor = 1;
+// 1.1: one flags byte appended (grace in 1.1.6-1.1.7; spare1, always 0, since 1.1.8) -- the first
+//      field added under the version rule rather than a magic letter.
+// 1.2: trickSerial + paSerial (1.1.8) -- the owner's SetTrick count and body-physics state; see
+//      trick_pulse.h and pa_state.h.
+constexpr uint8_t kWireMinor = 2;
 
 // What a snapshot that would not parse actually was. Lets the reject path say who needs to update
 // instead of leaving a peer silently invisible.

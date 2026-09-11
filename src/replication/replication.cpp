@@ -102,7 +102,10 @@ namespace omp { namespace repl {
 //     caught that on minor 1's first run; it is the easy mistake here, not the version arithmetic.
 //
 // MINOR LINEAGE, so an appended field's introducing version is never guesswork:
-//   1.1 -> `grace` (spawn / marker-return collision grace, one flags byte; bit 0 used, 1-7 spare)
+//   1.1 -> one flags byte: `grace` (spawn / marker-return collision grace, bit 0) in 1.1.6-1.1.7,
+//          WITHDRAWN in 1.1.8 and kept as `spare1` (always 0) so the layout does not move
+//   1.2 -> `trickSerial` + `paSerial` (1.1.8): the owner's SetTrick count and body-physics state,
+//          one byte each (trick_pulse.h, pa_state.h)
 // The cost is two bytes on a packet of several hundred. The thing it buys is that "one of you needs
 // to update or you will not see each other" stops being the answer to every future wire change.
 static const uint32_t kMagic = 0x5A504D4Fu; // "OMPZ"
@@ -314,7 +317,7 @@ static void limbRead(Rd& r, uint8_t mode, float* p, const float* body) {
 // Bytes written AFTER the audio section -- the appended fields of minor >= 1. Both the pose slice and
 // the audio sizing reserve them, or a cap that the audio fills exactly leaves no room for the
 // trailer and the whole packet fails, which is what the codec gate caught the first time.
-static const int kTrailBytes = 1;   // minor 1: the grace flags byte
+static const int kTrailBytes = 3;   // minor 1: spare1 (was the grace flag); minor 2: trickSerial, paSerial
 
 int Pack(const State& s, uint64_t senderUs, uint8_t* out, int cap, int* poseWrote) {
     if (poseWrote) *poseWrote = 0;
@@ -517,7 +520,9 @@ int Pack(const State& s, uint64_t senderUs, uint8_t* out, int cap, int* poseWrot
         for (int i = 0; i < ne; i++) audioWriteEvent(w, s.events[i]);
     }
     // ---- APPENDED, minor 1: after everything a minor-0 reader parses, so it never reaches this.
-    w.u8((uint8_t)(s.grace ? 1 : 0));
+    w.u8(s.spare1);                              // always 0 since 1.1.8: a 1.1.6/1.1.7 reader takes bit 0 as grace
+    w.u8(s.trickSerial);                         // minor 2
+    w.u8(s.paSerial);                            // minor 2
     return w.ok ? w.n : 0;
 }
 
@@ -709,7 +714,8 @@ bool Unpack(const uint8_t* d, int len, State& out, uint64_t* senderUs) {
         out.nEvents = (uint8_t)ne;
     }
     // ---- APPENDED FIELDS, each gated on the minor that introduced it.
-    if (wireMinor >= 1) out.grace = (uint8_t)(r.u8() & 1);
+    if (wireMinor >= 1) out.spare1 = r.u8();     // a 1.1.6/1.1.7 sender's grace bit lands here and is ignored
+    if (wireMinor >= 2) { out.trickSerial = r.u8(); out.paSerial = r.u8(); }
     if (!r.ok) return false;
     // Post-decode discipline: no packet field is an index or a pointer, and poses are range-checked,
     // so a hostile or corrupt packet can at worst move a proxy, never corrupt local state.
