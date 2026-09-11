@@ -477,6 +477,7 @@ struct Syms {
     void*                SetTrick = nullptr;           // the flick seam trick_pulse.cpp hooks
     void*                BcastPaDisable = nullptr;     // the body-physics lifecycle pa_state.cpp hooks
     void*                BcastPaEnable  = nullptr;
+    void*                TransitOpenMap = nullptr;        // UTransitMapWidget::SetOpenTransitMap -- custom_maps.cpp hooks it
     WidgetSetEnabledFn   WidgetSetEnabled = nullptr;    // grey a menu row out (UWidget::SetIsEnabled)
     // Peer body trim (peer_bodies.h): cutting a proxy's physical animation down to what can be seen.
     // All optional -- without them a peer simply keeps the whole simulated asset, as before.
@@ -793,6 +794,26 @@ namespace off {
     constexpr int kAnimFlipTrick      = 0x4c8;   // FlipTrick (gates the trick ratios)
     constexpr int kAnimIsTrickPending = 0x310;   // IsTrickPending -- the one-frame pulse a flick leaves (trick_pulse.h)
     constexpr int kAnimResetSkater    = 0x59e;   // ResetSkater -- the graph reset a marker return leaves (proxy.cpp 4.7c)
+    // ---- the TRANSIT MAP (custom_maps.cpp): the Select Map screen's data. PDB-exact (pdbmembers).
+    constexpr int kTransitWidgetAsset   = 0x3b0;   // UTransitMapWidget::_transitDataAsset
+    constexpr int kTransitAssetCities   = 0x30;    // UTransitDataAsset::_transitCityData (TArray<FTransitCityData>)
+    constexpr int kTransitAssetNodes    = 0x40;    // UTransitDataAsset::_transitNodeData (TArray<FTransitNodeData>)
+    constexpr int kTransitCityStride    = 88;      // sizeof(FTransitCityData)
+    constexpr int kTransitCityPrefix    = 0x00;    // FTransitCityData::CityPrefix (FName) -- what nodes point at
+    constexpr int kTransitCityName      = 0x08;    // ::CityNameText (FText)
+    constexpr int kTransitCityDisplay   = 0x20;    // ::CityNameDisplayText (FText) -- the heading
+    constexpr int kTransitCityColor     = 0x38;    // ::CityColor (FLinearColor)
+    constexpr int kTransitCityMapBp     = 0x48;    // ::MapBlueprint (TSubclassOf<UTransitMapCityWidget>)
+    constexpr int kTransitCityEditorOnly = 0x50;   // ::IsEditorOnly
+    constexpr int kTransitNodeStride    = 192;     // sizeof(FTransitNodeData)
+    constexpr int kTransitNodeCity      = 0x00;    // FTransitNodeData::City (FName = a city prefix)
+    constexpr int kTransitNodeDisplay   = 0x08;    // ::DisplayName (FText)
+    constexpr int kTransitNodePortal    = 0x20;    // ::PortalID (FName)
+    constexpr int kTransitNodeLevel     = 0x28;    // ::LevelID (FName) -- what LoadLevel opens
+    constexpr int kTransitNodeLocked    = 0x30;    // ::IsLocked
+    constexpr int kTransitNodeLockedData = 0x38;   // ::LockedNodeData (FText + TSoftObjectPtr, 64 B)
+    constexpr int kTransitNodeApartment = 0x84;    // ::ApartmentLevelID (FName)
+    constexpr int kTransitNodeImage     = 0x90;    // ::ImageDescription (TSoftObjectPtr<UMaterialInterface>, 40 B)
     constexpr int kAnimRevertBS       = 0x4e0;   // RevertBlendSpace
     constexpr int kObjNamePrivate     = 0x18;    // UObjectBase::NamePrivate (FName)
     // USkeletalMeshComponent, for the replay-driver probe (PDB): the bitfield byte carrying

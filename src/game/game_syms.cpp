@@ -317,6 +317,10 @@ static const SigEntry kSigs[] = {
     // HOOKED (pa_state.cpp), never called: the owner's body-physics lifecycle, counted for the wire.
     { "BcastPaDisable",        "48 89 5C 24 10 57 48 83 EC 20 48 83 B9 40 05 00 00 00 48 8B F9 ?? ?? 48 8B 01 48 89 74 24 30 FF 90 ?? ?? ?? ?? 48 8B B0 80 01 00 00", false },
     { "BcastPaEnable",         "40 55 53 48 8D 6C 24 B1 48 81 EC C8 00 00 00 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 45 27 48 8B 01 48 8B D9 FF 90 ?? ?? ?? ??", false },
+    // UTransitMapWidget::SetOpenTransitMap                              Epic 0x1192890 / Steam 0x1153070
+    // HOOKED (custom_maps.cpp), never called: the Select Map screen opening, where the custom maps
+    // are added to its data. Optional: without it they simply do not appear.
+    { "TransitOpenMap",        "48 8B C4 55 56 48 8B EC 48 83 EC 78 48 89 58 10 48 89 78 18 48 8B F9 48 8B 0D ?? ?? ?? ?? 4C 89 68 E8", false },
     // UWidget::SetIsEnabled                                              Epic 0x27b7a20 / Steam 0x2779db0
     // Greys a menu row and refuses its input -- how "Teleport to them" says no when there is nowhere
     // to go. Optional: without it the row still declines in its status text.
@@ -1045,6 +1049,7 @@ const Syms& Resolve(void (*logf)(const char*)) {
     g_syms.SetTrick           =                     take("SetTrick");             // hooked, never called
     g_syms.BcastPaDisable     =                     take("BcastPaDisable");       // hooked, never called
     g_syms.BcastPaEnable      =                     take("BcastPaEnable");        // hooked, never called
+    g_syms.TransitOpenMap     =                     take("TransitOpenMap");       // hooked, never called
     g_syms.WidgetSetEnabled   = (WidgetSetEnabledFn) take("WidgetSetEnabled");
     g_syms.BodySetSimulate    = (BodySetSimulateFn)  take("BodySetSimulate");
     g_syms.BodySetResponse    = (BodySetResponseFn)  take("BodySetResponse");

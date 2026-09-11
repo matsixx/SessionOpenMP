@@ -72,6 +72,7 @@ add_library(omp_game STATIC src/game/game_syms.cpp src/game/proxy.cpp src/game/g
                             src/game/teleport.cpp
                             src/game/trick_pulse.cpp
                             src/game/pa_state.cpp
+                            src/game/custom_maps.cpp
                             src/game/dropper.cpp)
 target_include_directories(omp_game PUBLIC src)
 target_link_libraries(omp_game PUBLIC omp_replication)
@@ -142,6 +143,7 @@ if(EXISTS "${UE4SS_LIB}")
         src/game/teleport.cpp
         src/game/trick_pulse.cpp
         src/game/pa_state.cpp
+        src/game/custom_maps.cpp
         src/game/spectate.cpp
         # Preferences are read by the LOADER before any transport starts, so they belong here and not
         # in the ImGui block below -- that block is conditional on the vendored sources existing.

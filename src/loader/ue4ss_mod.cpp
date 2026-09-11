@@ -34,6 +34,7 @@
 #include "game/audio.h"
 #include "game/trick_pulse.h"
 #include "game/pa_state.h"
+#include "game/custom_maps.h"
 #include "game/pose.h"
 #include "game/spectate.h"
 #include "game/dropper.h"
@@ -1510,6 +1511,7 @@ public:
         // engine's own menu code, so unlike the overlay this installs right here. It self-disables
         // loudly on any fault and shares nothing with the F1 path but MpUiState.
         PauseMenu_Install();
+        game::maps::Install(&logLine);       // custom maps join the Select Map screen
         // ...and put the mod's version beside the game's own, bottom-left.
         VersionTag_Install();
         // Ask GitHub whether this build is the newest, once, off the game thread. The answer is
