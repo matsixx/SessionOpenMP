@@ -22,6 +22,9 @@ void UpscaleFsr_SetGameplay(bool inLevel);  // GAME THREAD: FSR runs only in a l
 // when it replaced them with FSR's output.
 bool UpscaleFsr_AddPasses(void* graphBuilder, const uint8_t* view, const uint8_t* passInputs, void** outColor, int32_t* outRect);
 bool UpscaleFsr_Active();                   // on, engine resolved, not failed this session
+// False when the game cannot run FSR at all -- a DirectX 11 launch. The setting is forced off and
+// refuses to turn on, because enabling it there crashes.
+bool UpscaleFsr_Available();
 int  UpscaleFsr_WantedTaaSamples();         // r.TemporalAASamples to hold while on / off
 const char* UpscaleFsr_Status();
 bool  UpscaleFsr_Enabled();      void UpscaleFsr_SetEnabled(bool on);

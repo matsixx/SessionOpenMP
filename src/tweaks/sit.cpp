@@ -70,6 +70,7 @@ static int   g_holdMs    = 320;     // SitHoldMs: how long the key must be held 
 static int   g_styleMs   = 260;     // SitStyleBlendMs: how long one sitting style takes to become the next
 static int   g_debug     = 0;       // SitDebug: one chain dump per sit
 static int   g_promptLog = 0;      // SitPromptLog: 1/s line proving the pump still reaches the prompt
+static int   g_capMove   = 1;      // SitMoveCapsule: the collision follows you to the seat
 static volatile LONGLONG g_pumpMs = 0;   // when the sit pump last ran: the watchdog's whole input
 static uint64_t g_modeWatchUntil = 0;    // ...and until when a stolen movement mode is watched for
 static int   g_boardRest = 1;      // SitBoardRest: set the board down beside you and let it settle
@@ -505,13 +506,42 @@ static ProxyHeadFn g_proxyHead  = nullptr;
 // base rig's and are shared.
 struct PxRig  { void* skel; int n; int head, neck; uint8_t underNeck[MAX_BONES]; uint8_t underHead[MAX_BONES]; bool ok; };
 struct PxHead { void* mesh; V3 bodyFwdW; float yaw, pitch, w; const PxRig* rig; };   // w eases with their on/off-board
-static PxRig  g_pxRigs[4]; static int g_pxRigN = 0;
+// ONE SLOT PER PROXY. This was four, while the proxy arrays beside it hold sixteen -- so with a fifth
+// peer the old code reused slot 3 destructively on every miss: each peer rebuilt the rig it had just
+// evicted, every frame, and logged a line for it. Field: 1.6 MILLION log lines in 37 minutes.
+// It was also a CORRECTNESS bug, and the worse half. `PxHead::rig` stores a POINTER into this array,
+// so a repointed slot drives one peer's head with ANOTHER peer's bone indices -- the same shape as the
+// replay bone-mismatch crash, where a stale index writes past the end of a pose.
+// So: sized to the proxy cap, and NEVER reused destructively. A 17th distinct skeleton is refused
+// rather than evicting a live one.
+static PxRig  g_pxRigs[16]; static int g_pxRigN = 0;
+static bool   g_pxRigFull = false;
+static void*  g_pxRigsFor = nullptr;   // the local skater the cache was built under
+static int    g_pxRigLogs = 0;         // rig lines printed: a cap, so a future thrash cannot flood again
 static PxHead g_px[16];    static int g_nPx = 0;
 static uint64_t    g_bridgeTryMs = 0;
 static bool        g_bridgeLogged = false;
 static void* g_mesh = nullptr;       // the mesh being posed
 static void* g_skater = nullptr;
 static uint8_t g_savedMode = 0, g_savedCustom = 0;
+// THE CAPSULE FOLLOWS THE BODY TO THE SEAT. Sitting parks the capsule (MOVE_None) and anchors the pose
+// to a WORLD seat point, so on a ledge you are looking at -- where the seat is up and ahead of you --
+// the body sits on the ledge while the collision stays where you were standing (field). Everything that
+// asks the game where you are (another player skating into you, the camera, the board) was still asking
+// about the old spot.
+// Moving it is safe BY CONSTRUCTION: `SeatFrame` rebuilds the seat origin in mesh space from `g_seatW`
+// every frame, so the rendered pose is anchored to the world and cannot follow the capsule. Only the
+// collision moves.
+// IN ONE STEP, not a slide. 3.19.370 slid the capsule over the sit-down blend to spare the camera a
+// jump, and the first 1 cm step lifted it off its floor toward a seat 40 cm up: the game's floor check
+// found nothing under it, flipped the mode None -> Falling, and our own watchdog read that as "the game
+// took the movement back" and stood you straight up. Field: "a tiny little teleport and he just keeps
+// standing", every attempt. A capsule between floors has no floor; the seat has one. So it goes there
+// in a single move, and the watchdog below forgives the Falling frame that move can still produce.
+static bool  g_capMoved = false;
+static V3    g_capFrom = { 0, 0, 0 }, g_capTo = { 0, 0, 0 };
+static float g_capRot[3] = { 0, 0, 0 };   // held: the sit turns the POSE, never the capsule
+static int   g_capReassert = 0;            // frames the watchdog may re-park a Falling capsule
 static V3    g_seatW, g_faceW;       // the seat point and its facing, WORLD space (the capsule may yet be nudged)
 static V3    g_fcur;                 // the character's own forward in mesh space: constant, the mesh rides the capsule
 static V3    g_os, g_f, g_r, g_u;    // seat origin + frame in the mesh's component space, rebuilt every frame
@@ -1256,7 +1286,15 @@ static const PxRig* PxRigFor(void* mesh) {
     void* skel = twkP(mesh, SKM_MESH);
     if (!skel) return nullptr;
     for (int i = 0; i < g_pxRigN; i++) if (g_pxRigs[i].skel == skel) return g_pxRigs[i].ok ? &g_pxRigs[i] : nullptr;
-    PxRig* r = &g_pxRigs[g_pxRigN < 4 ? g_pxRigN++ : 3];
+    if (g_pxRigN >= (int)(sizeof(g_pxRigs) / sizeof(g_pxRigs[0]))) {
+        if (!g_pxRigFull) {
+            g_pxRigFull = true;
+            TwkLog("[sit] more distinct player rigs than slots -- the newest get no head look "
+                   "(never evicting: a live one is pointed at by a proxy)");
+        }
+        return nullptr;
+    }
+    PxRig* r = &g_pxRigs[g_pxRigN++];
     memset(r, 0, sizeof(*r)); r->skel = skel; r->head = -1; r->neck = -1;
     const uint8_t* rs = (const uint8_t*)skel + SM_REFSKEL;
     const uint8_t* info = *(const uint8_t* const*)(rs + RS_FINAL_INFO);
@@ -1275,14 +1313,18 @@ static const PxRig* PxRigFor(void* mesh) {
     }
     if (r->head < 0) r->head = headLoose;
     r->n = n;
-    if (r->head < 0) { TwkLog("[sit] a player's rig has no head bone we know -- their head look is not applied"); return nullptr; }
+    if (r->head < 0) {
+        if (g_pxRigLogs++ < 32) TwkLog("[sit] a player's rig has no head bone we know -- their head look is not applied");
+        return nullptr;    // cached as a failure: this skeleton is not asked about again
+    }
     for (int i = 0; i < n; i++) {
         uint8_t uh = 0, un = 0;
         for (int b = i; b >= 0 && b < n; b = parent[b]) { if (b == r->head) uh = 1; if (b == r->neck) un = 1; }
         r->underHead[i] = uh; r->underNeck[i] = un ? 1 : uh;
     }
     r->ok = true;
-    TwkLog("[sit] a player's rig: %d bones, neck %d, head %d -- their head look applies", n, r->neck, r->head);
+    if (g_pxRigLogs++ < 32)
+        TwkLog("[sit] a player's rig: %d bones, neck %d, head %d -- their head look applies", n, r->neck, r->head);
     return r;
 }
 
@@ -1488,6 +1530,8 @@ static bool OnFoot(void* sk) {
 static void StandUp(const char* why) {
     if (!g_sitting) return;
     g_sitting = 0;
+    // Standing up leaves the capsule at the seat -- which is where the body is.
+    g_capMoved = false; g_capReassert = 0;
     g_fp = 0;                       // the camera comes back with the body
     if (g_realMove) g_avel = -0.6f / ((g_blendEff > 50.0f ? g_blendEff : 50.0f) * 0.001f);   // the push off: up is brisker than down
     ReleaseBoard();
@@ -1622,11 +1666,40 @@ static void TrySit(void* sk) {
     g_groundDz = seat.groundDz;
     SeatFrame(mesh);
     g_blendEff = (float)g_blendMs * (1.0f + fabsf(g_turnDeg) / 180.0f * 0.8f);   // a turn-around takes longer
+    // Arm the capsule slide. The target puts the FEET on the seat surface (the root is the capsule's
+    // centre -- floorZ was derived as P.z - half just above), and the rotation is the one we already
+    // have: the sit turns the body in the POSE, so turning the capsule too would double it.
+    g_capMoved = false; g_capReassert = 0;
     g_savedMode = (uint8_t)twkB(move, MOVE_MODE); g_savedCustom = (uint8_t)twkB(move, MOVE_MODE + 1);
     __try {
         g_setMode(move, 0, 0);                                   // MOVE_None: the capsule stays put
         float* vel = (float*)((uint8_t*)move + MOVE_VEL); vel[0] = vel[1] = vel[2] = 0.0f;
     } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; }
+    if (g_capMove && g_teleport && root) {
+        __try {
+            memcpy(g_capRot, (const uint8_t*)root + SC_REL_ROT, 12);
+            const V3 to = v3(seat.point.x, seat.point.y, seat.point.z + half);
+            const V3 d  = sub(to, P);
+            if (len(d) > 2.0f) {
+                // A TEST teleport first: "would the capsule fit there", moving nothing. A refusal --
+                // something standing in the seat -- leaves the capsule where it is, which is exactly
+                // the old behaviour, so this can only ever improve on it.
+                const float toArr[3] = { to.x, to.y, to.z };
+                if (g_teleport(sk, toArr, g_capRot, true, false)) {
+                    g_teleport(sk, toArr, g_capRot, false, true);        // one move, onto the seat
+                    g_capFrom = P; g_capTo = to; g_capMoved = true;
+                    g_capReassert = 30;                                  // half a second of forgiveness
+                    // the move can re-run the floor check: park it again so the first frame is ours
+                    g_setMode(move, 0, 0);
+                    float* vel = (float*)((uint8_t*)move + MOVE_VEL); vel[0] = vel[1] = vel[2] = 0.0f;
+                    TwkLog("[sit] collision moved %.0f cm to the seat", len(d));
+                } else {
+                    TwkLog("[sit] the seat is %.0f cm off but the capsule will not fit there -- collision stays put",
+                           len(d));
+                }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; g_capMoved = false; }
+    }
     g_rand ^= (unsigned)GetTickCount64() ^ (unsigned)(seat.point.x * 7.0f) ^ ((unsigned)(seat.point.y * 13.0f) << 8);
     RestBoard(sk, seat.point, seat.facing, seat.kind == M_LEDGE, seat.groundDz);
     g_mode = seat.kind; g_mesh = mesh; g_skater = sk; g_sitting = 1;
@@ -1924,7 +1997,18 @@ void Sit_PumpFrame() {
         void* move = g_skater ? twkP(g_skater, CH_MOVE) : nullptr;
         if (!onFoot) StandUp("back on the board");
         else if (sk != g_skater) StandUp("skater changed");
-        else if (move && twkB(move, MOVE_MODE) != 0) StandUp("the game took the movement back");
+        else if (move && twkB(move, MOVE_MODE) != 0) {
+            // A moved capsule can come up FALLING for a frame while the floor check settles on the
+            // seat. That is the move's doing, not the game taking the sit back: re-park it, for a
+            // bounded number of frames, and only past that call it what the old test called it.
+            const int mm = twkB(move, MOVE_MODE);
+            if (g_capMoved && g_capReassert > 0 && mm == 3 && g_setMode) {
+                g_capReassert--;
+                __try { g_setMode(move, 0, 0); float* vel = (float*)((uint8_t*)move + MOVE_VEL); vel[0] = vel[1] = vel[2] = 0.0f; }
+                __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; }
+                if (g_capReassert == 29) TwkLog("[sit] the moved capsule came up Falling -- re-parked");
+            } else StandUp("the game took the movement back");
+        }
     }
     // hold the key down to stand: fires while it is still held, like the menu's hold-to-confirm
     if (g_pressDown && g_sitting && !g_holdFired && !g_pressConsumed) {
@@ -2052,6 +2136,15 @@ void Sit_PumpFrame() {
     {
         PxHead prev[16]; const int nPrev = g_nPx; memcpy(prev, g_px, sizeof(PxHead) * (size_t)(nPrev > 0 ? nPrev : 0));
         g_nPx = 0;
+        // A NEW LEVEL RE-USES ADDRESSES. The cache is keyed on the skeletal mesh pointer, and after a
+        // map change that same address can belong to a different peer's rig -- which would hand a proxy
+        // bone indices from somebody else's skeleton. The local skater changing is the cheap, reliable
+        // tell that everything has been respawned, so the whole cache goes with it. Any live PxHead is
+        // dropped in the same breath: its `rig` points into what is being cleared.
+        if (sk && sk != g_pxRigsFor) {
+            g_pxRigsFor = sk;
+            g_pxRigN = 0; g_pxRigFull = false; g_pxRigLogs = 0; g_nPx = 0;
+        }
         if (g_headLook && g_proxyHead && g_proxyList && !InReplay()) {
             void* acts[16]; int n = 0;
             __try { n = g_proxyList(acts, 16); } __except (EXCEPTION_EXECUTE_HANDLER) { n = 0; }
@@ -2293,6 +2386,7 @@ void Sit_ReadConfig(const char* buf) {
     g_styleMs  = TwkIniInt(buf, "SitStyleBlendMs", 260);
     g_debug    = TwkIniInt(buf, "SitDebug", 0) ? 1 : 0;
     g_promptLog = TwkIniInt(buf, "SitPromptLog", 0) ? 1 : 0;
+    g_capMove   = TwkIniInt(buf, "SitMoveCapsule", 1) ? 1 : 0;
     g_boardRest = TwkIniInt(buf, "SitBoardRest", 1) ? 1 : 0;
     g_boardOut  = (float)TwkIniInt(buf, "SitBoardOutCm", 46);
     g_boardDrop = (float)TwkIniInt(buf, "SitBoardDropCm", 9);
@@ -2348,6 +2442,7 @@ void Sit_SaveConfig(char* buf, size_t cap) {
     TwkIniSetInt(buf, cap, "SitStyleBlendMs",  g_styleMs);
     TwkIniSetInt(buf, cap, "SitDebug",         g_debug);
     TwkIniSetInt(buf, cap, "SitPromptLog",     g_promptLog);
+    TwkIniSetInt(buf, cap, "SitMoveCapsule",   g_capMove);
     TwkIniSetInt(buf, cap, "SitBoardRest",     g_boardRest);
     TwkIniSetInt(buf, cap, "SitBoardOutCm",    (int)g_boardOut);
     TwkIniSetInt(buf, cap, "SitBoardDropCm",   (int)g_boardDrop);

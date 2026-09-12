@@ -314,6 +314,7 @@ static const char* const kTwkDetDist     = "TwkDetailDistance";
 static const char* const kTwkDetRefl     = "TwkDetailReflections";
 static const char* const kTwkDetFog      = "TwkDetailFog";
 static const char* const kTwkDetMax      = "TwkDetailMax";
+static const char* const kTwkFsrNA       = "TwkFsrUnavailable";
 // "Sitting"
 static const char* const kTwkSit         = "TwkSit";
 static const char* const kTwkSitFloor    = "TwkSitFloor";
@@ -759,6 +760,35 @@ static const OmpPageItem2 kTwkGfxItems[] = {
     { OMP_ITEM_ACTION, kTwkDetMax,      "Detail settings to maximum",
       "Every detail setting above to its highest, draw distance to 250%" },
 };
+// THE SAME PAGE ON A DIRECTX 11 LAUNCH, with the four FSR rows replaced by one that says why they are
+// not there. The seam has no "greyed out" flag for an injected row -- greying is done on the WIDGET,
+// which only the host's own pages reach -- so the honest equivalent is to not offer a control that
+// cannot work and to say so in its place. The render scale stays: it is a console variable, it works
+// on either renderer, and temporal upsampling follows it now.
+static const OmpPageItem2 kTwkGfxItemsDx11[] = {
+    { OMP_ITEM_ACTION, kTwkFsrNA,       "FSR upscaling needs DirectX 12",
+      "The game is running DirectX 11. Remove -dx11 from the launch options to use FSR" },
+    { OMP_ITEM_SLIDER, kTwkRenderScale, "Render scale (%)",
+      "Internal render resolution; 100 is native. Lower is faster and the engine's own temporal upsampler fills in the rest",
+      nullptr, nullptr, 50.0f, 100.0f, 5.0f },
+    { OMP_ITEM_SLIDER, kTwkDetTex,      "Texture sharpness",
+      "Anisotropic filtering and the streaming pool: ground textures stay sharp along the camera instead of blurring. Costs video memory, not frames",
+      nullptr, nullptr, 0.0f, 3.0f, 1.0f },
+    { OMP_ITEM_SLIDER, kTwkDetShadow,   "Shadows",
+      "Higher shadow resolution, more cascades, further out, and small objects cast too. Costs some frames",
+      nullptr, nullptr, 0.0f, 3.0f, 1.0f },
+    { OMP_ITEM_SLIDER, kTwkDetDist,     "Draw distance (%)",
+      "How far detail is kept before it drops to a lower model or vanishes. 100 is the game's own. The most expensive setting here",
+      nullptr, nullptr, 100.0f, 400.0f, 25.0f },
+    { OMP_ITEM_SLIDER, kTwkDetRefl,     "Reflections",
+      "Sharper, fuller-resolution screen space reflections on wet ground and polished concrete",
+      nullptr, nullptr, 0.0f, 2.0f, 1.0f },
+    { OMP_ITEM_SLIDER, kTwkDetFog,      "Volumetric fog",
+      "A finer fog grid: light shafts get an edge instead of a staircase. Costs memory",
+      nullptr, nullptr, 0.0f, 2.0f, 1.0f },
+    { OMP_ITEM_ACTION, kTwkDetMax,      "Detail settings to maximum",
+      "Every detail setting above to its highest, draw distance to 250%" },
+};
 static const OmpPageItem2 kTwkSitItems[] = {
     { OMP_ITEM_TOGGLE, kTwkSit,         "Sit down",
       "Off the board, press B to sit on the edge of the ledge you are facing or standing at; press it again to stand" },
@@ -824,6 +854,7 @@ static_assert(sizeof(kTwkRootItems)  / sizeof(kTwkRootItems[0])  <= 13 &&
               sizeof(kTwkPhysItems)   / sizeof(kTwkPhysItems[0])   <= 13 &&
               sizeof(kTwkPhys2Items)  / sizeof(kTwkPhys2Items[0])  <= 13 &&
               sizeof(kTwkGfxItems)    / sizeof(kTwkGfxItems[0])    <= 13 &&
+              sizeof(kTwkGfxItemsDx11) / sizeof(kTwkGfxItemsDx11[0]) <= 13 &&
               sizeof(kTwkSitItems)    / sizeof(kTwkSitItems[0])    <= 13,
               "A Session Tweaks page exceeds the engine's visible-row window (14 incl. the Back row "
               "the host appends). Split it into another category page rather than raising this.");
@@ -876,7 +907,8 @@ static bool tryRegisterMenu() {
                 TWK_SUBPAGE("Clothing",       kTwkClothItems);
                 TWK_SUBPAGE("Physical animation", kTwkPhysItems);
                 TWK_SUBPAGE("Style settings",     kTwkPhys2Items);
-                TWK_SUBPAGE("Graphics",           kTwkGfxItems);
+                if (Twk_GraphicsIsD3D11()) TWK_SUBPAGE("Graphics", kTwkGfxItemsDx11);
+                else                       TWK_SUBPAGE("Graphics", kTwkGfxItems);
                 TWK_SUBPAGE("Sitting",            kTwkSitItems);
                 #undef TWK_SUBPAGE
             }

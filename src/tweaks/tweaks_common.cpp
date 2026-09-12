@@ -86,6 +86,53 @@ typedef void (*SetPoseHoldFn)(int);
 static SetPoseHoldFn g_setPoseHold = nullptr;
 static uint64_t      g_setPoseHoldTryMs = 0;
 static int           g_poseHeldSent = -1;
+// ------------------------------------------------------------------ which RHI is running
+// FSR's native path builds D3D12 command lists directly off the RHI context, so on a DirectX 11 launch
+// it reads a D3D11 context through D3D12 layouts -- field-reported as a crash the moment FSR is on,
+// for anyone who runs Session with -dx11.
+//
+// THE COMMAND LINE IS THE SIGNAL, and it is the right one for this: the launcher passes -d3d12 by
+// default (seen in the crash contexts), and a player who wants DirectX 11 adds -dx11 or -d3d11. A flag
+// either way is a stated decision, so it is believed.
+// With NO flag at all there is exactly one sound test left, and it only runs in one direction: if
+// d3d12.dll is not even loaded, this process is certainly not rendering with D3D12. The converse is
+// NOT true -- overlays load d3d12.dll into DirectX 11 games all the time -- so a loaded d3d12.dll is
+// never taken as proof of anything, it just means "no evidence against", and the game's own default
+// stands.
+static bool cmdHasToken(const wchar_t* cmd, const wchar_t* tok) {
+    if (!cmd || !tok) return false;
+    const size_t n = wcslen(tok);
+    for (const wchar_t* p = cmd; *p; p++) {
+        if (_wcsnicmp(p, tok, n) != 0) continue;
+        // a real token: preceded by whitespace (or the very start) and ended by whitespace/end, so a
+        // path that happens to contain the letters cannot masquerade as a launch flag
+        const wchar_t before = (p == cmd) ? L' ' : p[-1];
+        const wchar_t after  = p[n];
+        if ((before == L' ' || before == L'\t' || before == L'"') &&
+            (after == 0 || after == L' ' || after == L'\t' || after == L'"')) return true;
+    }
+    return false;
+}
+static int g_rhiIsD3D11 = -1;
+bool Twk_GraphicsIsD3D11() {
+    if (g_rhiIsD3D11 >= 0) return g_rhiIsD3D11 != 0;
+    int d11 = 0;
+    const char* why = "no DirectX launch flag, and d3d12.dll is loaded -- the game's own default stands";
+    __try {
+        const wchar_t* cmd = GetCommandLineW();
+        if (cmdHasToken(cmd, L"-dx11") || cmdHasToken(cmd, L"-d3d11")) {
+            d11 = 1; why = "the command line asks for DirectX 11";
+        } else if (cmdHasToken(cmd, L"-dx12") || cmdHasToken(cmd, L"-d3d12")) {
+            d11 = 0; why = "the command line asks for DirectX 12";
+        } else if (!GetModuleHandleW(L"d3d12.dll")) {
+            d11 = 1; why = "no DirectX launch flag and d3d12.dll is not loaded";
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { d11 = 0; why = "the command line could not be read"; }
+    g_rhiIsD3D11 = d11;
+    TwkLog("[twk] graphics: the game is running %s (%s)", d11 ? "DIRECTX 11" : "DirectX 12", why);
+    return d11 != 0;
+}
+
 void Twk_SetPoseHold(bool held) {
     if (!g_setPoseHold) {
         const uint64_t ms = GetTickCount64();

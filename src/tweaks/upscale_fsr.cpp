@@ -60,8 +60,22 @@ static int   g_taaSamplesFsr = 8;    // FsrTaaSamples: r.TemporalAASamples while
 static int   g_taaSamplesOff = 4;    // FsrTaaSamplesRestore: what to put back when it is off
 static int   g_log         = 1;      // FsrLog: the 1/s status line
 
+// FSR needs DirectX 12: its whole native path is D3D12 command lists. On a -dx11 launch it would read
+// a D3D11 context through those layouts, which is a crash -- so it is not merely hidden, it is refused
+// at every door: the ini cannot turn it on, the menu cannot turn it on, and the pass never runs.
+bool UpscaleFsr_Available() { return !Twk_GraphicsIsD3D11(); }
+static void SayUnavailable() {
+    static bool said = false;
+    if (said) return;
+    said = true;
+    TwkLog("[fsr] the game is running DirectX 11 -- FSR is switched OFF and cannot be turned on "
+           "(it builds DirectX 12 commands directly, and enabling it here crashes the game). "
+           "Remove -dx11 from the launch options to use it.");
+}
+
 void UpscaleFsr_ReadConfig(const char* buf) {
     g_on         = TwkIniInt(buf, "Upscaler", 0) ? 1 : 0;
+    if (g_on && !UpscaleFsr_Available()) { g_on = 0; SayUnavailable(); }
     g_sharpPct   = TwkIniInt(buf, "FsrSharpnessPct", 50);
     if (g_sharpPct < 0) g_sharpPct = 0; if (g_sharpPct > 100) g_sharpPct = 100;
     g_preferFsr4 = TwkIniInt(buf, "FsrPreferFsr4", 1) ? 1 : 0;
@@ -93,7 +107,10 @@ void UpscaleFsr_SaveConfig(char* buf, size_t cap) {
 }
 void UpscaleFsr_ResetDefaults() { g_on = 0; g_sharpPct = 50; g_preferFsr4 = 1; }
 bool  UpscaleFsr_Enabled()            { return g_on != 0; }
-void  UpscaleFsr_SetEnabled(bool o)   { g_on = o ? 1 : 0; TwkMarkDirty(); }
+void  UpscaleFsr_SetEnabled(bool o)   {
+    if (o && !UpscaleFsr_Available()) { SayUnavailable(); g_on = 0; TwkMarkDirty(); return; }
+    g_on = o ? 1 : 0; TwkMarkDirty();
+}
 float UpscaleFsr_SharpnessPct()       { return (float)g_sharpPct; }
 void  UpscaleFsr_SetSharpnessPct(float v) { int p = (int)(v + 0.5f); if (p < 0) p = 0; if (p > 100) p = 100; g_sharpPct = p; TwkMarkDirty(); }
 bool  UpscaleFsr_PreferFsr4()         { return g_preferFsr4 != 0; }
@@ -523,6 +540,7 @@ void UpscaleFsr_SetGameplay(bool in) {
 
 bool UpscaleFsr_AddPasses(void* gb, const uint8_t* view, const uint8_t* inputs, void** outColor, int32_t* outRect) {
     if (!g_on || !g_engineOk || g_failStage[0] || !view || !inputs || !outColor || !outRect) return false;
+    if (!UpscaleFsr_Available()) return false;   // belt and braces: the pass never runs on DirectX 11
     // Only upscale actual gameplay, and only while the game thread is still SAYING so. With FSR on,
     // sitting in the main menu killed the RHI thread -- a NULL compute pipeline state reaching
     // RHISetComputePipelineState (it reads +0x18 of it unchecked), and once a device removal at a Map.
@@ -817,6 +835,13 @@ static void __fastcall Pass_Execute(OurPass* self, void* rhiCmdList) {
 
 // ------------------------------------------------------------------ install / pump
 void UpscaleFsr_Install() {
+    if (!UpscaleFsr_Available()) {
+        // Nothing is resolved and nothing is hooked: on DirectX 11 every engine function this would
+        // reach for belongs to a renderer that is not running.
+        SayUnavailable();
+        g_engineOk = false;
+        return;
+    }
     g_engineOk = ResolveEngine();
     if (!g_engineOk) TwkLog("[fsr] engine functions incomplete -- FSR unavailable (game updated?)");
 }
@@ -824,6 +849,7 @@ bool UpscaleFsr_Active() { return g_on && g_engineOk && !g_failStage[0]; }
 int  UpscaleFsr_WantedTaaSamples() { return UpscaleFsr_Active() ? g_taaSamplesFsr : g_taaSamplesOff; }
 const char* UpscaleFsr_Status() {
     static char s[200];
+    if (!UpscaleFsr_Available()) return "unavailable -- the game is running DirectX 11";
     if (!g_on) return "off";
     if (g_failStage[0]) { snprintf(s, sizeof(s), "FAILED: %s", g_failStage); return s; }
     snprintf(s, sizeof(s), "%s, %ld dispatches, %ld skipped, provider %s, %s", g_ctx ? "running" : "starting",

@@ -236,9 +236,13 @@ static void Apply(void* sk) {
     if (!wantScale && !g_scaleOwned) return;
 
     // Temporal upsampling is not a choice any more: it is what makes rendering below native produce a
-    // full-resolution image, so it follows the upscaler rather than being a switch of its own that
-    // could be left in the wrong position. On means FSR is on; off hands the engine back its own path.
-    const int g_taau = UpscaleFsr_Enabled() ? 1 : 0;
+    // full-resolution image, so it follows the thing that needs it rather than being a switch of its
+    // own that could be left in the wrong position.
+    // IT FOLLOWS THE RENDER SCALE, not just FSR. 3.19.361 tied it to FSR alone, which quietly took
+    // temporal upsampling away from anyone running a reduced render scale WITHOUT FSR -- their scale
+    // became a plain downscale. That matters doubly now: on DirectX 11 FSR is forced off, and the
+    // render-scale slider is the only upscaling left, so it must keep the engine's own upsampler.
+    const int g_taau = (UpscaleFsr_Enabled() || g_renderScale != 100) ? 1 : 0;
     const int scale  = wantScale ? g_renderScale : 100;
     snprintf(c, sizeof(c), "r.TemporalAA.Upsampling %d", g_taau);
     const bool a = Exec(sk, c);

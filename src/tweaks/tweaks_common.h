@@ -174,3 +174,8 @@ void TwkIniStr(const char* text, const char* key, char* out, size_t cap, const c
 // F1-menu changes call this (render thread); the shell auto-saves the ini once things go quiet.
 void TwkMarkDirty();
 
+// Is the game rendering with DIRECTX 11? Decided once, logged once. Anything that builds native D3D12
+// work (FSR) must refuse to run when this is true -- on a -dx11 launch it would read a D3D11 context
+// through D3D12 layouts, which crashes.
+bool Twk_GraphicsIsD3D11();
+
