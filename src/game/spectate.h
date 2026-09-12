@@ -53,6 +53,9 @@ void* Target();
 // stack. Safe and near-free to call for every retiring proxy: it returns immediately unless the actor
 // is the one being watched.
 void OnActorGone(void* actor, void (*logf)(const char*));
+// The world changed: every stashed component died with its actor. Empty the stash, so a new actor
+// at a recycled address cannot be handed dead component pointers to re-register.
+void ForgetStash();
 // Per-frame safety net for the camera's subject. OnActorGone covers the teardowns the mod runs
 // itself; this covers every other way a proxy can stop existing, because the engine reads that
 // pointer on its own tick and a stale one faults inside the camera with this DLL nowhere in the

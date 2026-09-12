@@ -257,6 +257,7 @@ using SetScalarParamFn = void (*)(void* mid, uint64_t nameFName, float value);
 // instance's profile, so it only means anything inside the cosmetics borrow window.
 using BoardRefreshVisFn = void (*)(void* boardActor);
 // UWidget::SetIsEnabled(bool). Greys the widget and blocks its input; the row stays on the page.
+using CompDestroyFn     = void  (*)(void* comp, bool promoteChildren);   // UActorComponent::DestroyComponent
 using WidgetSetEnabledFn = void (*)(void* widget, bool enabled);
 // Peer body trim (peer_bodies.cpp): the body-level knobs behind a proxy's physical animation.
 // FBodyInstance::SetInstanceSimulatePhysics takes three bools in 4.26 and two in 4.25; passing three
@@ -478,6 +479,7 @@ struct Syms {
     void*                BcastPaDisable = nullptr;     // the body-physics lifecycle pa_state.cpp hooks
     void*                BcastPaEnable  = nullptr;
     void*                TransitOpenMap = nullptr;        // UTransitMapWidget::SetOpenTransitMap -- custom_maps.cpp hooks it
+    CompDestroyFn        CompDestroy    = nullptr;        // UActorComponent::DestroyComponent -- audio.cpp, a stopped loop
     WidgetSetEnabledFn   WidgetSetEnabled = nullptr;    // grey a menu row out (UWidget::SetIsEnabled)
     // Peer body trim (peer_bodies.h): cutting a proxy's physical animation down to what can be seen.
     // All optional -- without them a peer simply keeps the whole simulated asset, as before.

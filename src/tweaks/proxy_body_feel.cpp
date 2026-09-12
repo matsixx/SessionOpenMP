@@ -719,7 +719,12 @@ void ProxyBodyFeel_PumpFrame() {
             continue;
         }
         if (!r) { r = RigAlloc(sk); if (!r) continue; }
-        Cfg c; CfgFromWire(v, n, c);
+        // Zeroed FIRST: Cfg carries padding (after each bool), the compare below is a memcmp, and
+        // neither `Cfg{}` nor the assignment inside CfgFromWire writes padding. Stack garbage there
+        // read as "the owner changed their settings" on most passes -- 1,354 such lines in one
+        // 35-minute session -- and every one re-stamped all 21 drives on that proxy. The rig side is
+        // clean: rigs live in a zeroed static array and only ever receive member-wise copies.
+        Cfg c; memset(&c, 0, sizeof(c)); CfgFromWire(v, n, c);
         if (memcmp(&c, &r->cfg, sizeof(Cfg)) != 0) {
             const bool first = !r->armed;
             r->cfg = c;

@@ -321,6 +321,12 @@ static const SigEntry kSigs[] = {
     // HOOKED (custom_maps.cpp), never called: the Select Map screen opening, where the custom maps
     // are added to its data. Optional: without it they simply do not appear.
     { "TransitOpenMap",        "48 8B C4 55 56 48 8B EC 48 83 EC 78 48 89 58 10 48 89 78 18 48 8B F9 48 8B 0D ?? ?? ?? ?? 4C 89 68 E8", false },
+    // UActorComponent::DestroyComponent(bool bPromoteChildren)          Epic 0x2ae3280 / Steam 0x2aa5ac0
+    // A proxy's looping sounds are spawned with bAutoDestroy off (they are updated while they play),
+    // so stopping one left the component attached to the actor for the life of the world: one more
+    // scene component per loop start, every one moved with the proxy every frame. Optional: without
+    // it the leak is back, nothing else changes.
+    { "CompDestroy",           "40 57 48 83 EC 40 0F B6 81 8B 00 00 00 48 8B F9 A8 02 0F 85 ?? ?? ?? ?? 0C 02 48 89 6C 24 60 4C 89 6C 24 30", false },
     // UWidget::SetIsEnabled                                              Epic 0x27b7a20 / Steam 0x2779db0
     // Greys a menu row and refuses its input -- how "Teleport to them" says no when there is nowhere
     // to go. Optional: without it the row still declines in its status text.
@@ -1050,6 +1056,7 @@ const Syms& Resolve(void (*logf)(const char*)) {
     g_syms.BcastPaDisable     =                     take("BcastPaDisable");       // hooked, never called
     g_syms.BcastPaEnable      =                     take("BcastPaEnable");        // hooked, never called
     g_syms.TransitOpenMap     =                     take("TransitOpenMap");       // hooked, never called
+    g_syms.CompDestroy        = (CompDestroyFn)     take("CompDestroy");
     g_syms.WidgetSetEnabled   = (WidgetSetEnabledFn) take("WidgetSetEnabled");
     g_syms.BodySetSimulate    = (BodySetSimulateFn)  take("BodySetSimulate");
     g_syms.BodySetResponse    = (BodySetResponseFn)  take("BodySetResponse");

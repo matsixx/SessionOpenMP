@@ -374,7 +374,10 @@ static void* g_origSetTrick = nullptr;
 static volatile long g_quickBlocked = 0;          // count, drained into a throttled pump log
 static void hkSetTrick(void* sk, void* def, float a3, float a4,
                        uintptr_t a5, uintptr_t a6, uintptr_t a7, uintptr_t a8) {
-    if (SchemeOn() && def) {
+    // OUR skater only: the block below is keyed on the local pad's timing, which means nothing
+    // for another player's skater. Unknown (no skater learned yet) = ours, the solo behaviour.
+    void* const mineT = CatchTweaks_Skater();
+    if (SchemeOn() && def && !(mineT && sk && sk != mineT)) {
         bool block = false;
         __try {
             if (twkB(def, FTD_IS_QUICK_SHOVE)) {

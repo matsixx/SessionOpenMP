@@ -57,6 +57,12 @@ struct Slot {
     int16_t  map[kPoseMaxBones];
     bool     mapReady = false;
     void*    mapBuiltFor = nullptr;
+    // ...and the SKELETON the map was read from. The component survives a re-dress (the merged
+    // asset on it is what changes), so the component pointer alone said "still valid" over a map
+    // built for the previous outfit -- field: a peer bailing at the moment their proxy spawned had
+    // the map built on the undressed 70-bone body, then the dress swapped in 95 bones under it.
+    void*    mapBuiltForAsset = nullptr;
+    int      mapBuiltForBones = 0;
     uint8_t  mapPeerN = 0;
     uint8_t  holdN = 0;
     float    holdRot[kPoseMaxBones][4];
@@ -69,6 +75,11 @@ struct Slot {
     uint64_t holdUntilMs = 0;
 };
 static Slot g_slots[kSlots];
+// A slot is claimed by ADDRESS, and UE hands addresses back: a proxy dies with its world, a new
+// proxy's mesh lands on the same bytes. Every claim starts from nothing -- no previous occupant's
+// fingerprint, map, coverage bits or hold may leak into the next mesh (field: legs broken on every
+// pose-lane peer after a map change, healed only by leaving the session, which recreates the slots).
+static void claimSlot(Slot* sl, void* mesh) { *sl = Slot{}; sl->mesh = mesh; }
 static void (*g_logf)(const char*) = nullptr;   // optional; set via SetLogger
 static bool g_localHold = false;                 // SetLocalHold: our pose is a held one (sitting)
 
@@ -220,7 +231,7 @@ bool SetPeerSkeleton(void* mesh, const uint32_t* hashes, int n) {
         if (!hashes || n <= 0) return false;                  // nothing to remember: do not claim
         for (auto& c : g_slots) if (!c.mesh) { sl = &c; break; }
         if (!sl) return false;                                // all busy: the caller retries
-        sl->mesh = mesh; sl->n = 0; sl->freshMs = 0; sl->holdN = 0;
+        claimSlot(sl, mesh);
     }
     if (!hashes || n <= 0) { sl->peerN = 0; sl->mapReady = false; sl->mapBuiltFor = nullptr; return true; }
     if (n > kPoseMaxBones) n = kPoseMaxBones;
@@ -255,7 +266,7 @@ void Note(void* mesh, const State& s, uint64_t nowMs) {
     if (!sl) {
         for (auto& c : g_slots) if (!c.mesh) { sl = &c; break; }
         if (!sl) return;
-        sl->mesh = mesh;
+        claimSlot(sl, mesh);
     }
     const int total = s.poseN < kPoseMaxBones ? s.poseN : kPoseMaxBones;
     if (sl->covTotal != (uint8_t)total) {     // re-dressed: what we have describes another skeleton
@@ -288,7 +299,10 @@ void Note(void* mesh, const State& s, uint64_t nowMs) {
 }
 void Forget(void* mesh) {
     Slot* sl = slotFor(mesh);
-    if (sl) { sl->mesh = nullptr; sl->n = 0; sl->freshMs = 0; sl->holdN = 0; sl->holdPing = false; sl->holdUntilMs = 0; }
+    if (sl) *sl = Slot{};                  // the whole slot: a released mesh's address comes back
+}
+void ForgetAll() {
+    for (auto& sl : g_slots) sl = Slot{};
 }
 void NoteHold(void* mesh, bool hold, uint32_t ttlMs) {
     if (!g_tun.enabled || !mesh) return;
@@ -297,7 +311,7 @@ void NoteHold(void* mesh, bool hold, uint32_t ttlMs) {
         if (!hold) return;
         for (auto& c : g_slots) if (!c.mesh) { sl = &c; break; }
         if (!sl) return;
-        sl->mesh = mesh; sl->n = 0; sl->freshMs = 0; sl->holdN = 0;
+        claimSlot(sl, mesh);
     }
     if (hold) { sl->holdPing = true; sl->holdTtlMs = ttlMs; }
     else      { sl->holdPing = false; sl->holdUntilMs = 0; }   // the next pose-less snapshot releases
@@ -312,7 +326,13 @@ void NoteHold(void* mesh, bool hold, uint32_t ttlMs) {
 // name a peer's bones needs it built, and an ordinary riding frame never reaches the stamp.
 static void EnsureBoneMap(Slot* sl, void* mesh) {
     if (!g_tun.skeletonSync || !g_tun.nameKeyedBones || !sl->peerN) return;
-    if (sl->mapReady && sl->mapBuiltFor == mesh && sl->mapPeerN == sl->peerN) return;
+    // The key is the SKELETON, not the component: the asset on the component and its bone count.
+    void* asset = nullptr;
+    __try { asset = *(void**)((uint8_t*)mesh + off::kMeshSkeletalMesh); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { asset = nullptr; }
+    const int bones = game::SkeletonBoneCount(mesh);
+    if (sl->mapReady && sl->mapBuiltFor == mesh && sl->mapPeerN == sl->peerN &&
+        sl->mapBuiltForAsset == asset && sl->mapBuiltForBones == bones) return;
     uint32_t localHash[kPoseMaxBones];
     const int ln = game::SkeletonBoneHashes(mesh, localHash, kPoseMaxBones);
     if (ln <= 0) return;
@@ -323,6 +343,7 @@ static void EnsureBoneMap(Slot* sl, void* mesh) {
             if (sl->peerHash[r] == localHash[b]) { sl->map[b] = (int16_t)r; mapped++; break; }
     }
     sl->mapReady = true; sl->mapBuiltFor = mesh; sl->mapPeerN = sl->peerN;
+    sl->mapBuiltForAsset = asset; sl->mapBuiltForBones = bones;
     g_st.mappedBones = (uint8_t)(mapped > 255 ? 255 : mapped);
     g_st.unmappedBones = (uint8_t)((ln - mapped) > 255 ? 255 : (ln - mapped));
 }
@@ -348,7 +369,7 @@ void OnFinalizeBones(void* mesh, uint64_t nowMs) {
     if (!sl) {
         for (auto& c : g_slots) if (!c.mesh) { sl = &c; break; }
         if (!sl) return;
-        sl->mesh = mesh; sl->n = 0; sl->freshMs = 0; sl->holdN = 0;
+        claimSlot(sl, mesh);
     }
     g_st.hookCalls++;
     // Measurement round: adopt the slot (the probe reads flags off its mesh) but write NOTHING --

@@ -1522,7 +1522,7 @@ void Proxy::AudioApply(const repl::State& s, void* bd) {
     }
     for (int i = 0; i < repl::kAudioMaxLoops; i++) {
         if (audioLoops_[i].comp && !keep[i]) {              // gone from the wire = the sender stopped it
-            audio::StopSound(audioLoops_[i].comp);
+            audio::DestroySound(audioLoops_[i].comp);        // ...and its component goes with it
             audioLoops_[i].comp = nullptr; audioLoops_[i].slot = 0; audioLoops_[i].cue[0] = 0;
         }
     }
@@ -1536,7 +1536,7 @@ void Proxy::PlayAudioEvents(const repl::AudioEvent* e, int n) {
 
 void Proxy::AudioStopAll() {
     for (auto& l : audioLoops_) {
-        if (l.comp) audio::StopSound(l.comp);
+        if (l.comp) audio::DestroySound(l.comp);
         l.comp = nullptr; l.slot = 0; l.cue[0] = 0;
     }
 }

@@ -198,6 +198,15 @@ static bool isPlaying(void* comp) {
         return ((Fn)vt[off::kAcVtblIsPlaying / 8])(comp);
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
+void DestroySound(void* comp) {
+    if (!comp) return;
+    StopSound(comp);
+    const Syms& S = Get();
+    if (!S.CompDestroy) return;                     // symbol missing: the old behaviour (a leak), not a fault
+    __try { S.CompDestroy(comp, false); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { g_st.faults++; }
+}
+
 void StopSound(void* comp) {
     if (!comp) return;
     g_inReplay++;                       // this Stop must not be mistaken for game activity

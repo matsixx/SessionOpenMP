@@ -922,7 +922,18 @@ static bool worldTakesProxies(const char* world) {
 static const uint64_t kWorldSettleMs = 2000;
 
 void ForgetProxies() {
-    for (auto& s : g_slots) if (s.used) { s.proxy.Forget(); game::voice::ProxyGone(s.vrx.voice); s.replayHidden = false; s.away = false; }
+    for (auto& s : g_slots) if (s.used) {
+        s.proxy.Forget(); game::voice::ProxyGone(s.vrx.voice); s.replayHidden = false; s.away = false;
+        // "Done for THIS actor/mesh/board" markers, keyed by address. UE recycles addresses, so the
+        // respawned proxy's parts routinely land where the dead ones were and every one of these
+        // then said "already done": no dress, no skeleton fingerprint for the pose lane, no board
+        // wear. Field: after a map change some peers wore the local defaults and every pose-lane peer
+        // (sitting, bailing, in replay) stood on a bone map built for a skeleton that no longer
+        // existed; leaving the session healed it because a new slot starts from nothing.
+        s.wornForActor = nullptr; s.wearAppliedFor = nullptr; s.skelFedFor = nullptr; s.replayConcealedActor = nullptr;
+    }
+    game::pose::ForgetAll();             // every tracked mesh died with the world
+    game::spectate::ForgetStash();       // every parked component too
     g_settleUntilMs = 0;                 // re-armed by Frame, which owns the clock
     g_lastOwnPawn   = nullptr;
     g_ownMap[0]     = 0;
@@ -1488,6 +1499,13 @@ static void dropFrame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, int nPeers,
         for (auto& d : s.drop) {
             if (!d.used) continue;
             if (d.dead || elsewhere) {
+                // NOT WHILE THE LOCAL PLAYER IS IN REPLAY PLAYBACK. The recorder pools every dynamic
+                // actor at playback start and, on exit, walks the pool calling SetActorTransform on
+                // each; an actor destroyed in between is a null entry it does not check (field:
+                // a peer changed maps while we scrubbed, their bench was destroyed and respawned
+                // under the pool, and exiting the replay crashed in ClearObjectPools). The object
+                // stays for the length of the replay and goes the frame after it ends.
+                if (d.actor && game::LocalReplayMode() == 2) continue;
                 if (d.actor) dropper::DestroyRemote(d.actor, g_logf);
                 d.actor = nullptr;
                 if (d.dead) d = Slot::DropObj();
@@ -2286,6 +2304,10 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
         // timer purely as the fallback for unannounced silence.
         PeerStats ps{};
         const bool departed = (s.peerIdx >= 0 && GetStats(s.peerIdx, &ps) && ps.state == 5);
+        // Same rule as their props: nothing of theirs is destroyed while the local player is in
+        // replay playback (the recorder's pool would keep a null entry -- see the drop apply).
+        // The condition stays true, so the release happens the frame after playback ends.
+        if ((departed || quietForUs > dropUs) && game::LocalReplayMode() == 2) continue;
         if (departed || quietForUs > dropUs) {
             s.proxy.Destroy(g_logf);    // out of the level entirely; Forget only drops pointers
             game::voice::ProxyGone(s.vrx.voice); s.used = false;

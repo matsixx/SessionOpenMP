@@ -1255,7 +1255,19 @@ enum { kMatRecords = 24 };
 // away from anything to do with clothes. Reproducible by entering the shop twice.
 // Stamping each record with the dress it came from means a stale one is never returned: it simply does
 // not match the current generation, and gets overwritten in place.
-struct GarmentMatRec { void* mesh; void* mat; int matIdx; long gen; };
+// ...and ALSO KEYED BY NAME, because the mesh object is not stable across the un-merge's own
+// two-pass dress. Pass one learns each garment's material and captures it; pass two re-dresses with
+// the garments separated, and that second dress bumps the generation. After a level load the game
+// hands pass two BRAND NEW garment mesh objects, so pass one's record -- the one the un-merge is
+// holding a pointer to -- is left stamped with the previous generation and the guard below refuses
+// it. The trousers then reach the component with no material at all and render untextured, for the
+// rest of the session, because every later dress repeats the pattern (field, 2026-09-11: fine until
+// the third map change of a session, "customization has NO record for this garment" from then on).
+// The garment's NAME is stable across all of it, so a record from THIS generation under the same
+// name is the same garment freshly resolved -- and being this generation's, its material is live.
+// That keeps the whole point of the stamp: nothing from an older dress is ever handed back.
+enum { kMatNameLen = 64 };
+struct GarmentMatRec { void* mesh; void* mat; int matIdx; long gen; char name[kMatNameLen]; };
 static GarmentMatRec g_matRec[kMatRecords] = {};
 
 static void LogGarmentMat(const char* what, void* mesh, int idx, void* mat) {
@@ -1266,11 +1278,14 @@ static void LogGarmentMat(const char* what, void* mesh, int idx, void* mat) {
 }
 
 static void RecordGarmentMat(void* mesh, int matIdx, void* mat) {
+    char nm[kMatNameLen];
+    if (!CatchSound_ObjName(mesh, nm, sizeof(nm))) nm[0] = 0;
     int free = -1;
     for (int i = 0; i < kMatRecords; i++) {
         if (g_matRec[i].mesh == mesh) {
             const bool changed = (g_matRec[i].mat != mat);
             g_matRec[i].mat = mat; g_matRec[i].matIdx = matIdx; g_matRec[i].gen = g_matGen;
+            strncpy_s(g_matRec[i].name, nm, _TRUNCATE);
             if (changed) LogGarmentMat("changed", mesh, matIdx, mat);
             return;
         }
@@ -1279,15 +1294,35 @@ static void RecordGarmentMat(void* mesh, int matIdx, void* mat) {
     if (free < 0) free = 0;                       // wrap: the oldest is the least interesting
     g_matRec[free].mesh = mesh; g_matRec[free].mat = mat; g_matRec[free].matIdx = matIdx;
     g_matRec[free].gen  = g_matGen;
+    strncpy_s(g_matRec[free].name, nm, _TRUNCATE);
     LogGarmentMat("learned", mesh, matIdx, mat);
+}
+
+// What this dress resolved for a garment: the record under its own mesh pointer, else the one under
+// its NAME. Only ever a record from the CURRENT generation -- see GarmentMatRec for why both keys
+// are needed and why the generation test is never relaxed.
+static const GarmentMatRec* FindGarmentMatRec(void* mesh) {
+    for (int i = 0; i < kMatRecords; i++)
+        if (g_matRec[i].mesh == mesh && g_matRec[i].gen == g_matGen) return &g_matRec[i];
+    char nm[kMatNameLen];
+    if (!CatchSound_ObjName(mesh, nm, sizeof(nm)) || !nm[0]) return nullptr;
+    for (int i = 0; i < kMatRecords; i++) {
+        if (g_matRec[i].gen != g_matGen || g_matRec[i].mesh == mesh) continue;
+        if (strncmp(g_matRec[i].name, nm, kMatNameLen - 1) != 0) continue;
+        static long lastLogged = -1;              // once per dress: the mesh swap is the news, not each read
+        if (lastLogged != g_matGen) {
+            lastLogged = g_matGen;
+            TwkLog("[mat] '%s': this dress rebuilt the garment mesh -- matched by name instead", nm);
+        }
+        return &g_matRec[i];
+    }
+    return nullptr;
 }
 
 // Which of a garment mesh's material slots is the garment itself. -1 when unknown.
 int ClothMerge_GarmentMaterialIndex(void* mesh) {
-    mesh = SourceOfOwn(mesh);
-    for (int i = 0; i < kMatRecords; i++)
-        if (g_matRec[i].mesh == mesh && g_matRec[i].gen == g_matGen) return g_matRec[i].matIdx;
-    return -1;
+    const GarmentMatRec* r = FindGarmentMatRec(SourceOfOwn(mesh));
+    return r ? r->matIdx : -1;
 }
 
 // A garment whose own material cannot draw cloth has to be DRIVEN rather than bound: the cloth
@@ -1307,14 +1342,10 @@ bool ClothMerge_GarmentWantsDirect(void* mesh) {
 }
 
 void* ClothMerge_ConfiguredMaterial(void* mesh, int* outIdx) {
-    mesh = SourceOfOwn(mesh);
-    for (int i = 0; i < kMatRecords; i++)
-        if (g_matRec[i].mesh == mesh) {
-            if (g_matRec[i].gen != g_matGen) return nullptr;   // an older dress: that material may be gone
-            if (outIdx) *outIdx = g_matRec[i].matIdx;
-            return g_matRec[i].mat;
-        }
-    return nullptr;
+    const GarmentMatRec* r = FindGarmentMatRec(SourceOfOwn(mesh));
+    if (!r) return nullptr;                       // nothing from THIS dress: that material may be gone
+    if (outIdx) *outIdx = r->matIdx;
+    return r->mat;
 }
 
 static void hkMapItemMaterials(void* self, uint8_t gender, int a3, int variantIdx,

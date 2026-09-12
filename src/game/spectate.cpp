@@ -372,8 +372,18 @@ void ValidateLookTarget(void (*logf)(const char*)) {
     SetLookTarget(nullptr, nullptr);
 }
 
+void ForgetStash() {
+    for (auto& b : g_stash) { b.owner = nullptr; b.n = 0; }
+}
+
 void OnActorGone(void* actor, void (*logf)(const char*)) {
-    if (!actor || g_target != actor) return;
+    if (!actor) return;
+    // Their parked components die with them. A bucket that outlived its actor was never released
+    // before: 24 buckets, one per actor ever hidden, and a long session with players coming and
+    // going filled them with dead owners -- and with dead component pointers a recycled actor
+    // address would have had re-registered into the replay manager's array.
+    if (CompStash* b = stashFor(actor, false)) { b->owner = nullptr; b->n = 0; }
+    if (g_target != actor) return;
     // They were the camera's subject and their actor is about to die. Clearing the local pointer is
     // not enough -- the game holds its own copy in AReplayCamera::_lookAtTarget and dereferences it
     // every frame of playback. Hand the camera back before the actor goes, not after.

@@ -166,6 +166,9 @@ void Note(void* mesh, const repl::State& s, uint64_t nowMs);
 // the transported pose. `hold` false = released now.
 void NoteHold(void* mesh, bool hold, uint32_t ttlMs);
 void Forget(void* mesh);
+// The world changed: every mesh a slot tracks is gone, and its ADDRESS is about to be reused. Drop
+// everything -- fingerprints and maps included -- so no new mesh can inherit a dead one's.
+void ForgetAll();
 // Called from the FinalizeBoneTransform pre-hook for EVERY skeletal mesh in the game; cheap and
 // silent unless the mesh is a proxy we have a fresh pose for.
 void OnFinalizeBones(void* mesh, uint64_t nowMs);

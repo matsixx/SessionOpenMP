@@ -142,6 +142,9 @@ void* PlayLoop(const repl::AudioLoop& l, void* actor, void* board, const float* 
 void  UpdateLoop(void* comp, const repl::AudioLoop& l);
 void  PlayOneShot(const repl::AudioEvent& e, void* actor, void* board, const float* bodyPos);
 void  StopSound(void* comp);
+// Stop AND destroy one of OUR loop components (spawned with bAutoDestroy off). The handle is dead on
+// return. Never for a component the game spawned.
+void  DestroySound(void* comp);
 // True while we are re-issuing a captured sound. Anything that could re-enter the funnel checks it.
 bool  Replaying();
 // A sound WE spawn that is not the game's: raise this around the spawn so the funnel neither
