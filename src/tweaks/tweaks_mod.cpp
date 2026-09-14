@@ -50,6 +50,7 @@
 #include "foot_steer.h"
 #include "grind_pop.h"
 #include "camera_height.h"
+#include "cam_fp.h"
 #include "sit.h"
 #include "pop_probe.h"
 #include "body_feel.h"
@@ -61,7 +62,7 @@
 #include "ue4ss_abi.h"
 #include "ui/menu_ext.h"
 
-#define TWEAKS_VERSION "3.19.374"
+#define TWEAKS_VERSION "3.19.379"
 #define TWK_WIDEN(x) STR(x)   // STR() prepends L before the macro expands; expand first
 
 // ------------------------------------------------------------------ log (own file, fresh per launch)
@@ -275,6 +276,7 @@ static const char* const kTwkClothCuff = "TwkClothCuffGrip";
 static const char* const kTwkCamFollow    = "TwkCamFollow";
 static const char* const kTwkCamPitchDrop = "TwkCamPitchDrop";
 static const char* const kTwkCamPitch  = "TwkCamPitch";
+static const char* const kTwkCamFp     = "TwkCamFirstPerson";
 static const char* const kTwkFlip     = "TwkFlipSpeed";
 static const char* const kTwkFlipMin  = "TwkFlipVelMin";
 static const char* const kTwkFlipMax  = "TwkFlipVelMax";
@@ -398,6 +400,7 @@ static void pageValue(const char* key, int iv, float fv, void*) {
     else if (!strcmp(key, kTwkCamFollow))    CameraHeight_SetFollowEnabled(iv != 0);
     else if (!strcmp(key, kTwkCamPitchDrop)) CameraHeight_SetPitchOnDropEnabled(iv != 0);
     else if (!strcmp(key, kTwkCamPitch))  CameraHeight_SetPitchDeg(fv);
+    else if (!strcmp(key, kTwkCamFp))     CamFp_SetEnabled(iv != 0);
     else if (!strcmp(key, kTwkBodyFeel))  BodyFeel_SetEnabled(iv != 0);
     else if (!strcmp(key, kTwkBodyAmt))   BodyFeel_SetAmountPct(fv);
     else if (!strcmp(key, kTwkBrace))     BodyFeel_SetBraceEnabled(iv != 0);
@@ -488,6 +491,7 @@ static int pageGet(const char* key, int* oi, float* of, void*) {
     else if (!strcmp(key, kTwkCamFollow))    { *oi = CameraHeight_FollowEnabled()      ? 1 : 0; return 1; }
     else if (!strcmp(key, kTwkCamPitchDrop)) { *oi = CameraHeight_PitchOnDropEnabled() ? 1 : 0; return 1; }
     else if (!strcmp(key, kTwkCamPitch))  { *of = CameraHeight_PitchDeg();            return 1; }
+    else if (!strcmp(key, kTwkCamFp))     { *oi = CamFp_Enabled() ? 1 : 0;            return 1; }
     else if (!strcmp(key, kTwkBone))      { *of = CatchTweaks_BoneScalePct();          return 1; }
     else if (!strcmp(key, kTwkBoneX))     { *of = CatchTweaks_BoneAdd(0);              return 1; }
     else if (!strcmp(key, kTwkBoneY))     { *of = CatchTweaks_BoneAdd(1);              return 1; }
@@ -840,6 +844,8 @@ static const OmpPageItem2 kTwkCameraItems[] = {
     { OMP_ITEM_SLIDER, kTwkCamPitch, "Pitch on the board (deg)",
       "Tilts the camera while you are riding: positive looks up, negative looks down. 0 is the stock camera, and so is walking around",
       nullptr, nullptr, -30.0f, 30.0f, 1.0f },
+    { OMP_ITEM_TOGGLE, kTwkCamFp, "First person",
+      "See through your skater's eyes. Switches back to third person when you bail" },
 };
 // Every page must stay inside the host's cap AND inside the engine's visible window -- the host
 // truncates the TAIL, so an over-long page loses its Back row, not the row just added.

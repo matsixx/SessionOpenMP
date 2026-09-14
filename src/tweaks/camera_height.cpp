@@ -47,6 +47,7 @@
 #include "camera_height.h"
 #include "grind_pop.h"     // GrindPop_NameOfFName -- names the component class in the probe
 #include "sit.h"           // Sit_FirstPersonView -- the seated first-person view this module writes
+#include "cam_fp.h"        // CamFp_View -- first person while skating, the other view this module writes
 #include "foot_place.h"    // FootPlace_AnimInstance -- riding, or walking around
 #include "MinHook.h"
 
@@ -369,18 +370,36 @@ static void quatRotate(const float q[4], const float v[3], float r[3]) {   // v'
 // component's current transform, which after our first write is ours. The last write on the way out
 // puts the component back on that stock relative. Returns true while it wrote; the pitch slider then
 // stands aside for the frame.
-static bool applyFirstPerson(void* cam) {
+// Blend one camera pose toward another: the position straight, the rotation the shorter way round.
+static void blendView(const float pa[3], const float qa[4], const float pb[3], const float qb[4], float w,
+                      float po[3], float qo[4]) {
+    for (int i = 0; i < 3; i++) po[i] = pa[i] + (pb[i] - pa[i]) * w;
+    float d = 0.0f; for (int i = 0; i < 4; i++) d += qa[i] * qb[i];
+    const float sg = d < 0.0f ? -1.0f : 1.0f;
+    float n = 0.0f;
+    for (int i = 0; i < 4; i++) { qo[i] = qa[i] + (qb[i] * sg - qa[i]) * w; n += qo[i] * qo[i]; }
+    n = n > 1e-8f ? 1.0f / sqrtf(n) : 1.0f;
+    for (int i = 0; i < 4; i++) qo[i] *= n;
+}
+
+// TWO FIRST-PERSON SOURCES, layered: first person while skating (the Camera page) under the seated view
+// (A while sitting). The seated one wins while it is up, and it blends in FROM the skating one rather
+// than from the game's camera, so sitting down with both on never flicks the view out to third person
+// and back in. Both are asked every tick so each keeps its own dolly and filters honest.
+static bool applyFirstPerson(void* cam, float dt) {
     if (!g_setWorldLocRot) return false;
     void* comp = twkP(cam, CAM_COMPONENT);
     void* root = twkP(cam, ACTOR_ROOT);
     if (!comp || !root) return false;
     if (comp != g_fpComp) { g_fpComp = comp; g_fpWrote = 0; }     // a fresh component: nothing of ours on it
-    float eye[3], look[4], w = 0.0f, fov = 0.0f;
-    const bool want = Sit_FirstPersonView(eye, look, &w, &fov) && w > 0.0f;
     float actorQ[4] = { twkF(root, COMP_WORLD_QUAT),     twkF(root, COMP_WORLD_QUAT + 4),
                         twkF(root, COMP_WORLD_QUAT + 8), twkF(root, COMP_WORLD_QUAT + 12) };
     float actorP[3] = { twkF(root, COMP_WORLD_POS), twkF(root, COMP_WORLD_POS + 4), twkF(root, COMP_WORLD_POS + 8) };
-    if (!want) {
+    float eyeK[3], lookK[4], wK = 0.0f, fovK = 0.0f;
+    const bool skate = CamFp_View(actorQ, dt, eyeK, lookK, &wK, &fovK) && wK > 0.0f;
+    float eyeS[3], lookS[4], wS = 0.0f, fovS = 0.0f;
+    const bool seat = Sit_FirstPersonView(eyeS, lookS, &wS, &fovS) && wS > 0.0f;
+    if (!skate && !seat) {
         if (g_fpWrote) {   // one restoring write: back under the actor, on the relative it had when we began
             float relQ[4]; quatFromRotator(g_fpStockRelRot, relQ);
             float off[3];  quatRotate(actorQ, g_fpStockRelLoc, off);
@@ -396,26 +415,26 @@ static bool applyFirstPerson(void* cam) {
     if (!g_fpWrote) {
         for (int i = 0; i < 3; i++) { g_fpStockRelLoc[i] = twkF(comp, COMP_REL_LOC + 4 * i); g_fpStockRelRot[i] = twkF(comp, COMP_REL_ROT + 4 * i); }
         g_fpStockFov = twkF(comp, CAMC_FOV);
-        TwkLog("[camh] first person: camera to the eyes (stock relative (%.1f %.1f %.1f) / (%.1f %.1f %.1f), fov %.1f%s)",
-               g_fpStockRelLoc[0], g_fpStockRelLoc[1], g_fpStockRelLoc[2], g_fpStockRelRot[0], g_fpStockRelRot[1], g_fpStockRelRot[2],
-               g_fpStockFov, fov > 0.0f ? "" : " kept");
+        TwkLog("[camh] first person: camera to the eyes (%s; stock relative (%.1f %.1f %.1f) / (%.1f %.1f %.1f), fov %.1f)",
+               seat ? "seated" : "skating", g_fpStockRelLoc[0], g_fpStockRelLoc[1], g_fpStockRelLoc[2],
+               g_fpStockRelRot[0], g_fpStockRelRot[1], g_fpStockRelRot[2], g_fpStockFov);
     }
     // the game's own view this frame, off the actor
     float relQ[4]; quatFromRotator(g_fpStockRelRot, relQ);
     float off[3];  quatRotate(actorQ, g_fpStockRelLoc, off);
     const float gameP[3] = { actorP[0] + off[0], actorP[1] + off[1], actorP[2] + off[2] };
     float gameQ[4]; quatMul(actorQ, relQ, gameQ);
-    // ...blended toward the eyes: the position straight, the rotation by the shorter way round
-    float loc[3];
-    for (int i = 0; i < 3; i++) loc[i] = gameP[i] + (eye[i] - gameP[i]) * w;
-    float d = 0.0f; for (int i = 0; i < 4; i++) d += gameQ[i] * look[i];
-    const float sg = d < 0.0f ? -1.0f : 1.0f;
-    float q[4]; float n = 0.0f;
-    for (int i = 0; i < 4; i++) { q[i] = gameQ[i] + (look[i] * sg - gameQ[i]) * w; n += q[i] * q[i]; }
-    n = n > 1e-8f ? 1.0f / sqrtf(n) : 1.0f;
-    for (int i = 0; i < 4; i++) q[i] *= n;
+    // game -> skating -> seated
+    float p1[3], q1[4];
+    if (skate) blendView(gameP, gameQ, eyeK, lookK, wK, p1, q1);
+    else { for (int i = 0; i < 3; i++) p1[i] = gameP[i]; for (int i = 0; i < 4; i++) q1[i] = gameQ[i]; }
+    float loc[3], q[4];
+    if (seat) blendView(p1, q1, eyeS, lookS, wS, loc, q);
+    else { for (int i = 0; i < 3; i++) loc[i] = p1[i]; for (int i = 0; i < 4; i++) q[i] = q1[i]; }
     g_setWorldLocRot(comp, loc, q, false, nullptr, 0);
-    if (fov > 0.0f && g_fpStockFov > 0.0f) wrF(comp, CAMC_FOV, g_fpStockFov + (fov - g_fpStockFov) * w);
+    const float fovWant = (seat && fovS > 0.0f) ? fovS : ((skate && fovK > 0.0f) ? fovK : 0.0f);
+    const float fovW    = (seat && fovS > 0.0f) ? wS   : wK;
+    if (g_fpStockFov > 0.0f) wrF(comp, CAMC_FOV, fovWant > 0.0f ? g_fpStockFov + (fovWant - g_fpStockFov) * fovW : g_fpStockFov);
     g_fpWrote = 1;
     return true;
 }
@@ -434,7 +453,7 @@ static void hkCameraTick(void* self, float dt) {
     ((void(*)(void*, float))g_origTick)(self, dt);
     bool fp = false;
     if (!g_fpDead) {
-        __try { fp = applyFirstPerson(self); }
+        __try { fp = applyFirstPerson(self, dt); }
         __except (EXCEPTION_EXECUTE_HANDLER) {
             g_fpDead = 1;
             TwkLog("[camh] FAULT in the seated first-person view -- off for this run");
@@ -480,7 +499,8 @@ void CameraHeight_Install() {
     g_setWorldRot = (SetWorldRotFn)TwkScanExe(SIG_SET_WORLD_ROT);
     if (!g_setWorldRot) TwkLog("[camh] SetWorldRotation sig NOT FOUND -- pitch slider off, levers still work");
     g_setWorldLocRot = (SetWorldLocRotFn)TwkScanExe(SIG_SET_WORLD_LOCROT);
-    if (!g_setWorldLocRot) TwkLog("[camh] SetWorldLocationAndRotation sig NOT FOUND -- seated first person off");
+    if (!g_setWorldLocRot) TwkLog("[camh] SetWorldLocationAndRotation sig NOT FOUND -- seated and skating first person off");
+    CamFp_Install();
     TwkLog("[camh] installed (camera Tick @ %p, followHeight=%d pitchBeforeDrop=%d pitch=%.0f deg)",
            g_hookAt, g_follow, g_pitchOnDrop, g_pitchDeg);
 }
@@ -508,6 +528,7 @@ void CameraHeight_ReadConfig(const char* iniText) {
     g_pitchBlendMs = TwkIniInt(iniText, "CameraPitchBlendMs", 400);
     if (g_pitchDeg < -30.0f) g_pitchDeg = -30.0f;
     if (g_pitchDeg >  30.0f) g_pitchDeg =  30.0f;
+    CamFp_ReadConfig(iniText);
 }
 void CameraHeight_SaveConfig(char* iniText, size_t cap) {
     TwkIniSetInt(iniText, cap, "CameraFollowHeight",    g_follow);
@@ -515,9 +536,11 @@ void CameraHeight_SaveConfig(char* iniText, size_t cap) {
     TwkIniSetInt(iniText, cap, "CameraDropDebug",       g_dropDebug);
     TwkIniSetInt(iniText, cap, "CameraPitchDeg",   (int)g_pitchDeg);
     TwkIniSetInt(iniText, cap, "CameraPitchBlendMs", g_pitchBlendMs);
+    CamFp_SaveConfig(iniText, cap);
 }
 void CameraHeight_ResetDefaults() {
     g_follow = 0; g_pitchOnDrop = 1; g_dropDebug = 0; g_pitchDeg = 0;
+    CamFp_ResetDefaults();
     TwkMarkDirty();
 }
 
@@ -552,4 +575,5 @@ void CameraHeight_DrawMenu(const OmpMenuApi* api) {
         api->TextDisabled(b);
     }
     if (g_dead) api->TextDisabled("FAULTED this run -- see SessionTweaks.log");
+    CamFp_DrawMenu(api);
 }

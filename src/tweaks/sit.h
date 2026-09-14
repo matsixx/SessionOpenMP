@@ -31,6 +31,7 @@ void Sit_NoteReplayTick(void* replayManager);   // the AReplayManager whose Tick
 // on-screen prompt is hidden. Cheap, and safe to call from anything on the game thread.
 void Sit_WatchdogTick();
 bool Sit_PoseHeld();                         // the sit pose is on the skeleton right now (seated, or blending either way)
+bool Sit_EditorOpen();                       // the replay editor or the object dropper's prop editor is up
 // GAME THREAD, for the camera module: the seated first-person view -- the eyes (world), the look (world
 // FQuat), the dolly weight 0..1 and the wanted FOV (0 = the game's). False = the camera is the game's.
 bool Sit_FirstPersonView(float eye[3], float look[4], float* weight, float* fov);

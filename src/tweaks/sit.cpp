@@ -1488,6 +1488,7 @@ static bool InPropEditor() {
         return m && *(const uint8_t*)(m + DROP_MGR_MODE) != 0;
     } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; g_dropInst = nullptr; return false; }
 }
+bool Sit_EditorOpen() { return InReplay() || InPropEditor(); }
 static void StandUp(const char* why);
 // THE WATCHDOG. `Tweaks_PumpFrame` rides InputHandler::Tick, and the replay editor and the object
 // dropper both stop it -- measured: 3.6 s of an open replay editor with not one pump line, the prompt

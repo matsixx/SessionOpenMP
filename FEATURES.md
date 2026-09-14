@@ -237,6 +237,8 @@ quick shoves, boardslides and 180s into grinds along the way.
 
 * \[fix] Camera always follows height: the camera's height only tracked the skater when landing HIGHER than
 the launch point (data thresholds); ordinary airs and drops left it behind. Pitch camera before a drop.
+* \[feature] First person while skating (3.19.375): a Camera page toggle; the view follows the game camera's
+direction from the eyes with a level horizon, a little head motion, the head hidden, and third person on a bail.
 
 ## Clothing
 

@@ -278,6 +278,7 @@ if(EXISTS "${UE4SS_LIB}")
             src/tweaks/body_feel.cpp
             src/tweaks/proxy_body_feel.cpp
             src/tweaks/camera_height.cpp
+            src/tweaks/cam_fp.cpp
             src/tweaks/upscale.cpp
             src/tweaks/max_detail.cpp
             src/tweaks/upscale_fsr.cpp
