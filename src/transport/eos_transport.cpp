@@ -57,6 +57,7 @@ struct Peer {
     PeerStats         st{};
     uint64_t          lastRecvMs = 0;
     uint64_t          closedUntilMs = 0;   // send cooldown after a remote close
+    uint64_t          departedAtMs = 0;    // when state went to 5 (0 = not departed); picks the entry a full table reclaims
     // Send-failure reporting: the first refusal is named in full, then at most one summary line per
     // kSendFailQuietMs. A refused send can repeat at the publish rate, so an unthrottled line would
     // bury the log it is meant to make readable.
@@ -74,6 +75,11 @@ struct Peer {
 };
 static Peer g_peers[16];   // sized for the 16-member lobby (15 remotes + headroom)
 static int  g_nPeers = 0;
+// A peer leaves the session. The entry is KEPT (see rosterSeen) but becomes reclaimable, oldest first.
+static void markDeparted(Peer& p) {
+    if (p.st.state != 5) p.departedAtMs = GetTickCount64();
+    p.st.state = 5;
+}
 
 // ---- lobby state. One bucket for the whole mod: search-by-bucket IS the server browser for now.
 static const char*    kBucket = "openmp:1";
@@ -252,7 +258,7 @@ static void rosterAddAll(const char* lobbyId) {
         if (EOS_ProductUserId_ToString(m, id, &idn) != EOS_EResult::EOS_Success) continue;
         if (!_stricmp(id, g_myId)) continue;             // handles are not guaranteed canonical; compare strings
         const int pi = addPeerEx(id, true);              // straight from the lobby: vouched
-        if (pi >= 0 && g_peers[pi].st.state == 5) g_peers[pi].st.state = 0;   // rejoiner: un-depart
+        if (pi >= 0 && g_peers[pi].st.state == 5) { g_peers[pi].st.state = 0; g_peers[pi].departedAtMs = 0; }   // rejoiner: un-depart
     }
     EOS_LobbyDetails_Release(det);
 }
@@ -303,7 +309,7 @@ static void EOS_CALL onMemberStatus(const EOS_Lobby_LobbyMemberStatusReceivedCal
     case EOS_ELobbyMemberStatus::EOS_LMS_JOINED:
         if (!isMe) {
             const int i = addPeerEx(who, true);          // the lobby vouching for them, by definition
-            if (i >= 0 && g_peers[i].st.state == 5) g_peers[i].st.state = 0;
+            if (i >= 0 && g_peers[i].st.state == 5) { g_peers[i].st.state = 0; g_peers[i].departedAtMs = 0; }
             Log("[lobby] member JOINED: %s", who);
         }
         break;
@@ -313,7 +319,7 @@ static void EOS_CALL onMemberStatus(const EOS_Lobby_LobbyMemberStatusReceivedCal
         if (isMe) { InterlockedExchange(&g_lobbyStatus, 0); g_lobbyId[0] = 0; Log("[lobby] we are OUT (status %d)", (int)d->CurrentStatus); }
         else for (int i = 0; i < g_nPeers; i++)
             if (!_stricmp(g_peers[i].idStr, who)) {
-                g_peers[i].st.state = 5; Log("[lobby] member DEPARTED: %s", who);
+                markDeparted(g_peers[i]); Log("[lobby] member DEPARTED: %s", who);
                 // ...and the channel goes with them. Their client may keep our id and keep sending
                 // (a stale session does exactly that); membership ended, so the link ends.
                 EOS_P2P_CloseConnectionOptions c{};
@@ -325,7 +331,7 @@ static void EOS_CALL onMemberStatus(const EOS_Lobby_LobbyMemberStatusReceivedCal
     case EOS_ELobbyMemberStatus::EOS_LMS_CLOSED:
         Log("[lobby] lobby CLOSED");
         InterlockedExchange(&g_lobbyStatus, 0); g_lobbyId[0] = 0;
-        for (int i = 0; i < g_nPeers; i++) g_peers[i].st.state = 5;
+        for (int i = 0; i < g_nPeers; i++) markDeparted(g_peers[i]);
         break;
     case EOS_ELobbyMemberStatus::EOS_LMS_PROMOTED:
         // The roster is unchanged -- who can DO things is not. Handled by refreshOwnership below,
@@ -877,6 +883,13 @@ bool LobbyBrowse() {
 bool LobbyJoinAt(int i) {
     if (!g_plat || !g_me || !g_search) return false;
     if (i < 0 || i >= g_nBrowse) return false;
+    // THE SESSION YOU ARE ALREADY IN. Leaving and re-joining it in one call cannot work: the leave is
+    // asynchronous, so the join lands while we are still a member and fails with LobbyAlreadyExists
+    // -- which left the session armed with no lobby at all (field, 2026-09-13).
+    if (g_lobbyStatus >= 2 && g_lobbyId[0] && g_browse[i].id[0] && !_stricmp(g_browse[i].id, g_lobbyId)) {
+        Log("[lobby] browse[%d] is the session you are already in -- nothing to do", i);
+        return true;
+    }
     if (!leaveCurrentBeforeJoining("join the session you picked")) return false;
     EOS_LobbySearch_CopySearchResultByIndexOptions ro{};
     // THE ROW'S OWN search index, never the row number: the list is filtered (private lobbies,
@@ -911,7 +924,7 @@ void LobbyLeave() {
     o.LobbyId = g_lobbyId; o.LocalUserId = g_me;
     EOS_Lobby_LeaveLobby(g_lobbyH, &o, nullptr, onLeaveLobby);
     InterlockedExchange(&g_lobbyStatus, 0); g_lobbyId[0] = 0; g_lobbyOwner[0] = 0;
-    for (int i = 0; i < g_nPeers; i++) g_peers[i].st.state = 5;   // we left; nobody to send to
+    for (int i = 0; i < g_nPeers; i++) markDeparted(g_peers[i]);  // we left; nobody to send to
     // Every channel closes with the membership: the session is the lobby, and a link that outlives
     // it is exactly how a dead session's players walk into the next one.
     if (g_p2p && g_me) {
@@ -1256,6 +1269,35 @@ static int addPeerEx(const char* puidStr, bool fromRoster) {
         return i;
     }
     const int budget = fromRoster ? kPeerCap : kMaxLearned;
+    // A FULL TABLE RECLAIMS THE LONGEST-DEPARTED ENTRY -- for a LOBBY MEMBER only. Entries were never
+    // freed, so once sixteen distinct players had passed through a lobby this client refused every
+    // new one: their packets were dropped without a hang-up and nothing was ever sent back, so the
+    // two of you never appeared to each other (field, 2026-09-13: a long-running public lobby, the
+    // newcomer saw two of six players; "roster budget full (16/16 used)" in an older log of ours).
+    // Only a departed entry whose player is not in the lobby now is taken. The index then names a
+    // different player: the session compares PeerIdStr against the identity its slot recorded and
+    // releases the old player's slot (session.cpp slotFor), which is what makes the reuse safe.
+    if (g_nPeers >= budget && fromRoster) {
+        int victim = -1;
+        for (int j = 0; j < g_nPeers; j++) {
+            const Peer& q = g_peers[j];
+            if (q.st.state != 5 || lobbyHasMember(q.puid)) continue;
+            if (victim < 0 || q.departedAtMs < g_peers[victim].departedAtMs) victim = j;
+        }
+        if (victim >= 0) {
+            EOS_ProductUserId np = EOS_ProductUserId_FromString(puidStr);
+            if (!np || EOS_ProductUserId_IsValid(np) != EOS_TRUE) { Log("[p2p] invalid peer id '%s'", puidStr); return -1; }
+            Peer& pe = g_peers[victim];
+            const uint64_t agoS = pe.departedAtMs ? (GetTickCount64() - pe.departedAtMs) / 1000 : 0;
+            char was[64]; strncpy_s(was, pe.idStr, _TRUNCATE);
+            pe = Peer{};
+            pe.puid = np; strncpy_s(pe.idStr, puidStr, _TRUNCATE);
+            pe.rosterSeen = true;
+            Log("[p2p] peer #%d = %s (lobby roster) -- the table was full, so this entry was reclaimed"
+                " from %s, who departed %llus ago", victim, pe.idStr, was, (unsigned long long)agoS);
+            return victim;
+        }
+    }
     if (g_nPeers >= budget) {
         // Rate-limited: a flood must not become a log flood, but the refusal must still be visible.
         const uint64_t now = GetTickCount64();

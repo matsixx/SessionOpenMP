@@ -64,7 +64,10 @@ void        Shutdown();
 void        Deactivate();
 const char* MyId();                          // Eos: PUID string. Shm: "shm:<slot>". Valid after Init.
 int         AddPeer(const char* puidStr);    // -> peer index, or -1 (Shm: peers are discovered, not added)
-int         PeerCount();                     // peer indices are [0, PeerCount) and are NEVER reused
+// Peer indices are [0, PeerCount). An index is never reused while its peer is live; EOS reclaims the
+// entry of a long-DEPARTED peer when its table is full, so anything keyed by index must also compare
+// PeerIdStr (the session's slots do).
+int         PeerCount();
 void        Send(int peerIdx, const void* data, int len, bool reliable);
 // How many RELIABLE messages this wire can absorb per Tick without loss -- the backpressure hint
 // for bulk senders (replay sync paces its chunk bursts by it). Shm: half its reliable ring, so one

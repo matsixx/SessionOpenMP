@@ -140,6 +140,11 @@ struct Slot {
     repl::SkelPrint skel;
     bool        haveSkel = false;
     void*       skelFedFor = nullptr;    // the mesh we last fed it to; a respawn re-feeds
+    // WHO this slot is, as the transport named them when it was claimed. An index can be reclaimed for
+    // another player (eos_transport addPeerEx); a mismatch ORPHANS the slot -- peerIdx -1, released by
+    // Frame on the game thread -- and the newcomer gets a fresh one.
+    char        peerId[64] = {0};
+    bool        orphaned = false;
     // The per-peer name cache for interned loop/trick names -- see AudioNameCache. Applied at
     // OnPacket, before the state reaches the stream, so everything downstream is complete.
     repl::AudioNameCache nameCache;
@@ -341,11 +346,23 @@ const Config& GetConfig() { return g_cfg; }
 Stats GetStats() { return g_st; }
 
 static Slot* slotFor(int peerIdx, uint64_t nowUs) {
-    for (auto& s : g_slots) if (s.used && s.peerIdx == peerIdx) return &s;
+    for (auto& s : g_slots) {
+        if (!s.used || s.peerIdx != peerIdx) continue;
+        const char* now = PeerIdStr(peerIdx);
+        if (!now || !now[0] || !s.peerId[0] || !_stricmp(now, s.peerId)) return &s;
+        // The transport reclaimed this index for somebody else. Nothing of the old player may reach
+        // the newcomer, and no game object may be touched here (this is the packet pump): detach the
+        // slot and let Frame release it.
+        s.peerIdx = -1; s.orphaned = true;
+        if (g_logf) { char m[200]; snprintf(m, sizeof(m), "[session] peer %d is now a different player (%s"
+                      " replaced %s) -- the old slot is released", peerIdx, now, s.peerId); g_logf(m); }
+        break;
+    }
     for (auto& s : g_slots) {
         if (s.used) continue;
         s.stream.Reset(); s.proxy.Forget(); voiceResetPeer(s);          // nothing carries across to a new peer
         s.used = true; s.peerIdx = peerIdx; s.lastPacketUs = nowUs; s.quietHandled = false;
+        { const char* id = PeerIdStr(peerIdx); strncpy_s(s.peerId, id ? id : "", _TRUNCATE); s.orphaned = false; }
         memset(&s.cosmetics, 0, sizeof(s.cosmetics));   // padding too -- it is memcmp'd for changes
         s.haveCosmetics = false; s.wornForActor = nullptr; s.peerReplaying = false;
         s.wear = repl::WearSet{}; s.haveWear = false; s.wearAppliedFor = nullptr;
@@ -2307,10 +2324,11 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
         // Same rule as their props: nothing of theirs is destroyed while the local player is in
         // replay playback (the recorder's pool would keep a null entry -- see the drop apply).
         // The condition stays true, so the release happens the frame after playback ends.
-        if ((departed || quietForUs > dropUs) && game::LocalReplayMode() == 2) continue;
-        if (departed || quietForUs > dropUs) {
+        const bool gone = departed || s.orphaned || quietForUs > dropUs;
+        if (gone && game::LocalReplayMode() == 2) continue;
+        if (gone) {
             s.proxy.Destroy(g_logf);    // out of the level entirely; Forget only drops pointers
-            game::voice::ProxyGone(s.vrx.voice); s.used = false;
+            game::voice::ProxyGone(s.vrx.voice); s.used = false; s.orphaned = false;
             // Their props leave with them. Nobody else will ever hold these pointers.
             for (auto& d : s.drop) {
                 if (d.actor) game::dropper::DestroyRemote(d.actor, g_logf);
@@ -2319,7 +2337,8 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
             dropsync::ForgetPeer(s.peerIdx);
             s.haveDropAuth = false; s.dropAuthKey = 0;
             if (g_logf) { char m[140];
-                if (departed) snprintf(m, sizeof(m), "[session] peer %d released (they left)", s.peerIdx);
+                if (s.orphaned) snprintf(m, sizeof(m), "[session] a replaced player's slot released");
+                else if (departed) snprintf(m, sizeof(m), "[session] peer %d released (they left)", s.peerIdx);
                 else          snprintf(m, sizeof(m), "[session] peer %d released (quiet %llums, no goodbye)",
                                        s.peerIdx, (unsigned long long)(quietForUs / 1000));
                 g_logf(m); }

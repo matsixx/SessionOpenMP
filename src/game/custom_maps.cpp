@@ -5,6 +5,8 @@
 #include <cstring>
 #include <cstdint>
 #include <cstdarg>
+#include <cstdlib>
+#include <cctype>
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -20,8 +22,8 @@ struct Entry {
     char label[64];     // what the node list shows
     char name[128];     // the level's own name (the file name) -- doubles as the node's portal id
     char path[300];     // the package path OpenLevel loads: /Game/CustomMaps/...
-    char group[160];    // the install folder: CustomMaps\<author>\<map>
-    int  depth;         // folders between the install folder and the level file
+    char rel[300];      // under CustomMaps, backslashes, extension kept: Author\Map\Map\Map.umap
+    char dir[300];      // the folder the level sits in, same form: Author\Map\Map
 };
 Entry g_entries[kMaxEntries];
 int   g_count = 0;
@@ -48,42 +50,110 @@ bool contentRoot(wchar_t* out, int cap) {
     return swprintf(out, cap, L"%s\\Content", exe) > 0;
 }
 
-// The mod manager's per-map record, when present: Content\MapSwitcherMetaData\<dir>_<map>_meta.json.
-// Only the two fields that matter are read, off the first few KB (the file list behind them can be
-// megabytes). No JSON library: two keyed string scans are enough for a file that tool writes.
-void readMeta(const wchar_t* root, const wchar_t* parentDir, const wchar_t* mapName, bool* hidden, char* customName, int cap) {
-    *hidden = false; customName[0] = 0;
-    wchar_t p[MAX_PATH];
-    swprintf(p, MAX_PATH, L"%s\\MapSwitcherMetaData\\%s_%s_meta.json", root, parentDir, mapName);
-    HANDLE h = CreateFileW(p, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return;
-    static char buf[8192];
+// The first `cap` bytes of a file (all of it when smaller), malloc'd and NUL-terminated.
+bool readHead(const wchar_t* path, char** out, size_t* len, size_t cap) {
+    *out = nullptr; *len = 0;
+    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER sz{};
+    if (!GetFileSizeEx(h, &sz) || sz.QuadPart <= 0) { CloseHandle(h); return false; }
+    const DWORD want = (DWORD)((uint64_t)sz.QuadPart < cap ? (uint64_t)sz.QuadPart : cap);
+    char* b = (char*)malloc((size_t)want + 1);
     DWORD got = 0;
-    const bool ok = ReadFile(h, buf, sizeof(buf) - 1, &got, nullptr) != 0;
+    const bool ok = b && ReadFile(h, b, want, &got, nullptr) && got > 0;
     CloseHandle(h);
-    if (!ok) return;
-    buf[got] = 0;
-    if (const char* k = strstr(buf, "\"IsHiddenByUser\"")) {
-        k = strchr(k + 16, ':');
-        if (k) { k++; while (*k == ' ' || *k == '\t') k++; *hidden = strncmp(k, "true", 4) == 0; }
+    if (!ok) { free(b); return false; }
+    b[got] = 0;
+    *out = b; *len = got;
+    return true;
+}
+
+// A string or boolean field of the mod manager's JSON, by key. Enough for a file that one tool writes;
+// no JSON library. String values are unescaped (\\ and \"). False = the key is not there.
+bool jsonString(const char* text, const char* key, char* out, int cap) {
+    out[0] = 0;
+    char k[64]; snprintf(k, sizeof(k), "\"%s\"", key);
+    const char* p = strstr(text, k);
+    if (!p) return false;
+    p = strchr(p + strlen(k), ':');
+    if (!p) return false;
+    p++; while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    if (*p != '"') return true;                         // null or not a string: present, empty
+    p++;
+    int n = 0;
+    for (; *p && *p != '"' && n < cap - 1; p++) {
+        char c = *p;
+        if (c == '\\' && p[1]) { p++; c = *p; }
+        out[n++] = (c >= 32 && c < 127) ? c : '?';
     }
-    if (const char* k = strstr(buf, "\"CustomName\"")) {
-        k = strchr(k + 12, ':');
-        if (k) {
-            k++; while (*k == ' ' || *k == '\t') k++;
-            if (*k == '"') {
-                k++;
-                int n = 0;
-                for (; *k && *k != '"' && n < cap - 1; k++) customName[n++] = (*k >= 32 && *k < 127) ? *k : '?';
-                customName[n] = 0;
-            }
-        }
-    }
+    out[n] = 0;
+    return true;
+}
+bool jsonTrue(const char* text, const char* key) {
+    char k[64]; snprintf(k, sizeof(k), "\"%s\"", key);
+    const char* p = strstr(text, k);
+    if (!p || !(p = strchr(p + strlen(k), ':'))) return false;
+    p++; while (*p == ' ' || *p == '\t') p++;
+    return strncmp(p, "true", 4) == 0;
+}
+// The part of a path after "CustomMaps\", or "" when it has none.
+void underCustomMaps(const char* full, char* out, int cap) {
+    out[0] = 0;
+    for (const char* p = full; *p; p++)
+        if (!_strnicmp(p, "CustomMaps\\", 11)) { strncpy_s(out, (size_t)cap, p + 11, _TRUNCATE); return; }
+}
+
+// ---- THE MOD MANAGER'S RECORDS: Content\MapSwitcherMetaData\*_meta.json, one per level it knows.
+// Read for three things: the player HID the level, gave it a CUSTOM NAME, or the manager INSTALLED it
+// as a map from an archive (AssetName; a level it merely came across has none). Those fields sit at
+// the top of the file, ahead of the file list, so only the head is read.
+struct MapRecord {
+    char   mapName[128];
+    char   asset[128];      // empty = not an install, just a level the manager found
+    char   dir[300];        // MapFileDirectory under CustomMaps
+    char   custom[64];
+    bool   hidden;
+};
+constexpr int kMaxRecords = 128;
+MapRecord* g_rec = nullptr;
+int        g_nRec = 0;
+
+void loadRecords(const wchar_t* root) {
+    g_nRec = 0;
+    g_rec = (MapRecord*)calloc(kMaxRecords, sizeof(MapRecord));
+    if (!g_rec) return;
+    wchar_t pat[MAX_PATH];
+    swprintf(pat, MAX_PATH, L"%s\\MapSwitcherMetaData\\*_meta.json", root);
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        if (g_nRec >= kMaxRecords) break;
+        wchar_t p[MAX_PATH];
+        swprintf(p, MAX_PATH, L"%s\\MapSwitcherMetaData\\%s", root, fd.cFileName);
+        MapRecord& r = g_rec[g_nRec];
+        char* text = nullptr; size_t len = 0;
+        if (!readHead(p, &text, &len, 16u << 10)) continue;
+        char full[300];
+        jsonString(text, "MapName", r.mapName, sizeof(r.mapName));
+        jsonString(text, "AssetName", r.asset, sizeof(r.asset));
+        jsonString(text, "CustomName", r.custom, sizeof(r.custom));
+        jsonString(text, "MapFileDirectory", full, sizeof(full));
+        underCustomMaps(full, r.dir, sizeof(r.dir));
+        r.hidden = jsonTrue(text, "IsHiddenByUser");
+        free(text);
+        if (r.mapName[0]) g_nRec++;
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+}
+void freeRecords() {
+    free(g_rec); g_rec = nullptr; g_nRec = 0;
 }
 
 bool asciiOnly(const wchar_t* s) { for (; *s; s++) if (*s < 32 || *s > 126) return false; return true; }
 
-// rel is relative to Content, e.g. "CustomMaps\Author\Map".
+// rel is relative to Content, e.g. "CustomMaps\Author\Map". Collects every level; Decide filters.
 void scanDir(const wchar_t* root, const wchar_t* rel, int depth) {
     if (depth > 8 || g_count >= kMaxEntries) return;
     wchar_t pat[MAX_PATH];
@@ -100,23 +170,11 @@ void scanDir(const wchar_t* root, const wchar_t* rel, int depth) {
         if (n < 6 || _wcsicmp(fd.cFileName + n - 5, L".umap") != 0) continue;
         if (!asciiOnly(sub)) { logv("[maps] skipped (non-ASCII path): %ls", sub); continue; }
         if (g_count >= kMaxEntries) { logv("[maps] more than %d levels -- the rest are not listed", kMaxEntries); break; }
-        wchar_t mapName[128]; wcsncpy_s(mapName, fd.cFileName, n - 5);
-        const wchar_t* parent = wcsrchr(rel, L'\\'); parent = parent ? parent + 1 : rel;
-        bool hidden = false; char custom[64];
-        readMeta(root, parent, mapName, &hidden, custom, sizeof(custom));
-        if (hidden) { logv("[maps] hidden in the mod manager, not listed: %ls", mapName); continue; }
         Entry& e = g_entries[g_count];
-        snprintf(e.name, sizeof(e.name), "%ls", mapName);
-        // Install folder = the first two folders under CustomMaps; depth = how many folders deeper
-        // than the first one below it the file sits. "CustomMaps\Lucas\CCSESION\Map\CCSesion.umap"
-        // -> group CustomMaps\Lucas\CCSESION, depth 0; the same install's KiteDemo leftovers, depth 4.
-        { int seg = 0; const wchar_t* cut = nullptr;
-          for (const wchar_t* c = rel; *c; c++) if (*c == L'\\' && ++seg == 3) { cut = c; break; }
-          if (cut) { snprintf(e.group, sizeof(e.group), "%.*ls", (int)(cut - rel), rel); e.depth = 0;
-                     for (const wchar_t* c = cut + 1; *c; c++) if (*c == L'\\') e.depth++; }
-          else { snprintf(e.group, sizeof(e.group), "%ls", rel); e.depth = 0; } }
-        if (custom[0]) snprintf(e.label, sizeof(e.label), "%s", custom);
-        else           snprintf(e.label, sizeof(e.label), "%ls", mapName);
+        snprintf(e.name, sizeof(e.name), "%.*ls", (int)(n - 5), fd.cFileName);
+        snprintf(e.label, sizeof(e.label), "%s", e.name);
+        snprintf(e.rel, sizeof(e.rel), "%ls", sub + 11);            // drop "CustomMaps\"
+        snprintf(e.dir, sizeof(e.dir), "%ls", rel[10] ? rel + 11 : L"");
         // "CustomMaps\Author\Map\Map.umap" -> "/Game/CustomMaps/Author/Map/Map"
         char relA[300]; snprintf(relA, sizeof(relA), "%ls", sub);
         for (char* c = relA; *c; c++) if (*c == '\\') *c = '/';
@@ -127,32 +185,84 @@ void scanDir(const wchar_t* root, const wchar_t* rel, int depth) {
     FindClose(h);
 }
 
+// ---- which levels are maps -------------------------------------------------------------------------
+const MapRecord* ownRecord(const Entry& e) {
+    for (int i = 0; i < g_nRec; i++)
+        if (!_stricmp(g_rec[i].mapName, e.name) && !_stricmp(g_rec[i].dir, e.dir)) return &g_rec[i];
+    return nullptr;
+}
+// Case-insensitive search of an ASCII string inside a binary buffer.
+bool containsNoCase(const char* buf, size_t len, const char* s) {
+    const size_t n = strlen(s);
+    if (!n || len < n) return false;
+    const char f = (char)tolower((unsigned char)s[0]);
+    for (size_t i = 0; i + n <= len; i++) {
+        if ((char)tolower((unsigned char)buf[i]) != f) continue;
+        if (!_strnicmp(buf + i, s, n)) return true;
+    }
+    return false;
+}
+// IS THIS LEVEL BUILT TO BE PLAYED IN SESSION? A playable map's world settings override the game mode
+// with Session's in-game one -- without it nothing spawns the skater -- so its package names
+// PBP_InGameSessionGameMode. Measured on every installed map (DCP, CCSesion, Downtown3, Calida,
+// 16thAveDIY): all five do, and neither Kite-demo showroom shipped inside the Chevy Chase install
+// does; a streaming sub-level's own world settings carry no override either. The name sits in the
+// package's name table near the start of the file (byte 234k of the 3.9 MB Downtown3 at most), so
+// the head of the file is enough.
+bool isSessionLevel(const wchar_t* root, const Entry& e) {
+    wchar_t p[MAX_PATH];
+    swprintf(p, MAX_PATH, L"%s\\CustomMaps\\%hs", root, e.rel);
+    char* buf = nullptr; size_t len = 0;
+    if (!readHead(p, &buf, &len, 8u << 20)) return false;
+    const bool yes = containsNoCase(buf, len, "PBP_InGameSessionGameMode");
+    free(buf);
+    return yes;
+}
+
 void Scan() {
     g_count = 0;
     wchar_t root[MAX_PATH];
     if (!contentRoot(root, MAX_PATH)) { logv("[maps] could not locate the Content folder"); return; }
     scanDir(root, L"CustomMaps", 0);
-    // One install can carry more level files than its map -- demo scenes an author left in, sub-
-    // levels -- always deeper in the tree than the map itself. Within an install folder, only the
-    // shallowest level files are listed.
+    loadRecords(root);
+    int installs = 0;
+    for (int i = 0; i < g_nRec; i++) if (g_rec[i].asset[0]) installs++;
+    if (g_nRec) logv("[maps] mod manager records: %d (%d from an installed archive)", g_nRec, installs);
+    // DECIDE -- by what the LEVEL is, not where it sits. The old rule listed only the shallowest level
+    // of each install folder, and hid real maps whenever an install nested its map below another level
+    // (a map pack at two depths, a stray test level at the top).
     for (int i = 0; i < g_count; ) {
-        int minDepth = g_entries[i].depth;
-        for (int j = 0; j < g_count; j++)
-            if (!_stricmp(g_entries[j].group, g_entries[i].group) && g_entries[j].depth < minDepth) minDepth = g_entries[j].depth;
-        if (g_entries[i].depth > minDepth) {
-            logv("[maps]   not listed: '%s' (a level %d folder(s) inside the %s install, deeper than the map itself)",
-                 g_entries[i].name, g_entries[i].depth, g_entries[i].group);
+        Entry& e = g_entries[i];
+        const MapRecord* own = ownRecord(e);
+        const char* why = nullptr;
+        if (own && own->hidden) {
+            why = "hidden in the mod manager";
+        } else if (isSessionLevel(root, e)) {
+            // a Session map
+        } else if (own && own->asset[0]) {
+            // The manager installed it as a map from an archive: trust that over the game-mode test.
+            logv("[maps]   '%s' does not name Session's game mode, but the mod manager installed it as a map (%s) -- listed",
+                 e.name, own->asset);
+        } else {
+            why = "not a Session map -- the level does not use Session's game mode (a demo scene or a sub-level)";
+        }
+        if (why) {
+            logv("[maps]   not listed: '%s' (%s)", e.name, why);
             for (int j = i + 1; j < g_count; j++) g_entries[j - 1] = g_entries[j];
             g_count--;
-        } else i++;
+            continue;
+        }
+        if (own && own->custom[0]) snprintf(e.label, sizeof(e.label), "%s", own->custom);
+        i++;
     }
+    freeRecords();
     for (int i = 1; i < g_count; i++) {                 // by label, case-insensitive
         Entry t = g_entries[i]; int j = i - 1;
         while (j >= 0 && _stricmp(g_entries[j].label, t.label) > 0) { g_entries[j + 1] = g_entries[j]; j--; }
         g_entries[j + 1] = t;
     }
     if (!g_count) { logv("[maps] no custom maps under Content\\CustomMaps -- the Select Map screen is unchanged"); return; }
-    logv("[maps] %d custom map(s) under Content\\CustomMaps:", g_count);
+    logv("[maps] %d custom map(s) under Content\\CustomMaps (read at start-up; a map installed while the game runs appears after a restart):", g_count);
     for (int i = 0; i < g_count; i++) logv("[maps]   '%s' -> %s", g_entries[i].label, g_entries[i].path);
 }
 #else

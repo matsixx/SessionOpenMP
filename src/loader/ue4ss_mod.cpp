@@ -526,8 +526,12 @@ static void MpPump() {
     }
     if (g_pendingCode[0]) { if (!omp::LobbyJoinByCode(g_pendingCode)) logLine("[mp] join-by-code refused"); g_pendingCode[0] = 0; }
     if (g_wantBrowse) { g_wantBrowse = false; omp::LobbyBrowse(); }   // wire came up on an earlier path
-    if (leave && omp::LobbyStatus() >= 2) {
-        omp::LobbyLeave();
+    // ARMED IS ENOUGH. The lobby status can read "busy" or "failed" while the session is still armed
+    // (a join that failed after leaving the lobby we were in), and gating Leave on "hosting/joined"
+    // made it silently do nothing -- the player could not leave (field, 2026-09-13).
+    if (leave && !g_armed && omp::LobbyStatus() < 2) logLine("[mp] leave -- not in a session, nothing to leave");
+    if (leave && (g_armed || omp::LobbyStatus() >= 2)) {
+        omp::LobbyLeave();                    // a no-op if we are no longer in any lobby
         // RELEASE THE SLOTS TOO, and do it BEFORE disarming. `Frame()` is gated on `g_armed`, so once
         // disarmed nothing retires the proxies -- dropping only the lobby leaves everyone you were
         // skating with standing in your now single-player world until the next map load. This is the
@@ -595,7 +599,14 @@ static void MpPump() {
               snprintf(m, sizeof(m), "[mp] posture: %s", p);
               logLine(m); }
         }
-        else if (ls == 0 && g_armed) { g_armed = false; clearChatBubbles(); logLine("[mp] lobby gone -- session DISARMED"); }
+        // OUT OF THE LOBBY WHILE ARMED -- it closed, we were removed, or a join failed after leaving the
+        // one we were in. Release the slots BEFORE disarming (Frame is gated on g_armed, so nothing
+        // else would retire the proxies), exactly like the Leave path.
+        else if (ls <= 0 && g_armed) {
+            session::ResetAll(); clearChatBubbles(); g_armed = false;
+            logLine(ls == 0 ? "[mp] lobby gone -- session DISARMED"
+                            : "[mp] lobby op FAILED while in a session -- you are out of the lobby; session DISARMED (retry from the menu)");
+        }
         else if (ls == -1) logLine("[mp] lobby op FAILED (retry from the menu)");
     }
 }
