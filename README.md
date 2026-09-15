@@ -92,6 +92,9 @@ Three transports sit behind one interface:
    Set either to `0` to disable that mod without uninstalling anything.
 4. Launch the game and press **F1** for the mod menu.
 
+**Linux Special Insturctions**
+right click the game in Steam go to properties > compatibility then check “force the use of specific Steam play compatibility tool and then select proton 8.0-5 from the drop down list.
+
 The release package contains all of this laid out correctly, including the EOS runtime that the
 networking needs — start there rather than assembling it by hand.
 
