@@ -472,9 +472,18 @@ kSkaterToggleState             -   # derived in ApplyToggleOnBoard, not read as 
 kSkaterDerivedPart             -   # where ASkaterCharacter's derived part begins; a boundary
 kReplayCompIface               -   # interface sub-object offset
 
+kBoardTruckFront               ASkateboardEx::_truckFront
+kBoardWheelBL                  ASkateboardEx::_wheelBackLeft
+kBoardWheelBR                  ASkateboardEx::_wheelBackRight
+kBoardWheelFL                  ASkateboardEx::_wheelFrontLeft
+kBoardWheelFR                  ASkateboardEx::_wheelFrontRight
+kReplayInstCurTime             FReplayManagerInstanceData::CurrentPlayTime
+kReplayInstTotalTime           FReplayManagerInstanceData::TotalPlayTime
+kReplayInstRealTotal           FReplayManagerInstanceData::RealTotalPlayTime
+kReplayInstClipStart           FReplayKeyframeHandler::_clipStartTime   # KeyframeHandler sits at +0 of the instance
+kReplayInstClipEnd             FReplayKeyframeHandler::_clipEndTime     # ditto
+
 # LEFT UNMAPPED, deliberately:
-#   kReplayInstCurTime / kReplayInstTotalTime  0x8d4 / 0x8dc
-#       on the replay INSTANCE data, whose type the PDB does not name from _activeInstanceData.
 #   kSkaterReplayAttachA / kSkaterReplayAttachB  0xa68 / 0xa50
 #       skater-relative (the derived part starts at 0xa40), not USkeletalMeshComponent members --
 #       matching them there lands on ClothCollisionSources, which is meaningless here.

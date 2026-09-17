@@ -51,6 +51,10 @@
 #include "game/game_font.h"
 #include "session/banlist.h"
 #include "session/mutelist.h"
+#include "session/modapi.h"
+#include "session/replay_ghosts.h"
+#include "replication/sidecar.h"
+#include "loader/lua_api.h"
 #include "ui/mp_prefs.h"
 #include "game/peer_bodies.h"      // the trim knobs the Peer body physics tier drives
 
@@ -790,6 +794,191 @@ static void publishNameplates() {
     g_npPlated = n; g_npShow = show; g_npVw = vw; g_npVh = vh;
 }
 
+// =====================================================================================================
+// SAVED REPLAYS: THE PEER SIDECAR (replication/sidecar.h, session/replay_ghosts.h).
+// After the game writes <replay>, the peers synced in the editor are written to <replay>.ompsync;
+// after it reads <replay>, that file (if any) brings them back as ghosts. Both hooks only OBSERVE:
+// the original runs first and untouched, and anything that goes wrong here is a log line, never a
+// failed save or load. Both run on the game thread (a UI delegate and the manager's own tick).
+// =====================================================================================================
+struct FStr { wchar_t* data; int32_t num; int32_t max; };   // FString: TArray<TCHAR>, num counts the NUL
+static const wchar_t kSidecarExt[] = L".ompsync";
+
+// OUR OWN COPY of one of the game's strings, taken BEFORE the original runs. SaveReplay and
+// LoadReplayInternal take their FStrings BY VALUE: each frees the buffers it was handed on its way out
+// (FMemory::Free at both tails), so after the original returns those pointers are dead. The first cut
+// of these hooks read them afterwards and passed them on -- a use-after-free and then a double free,
+// which corrupted the heap and crashed a frame later in unrelated engine code (field crash: a null
+// call in FPerInstanceRenderData::UpdateFromPreallocatedData, neither hook nor SaveReplay in the stack).
+struct StrCopy { wchar_t buf[600]; int32_t num; };          // num counts the NUL; 0 = nothing usable
+static void copyFStr(const FStr* s, StrCopy* out) {
+    out->num = 0; out->buf[0] = 0;
+    __try {
+        if (s && s->data && s->num > 1 && s->num <= 600) {
+            memcpy(out->buf, s->data, (size_t)s->num * sizeof(wchar_t));
+            out->buf[s->num - 1] = 0;
+            out->num = s->num;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { out->num = 0; }
+}
+
+// The full path the game uses, exactly as GetReplayFilename builds it. POD only: this holds a __try.
+// GetReplayFilename takes `name` BY VALUE too -- it FREES the buffer it is given -- so it gets a copy
+// made with the game's own allocator, never the game's string and never stack memory. `folder` is by
+// const reference (only read, never freed), so our own buffer is fine there.
+static bool replayPathOf(const StrCopy& name, const StrCopy& folder, wchar_t* out, int cap) {
+    const game::Syms& S = game::Get();
+    if (!S.ReplayFilename || !S.MemMalloc || !S.MemFree || name.num < 2 || !out || cap < 2) return false;
+    bool ok = false;
+    __try {
+        FStr nm{};
+        nm.data = (wchar_t*)S.MemMalloc((size_t)name.num * sizeof(wchar_t), 0);
+        if (!nm.data) return false;
+        memcpy(nm.data, name.buf, (size_t)name.num * sizeof(wchar_t));
+        nm.num = nm.max = name.num;
+        FStr fd{};
+        if (folder.num > 1) { fd.data = (wchar_t*)folder.buf; fd.num = fd.max = folder.num; }
+        FStr tmp{};
+        S.ReplayFilename(&tmp, &nm, &fd);              // frees nm.data; tmp.data is ours to free
+        if (tmp.data && tmp.num > 1 && tmp.num < cap) {
+            memcpy(out, tmp.data, (size_t)(tmp.num - 1) * sizeof(wchar_t));
+            out[tmp.num - 1] = 0; ok = true;
+        }
+        if (tmp.data) S.MemFree(tmp.data);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { ok = false; }
+    return ok;
+}
+static bool sidecarPathOf(const wchar_t* replayPath, wchar_t* out, size_t cap) {
+    const size_t n = wcslen(replayPath), e = wcslen(kSidecarExt);
+    if (n + e + 1 > cap) return false;
+    memcpy(out, replayPath, n * sizeof(wchar_t));
+    memcpy(out + n, kSidecarExt, (e + 1) * sizeof(wchar_t));
+    return true;
+}
+static bool fileExistsW(const wchar_t* p) {
+    const DWORD a = GetFileAttributesW(p);
+    return a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY);
+}
+static std::string narrowPath(const wchar_t* w) {
+    const int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0, nullptr, nullptr);
+    std::string s((size_t)(n > 0 ? n - 1 : 0), '\0');
+    if (n > 1) WideCharToMultiByte(CP_UTF8, 0, w, -1, &s[0], n, nullptr, nullptr);
+    return s;
+}
+
+static game::ReplaySaveFn    o_ReplaySave = nullptr;
+static game::ReplayLoadIntFn o_ReplayLoadInt = nullptr;
+
+static void writeSidecarFor(const StrCopy& name) {
+    wchar_t rp[1024], scp[1040];
+    StrCopy noFolder; noFolder.num = 0; noFolder.buf[0] = 0;
+    if (!replayPathOf(name, noFolder, rp, 1024) || !sidecarPathOf(rp, scp, 1040)) {
+        logLine("[ghost] save: could not resolve the replay's path -- no sidecar written"); return; }
+    if (!fileExistsW(rp)) { logLine("[ghost] save: the game wrote no replay file -- no sidecar written"); return; }
+    session::SavedPeer peers[sidecar::kMaxPeers];
+    const int n = session::SyncedPeersForSave(peers, sidecar::kMaxPeers);
+    if (n <= 0) {
+        // A re-save with nobody synced must not leave an older cast attached to the new file.
+        if (fileExistsW(scp) && DeleteFileW(scp)) logLine("[ghost] save: no synced peers -- removed the sidecar an earlier save left");
+        return;
+    }
+    std::vector<std::vector<uint8_t>> hist((size_t)n);
+    sidecar::Peer sc[sidecar::kMaxPeers];
+    int m = 0;
+    for (int i = 0; i < n; i++) {
+        uint32_t cnt = 0;
+        const uint32_t need = replaysync::ExportBuffer(peers[i].peerIdx, nullptr, 0, &cnt);
+        if (!need) continue;
+        hist[(size_t)m].resize(need);
+        if (replaysync::ExportBuffer(peers[i].peerIdx, hist[(size_t)m].data(), need, &cnt) != need) continue;
+        sidecar::Peer& o = sc[m];
+        o = sidecar::Peer{};
+        memcpy(o.name, peers[i].name, sizeof(o.name));
+        o.cosmetics = peers[i].cosmetics;
+        o.haveWear = peers[i].haveWear; o.wear = peers[i].wear;
+        o.haveSkel = peers[i].haveSkel; o.skel = peers[i].skel;
+        o.anchorEndUs = peers[i].anchorEndUs;
+        o.entryCount = cnt; o.entries = hist[(size_t)m].data(); o.entriesLen = need;
+        m++;
+    }
+    if (!m) { logLine("[ghost] save: synced peers had no exportable history -- no sidecar written"); return; }
+    const uint32_t size = sidecar::Pack(sc, m, nullptr, 0);
+    std::vector<uint8_t> bytes((size_t)size);
+    if (!size || sidecar::Pack(sc, m, bytes.data(), size) != size) { logLine("[ghost] save: sidecar pack failed"); return; }
+    FILE* f = _wfopen(scp, L"wb");
+    if (!f) { logLine("[ghost] save: could not create the sidecar file"); return; }
+    const size_t wrote = fwrite(bytes.data(), 1, bytes.size(), f);
+    fclose(f);
+    char msg[1300];
+    snprintf(msg, sizeof(msg), "[ghost] saved %d peer(s) with the replay: %s (%u KB)%s", m, narrowPath(scp).c_str(),
+             size / 1024, wrote == bytes.size() ? "" : " *** SHORT WRITE");
+    logLine(msg);
+}
+
+static void loadSidecarFor(const StrCopy& name, const StrCopy& folder, uintptr_t gameResult) {
+    wchar_t rp[1024], scp[1040];
+    if (!replayPathOf(name, folder, rp, 1024) || !sidecarPathOf(rp, scp, 1040)) { ghosts::Clear(&logLine); return; }
+    if (!fileExistsW(scp)) { ghosts::Clear(&logLine); return; }
+    FILE* f = _wfopen(scp, L"rb");
+    if (!f) { logLine("[ghost] load: sidecar present but unreadable"); ghosts::Clear(&logLine); return; }
+    fseek(f, 0, SEEK_END); const long len = ftell(f); fseek(f, 0, SEEK_SET);
+    std::vector<uint8_t> bytes;
+    if (len > 0 && len <= (64 << 20)) { bytes.resize((size_t)len); if (fread(bytes.data(), 1, bytes.size(), f) != bytes.size()) bytes.clear(); }
+    fclose(f);
+    if (bytes.empty()) { logLine("[ghost] load: sidecar empty or oversized -- ignored"); ghosts::Clear(&logLine); return; }
+    char msg[1300];
+    snprintf(msg, sizeof(msg), "[ghost] replay loaded (game result %u) with a sidecar: %s", (unsigned)(gameResult & 0xff), narrowPath(scp).c_str());
+    logLine(msg);
+    ghosts::LoadSidecar(bytes.data(), (uint32_t)bytes.size(), &logLine);
+}
+
+static uintptr_t hkReplaySave(void* self, const void* name, uintptr_t a3, uintptr_t a4) {
+    static StrCopy nm;                                 // game thread only; too big for the stack twice over
+    copyFStr((const FStr*)name, &nm);                  // BEFORE: the original frees it
+    const uintptr_t r = o_ReplaySave(self, name, a3, a4);
+    if (nm.num > 1) writeSidecarFor(nm);
+    return r;
+}
+static uintptr_t hkReplayLoadInt(void* self, const void* name, const void* folder, uintptr_t a4) {
+    static StrCopy nm, fd;
+    copyFStr((const FStr*)name, &nm);                  // BEFORE: the original frees both
+    copyFStr((const FStr*)folder, &fd);
+    const uintptr_t r = o_ReplayLoadInt(self, name, folder, a4);
+    if ((r & 0xff) == 0 || nm.num < 2) { ghosts::Clear(&logLine); return r; }   // refused, or no name
+    loadSidecarFor(nm, fd, r);
+    return r;
+}
+static void InstallReplaySidecarHooks() {
+    const game::Syms& S = game::Get();
+    if (!S.ReplaySave || !S.ReplayLoadInt || !S.ReplayFilename) {
+        logLine("[ghost] replay save/load symbols unresolved -- saved replays keep no peers"); return; }
+    bool ok = MH_CreateHook(S.ReplaySave, (void*)&hkReplaySave, (void**)&o_ReplaySave) == MH_OK &&
+              MH_EnableHook(S.ReplaySave) == MH_OK;
+    ok = ok && MH_CreateHook(S.ReplayLoadInt, (void*)&hkReplayLoadInt, (void**)&o_ReplayLoadInt) == MH_OK &&
+               MH_EnableHook(S.ReplayLoadInt) == MH_OK;
+    logLine(ok ? "[ghost] replay save/load hooked (synced peers travel in a .ompsync beside the replay)"
+               : "[ghost] *** replay save/load hook failed -- saved replays keep no peers");
+}
+
+// ---- the two per-frame facts every driver needs: a live own pawn, and whether the world changed.
+// Shared by the session frame and the saved-replay frame (which runs with no session).
+static void refreshOwnPawn(uint64_t ms) {
+    if (ownPawnStillValid()) return;
+    g_ownPawn = nullptr;
+    // Re-discover at 4 Hz: FindFirstOf walks GUObjectArray -- too costly to run 60x/s in a menu.
+    static uint64_t lastTry = 0;
+    if (ms - lastTry >= 250) { lastTry = ms; discoverOwnPawn(); }
+}
+// world change -> every actor we spawned died with it; drop the pointers before anything reads them.
+static void noteWorldChange() {
+    if (!g_ownPawn) return;
+    const game::Syms& S = game::Get();
+    void* w = nullptr;
+    if (S.GetWorld) { __try { w = S.GetWorld(g_ownPawn); } __except (EXCEPTION_EXECUTE_HANDLER) {} }
+    if (w && g_lastWorld && w != g_lastWorld) { session::ForgetProxies(); ghosts::ForgetAll(); }
+    if (w) g_lastWorld = w;
+}
+
 static void GameThreadFrame() {
     static thread_local bool inFrame = false;    // our own spawns fire BeginPlay scripts; never re-enter
     if (inFrame) return;
@@ -798,7 +987,16 @@ static void GameThreadFrame() {
     const uint64_t ms = GetTickCount64();
 
     MpPump();                                    // input + transport/lobby state machine; sets g_armed
-    if (!g_armed) { inFrame = false; return; }
+    if (!g_armed) {
+        // THE ONE THING THAT RUNS WITHOUT A SESSION: a saved replay's peers (replay_ghosts.h). It
+        // needs the own pawn (to spawn from) and the world-change edge, nothing else of the frame.
+        if (ghosts::Active() || ghosts::AnyAlive()) {
+            refreshOwnPawn(ms);
+            noteWorldChange();
+            ghosts::Frame(g_ownPawn, us, ms, &logLine);
+        }
+        inFrame = false; return;
+    }
 
     // ---- audio capture. Installed on the first ARMED frame, never before: these detours sit on the
     // path EVERY sound in the game takes, and the standing rule is that the mod is fully inert until
@@ -826,21 +1024,8 @@ static void GameThreadFrame() {
         refreshLobbyAd();
     }
 
-    if (!ownPawnStillValid()) {
-        g_ownPawn = nullptr;
-        // Re-discover at 4 Hz: FindFirstOf walks GUObjectArray -- too costly to run 60x/s in a menu.
-        static uint64_t lastTry = 0;
-        if (ms - lastTry >= 250) { lastTry = ms; discoverOwnPawn(); }
-    }
-
-    // world change -> every actor we spawned died with it; drop the pointers before anything reads them.
-    if (g_ownPawn) {
-        const game::Syms& S = game::Get();
-        void* w = nullptr;
-        if (S.GetWorld) { __try { w = S.GetWorld(g_ownPawn); } __except (EXCEPTION_EXECUTE_HANDLER) {} }
-        if (w && g_lastWorld && w != g_lastWorld) session::ForgetProxies();
-        if (w) g_lastWorld = w;
-    }
+    refreshOwnPawn(ms);
+    noteWorldChange();
 
     // Audio attribution: a captured sound is transported only if it belongs to the LOCAL skater or
     // the LOCAL board. That is a WHITELIST, which is why no proxy registry is needed -- a proxy's own
@@ -886,6 +1071,7 @@ static void GameThreadFrame() {
 
     // the wire was already pumped in MpPump (same thread, same run); just drive the frame.
     session::Frame(g_ownPawn, us, ms, &game::GatherOwnState);
+    ghosts::Frame(g_ownPawn, us, ms, &logLine);      // a saved replay loaded while in a session
 
     // After the frame, so a plate is placed on where its skater was just put rather than a frame behind.
     publishNameplates();
@@ -1512,7 +1698,7 @@ public:
         // Unarmed cost: one branch per frame.
         // ORDER MATTERS: without the rename guard, the first proxy spawn is a GUARANTEED
         // LowLevelFatalError -- so no guard means no anchor, which means no sessions at all.
-        if (InstallRenameGuard()) { InstallAnimApplyHook(); InstallReplayGuard(); InstallMarkerGuard(); InstallPoseSeam(); InstallMapDefaultSeam(); InstallSaveGuard(); InstallReplayCamGuard(); InstallEngineTickAnchor(); }
+        if (InstallRenameGuard()) { InstallAnimApplyHook(); InstallReplayGuard(); InstallMarkerGuard(); InstallPoseSeam(); InstallMapDefaultSeam(); InstallSaveGuard(); InstallReplayCamGuard(); InstallReplaySidecarHooks(); InstallEngineTickAnchor(); }
         else logLine("[mod] *** sessions DISABLED (rename guard missing)");
         // Pause must not freeze the world: in overlay mode YOUR pause stops your own skater and every
         // proxy in your world, so you cannot watch anyone while the menu is open. Unconditional -- it
@@ -1538,6 +1724,17 @@ public:
     // (the engine-tick anchor) instead. Kept as an explicit empty override so the next reader finds
     // this warning instead of an inviting extension point.
     auto on_update() -> void override {}
+
+    // Every UE4SS Lua mod, before its main.lua runs: the `OpenMP` table (lua_api.h). And when one stops
+    // (UE4SS stops Lua mods BEFORE it uninstalls C++ mods), its channels close.
+    auto on_lua_start(RC::StringViewType mod_name, RC::LuaMadeSimple::Lua&, RC::LuaMadeSimple::Lua& main_lua,
+                      RC::LuaMadeSimple::Lua&, std::vector<RC::LuaMadeSimple::Lua*>&) -> void override {
+        omp::luaapi::OnLuaStart(mod_name, main_lua, &logLine);
+    }
+    auto on_lua_stop(RC::StringViewType mod_name, RC::LuaMadeSimple::Lua&, RC::LuaMadeSimple::Lua&,
+                     RC::LuaMadeSimple::Lua&, std::vector<RC::LuaMadeSimple::Lua*>&) -> void override {
+        omp::luaapi::OnLuaStop(mod_name);
+    }
 
     // Set the local pawn from UE4SS's own notification path when available; otherwise the per-frame
     // validity check keeps the last known one.
@@ -1578,6 +1775,29 @@ extern "C" {
     OMP_MOD_API int  OmpSession_PeerBodyPhysicsOn() { return MpPrefs_PeerBodyPhysics() ? 1 : 0; }
     // The pose hold: SessionTweaks says its sitting pose is on the local skeleton (or no longer is).
     OMP_MOD_API void OmpSession_SetOwnPoseHold(int on) { omp::session::SetOwnPoseHold(on != 0); }
+
+    // THE MOD CHANNEL -- the PUBLIC API for other mods (sdk/omp_mod_api.h, docs/modding-api.md).
+    // Unlike the OmpSession_ bridges above, which exist for SessionTweaks and may change, these are a
+    // contract: never rename, remove or change the meaning of one; add new ones and bump kApiVersion.
+    OMP_MOD_API int   OmpMod_ApiVersion() { return omp::modapi::kApiVersion; }
+    OMP_MOD_API int   OmpMod_Register(const char* channel, omp::modapi::OnMessageFn onMessage,
+                                      omp::modapi::OnPlayerFn onPlayer, void* user) {
+        return omp::modapi::Register(channel, onMessage, onPlayer, user);
+    }
+    OMP_MOD_API void  OmpMod_Unregister(int handle) { omp::modapi::Unregister(handle); }
+    OMP_MOD_API int   OmpMod_Send(int handle, int player, const uint8_t* data, int len, int reliable) {
+        return omp::modapi::Send(handle, player, data, len, reliable);
+    }
+    OMP_MOD_API int   OmpMod_InSession() { return omp::modapi::InSession(); }
+    OMP_MOD_API int   OmpMod_Players(int handle, int* out, int cap) { return omp::modapi::Players(handle, out, cap); }
+    OMP_MOD_API int   OmpMod_IsAuthority(int handle) { return omp::modapi::IsAuthority(handle); }
+    OMP_MOD_API int   OmpMod_Authority(int handle) { return omp::modapi::Authority(handle); }
+    OMP_MOD_API int   OmpMod_PlayerName(int player, char* out, int cap) { return omp::modapi::PlayerName(player, out, cap); }
+    OMP_MOD_API int   OmpMod_PlayerId(int player, char* out, int cap) { return omp::modapi::PlayerId(player, out, cap); }
+    OMP_MOD_API int   OmpMod_LocalName(char* out, int cap) { return omp::modapi::LocalName(out, cap); }
+    OMP_MOD_API int   OmpMod_LocalId(char* out, int cap) { return omp::modapi::LocalId(out, cap); }
+    OMP_MOD_API void* OmpMod_PlayerActor(int player) { return omp::modapi::PlayerActor(player); }
+    OMP_MOD_API int   OmpMod_ActorPlayer(void* actor) { return omp::modapi::ActorPlayer(actor); }
     OMP_MOD_API RC::CppUserModBase* start_mod()      { return new SessionOpenMP(); }
     OMP_MOD_API void uninstall_mod(RC::CppUserModBase* mod) { delete mod; }
 }

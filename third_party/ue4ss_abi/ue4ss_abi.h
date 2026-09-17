@@ -41,12 +41,38 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace RC
 {
 namespace GUI { class GUITab; }                       // deliberately incomplete
-namespace LuaMadeSimple { class Lua; }
+// ---- LuaMadeSimple::Lua: only the exported, NON-virtual members the Lua mod API calls (lua_api.cpp).
+// Transcribed from deps/first/LuaMadeSimple/include/LuaMadeSimple/LuaMadeSimple.hpp (3.0.1) and checked
+// against UE4SS.dll's exports with undname. The class is never constructed or sized on our side --
+// UE4SS hands us references -- so only the member signatures have to agree, not the layout.
+// get_* read stack index 1 and REMOVE it; set_* push. get_string/set_string are NOT binary-safe
+// (lua_tostring/lua_pushstring): anything that may hold a zero byte must cross as text.
+namespace LuaMadeSimple
+{
+class Lua
+{
+  public:
+    using LuaFunction = int (*)(const Lua&);
+    __declspec(dllimport) auto register_function(const std::string& name, const LuaFunction&) const -> void;
+    __declspec(dllimport) auto execute_string(std::string_view) const -> void;   // throws on a Lua error
+    __declspec(dllimport) auto get_stack_size() const -> int32_t;
+    __declspec(dllimport) auto discard_value(int32_t force_index = 1) const -> void;
+    __declspec(dllimport) auto is_nil(int32_t force_index = 1) const -> bool;
+    __declspec(dllimport) auto set_nil() const -> void;
+    __declspec(dllimport) auto is_string(int32_t force_index = 1) const -> bool;
+    __declspec(dllimport) auto get_string(int32_t force_index = 1) const -> std::string_view;
+    __declspec(dllimport) auto set_string(std::string_view) const -> void;
+    __declspec(dllimport) auto is_number(int32_t force_index = 1) const -> bool;
+    __declspec(dllimport) auto get_number(int32_t force_index = 1) const -> double;
+    __declspec(dllimport) auto set_integer(int64_t number) const -> void;
+};
+} // namespace LuaMadeSimple
 
 using StringType     = std::wstring;
 using StringViewType = std::wstring_view;
@@ -91,10 +117,17 @@ class __declspec(dllimport) CppUserModBase
 // i.e. RC::Unreal::UObjectGlobals::FindFirstOf(const wchar_t*) -> RC::Unreal::UObject*, __cdecl.
 // Declaring it with exactly this namespace/signature reproduces that name, so it links against the
 // generated import lib with no headers from the source tree.
-// UObject stays INCOMPLETE: we only ever pass the pointer around and read raw offsets off it.
+// UObject declares ONE member, GetPathName (for the Lua mod API, which hands actors to Lua by path):
+//   ?GetPathName@UObject@Unreal@RC@@QEBA?AV?$basic_string@_W...@std@@PEAV123@@Z
+// UE4SS's UObject is a layout-free view of the engine object, so `this` is the raw object pointer.
+// Otherwise we only pass the pointer around and read raw offsets off it.
 namespace Unreal
 {
-class UObject;
+class UObject
+{
+  public:
+    __declspec(dllimport) auto GetPathName(UObject* StopOuter = nullptr) const -> std::wstring;
+};
 class UFunction;
 namespace UObjectGlobals
 {

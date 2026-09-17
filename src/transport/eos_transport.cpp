@@ -58,6 +58,11 @@ struct Peer {
     uint64_t          lastRecvMs = 0;
     uint64_t          closedUntilMs = 0;   // send cooldown after a remote close
     uint64_t          departedAtMs = 0;    // when state went to 5 (0 = not departed); picks the entry a full table reclaims
+    // THE LINK, as EOS last reported it (0 none, 1 direct, 2 relayed, 3 interrupted, 4 closed) -- kept
+    // APART from st.state, because DEPARTED (5) is a fact about the LOBBY and a link notification is
+    // not allowed to overwrite it. See setLink.
+    uint8_t           link = 0;
+    int               failCloses = 0;      // consecutive closes that mean "could not reach them"; backs the send mute off
     // Send-failure reporting: the first refusal is named in full, then at most one summary line per
     // kSendFailQuietMs. A refused send can repeat at the publish rate, so an unthrottled line would
     // bury the log it is meant to make readable.
@@ -79,6 +84,35 @@ static int  g_nPeers = 0;
 static void markDeparted(Peer& p) {
     if (p.st.state != 5) p.departedAtMs = GetTickCount64();
     p.st.state = 5;
+}
+// DEPARTED IS STICKY. Only the LOBBY may undo it (revive, from the two roster paths).
+// The three link callbacks used to write st.state unconditionally, and the DEPARTED handler closes
+// the connection as its next act -- so the CLOSED notification for that very close put the peer
+// straight back to state 4, un-departed within the frame. Everything keyed on 5 then failed at once:
+//   * Send() resumed after its 4 s cooldown. With bAllowDelayedDelivery a send to somebody who is
+//     gone is QUEUED while EOS spends ~49 s trying to reach them, times out, and we start again:
+//     a permanent zombie per departed player ("CLOSED <them> reason=3" every 49 s, for hours).
+//   * EOS has ONE outgoing queue. Enough zombies fill it, and EOS_LimitExceeded then refuses sends
+//     to EVERY peer at once (field log: fifteen zombies, ~24 refused sends a second to each of
+//     peers 0-14). Nobody receives our snapshots or cosmetics -- and every client in the lobby holds
+//     the same zombies, so it fails for everyone together: skaters vanish, and whatever slot a stray
+//     packet re-opens has no name yet, which the menu prints as "(connecting...)".
+//   * The full-table reclaim only takes state 5, so zombies were never reclaimable and newcomers were
+//     refused again (the 1.1.10 fix, defeated).
+//   * PeerTrust read them as vouched, the session never saw them depart (30 s quiet fallback
+//     instead), and the publish rate counted them as people to send to.
+// It surfaced "after a host migration" only because a host leaving is one more departure in a lobby
+// old enough to have collected a tableful.
+static void setLink(Peer* p, uint8_t v) {
+    if (!p) return;
+    p->link = v;
+    if (p->st.state != 5) p->st.state = v;
+}
+static void revive(Peer& p) {
+    if (p.st.state != 5) return;
+    p.st.state = (p.link == 1 || p.link == 2) ? p.link : 0;   // an ESTABLISHED that beat the roster event still counts
+    p.departedAtMs = 0;
+    p.failCloses = 0; p.closedUntilMs = 0;
 }
 
 // ---- lobby state. One bucket for the whole mod: search-by-bucket IS the server browser for now.
@@ -188,20 +222,36 @@ static Peer* peerByPuidOrLearn(EOS_ProductUserId p) {
 static void EOS_CALL onEstablished(const EOS_P2P_OnPeerConnectionEstablishedInfo* i) {
     Peer* p = peerByPuidOrLearn(i->RemoteUserId);
     const bool relay = (i->NetworkType == EOS_ENetworkConnectionType::EOS_NCT_RelayedConnection);
-    if (p) p->st.state = relay ? 2 : 1;
+    setLink(p, relay ? 2 : 1);
+    if (p) { p->failCloses = 0; p->closedUntilMs = 0; }
     Log("[p2p] ESTABLISHED %s (%s, %s)", p ? p->idStr : "?",
         i->ConnectionType == EOS_EConnectionEstablishedType::EOS_CET_Reconnection ? "reconnect" : "new",
         relay ? "RELAYED" : "DIRECT");
 }
 static void EOS_CALL onInterrupted(const EOS_P2P_OnPeerConnectionInterruptedInfo* i) {
     Peer* p = peerByPuidOrLearn(i->RemoteUserId);
-    if (p) p->st.state = 3;
+    setLink(p, 3);
     Log("[p2p] INTERRUPTED %s -- the SDK is attempting recovery", p ? p->idStr : "?");
 }
 static void EOS_CALL onClosed(const EOS_P2P_OnRemoteConnectionClosedInfo* i) {
     Peer* p = peerByPuidOrLearn(i->RemoteUserId);
-    if (p) { p->st.state = 4; p->closedUntilMs = GetTickCount64() + 4000; }
-    Log("[p2p] CLOSED %s reason=%d -- sends muted 4s", p ? p->idStr : "?", (int)i->Reason);
+    setLink(p, 4);
+    // A close that means WE COULD NOT REACH THEM (timed out, connection or negotiation failed) backs
+    // the mute off: 4, 8, 16, 30 s. Every send to an unreachable peer is queued for EOS's whole
+    // ~49 s attempt, in the queue every other peer shares -- so a crashed player, who is still a
+    // lobby member until Epic times them out, must not be re-dialled every four seconds. It costs a
+    // live peer nothing: THEIR sends still reach us, an incoming connection is still accepted, and
+    // the first ESTABLISHED or received packet clears the back-off.
+    uint32_t muteMs = 4000;
+    if (p) {
+        const int r = (int)i->Reason;
+        const bool unreachable = (r == 3 || r == 7 || r == 9);   // TimedOut, ConnectionFailed, NegotiationFailed
+        if (unreachable) { if (p->failCloses < 8) p->failCloses++; } else p->failCloses = 0;
+        if (p->failCloses > 1) { muteMs = 4000u << (p->failCloses - 1 > 3 ? 3 : p->failCloses - 1); if (muteMs > 30000) muteMs = 30000; }
+        p->closedUntilMs = GetTickCount64() + muteMs;
+    }
+    Log("[p2p] CLOSED %s reason=%d -- sends muted %us%s", p ? p->idStr : "?", (int)i->Reason, muteMs / 1000,
+        (p && p->st.state == 5) ? " (they have left the lobby: no sends at all)" : "");
 }
 static void EOS_CALL onConnRequest(const EOS_P2P_OnIncomingConnectionRequestInfo* i) {
     char id[64] = {0}; int32_t n = sizeof(id);
@@ -258,7 +308,7 @@ static void rosterAddAll(const char* lobbyId) {
         if (EOS_ProductUserId_ToString(m, id, &idn) != EOS_EResult::EOS_Success) continue;
         if (!_stricmp(id, g_myId)) continue;             // handles are not guaranteed canonical; compare strings
         const int pi = addPeerEx(id, true);              // straight from the lobby: vouched
-        if (pi >= 0 && g_peers[pi].st.state == 5) { g_peers[pi].st.state = 0; g_peers[pi].departedAtMs = 0; }   // rejoiner: un-depart
+        if (pi >= 0) revive(g_peers[pi]);                // rejoiner: un-depart
     }
     EOS_LobbyDetails_Release(det);
 }
@@ -309,7 +359,7 @@ static void EOS_CALL onMemberStatus(const EOS_Lobby_LobbyMemberStatusReceivedCal
     case EOS_ELobbyMemberStatus::EOS_LMS_JOINED:
         if (!isMe) {
             const int i = addPeerEx(who, true);          // the lobby vouching for them, by definition
-            if (i >= 0 && g_peers[i].st.state == 5) { g_peers[i].st.state = 0; g_peers[i].departedAtMs = 0; }
+            if (i >= 0) revive(g_peers[i]);
             Log("[lobby] member JOINED: %s", who);
         }
         break;
@@ -1495,6 +1545,7 @@ void Tick(RecvFn onRecv, void* user) {
                 if (p->st.state == 5) continue;              // still gone: their packet is not ours
             }
             p->st.recv++; p->lastRecvMs = GetTickCount64();
+            p->failCloses = 0;                               // they are plainly reachable
             if (onRecv) onRecv((int)(p - g_peers), buf, (int)got, user);
         }
     }

@@ -58,7 +58,7 @@ add_custom_command(TARGET omp_ping POST_BUILD
 
 # M2: the replication core -- game-free, judged by omp_looptest before any game loads it.
 add_library(omp_replication STATIC src/replication/replication.cpp src/replication/replaysync.cpp
-                                   src/replication/dropsync.cpp)
+                                   src/replication/dropsync.cpp src/replication/sidecar.cpp)
 target_include_directories(omp_replication PUBLIC src)
 
 add_executable(omp_looptest tools/looptest/loop_main.cpp)
@@ -81,7 +81,8 @@ add_executable(omp_symcheck tools/symcheck/symcheck_main.cpp)
 target_link_libraries(omp_symcheck PRIVATE omp_game)
 
 # M2.3: session orchestration (transport <-> streams <-> proxies)
-add_library(omp_session STATIC src/session/session.cpp src/session/banlist.cpp)
+add_library(omp_session STATIC src/session/session.cpp src/session/banlist.cpp src/session/modapi.cpp
+                               src/session/replay_ghosts.cpp)
 target_include_directories(omp_session PUBLIC src)
 # NOT linked against omp_transport on purpose: session.cpp needs only the transport's HEADER, and
 # omp_sessiontest substitutes its own Send/GetStats/PeerCount. Linking the real router here would drag
@@ -132,6 +133,7 @@ if(EXISTS "${UE4SS_LIB}")
         src/replication/replication.cpp
         src/replication/replaysync.cpp
         src/replication/dropsync.cpp
+        src/replication/sidecar.cpp
         src/game/game_syms.cpp
         src/game/dropper.cpp
         src/game/proxy.cpp
@@ -151,6 +153,9 @@ if(EXISTS "${UE4SS_LIB}")
         src/session/session.cpp
         src/session/banlist.cpp
         src/session/mutelist.cpp
+        src/session/modapi.cpp
+        src/session/replay_ghosts.cpp
+        src/loader/lua_api.cpp
         src/game/voice_audio.cpp
         src/voice/voice_capture.cpp)
     target_include_directories(omp_mod PRIVATE "${EOS_SDK}/Include")
@@ -299,6 +304,17 @@ if(EXISTS "${UE4SS_LIB}")
     else()
         message(FATAL_ERROR "tweaks_mod: MinHook sources not found at MINHOOK_SRC='${MINHOOK_SRC}'")
     endif()
+
+    # ---- OmpModTest: an in-game test of the mod channel, written like a third-party mod (it sees only
+    # sdk/omp_mod_api.h). Not shipped. -> build/modtest/Release/main.dll
+    add_library(omp_modtest SHARED tools/modtest/modtest_mod.cpp)
+    set_target_properties(omp_modtest PROPERTIES
+        OUTPUT_NAME "main"
+        MSVC_RUNTIME_LIBRARY "MultiThreadedDLL"
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/modtest")
+    target_compile_definitions(omp_modtest PRIVATE RC_UE4SS_IMPORT UNICODE _UNICODE NOMINMAX)
+    target_include_directories(omp_modtest PRIVATE sdk third_party/ue4ss_abi)
+    target_link_libraries(omp_modtest PRIVATE "${UE4SS_LIB}")
 else()
     message(FATAL_ERROR
         "UE4SS import library not found at '${UE4SS_LIB}'.\n"

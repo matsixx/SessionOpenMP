@@ -1,0 +1,532 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>SessionOpenMP Modding API</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:ital,wght@0,400;0,600;1,400&family=IBM+Plex+Sans+Condensed:wght@500;600;700&family=IBM+Plex+Sans:ital,wght@0,400;0,600;1,400&display=swap">
+<style>
+:root {
+  --desk: #e1e4e0;
+  --sheet: #ffffff;
+  --ink: #0f1113;
+  --muted: #596066;
+  --hair: #c3c8cb;
+  --code: #f1f2ef;
+  --link: #1d44b8;
+  --mark: #fff04a;
+  --shadow: rgba(20, 24, 22, 0.18);
+  --cond: "IBM Plex Sans Condensed", "Arial Narrow", "Roboto Condensed", sans-serif;
+  --sans: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
+  --mono: "IBM Plex Mono", "Cascadia Mono", Consolas, ui-monospace, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --desk: #0a0b0c;
+    --sheet: #16181a;
+    --ink: #e7e8e4;
+    --muted: #9ba1a6;
+    --hair: #33383c;
+    --code: #1e2124;
+    --link: #93aaff;
+    --mark: rgba(255, 224, 0, 0.28);
+    --shadow: rgba(0, 0, 0, 0.6);
+  }
+}
+:root[data-theme="dark"] {
+  --desk: #0a0b0c;
+  --sheet: #16181a;
+  --ink: #e7e8e4;
+  --muted: #9ba1a6;
+  --hair: #33383c;
+  --code: #1e2124;
+  --link: #93aaff;
+  --mark: rgba(255, 224, 0, 0.28);
+  --shadow: rgba(0, 0, 0, 0.6);
+}
+
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--desk);
+  color: var(--ink);
+  font-family: var(--sans);
+  font-size: 15.5px;
+  line-height: 1.6;
+  padding: 0 16px;
+  padding-block: 36px 72px;
+}
+a { color: var(--link); text-underline-offset: 2px; }
+a:focus-visible { outline: 2px solid var(--link); outline-offset: 2px; }
+
+.sheet {
+  max-width: 880px;
+  margin: 0 auto;
+  background: var(--sheet);
+  box-shadow: 0 1px 2px var(--shadow), 0 24px 48px -32px var(--shadow);
+  padding: 28px 52px 36px;
+}
+@media (max-width: 700px) { .sheet { padding: 18px 18px 28px; } }
+
+/* ---- running head + title block ---- */
+.runhead {
+  display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 18px;
+  font-family: var(--cond); font-weight: 500; font-size: 12.5px; letter-spacing: .06em; text-transform: uppercase;
+  color: var(--muted);
+  padding-bottom: 8px; border-bottom: 3px solid var(--ink);
+}
+.titleblock {
+  display: grid; grid-template-columns: 1fr; border-bottom: 1.5px solid var(--ink);
+}
+@media (min-width: 760px) { .titleblock { grid-template-columns: minmax(0, 1fr) 290px; } }
+.tb-main { padding: 22px 24px 22px 0; }
+@media (min-width: 760px) { .tb-main { border-right: 1.5px solid var(--ink); } }
+h1 {
+  font-family: var(--cond); font-weight: 700; font-size: clamp(32px, 5.4vw, 44px); line-height: 1.02;
+  letter-spacing: -.005em; margin: 0 0 10px; text-wrap: balance;
+}
+.tb-main p { margin: 0; font-size: 17px; max-width: 44ch; }
+.tb-meta { margin: 0; display: grid; grid-template-columns: 1fr 1fr; }
+@media (min-width: 760px) { .tb-meta { grid-template-columns: 1fr; } }
+.tb-meta > div { padding: 9px 0 9px 16px; border-top: 1px solid var(--hair); }
+@media (min-width: 760px) { .tb-meta > div:first-child { border-top: 0; } }
+@media (max-width: 759px) {
+  .tb-meta > div { padding-left: 0; }
+  .tb-meta > div:nth-child(even) { padding-left: 14px; border-left: 1px solid var(--hair); }
+}
+.tb-meta dt {
+  font-family: var(--cond); font-weight: 500; font-size: 11.5px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted);
+}
+.tb-meta dd { margin: 0; font-weight: 600; font-size: 14.5px; }
+.tb-meta dd code { font-weight: 400; }
+
+/* ---- overview ---- */
+.overview { display: grid; grid-template-columns: 1fr; gap: 8px 40px; padding: 26px 0 6px; }
+@media (min-width: 760px) { .overview { grid-template-columns: 1fr 1fr; } }
+.overview h2 { margin-top: 0; }
+.overview ul { margin: 0; padding-left: 18px; }
+.overview li { margin-bottom: 4px; }
+.overview p { margin: 0 0 12px; }
+
+/* ---- sections ---- */
+section { padding-top: 34px; }
+h2 {
+  font-family: var(--cond); font-weight: 700; font-size: 19px; letter-spacing: .05em; text-transform: uppercase;
+  margin: 0 0 14px; padding-bottom: 6px; border-bottom: 1.5px solid var(--ink);
+  display: flex; align-items: stretch; gap: 12px; text-wrap: balance;
+}
+h2 .no {
+  font-family: var(--mono); font-weight: 600; font-size: 13px; letter-spacing: 0;
+  background: var(--ink); color: var(--sheet); min-width: 28px; padding: 2px 6px;
+  display: inline-flex; align-items: center; justify-content: center; align-self: center;
+}
+h3 {
+  font-family: var(--cond); font-weight: 600; font-size: 15px; letter-spacing: .05em; text-transform: uppercase;
+  margin: 24px 0 8px;
+}
+p { margin: 0 0 12px; max-width: 70ch; }
+ul.notes { margin: 0 0 14px; padding-left: 20px; max-width: 70ch; }
+ul.notes li { margin-bottom: 6px; }
+code { font-family: var(--mono); font-size: .86em; background: var(--code); padding: 1px 4px; }
+.xref { font-family: var(--mono); font-size: .86em; }
+
+.sig {
+  font-family: var(--mono); font-size: 14px; margin: 0 0 14px; padding: 8px 0;
+  border-top: 1px solid var(--hair); border-bottom: 1px solid var(--hair);
+  overflow-x: auto; white-space: pre;
+}
+
+/* ---- markup on the printout ---- */
+mark {
+  color: inherit;
+  background: linear-gradient(100deg, transparent 0 2px, var(--mark) 2px calc(100% - 3px), transparent calc(100% - 3px));
+  padding: 1px 4px; margin: 0 -2px;
+  -webkit-box-decoration-break: clone; box-decoration-break: clone;
+}
+.caution {
+  display: grid; grid-template-columns: auto 1fr; gap: 4px 14px; align-items: baseline;
+  margin: 6px 0 16px; max-width: 70ch;
+}
+.caution .lbl {
+  font-family: var(--cond); font-weight: 700; font-size: 12.5px; letter-spacing: .1em; text-transform: uppercase;
+  border: 1.5px solid var(--ink); padding: 0 6px; line-height: 1.6;
+}
+.caution p { margin: 0; }
+
+/* ---- figures, listings, tables ---- */
+figure { margin: 8px 0 22px; }
+figcaption { font-size: 13px; color: var(--muted); margin-top: 8px; }
+figcaption b { font-family: var(--cond); font-weight: 600; letter-spacing: .03em; color: var(--ink); }
+
+pre {
+  margin: 0; font-family: var(--mono); font-size: 13px; line-height: 1.6;
+  background: var(--code); border-left: 3px solid var(--ink);
+  padding: 14px 18px; overflow-x: auto; tab-size: 4;
+}
+pre code { background: none; padding: 0; font-size: inherit; }
+pre .cm { color: var(--muted); font-style: italic; }
+pre .st { color: var(--link); }
+pre .kw { font-weight: 600; }
+
+.tablewrap { overflow-x: auto; margin: 4px 0 18px; }
+table { border-collapse: collapse; width: 100%; font-size: 14px; }
+th {
+  font-family: var(--cond); font-weight: 600; font-size: 12px; letter-spacing: .08em; text-transform: uppercase;
+  text-align: left; padding: 7px 12px 7px 0; border-bottom: 1.5px solid var(--ink); white-space: nowrap;
+}
+td { padding: 8px 12px 8px 0; border-bottom: 1px solid var(--hair); vertical-align: top; }
+td.v { font-family: var(--mono); font-size: 13px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+td code { white-space: nowrap; }
+
+.path { display: flex; flex-wrap: wrap; align-items: stretch; gap: 0; }
+.path .box {
+  border: 1.5px solid var(--ink); padding: 8px 12px; font-size: 13.5px; line-height: 1.3; flex: 1 1 130px;
+}
+.path .box small { display: block; font-family: var(--mono); font-size: 11.5px; color: var(--muted); margin-top: 3px; }
+.path .box.omp { background: var(--code); }
+.path .wire {
+  flex: 0 0 28px; display: flex; align-items: center; justify-content: center;
+  font-family: var(--mono); color: var(--muted);
+}
+@media (max-width: 700px) {
+  .path { flex-direction: column; }
+  .path .box { flex: none; }
+  .path .wire { flex: none; height: 22px; transform: rotate(90deg); }
+}
+
+.bytes { overflow-x: auto; }
+.bytes table { width: auto; min-width: 560px; border: 1.5px solid var(--ink); font-size: 13px; }
+.bytes th, .bytes td { text-align: center; padding: 6px 10px; border: 1px solid var(--hair); white-space: nowrap; }
+.bytes thead th { font-family: var(--mono); font-weight: 400; font-size: 11.5px; letter-spacing: 0; text-transform: none; color: var(--muted); border-bottom: 1.5px solid var(--ink); }
+.bytes td.hex { font-family: var(--mono); }
+.bytes td.lbl { font-family: var(--cond); font-weight: 500; font-size: 12px; letter-spacing: .04em; color: var(--muted); }
+.bytes td.payload { min-width: 180px; }
+
+footer {
+  margin-top: 40px; padding-top: 8px; border-top: 3px solid var(--ink);
+  display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 18px;
+  font-family: var(--cond); font-size: 12.5px; letter-spacing: .06em; text-transform: uppercase; color: var(--muted);
+}
+</style>
+</head>
+<body>
+<article class="sheet">
+  <div class="runhead">
+    <span>SessionOpenMP</span>
+    <span>Mod channel datasheet</span>
+    <span>Rev 1 &middot; 2026-09-17</span>
+  </div>
+
+  <header class="titleblock">
+    <div class="tb-main">
+      <h1>SessionOpenMP Modding API</h1>
+      <p>Send your mod's own data to the other players in a session.</p>
+    </div>
+    <dl class="tb-meta">
+      <div><dt>API version</dt><dd>1</dd></div>
+      <div><dt>Requires</dt><dd>SessionOpenMP 1.1.12+</dd></div>
+      <div><dt>For</dt><dd>UE4SS C++ and Lua mods</dd></div>
+      <div><dt>C++ header</dt><dd><code>sdk/omp_mod_api.h</code></dd></div>
+      <div><dt>Wire tag</dt><dd><code>OMPm</code></dd></div>
+      <div><dt>Header license</dt><dd>Any, free to ship</dd></div>
+    </dl>
+  </header>
+
+  <div class="overview">
+    <div>
+      <h2>Features</h2>
+      <ul>
+        <li>Named channels: only players with the same channel receive</li>
+        <li>Send to one player or everyone, reliable or not</li>
+        <li>Up to 1000 bytes per message</li>
+        <li>Join and leave events, so late joiners get your state</li>
+        <li>One agreed authority for shared state</li>
+        <li>Safe from any thread; callbacks on the game thread</li>
+        <li>Your mod still runs when OpenMP isn't installed</li>
+        <li>Works from UE4SS Lua mods, no DLL needed</li>
+      </ul>
+    </div>
+    <div>
+      <h2>Description</h2>
+      <p>There is no Unreal network connection between players. Everyone runs their own single-player game and OpenMP draws the other skaters in, so replicated variables, RPCs and multicasts never reach anyone else.</p>
+      <p>This API gives your mod the connection players already have. OpenMP carries your bytes and never reads them. Players on a SessionOpenMP older than 1.1.12 never show up to your mod.</p>
+      <p>Lua mods get the same API with no header and no DLL; see <a class="xref" href="#lua">10</a>. There is no Blueprint support yet.</p>
+    </div>
+  </div>
+
+  <figure>
+    <div class="path" aria-label="Message path">
+      <div class="box">Your mod<small>omp.Send</small></div>
+      <div class="wire" aria-hidden="true">&rarr;</div>
+      <div class="box omp">OpenMP, your game<small>limits, queue</small></div>
+      <div class="wire" aria-hidden="true">&rarr;</div>
+      <div class="box">The session<small>EOS / relay / UDP</small></div>
+      <div class="wire" aria-hidden="true">&rarr;</div>
+      <div class="box omp">OpenMP, their game<small>checks the channel</small></div>
+      <div class="wire" aria-hidden="true">&rarr;</div>
+      <div class="box">Their copy of your mod<small>OnMessage</small></div>
+    </div>
+    <figcaption><b>Figure 1.</b> Message path. Nothing but your bytes travels; no files and no code.</figcaption>
+  </figure>
+
+  <section id="connect">
+    <h2><span class="no">1</span>Connecting</h2>
+    <p>Copy <code>sdk/omp_mod_api.h</code> into your project.</p>
+    <figure>
+<pre><code><span class="kw">#include</span> <span class="st">"omp_mod_api.h"</span>
+
+<span class="kw">static</span> OmpModApi omp;     <span class="cm">// zeroed until bound</span>
+<span class="kw">static int</span> channel = 0;
+
+<span class="cm">// Call from something that runs regularly, e.g. once a second. Not from your</span>
+<span class="cm">// mod's constructor: UE4SS may load your mod before OpenMP.</span>
+<span class="kw">void</span> TryConnect() {
+    <span class="kw">if</span> (channel) <span class="kw">return</span>;
+    <span class="kw">if</span> (!omp.version &amp;&amp; !OmpMod_Bind(&amp;omp)) <span class="kw">return</span>;   <span class="cm">// OpenMP not loaded: single player</span>
+    channel = omp.Register(<span class="st">"yourname.yourmod"</span>, OnMessage, OnPlayer, <span class="kw">nullptr</span>);
+}</code></pre>
+      <figcaption><b>Listing 1.</b> Binding to OpenMP and registering a channel.</figcaption>
+    </figure>
+    <ul class="notes">
+      <li><code>OmpMod_Bind</code> finds OpenMP by its exports and fills the struct. It returns 0 when OpenMP isn't loaded, so your mod keeps working without it.</li>
+      <li><strong>Channel names</strong> are 1&ndash;63 characters from <code>A-Z a-z 0-9 _ . -</code>. Start with your name so two mods never pick the same one.</li>
+      <li><code>Register</code> works any time, in or out of a session. The handle stays valid across sessions and map changes until you call <code>Unregister</code>. Don't call it when the game closes: OpenMP may already be unloaded by then.</li>
+    </ul>
+  </section>
+
+  <section id="send">
+    <h2><span class="no">2</span>Sending</h2>
+    <div class="sig">omp.Send(channel, player, data, len, reliable);   <span style="color:var(--muted)">// 1 = queued, 0 = refused</span></div>
+    <ul class="notes">
+      <li><code>player</code> is <code>OMPMOD_EVERYONE</code> or one player's number.</li>
+      <li>Up to <strong>1000 bytes</strong>. Put your own format version in the first byte, so you can change the format later.</li>
+      <li><code>reliable = 1</code> arrives, in order. <code>reliable = 0</code> can be dropped; use it only for values you resend constantly.</li>
+      <li>Refused when you're not in a session, the message is too big, the handle is invalid, or you're over the limits in <a class="xref" href="#limits">4</a>.</li>
+    </ul>
+  </section>
+
+  <section id="receive">
+    <h2><span class="no">3</span>Receiving</h2>
+    <div class="sig">void OnMessage(int player, const uint8_t* data, int len, void* user);</div>
+    <p><code>data</code> is only valid during the call, so copy what you keep.</p>
+    <div class="caution">
+      <span class="lbl">Caution</span>
+      <p><mark>Treat everything you receive as untrusted.</mark> Any player in the lobby can send any bytes on your channel, including a modified copy of your mod. Check <code>len</code> before reading, range-check every value, and never use a received number as an array index, size or pointer without checking it.</p>
+    </div>
+  </section>
+
+  <section id="limits">
+    <h2><span class="no">4</span>Absolute maximum ratings</h2>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>Parameter</th><th>Limit</th><th>Past the limit</th></tr></thead>
+        <tbody>
+          <tr><td>Payload per message</td><td class="v">1000 B</td><td><code>Send</code> returns 0</td></tr>
+          <tr><td>Messages sent, per channel</td><td class="v">30 /s, burst 10</td><td><code>Send</code> returns 0</td></tr>
+          <tr><td>Bytes sent, per channel</td><td class="v">8000 B/s, burst 16000</td><td><code>Send</code> returns 0</td></tr>
+          <tr><td>Messages received from one player</td><td class="v">60 /s, burst 120</td><td>Dropped and logged</td></tr>
+          <tr><td>Channels registered in one game</td><td class="v">32</td><td><code>Register</code> returns 0</td></tr>
+          <tr><td>Channel name length</td><td class="v">1&ndash;63 chars</td><td><code>Register</code> returns 0</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <figure>
+      <div class="bytes">
+        <table>
+          <thead><tr><th>0</th><th>1</th><th>2</th><th>3</th><th>4</th><th>5</th><th colspan="4">6&ndash;9</th><th>10 &hellip; 1009</th></tr></thead>
+          <tbody>
+            <tr>
+              <td class="hex">4F</td><td class="hex">4D</td><td class="hex">50</td><td class="hex">6D</td>
+              <td class="hex">01</td><td class="hex">02</td><td class="hex" colspan="4">hash</td>
+              <td class="payload">your payload, &le; 1000 B</td>
+            </tr>
+            <tr>
+              <td class="lbl" colspan="4">"OMPm"</td><td class="lbl">version</td><td class="lbl">data</td>
+              <td class="lbl" colspan="4">FNV-1a of the channel name</td><td class="lbl">OpenMP never reads this</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <figcaption><b>Figure 2.</b> One data message on the wire. Ten bytes of header keep it under the 1024-byte message size every connection type carries.</figcaption>
+    </figure>
+  </section>
+
+  <section id="players">
+    <h2><span class="no">5</span>Players</h2>
+    <div class="sig">void OnPlayer(int player, int joined, void* user);</div>
+    <ul class="notes">
+      <li><code>joined = 1</code>: a player with your channel appeared, including everyone already there when you register. Send them your current state now.</li>
+      <li><code>joined = 0</code>: they left, or unregistered the channel. <code>PlayerId</code> and <code>PlayerName</code> still return them here, so you can tell who it was.</li>
+    </ul>
+    <div class="caution">
+      <span class="lbl">Note</span>
+      <p><mark>Player numbers are local to your game.</mark> The same person has a different number on every other machine, and a number can later belong to someone else. Never put a player number in a message; use <code>PlayerId</code> for anything you send or keep.</p>
+    </div>
+    <ul class="notes">
+      <li><code>PlayerName</code> is a label only: names can repeat, or be empty for a moment after someone joins.</li>
+      <li><code>PlayerActor</code> is their skater in your world, or null when they aren't spawned or are on another map. Use actors on the game thread only, and look them up again each frame instead of keeping them.</li>
+    </ul>
+  </section>
+
+  <section id="authority">
+    <h2><span class="no">6</span>Shared state</h2>
+    <p>There is no server. For anything everyone has to agree on, like a score or a round, one player decides: the <strong>authority</strong>. It's the player with the lowest player ID among everyone who has your channel. Every game works out the same answer without sending anything, and it moves on its own when that player leaves.</p>
+    <p>The pattern: other players send requests, the authority applies them and sends the full state, and everyone ignores state that doesn't come from <code>Authority(channel)</code>. <a class="xref" href="#example">9</a> is a complete example.</p>
+  </section>
+
+  <section id="threads">
+    <h2><span class="no">7</span>Threads</h2>
+    <ul class="notes">
+      <li>Every function is safe to call from any thread.</li>
+      <li>Callbacks run on the game thread. Don't block in them. Sending from inside a callback is fine.</li>
+      <li>Call <code>Unregister</code> from the game thread. From another thread, a callback already in flight can still run once.</li>
+    </ul>
+  </section>
+
+  <section id="reference">
+    <h2><span class="no">8</span>Function reference</h2>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>Function</th><th>Returns</th></tr></thead>
+        <tbody>
+          <tr><td><code>OmpMod_Bind(&amp;omp)</code></td><td>API version, or 0 if OpenMP isn't loaded</td></tr>
+          <tr><td><code>Register(name, onMessage, onPlayer, user)</code></td><td>Handle above 0, or 0 if refused</td></tr>
+          <tr><td><code>Unregister(handle)</code></td><td>Nothing</td></tr>
+          <tr><td><code>Send(handle, player, data, len, reliable)</code></td><td>1 queued, 0 refused</td></tr>
+          <tr><td><code>InSession()</code></td><td>1 while in a session</td></tr>
+          <tr><td><code>Players(handle, out, cap)</code></td><td>How many players have the channel; fills up to <code>cap</code></td></tr>
+          <tr><td><code>IsAuthority(handle)</code></td><td>1 if you decide shared state</td></tr>
+          <tr><td><code>Authority(handle)</code></td><td>The authority's player number, or -1 for you</td></tr>
+          <tr><td><code>PlayerId(player, out, cap)</code></td><td>1 and their stable ID, or 0</td></tr>
+          <tr><td><code>PlayerName(player, out, cap)</code></td><td>1 and their skater name, or 0</td></tr>
+          <tr><td><code>LocalId(out, cap)</code></td><td>1 and your own ID</td></tr>
+          <tr><td><code>LocalName(out, cap)</code></td><td>1 and your own name</td></tr>
+          <tr><td><code>PlayerActor(player)</code></td><td>Their skater actor, or null</td></tr>
+          <tr><td><code>ActorPlayer(actor)</code></td><td>The player behind a skater, or -1 (your own skater too)</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="example">
+    <h2><span class="no">9</span>Typical application</h2>
+    <p>A shared round timer. The authority owns the countdown and everyone else shows it. If the authority leaves, the next one already has the latest state and carries on.</p>
+    <figure>
+<pre><code><span class="kw">#include</span> <span class="st">"omp_mod_api.h"</span>
+
+<span class="kw">static</span> OmpModApi omp;
+<span class="kw">static int</span>       channel = 0;
+
+<span class="kw">static</span> uint8_t   roundNo = 0;
+<span class="kw">static</span> uint16_t  secondsLeft = 0;
+
+<span class="kw">enum</span> : uint8_t { MSG_STATE = 1, MSG_START = 2 };
+
+<span class="kw">static void</span> SendState(<span class="kw">int</span> player) {
+    <span class="kw">if</span> (!channel) <span class="kw">return</span>;
+    <span class="kw">const</span> uint8_t buf[] = { MSG_STATE, roundNo, (uint8_t)(secondsLeft &amp; 0xFF), (uint8_t)(secondsLeft &gt;&gt; 8) };
+    omp.Send(channel, player, buf, <span class="kw">sizeof</span>(buf), 1);
+}
+
+<span class="kw">static void</span> StartRound() {
+    roundNo++;
+    secondsLeft = 120;
+    SendState(OMPMOD_EVERYONE);
+}
+
+<span class="kw">static void</span> OnPlayer(<span class="kw">int</span> player, <span class="kw">int</span> joined, <span class="kw">void</span>*) {
+    <span class="kw">if</span> (joined &amp;&amp; omp.IsAuthority(channel)) SendState(player);      <span class="cm">// late joiners get the round</span>
+}
+
+<span class="kw">static void</span> OnMessage(<span class="kw">int</span> player, <span class="kw">const</span> uint8_t* data, <span class="kw">int</span> len, <span class="kw">void</span>*) {
+    <span class="kw">if</span> (len &lt; 1) <span class="kw">return</span>;
+    <span class="kw">if</span> (data[0] == MSG_STATE &amp;&amp; len == 4) {
+        <span class="kw">if</span> (player != omp.Authority(channel)) <span class="kw">return</span>;                <span class="cm">// only the authority's state counts</span>
+        <span class="kw">const</span> uint16_t secs = (uint16_t)(data[2] | (data[3] &lt;&lt; 8));
+        <span class="kw">if</span> (secs &gt; 120) <span class="kw">return</span>;                                      <span class="cm">// validate</span>
+        roundNo = data[1];
+        secondsLeft = secs;
+    } <span class="kw">else if</span> (data[0] == MSG_START &amp;&amp; len == 1 &amp;&amp; omp.IsAuthority(channel)) {
+        StartRound();
+    }
+}
+
+<span class="cm">// The local player pressed "start".</span>
+<span class="kw">void</span> RequestStart() {
+    <span class="kw">if</span> (!channel || !omp.InSession() || omp.IsAuthority(channel)) { StartRound(); <span class="kw">return</span>; }
+    <span class="kw">const</span> uint8_t buf[] = { MSG_START };
+    omp.Send(channel, omp.Authority(channel), buf, <span class="kw">sizeof</span>(buf), 1);
+}
+
+<span class="cm">// Once a second.</span>
+<span class="kw">void</span> Tick() {
+    <span class="kw">if</span> (!channel &amp;&amp; (omp.version || OmpMod_Bind(&amp;omp)))
+        channel = omp.Register(<span class="st">"yourname.round_timer"</span>, OnMessage, OnPlayer, <span class="kw">nullptr</span>);
+    <span class="kw">if</span> (secondsLeft &amp;&amp; (!channel || omp.IsAuthority(channel))) {
+        secondsLeft--;
+        SendState(OMPMOD_EVERYONE);
+    }
+}</code></pre>
+      <figcaption><b>Listing 2.</b> Shared round timer. Compiles as-is against the header.</figcaption>
+    </figure>
+  </section>
+
+  <section id="lua">
+    <h2><span class="no">10</span>Lua mods</h2>
+    <p>Every UE4SS Lua mod gets a global <code>OpenMP</code> table, ready from the first line of <code>main.lua</code>. It's the same API with Lua types, and everything above applies: the limits in <a class="xref" href="#limits">4</a>, untrusted data, local player numbers, and the authority.</p>
+    <figure>
+<pre><code><span class="kw">if not</span> OpenMP <span class="kw">then return end</span>   <span class="cm">-- SessionOpenMP isn't installed, or is older than 1.1.12</span>
+
+<span class="kw">local</span> ch                        <span class="cm">-- declared first, so the functions below can use it</span>
+ch = OpenMP.Register(<span class="st">"yourname.yourmod"</span>,
+    <span class="kw">function</span>(player, data)       <span class="cm">-- data: a Lua string of bytes</span>
+        print((<span class="st">"got %d bytes from %s\n"</span>):format(#data, OpenMP.PlayerName(player) <span class="kw">or</span> <span class="st">"?"</span>))
+    <span class="kw">end</span>,
+    <span class="kw">function</span>(player, joined)     <span class="cm">-- joined: true or false</span>
+        <span class="kw">if</span> joined <span class="kw">then</span> OpenMP.Send(ch, player, <span class="st">"welcome"</span>) <span class="kw">end</span>
+    <span class="kw">end</span>)</code></pre>
+      <figcaption><b>Listing 3.</b> A Lua mod registering a channel.</figcaption>
+    </figure>
+    <ul class="notes">
+      <li><code>Send(channel, player, data, reliable)</code> takes any Lua string up to 1000 bytes. <code>reliable</code> defaults to true.</li>
+      <li><code>PlayerActor</code> and <code>ActorPlayer</code> use UObjects and only work on the game thread: inside your callbacks, or in <code>ExecuteInGameThread</code>.</li>
+      <li>Callbacks run on the game thread, a frame or two after the message arrives. An error in one is printed to <code>UE4SS.log</code> as an <code>[OpenMP]</code> line and doesn't stop the others.</li>
+      <li>Lua and C++ mods can share a channel; bytes arrive exactly as sent. <code>string.pack</code> and <code>string.unpack</code> read and write the same layouts a C++ mod uses.</li>
+    </ul>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>Lua</th><th>Returns</th></tr></thead>
+        <tbody>
+          <tr><td><code>OpenMP.Register(name, onMessage, onPlayer)</code></td><td>Channel, or nil if refused</td></tr>
+          <tr><td><code>OpenMP.Unregister(channel)</code></td><td>Nothing</td></tr>
+          <tr><td><code>OpenMP.Send(channel, player, data, reliable)</code></td><td>true or false</td></tr>
+          <tr><td><code>OpenMP.InSession()</code></td><td>true or false</td></tr>
+          <tr><td><code>OpenMP.Players(channel)</code></td><td>Table of player numbers</td></tr>
+          <tr><td><code>OpenMP.IsAuthority(channel)</code></td><td>true or false</td></tr>
+          <tr><td><code>OpenMP.Authority(channel)</code></td><td>The authority's player number, or -1 for you</td></tr>
+          <tr><td><code>OpenMP.PlayerId(player)</code> / <code>PlayerName(player)</code></td><td>String, or nil</td></tr>
+          <tr><td><code>OpenMP.LocalId()</code> / <code>LocalName()</code></td><td>Your ID (or nil) / your name</td></tr>
+          <tr><td><code>OpenMP.PlayerActor(player)</code></td><td>Their skater as a UObject, or nil</td></tr>
+          <tr><td><code>OpenMP.ActorPlayer(actor)</code></td><td>Player number, or -1</td></tr>
+          <tr><td><code>OpenMP.EVERYONE</code>, <code>MAX_PAYLOAD</code>, <code>ApiVersion</code></td><td>-1, 1000, 1</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="log">
+    <h2><span class="no">11</span>Checking it works</h2>
+    <p><code>SessionOpenMP.log</code> in the game's Win64 folder has a <code>[modapi]</code> line for each registration, each player joining or leaving your channel, refused sends, and messages dropped over the limits. Lua callback errors show up in <code>UE4SS.log</code>.</p>
+  </section>
+
+  <footer>
+    <span>SessionOpenMP modding API</span>
+    <span>API version 1</span>
+    <span>Rev 1</span>
+  </footer>
+</article>
+</body>
+</html>

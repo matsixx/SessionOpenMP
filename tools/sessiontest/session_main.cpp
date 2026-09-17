@@ -18,7 +18,9 @@
 #include "../../src/session/session.h"
 #include "../../src/ui/update_check.h"
 #include "../../src/replication/replication.h"
+#include "../../src/session/modapi.h"
 #include <cstdio>
+#include <vector>
 #include <cstring>
 #include <cstdint>
 #include "transport/transport.h"    // PeerStats -- the roster mock below wears the real signature
@@ -31,7 +33,15 @@ using namespace omp;
 namespace omp {
 static int g_sent[64] = {};
 static int g_roster = 0;
-void Send(int peerIdx, const void*, int, bool) { if (peerIdx >= 0 && peerIdx < 64) g_sent[peerIdx]++; }
+static bool g_departed0 = false;     // peer 0 has left the lobby (transport state 5)
+// Mod channel packets ("OMPm") are also captured, so the test can hand them back as if a peer sent them.
+struct Captured { int peer; std::vector<uint8_t> bytes; };
+static std::vector<Captured> g_modOut;
+void Send(int peerIdx, const void* d, int len, bool) {
+    if (peerIdx >= 0 && peerIdx < 64) g_sent[peerIdx]++;
+    if (d && len >= 4 && !memcmp(d, "OMPm", 4))
+        g_modOut.push_back({ peerIdx, std::vector<uint8_t>((const uint8_t*)d, (const uint8_t*)d + len) });
+}
 int  SendBudget() { return 0; }   // no wire: replay-sync bursts uncapped (and unexercised) here
 Backend Current() { return BK_NONE; }   // no wire: nothing is reliable-on-shm here
 // The dropped-object lane hashes this into its authority key. A fixed answer is right for a headless
@@ -47,7 +57,9 @@ TrustLevel BackendTrust() { return TRUST_NONE; }  // no wire can vouch: the spaw
 TrustLevel PeerTrust(int) { return TRUST_NONE; }
 bool GetStats(int idx, PeerStats* out) {
     if (idx < 0 || idx >= g_roster || !out) return false;
-    *out = PeerStats{}; return true;
+    *out = PeerStats{};
+    if (idx == 0 && g_departed0) out->state = 5;
+    return true;
 }
 int PeerCount() { return g_roster; }
 }
@@ -87,6 +99,100 @@ static void feed(int peer, uint64_t senderUs, uint64_t nowUs) {
     uint8_t pkt[900];
     const int n = repl::Pack(s, senderUs, pkt, sizeof(pkt));
     session::OnPacket(peer, pkt, n, nowUs);
+}
+// The same snapshot, claiming an older wire minor (a peer on an earlier build).
+static void feedMinor(int peer, uint8_t minor, uint64_t senderUs, uint64_t nowUs) {
+    repl::State s{};
+    s.bodyPosOk = 1; s.bodyPos[0] = 100.f + (float)peer; s.bodyPos[2] = -52.f;
+    s.deckPos[0] = s.bodyPos[0]; s.deckPos[2] = -60.f;
+    s.onBoard = 1; s.grounded = 1; s.animLen = 229;
+    uint8_t pkt[900];
+    const int n = repl::Pack(s, senderUs, pkt, sizeof(pkt));
+    pkt[5] = minor;
+    session::OnPacket(peer, pkt, n, nowUs);
+}
+
+// ---- MOD CHANNEL -----------------------------------------------------------------------------------
+// One game plays both ends: our own lane packets are handed back as peer 0's. Proves the capability
+// gate (an older peer is never sent the lane -- it would call it a version mismatch), the list ->
+// joined edge, delivery, the size and rate limits, unannounced channels, and expiry -> left.
+static int  g_modJoined = 0, g_modLeft = 0, g_modMsgs = 0;
+static char g_modGot[32] = {};
+static char g_modLeftId[64] = {};
+static void modOnPlayer(int player, int joined, void*) {
+    if (joined) { g_modJoined++; return; }
+    g_modLeft++;
+    g_modLeftId[0] = 0;
+    modapi::PlayerId(player, g_modLeftId, sizeof(g_modLeftId));
+}
+static void modOnMessage(int, const uint8_t* d, int len, void*) {
+    g_modMsgs++;
+    if (len > 0 && len < (int)sizeof(g_modGot)) { memcpy(g_modGot, d, (size_t)len); g_modGot[len] = 0; }
+}
+static void modLoopBack(uint64_t us) {
+    std::vector<omp::Captured> out; out.swap(omp::g_modOut);
+    for (auto& c : out) if (c.peer == 0) session::OnPacket(0, c.bytes.data(), (int)c.bytes.size(), us);
+}
+static void modChannelCheck(uint64_t& us, uint64_t step) {
+    printf("\nmod channel\n");
+    modapi::Reset();
+    omp::g_roster = 1;
+    omp::g_modOut.clear();
+    check(modapi::Register("bad name", modOnMessage, modOnPlayer, nullptr) == 0, "a channel name with a space is refused");
+    check(modapi::Register("", modOnMessage, modOnPlayer, nullptr) == 0, "an empty channel name is refused");
+    const int h = modapi::Register("test.chan", modOnMessage, modOnPlayer, nullptr);
+    check(h > 0, "a valid channel registers");
+    check(modapi::Register("test.chan", modOnMessage, modOnPlayer, nullptr) == 0, "the same name twice is refused");
+    check(modapi::Send(h, -1, (const uint8_t*)"x", 1, 1) == 0, "a send outside a session is refused");
+
+    for (int i = 0; i < 10; i++) { feedMinor(0, 2, us, us); session::Frame(pawn(), us, msClock(us), gatherOwn); us += step; }
+    check(omp::g_modOut.empty(), "an OLDER peer (wire minor 2) is never sent the lane");
+
+    for (int i = 0; i < 10; i++) { feed(0, us, us); session::Frame(pawn(), us, msClock(us), gatherOwn); us += step; }
+    check(!omp::g_modOut.empty(), "a peer on this build is sent our channel list");
+    modLoopBack(us);
+    session::Frame(pawn(), us, msClock(us), gatherOwn); us += step;
+    check(g_modJoined == 1, "their list arrives: joined fires once");
+    int players[4] = {};
+    check(modapi::Players(h, players, 4) == 1 && players[0] == 0, "Players lists them");
+    check(modapi::IsAuthority(h) == 1, "an id tie keeps authority here");
+
+    check(modapi::Send(h, -1, (const uint8_t*)"hello", 5, 1) == 1, "a send in a session is queued");
+    session::Frame(pawn(), us, msClock(us), gatherOwn); us += step;
+    modLoopBack(us);
+    check(g_modMsgs == 1 && !strcmp(g_modGot, "hello"), "the message arrives intact");
+
+    static uint8_t big[1001];
+    check(modapi::Send(h, -1, big, 1001, 1) == 0, "a payload over 1000 bytes is refused");
+    {
+        uint8_t pkt[12] = { 'O', 'M', 'P', 'm', 1, 2, 0x78, 0x56, 0x34, 0x12, 'z', 'z' };
+        session::OnPacket(0, pkt, sizeof(pkt), us);
+    }
+    check(g_modMsgs == 1, "data on a channel they never announced is dropped");
+
+    int accepted = 0;
+    for (int i = 0; i < 20; i++) accepted += modapi::Send(h, 0, (const uint8_t*)"r", 1, 0);
+    check(accepted >= 8 && accepted < 20, "the outgoing rate limit refuses a burst");
+
+    for (int i = 0; i < 480; i++) {                 // ~8 s, their list never comes back
+        feed(0, us, us); session::Frame(pawn(), us, msClock(us), gatherOwn); us += step;
+        omp::g_modOut.clear();
+    }
+    check(g_modLeft == 1, "a peer who stops announcing leaves the channel");
+
+    // They announce again, then LEAVE THE LOBBY: the leave callback can still name them.
+    for (int i = 0; i < 130; i++) { feed(0, us, us); session::Frame(pawn(), us, msClock(us), gatherOwn); us += step; }
+    modLoopBack(us);
+    session::Frame(pawn(), us, msClock(us), gatherOwn); us += step;
+    check(g_modJoined == 2, "they announce again: joined fires again");
+    omp::g_departed0 = true;
+    session::Frame(pawn(), us, msClock(us), gatherOwn); us += step;
+    omp::g_departed0 = false;
+    check(g_modLeft == 2 && g_modLeftId[0] != 0, "leaving the lobby fires left, and the callback can still get their id");
+
+    modapi::Unregister(h);
+    check(modapi::Send(h, -1, (const uint8_t*)"x", 1, 1) == 0, "a stale handle is refused");
+    modapi::Reset();
 }
 
 // ---- VERSION COMPARISON -------------------------------------------------------------------------
@@ -233,6 +339,8 @@ int main() {
         for (int i = 0; i < 60; i++) session::OnPacket(9, junk, sizeof(junk), us);
         check(g_mismatches == 2, "a DIFFERENT peer announces on its own");
     }
+
+    modChannelCheck(us, step);
 
     if (!verOk) g_fails++;      // the version comparison is part of the verdict
     printf("\n%s\n", g_fails ? "*** SESSION TEST FAILURES ***" : "SESSION TEST PASS");

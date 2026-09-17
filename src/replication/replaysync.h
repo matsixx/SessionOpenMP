@@ -77,6 +77,15 @@ bool     SampleAt(int peerIdx, uint64_t targetUs, repl::State& out);
 // each frame's interval instead. Returns how many were written.
 int      AudioEventsBetween(int peerIdx, uint64_t fromUs, uint64_t toUs,
                             repl::AudioEvent* out, int cap);
+// ---- SAVED REPLAYS (the sidecar). A completed history goes out as its own wire-format entry stream
+// and comes back in as if it had just finished transferring, so a saved replay's peers are sampled by
+// exactly the code a live sync uses. Entries: [u16 len][u64 us][len bytes], oldest first.
+// ExportBuffer returns the bytes written (0 = no ready buffer, or `out` too small); `out` null asks
+// for the size. InjectBuffer COPIES `entries` and runs the transfer's own validation; false = rejected.
+uint32_t ExportBuffer(int peerIdx, uint8_t* out, uint32_t cap, uint32_t* entryCountOut);
+bool     InjectBuffer(int peerIdx, const uint8_t* entries, uint32_t total, uint32_t entryCount,
+                      void (*logf)(const char*));
+bool     HasBuffer(int peerIdx);
 uint64_t BufferNewestUs(int peerIdx);                 // 0 = no ready buffer
 uint64_t BufferOldestUs(int peerIdx);
 

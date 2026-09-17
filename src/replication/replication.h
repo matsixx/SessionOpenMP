@@ -115,7 +115,15 @@ struct State {
     float    lFootPos[3] = {}, lFootRot[3] = {}, rFootPos[3] = {}, rFootRot[3] = {};
     int      handOk = 0, handWorld = 0;
     float    lHandPos[3] = {}, lHandRot[3] = {}, rHandPos[3] = {}, rHandRot[3] = {};
-    int      artOk = 0;                                     // 1 = trucks, 2 = trucks + wheel
+    // THE BOARD'S ARTICULATION (wire minor 4). Trucks and wheels hang off the deck on PHYSICS
+    // CONSTRAINTS, so they only move on a board that SIMULATES; a board placed by a stamp is rigid by
+    // construction (a replayed or far-off peer, anything airborne). Transported, never re-simulated --
+    // simulating them locally was tried and reverted (winmm-era round 269). truckB/truckF are each
+    // truck's rotation RELATIVE TO THE DECK, in full: the axis wanders because the value is
+    // rest (x) articulation, and rest is unobservable on a sender whose board is simulating.
+    // wheelBL is the back-left wheel RELATIVE TO ITS TRUCK -- pure axle spin plus a fixed mount -- and
+    // drives all four on the receiver through each wheel's own rest mount.
+    int      artOk = 0;                                     // 0 none, 1 = trucks, 2 = trucks + wheel
     float    truckB[4] = {0,0,0,1}, truckF[4] = {0,0,0,1}, wheelBL[4] = {0,0,0,1};
     uint8_t  onBoard = 0, bailing = 0;
     // EXPLICIT, not dug out of `anim`: that blob is a PACKED FIELD SEQUENCE (offset -> index mapping
@@ -277,7 +285,11 @@ constexpr uint8_t kWireMajor = 1;
 //      field added under the version rule rather than a magic letter.
 // 1.2: trickSerial + paSerial (1.1.8) -- the owner's SetTrick count and body-physics state; see
 //      trick_pulse.h and pa_state.h.
-constexpr uint8_t kWireMinor = 2;
+// 1.3: no new bytes. A 1.3 sender understands the mod channel lane ("OMPm", session/modapi.h), which
+//      is only ever sent to peers at 1.3 or later -- an older build reports it as a version mismatch.
+// 1.4: the board's articulation: one flag byte (artOk), then -- only when it is non-zero -- three
+//      smallest-three quats (truckB, truckF, wheelBL). 1 or 13 bytes.
+constexpr uint8_t kWireMinor = 4;
 
 // What a snapshot that would not parse actually was. Lets the reject path say who needs to update
 // instead of leaving a peer silently invisible.

@@ -13,6 +13,7 @@
 // exes; `omp_symcheck` re-proves that from disk on every build.
 #include "game_syms.h"
 #include <cstring>
+#include <cmath>
 #include <cstdio>
 #ifdef _WIN32
 #include <windows.h>
@@ -130,6 +131,12 @@ static const SigEntry kSigs[] = {
     // ASessionReplayManager::GetInstance  Epic 0x10fa110 / Steam 0x10ba500 -- the route to the replay
     // camera: instance -> _replayInputController (+0x280) -> _replayCamera (+0x260).
     { "ReplayMgrInstance",    "40 53 48 83 EC 20 48 8B 1D ?? ?? ?? ?? 48 85 DB ?? ?? E8 ?? ?? ?? ?? 48 8B 4B 10 48 83 C0 30 48 63 50 08 3B 51 38 ?? ??", false },
+    // AReplayManager::SaveReplay  Epic 0x340b9d0 / Steam 0x33d2890 -- the peer sidecar is written
+    // after it. LoadReplayInternal  Epic 0x3401c70 / Steam 0x33c8b30 -- and read after this.
+    // GetReplayFilename  Epic 0x33fbc80 / Steam 0x33c2b40 -- names the file both of them use.
+    { "ReplaySave",           "48 89 54 24 10 55 57 41 57 48 8D AC 24 80 FE FF FF 48 81 EC 80 02 00 00 83 7A 08 01 48 8B FA 4C 8B F9 ?? ??", false },
+    { "ReplayLoadInt",        "40 55 53 41 54 41 56 41 57 48 8D AC 24 00 FF FF FF 48 81 EC 00 02 00 00 80 89 A9 02 00 00 08 45 33 E4 48 8B 81 78 02 00 00", false },
+    { "ReplayFilename",       "40 57 48 83 EC 30 48 89 5C 24 40 48 8B F9 33 DB 4C 89 74 24 58 48 89 19 4C 8B F2 48 89 59 08 41 83 78 08 01", false },
     // AReplayCamera::SetCameraType  Epic 0x340c080 / Steam 0x33d2f40.
     { "ReplayCamSetType",     "40 53 48 83 EC 70 F6 81 D4 08 00 00 01 48 8B D9 0F 84 ?? ?? ?? ?? 48 89 BC 24 80 00 00 00", false },
     // HOOK TARGET: UCameraReplayComponent::Replaying  Epic 0x340a090 / Steam 0x33d0f50.
@@ -918,6 +925,9 @@ const Syms& Resolve(void (*logf)(const char*)) {
     g_syms.SkaterReplayMode   =                     take("SkaterReplayMode");   // hooked, never called directly
     g_syms.GetConcHandles     = (GetConcHandlesFn)  take("GetConcHandles");
     g_syms.ReplayMgrInstance  = (GetReplayMgrFn)    take("ReplayMgrInstance");
+    g_syms.ReplaySave         = (ReplaySaveFn)      take("ReplaySave");         // hooked, never called
+    g_syms.ReplayLoadInt      = (ReplayLoadIntFn)   take("ReplayLoadInt");      // hooked, never called
+    g_syms.ReplayFilename     = (ReplayFilenameFn)  take("ReplayFilename");
     g_syms.ReplayCamSetType   = (SetCamTypeFn)      take("ReplayCamSetType");
     g_syms.CamReplaying       =                     take("CamReplaying");   // hooked, never called directly
     g_syms.FloatTrackReplaying =                    take("FloatTrackReplaying");   // hooked, never called directly
@@ -1192,6 +1202,40 @@ uint8_t LocalReplayMode() { return g_localReplayMode; }
 // The scrub clock: CurrentPlayTime/TotalPlayTime in seconds off the live manager's active instance
 // data. Pure reads under SEH -- the manager getter and both pointers are game-owned and may be down
 // during loads.
+bool ReplayClipRange(float* start, float* end, float* total) {
+    const Syms& S = Get();
+    if (!S.ReplayMgrInstance) return false;
+#ifdef _WIN32
+    __try {
+        void* mgr = S.ReplayMgrInstance();
+        if (!mgr) return false;
+        const uint8_t* inst = *(uint8_t**)((uint8_t*)mgr + off::kReplayMgrActiveInst);
+        if (!inst) return false;
+        const float t    = *(const float*)(inst + off::kReplayInstTotalTime);
+        const float real = *(const float*)(inst + off::kReplayInstRealTotal);
+        const float cs   = *(const float*)(inst + off::kReplayInstClipStart);
+        const float ce   = *(const float*)(inst + off::kReplayInstClipEnd);
+        if (!(t > 0.f && t < 1e6f) || !(real >= 0.f && real < 1e6f)) return false;
+        const float shift = real - t;                       // what the head of the recording has lost
+        auto conv = [&](float marker, float unset) {
+            if (!(marker == marker) || fabsf(marker - (-1.0f)) <= 1e-8f) return unset;
+            float v = marker - shift;
+            if (v < 0.f) v = 0.f;
+            if (v > t) v = t;
+            return v;
+        };
+        float a = conv(cs, 0.f), b = conv(ce, t);
+        if (b < a) b = a;
+        if (start) *start = a;
+        if (end)   *end = b;
+        if (total) *total = t;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+#else
+    return false;
+#endif
+}
+
 bool ReplayPlayTime(float* cur, float* total) {
     const Syms& S = Get();
     if (!S.ReplayMgrInstance) return false;

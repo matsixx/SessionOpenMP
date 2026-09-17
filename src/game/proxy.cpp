@@ -90,6 +90,8 @@ static void quatToRot3(const float* q, float* r) {   // UE FRotator (pitch,yaw,r
 // =====================================================================================================
 // SPAWN
 // =====================================================================================================
+static void clearReplayTags(void* actor, const char* what, void (*logf)(const char*));   // defined below
+
 bool Proxy::EnsureSpawned(void* ownPawn, const repl::State& first, uint64_t nowMs, void (*logf)(const char*)) {
     if (actor_) return true;
     const Syms& S = Get();
@@ -169,24 +171,10 @@ bool Proxy::EnsureSpawned(void* ownPawn, const repl::State& first, uint64_t nowM
         __try { S.SetActorTick(actor_, false); tickOff_ = true; } __except (EXCEPTION_EXECUTE_HANDLER) {}
 #endif
     }
-    // ---- TAKE THE PROXY OUT OF THE REPLAY SYSTEM AT THE SOURCE.
-    // Actors opt into the replay editor BY TAG: AReplayManager::AddReplayComponents runs
-    // UGameplayStatics::GetAllActorsWithTag for NAME_ACTORTAG_ActorReplayComponent,
-    // ...CameraReplayComponent, ...AnimInstanceReplayComponent, ...FilmerReplayComponent and the rest,
-    // then registers whatever it finds. A proxy is spawned from the LOCAL PLAYER'S skater class, so it
-    // carries those tags, and the manager would register the PROXY's replay components alongside the
-    // real player's and tick them across replay sessions they never recorded for -- which is where the
-    // AVs inside TickReplaying -> Filmer/CameraReplayComponent::Replaying come from. Clearing the tag
-    // list closes the whole class of fault at its source instead of guarding each consumer.
-    // Zeroing Num is safe: the array still owns and frees its allocation; it simply reports empty.
-    // Being undiscoverable-by-tag is correct for a proxy in general, like replication off, actor tick
-    // off and the bail veto.
-#ifdef _WIN32
-    __try {
-        int* tagNum = (int*)((uint8_t*)actor_ + off::kActorTagsNum);
-        if (*tagNum > 0 && *tagNum < 64) *tagNum = 0;
-    } __except (EXCEPTION_EXECUTE_HANDLER) {}
-#endif
+    // ---- TAKE THE PROXY OUT OF THE REPLAY SYSTEM AT THE SOURCE (see clearReplayTags). The board is
+    // done the same way in Apply, the frame it is first seen: it is a separate actor with its own
+    // replay component and its own copy of the tags, and it does not exist yet at spawn.
+    clearReplayTags(actor_, "skater", logf);
     // Registered HERE, at spawn: every guard that asks "is this actor one of ours?" must get the
     // right answer from the actor's first frame to its last, independently of whether packets are
     // flowing.
@@ -235,6 +223,8 @@ void Proxy::ClearState() {
     lastPaSerial_ = 0; ownerPa_ = true; paPulseUntilMs_ = 0;
     memset(lastTrickName_, 0, sizeof(lastTrickName_)); memset(lastGrindName_, 0, sizeof(lastGrindName_));
     trickDef_ = nullptr;
+    tagsClearedBoard_ = nullptr;          // a replacement board must have its tags cleared again
+    artRestBoard_ = nullptr; artSaid_ = false; artErrDeg_ = -1.f; articulate_ = false;
     st_.alive = false; st_.boardOwned = false;
 }
 
@@ -250,6 +240,42 @@ void* Proxy::OwnBoard() const {
     if (!bd) return nullptr;
     if (safePtr(bd, off::kBoardSkater) != actor_) return nullptr;
     return bd;
+}
+
+// TAKE AN ACTOR OF OURS OUT OF THE REPLAY SYSTEM AT THE SOURCE.
+// Actors opt into the replay editor BY TAG: AReplayManager::AddReplayComponents runs
+// UGameplayStatics::GetAllActorsWithTag for NAME_ACTORTAG_ActorReplayComponent,
+// ...CameraReplayComponent, ...AnimInstanceReplayComponent, ...FilmerReplayComponent and the rest,
+// then registers whatever it finds. A proxy is spawned from the LOCAL PLAYER'S skater class, so it
+// carries those tags, and the manager would register the PROXY's replay components alongside the
+// real player's and tick them across replay sessions they never recorded for -- which is where the
+// AVs inside TickReplaying -> Filmer/CameraReplayComponent::Replaying come from. Clearing the tag
+// list closes the whole class of fault at its source instead of guarding each consumer.
+// SAVING walks the same tags: AReplayManager::PackReplayData -> PackReplayComponentData runs
+// GetAllActorsWithTag per component class and packs every hit, dividing by each tracked component's
+// recorded-sample count (UActorReplayComponent::PackData). A peer's BOARD kept its tags while its
+// replay component was pruned from the recorder, so it had zero samples -- EXCEPTION_INT_DIVIDE_BY_ZERO
+// on every save of a replay made in a session (field crash, 1.1.11). Tag-free actors are simply not
+// packed, which is right: nothing of a peer's is in the recording.
+// Zeroing Num is safe: the array still owns and frees its allocation; it simply reports empty.
+// Being undiscoverable-by-tag is correct for a proxy in general, like replication off, actor tick
+// off and the bail veto.
+static void clearReplayTags(void* actor, const char* what, void (*logf)(const char*)) {
+    if (!actor) return;
+    int had = 0;
+#ifdef _WIN32
+    __try {
+        int* tagNum = (int*)((uint8_t*)actor + off::kActorTagsNum);
+        if (*tagNum > 0 && *tagNum < 64) { had = *tagNum; *tagNum = 0; }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+#endif
+    if (logf && had) {
+        static bool saidSkater = false, saidBoard = false;
+        bool& said = (what[0] == 'b') ? saidBoard : saidSkater;
+        if (!said) { said = true; char m[160];
+            snprintf(m, sizeof(m), "[proxy] a peer's %s carried %d actor tag(s) -- cleared, so the replay"
+                                   " system never finds it", what, had); logf(m); }
+    }
 }
 
 // =====================================================================================================
@@ -518,6 +544,8 @@ void Proxy::Apply(const repl::State& s, uint64_t nowMs, uint64_t nowUs, void (*l
     //         this latches the first frame it exists AND provably belongs to this proxy.
     void* bd = OwnBoard();
     st_.boardOwned = (bd != nullptr);
+    // Keyed by the board POINTER, not a bool: a replaced board is a fresh actor with its tags back.
+    if (bd && bd != tagsClearedBoard_) { tagsClearedBoard_ = bd; clearReplayTags(bd, "board", logf); }
     if (bd && !boardRepOff_ && S.SetReplicates) {
         boardRepOff_ = true;
 #ifdef _WIN32
@@ -1176,13 +1204,15 @@ void Proxy::Apply(const repl::State& s, uint64_t nowMs, uint64_t nowUs, void (*l
         static uint64_t lastBd = 0;
         if (nowMs - lastBd >= 1000) {
             lastBd = nowMs;
-            char m[220];
+            char m[260];
+            // art: the wire's articulation flag, and the first truck write's read-back error in degrees
+            // (~0 = our writes hold; the full lean = a parent recomputed them away; -1 = never applied).
             snprintf(m, sizeof(m),
                      "[proxy] board err=%.0fcm driven=%u snaps=%u stamps(air)=%u carry=%u stops=%u sim=%d"
-                     " onBoard=%d grounded=%d bail=%d mode=%d broken=%d rej=%u",
+                     " onBoard=%d grounded=%d bail=%d mode=%d broken=%d rej=%u art=%d/%.2f",
                      st_.driveErrCm, st_.driven, st_.snaps, st_.airSkips, st_.carryStamps, st_.stops,
                      (int)simOn_, (int)(s.onBoard != 0), (int)(s.grounded != 0), (int)(s.bailing != 0),
-                     (int)s.boardMode, (int)s.brokenState, TypeRejects());
+                     (int)s.boardMode, (int)s.brokenState, TypeRejects(), (int)s.artOk, (double)artErrDeg_);
             logf(m);
         }
         // GAME BODY PHYSICS ON PROXIES (syncPhysAnim). The lifecycle that switches physical animation
@@ -1564,6 +1594,75 @@ void Proxy::StampBoard(const repl::State& s) {
         if (deck) { __try { S.SetWorldRotQuat(deck, s.deckQuat, false, nullptr, 0); } __except (EXCEPTION_EXECUTE_HANDLER) {} }
     }
 #endif
+    // AFTER the deck is placed: every articulated part composes onto the deck's world rotation.
+    if (s.artOk && (articulate_ || boardNear_)) ApplyArticulation(s, bd);
+}
+
+// THE TRUCKS AND WHEELS OF A STAMPED BOARD (replication.h, wire minor 4).
+// A placed board does not simulate, so its kingpin and axle constraints never solve and the whole
+// assembly is rigid. The owner's articulation is written instead:
+//   truck world = deck world (x) truck-vs-deck                    (transported in full)
+//   wheel world = its truck's world (x) mount_i (x) spin          spin = conj(mount_BL) (x) wheelBL
+// One wheel drives all four. mount_i is wheel i relative to ITS TRUCK as found on this board the first
+// time it is seen and before anything is written to it (reading it back afterwards would read our own
+// output). Relative to the truck rather than the deck on purpose: a board that simulated earlier can
+// have stopped mid-lean, and a mount taken against the deck would bake that lean in; against the truck
+// the only thing a simulating past can leave behind is a spin phase, which nobody can see.
+void Proxy::ApplyArticulation(const repl::State& s, void* bd) {
+    const Syms& S = Get();
+    if (!S.SetWorldRotQuat || !bd) return;
+    static const int kWheelOff[4] = { off::kBoardWheelBL, off::kBoardWheelBR, off::kBoardWheelFL, off::kBoardWheelFR };
+    void* tb = safePtr(bd, off::kBoardTruckBack);
+    void* tf = safePtr(bd, off::kBoardTruckFront);
+    if (!tb || !tf) return;
+    void* wheel[4];
+    for (int i = 0; i < 4; i++) wheel[i] = safePtr(bd, kWheelOff[i]);
+
+    if (artRestBoard_ != bd) {
+        float tbq[4], tfq[4];
+        if (!safeRead((uint8_t*)tb + off::kCompQuat, tbq, 16) || !safeRead((uint8_t*)tf + off::kCompQuat, tfq, 16)) return;
+        for (int i = 0; i < 4; i++) {
+            float wq[4], inv[4];
+            artMount_[i][0] = artMount_[i][1] = artMount_[i][2] = 0; artMount_[i][3] = 1;
+            if (!wheel[i] || !safeRead((uint8_t*)wheel[i] + off::kCompQuat, wq, 16)) continue;
+            qConj(i < 2 ? tbq : tfq, inv);
+            qMul(inv, wq, artMount_[i]);
+        }
+        artRestBoard_ = bd;
+    }
+
+    float tbw[4], tfw[4];
+    qMul(s.deckQuat, s.truckB, tbw);
+    qMul(s.deckQuat, s.truckF, tfw);
+#ifdef _WIN32
+    __try {
+        S.SetWorldRotQuat(tb, tbw, false, nullptr, 0);
+        S.SetWorldRotQuat(tf, tfw, false, nullptr, 0);
+        if (s.artOk >= 2) {
+            float inv[4], spin[4];
+            qConj(artMount_[0], inv);
+            qMul(inv, s.wheelBL, spin);
+            for (int i = 0; i < 4; i++) {
+                if (!wheel[i]) continue;
+                float m[4], w[4];
+                qMul(artMount_[i], spin, m);
+                qMul(i < 2 ? tbw : tfw, m, w);
+                S.SetWorldRotQuat(wheel[i], w, false, nullptr, 0);
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+#endif
+    if (!artSaid_) { artSaid_ = true;
+        // Said once per proxy: does the write LAND? A component world write can be recomputed away by
+        // its parent; reading the truck back the same frame says whether ours held.
+        float back[4], inv[4], d[4];
+        if (safeRead((uint8_t*)tb + off::kCompQuat, back, 16)) {
+            qConj(tbw, inv); qMul(inv, back, d);
+            float w = d[3] < 0 ? -d[3] : d[3]; if (w > 1.f) w = 1.f;
+            const float errDeg = 2.f * acosf(w) * 57.29578f;
+            artErrDeg_ = errDeg;                 // surfaced by Apply's once-a-second board line
+        }
+    }
 }
 
 void Proxy::StopBoardSim() {

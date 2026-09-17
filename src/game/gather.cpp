@@ -141,6 +141,27 @@ bool GatherOwnState(void* pawn, repl::State& out) {
         if (deck) {
             rd((uint8_t*)deck + off::kCompPos,  out.deckPos,  12);
             rd((uint8_t*)deck + off::kCompQuat, out.deckQuat, 16);
+            // ---- THE ARTICULATION (replication.h). Read off OUR simulating board, where the kingpin
+            // constraints actually solve: each truck relative to the deck, one wheel relative to its
+            // truck. Three quaternion reads; nothing is written.
+            {
+                void* tb = rdPtr(bd, off::kBoardTruckBack);
+                void* tf = rdPtr(bd, off::kBoardTruckFront);
+                void* wb = rdPtr(bd, off::kBoardWheelBL);
+                float dq[4], tbq[4], tfq[4], wq[4], inv[4];
+                if (tb && tf && rd((uint8_t*)deck + off::kCompQuat, dq, 16) &&
+                    rd((uint8_t*)tb + off::kCompQuat, tbq, 16) && rd((uint8_t*)tf + off::kCompQuat, tfq, 16)) {
+                    qConj(dq, inv);
+                    qMul(inv, tbq, out.truckB);
+                    qMul(inv, tfq, out.truckF);
+                    out.artOk = 1;
+                    if (wb && rd((uint8_t*)wb + off::kCompQuat, wq, 16)) {
+                        qConj(tbq, inv);
+                        qMul(inv, wq, out.wheelBL);
+                        out.artOk = 2;
+                    }
+                }
+            }
             // ---- IS THIS BOARD LOOSE? Asked of the deck's OWN body, not of any one feature that
             // lets go of a board: sitting puts one down, a mount the game refuses drops one, and
             // both end up here. A carried board is attached to the hand and does not simulate, so

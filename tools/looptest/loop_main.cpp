@@ -19,6 +19,7 @@
 #include "../../src/replication/replication.h"
 #include "../../src/replication/replaysync.h"
 #include "../../src/replication/dropsync.h"
+#include "../../src/replication/sidecar.h"
 #include "../../src/replication/anim_fields.h"
 #include <cstdio>
 #include <cstring>
@@ -162,7 +163,8 @@ static bool codecCheck() {
     // Headroom for the appended trailer (minor >= 1). This check is about FIDELITY -- every field
     // round-trips exactly -- so it must not sit on the bare 1 KB ceiling, where a maximal packet
     // rightly drops its last audio event to fit the trailer. The ceiling itself is poseSliceCheck's.
-    uint8_t pkt[1024 + 8];
+    // Sized past the trailer's MAXIMUM (16 B since minor 4's articulation); 8 covered minor 2's 3 B.
+    uint8_t pkt[1024 + 32];
     const int n = Pack(s, 123456789ull, pkt, sizeof(pkt));
     if (n <= 0) { printf("  codec: Pack failed\n"); return false; }
     State o; uint64_t su = 0;
@@ -1643,6 +1645,83 @@ static bool wireVersionCheck() {
       printf("  minor-2 bytes round-trip; a minor-1 packet reads both 0    %s\n", both ? "PASS" : "FAIL");
       if (!both) ok = false; }
 
+    // THE THIRD: minor 4's articulation -- a flag, then three quats only when it is set. They
+    // round-trip within the smallest-three step; a minor-3 reader never reaches for them; and a
+    // board with no articulation costs ONE byte, not thirteen.
+    { State g = s; g.artOk = 2;
+      const float tb[4] = { 0.026f, 0.0f, 0.0f, 0.99966f }, tf[4] = { -0.026f, 0.0f, 0.0f, 0.99966f };
+      const float wh[4] = { 0.0f, 0.6f, 0.0f, 0.8f };
+      memcpy(g.truckB, tb, 16); memcpy(g.truckF, tf, 16); memcpy(g.wheelBL, wh, 16);
+      uint8_t gp[2048]; const int gn = Pack(g, 1234567, gp, sizeof(gp));
+      State rt{}; bool round = gn > 0 && Unpack(gp, gn, rt, nullptr) && rt.artOk == 2;
+      for (int k = 0; k < 4 && round; k++)
+          round = fabsf(rt.truckB[k] - tb[k]) < 0.003f && fabsf(rt.truckF[k] - tf[k]) < 0.003f && fabsf(rt.wheelBL[k] - wh[k]) < 0.003f;
+      uint8_t old[2048]; memcpy(old, gp, (size_t)gn); old[5] = 3;        // a minor-3 reader: same bytes, never read
+      State ro{}; const bool older = Unpack(old, gn, ro, nullptr) && ro.artOk == 0 && ro.truckB[3] == 1.f;
+      State none = s; none.artOk = 0;
+      uint8_t np[2048]; const int nn = Pack(none, 1234567, np, sizeof(np));
+      const bool cheap = nn > 0 && gn - nn == 12;
+      const bool all = round && older && cheap;
+      printf("  minor-4 articulation round-trips; minor 3 ignores it; 1 B when absent  %s\n", all ? "PASS" : "FAIL");
+      if (!all) ok = false; }
+
+    return ok;
+}
+
+// ---- REPLAY SIDECAR ------------------------------------------------------------------------------
+// A saved replay's peers: a history goes OUT as the entry stream a transfer assembles, into the
+// sidecar with its wardrobe and anchor, and comes BACK through the transfer's own validation into a
+// buffer SampleAt reads. Tampered files are refused, never misread.
+static bool sidecarCheck() {
+    printf("\n-- replay sidecar: export -> pack -> unpack -> inject -> sample --\n");
+    using namespace omp;
+    bool ok = true;
+    auto check = [&](bool c, const char* what) { printf("  %-62s %s\n", what, c ? "PASS" : "FAIL"); if (!c) ok = false; };
+    // three snapshots a second apart, x = 100, 200, 300
+    std::vector<uint8_t> stream;
+    for (int i = 0; i < 3; i++) {
+        State s{}; s.deckQuat[3] = s.bodyQuat[3] = 1; s.bodyPosOk = 1;
+        s.bodyPos[0] = 100.f * (float)(i + 1); s.bodyPos[2] = -52.f; s.onBoard = 1; s.grounded = 1; s.animLen = 229;
+        uint8_t pkt[2048];
+        const int n = Pack(s, (uint64_t)(i + 1) * 1000000ull, pkt, sizeof(pkt));
+        const uint16_t len = (uint16_t)n; const uint64_t us = (uint64_t)(i + 1) * 1000000ull;
+        const size_t w = stream.size(); stream.resize(w + 10 + (size_t)n);
+        memcpy(&stream[w], &len, 2); memcpy(&stream[w + 2], &us, 8); memcpy(&stream[w + 10], pkt, (size_t)n);
+    }
+    check(replaysync::InjectBuffer(100, stream.data(), (uint32_t)stream.size(), 3, nullptr), "a well-formed entry stream injects");
+    uint32_t cnt = 0;
+    const uint32_t need = replaysync::ExportBuffer(100, nullptr, 0, &cnt);
+    check(need == (uint32_t)stream.size() && cnt == 3, "export size query matches what went in");
+    std::vector<uint8_t> ex(need);
+    check(replaysync::ExportBuffer(100, ex.data(), need, &cnt) == need && memcmp(ex.data(), stream.data(), need) == 0,
+          "export round-trips the entry stream byte for byte");
+    sidecar::Peer p;
+    strcpy_s(p.name, "Tester"); p.cosmetics.nChar = 2; p.cosmetics.stance = 1;
+    p.haveSkel = true; p.skel.n = 3; p.skel.hash[0] = 7; p.skel.hash[2] = 9;
+    p.anchorEndUs = 3000000ull; p.entryCount = 3; p.entries = ex.data(); p.entriesLen = need;
+    const uint32_t size = sidecar::Pack(&p, 1, nullptr, 0);
+    std::vector<uint8_t> file((size_t)size);
+    check(size > need && sidecar::Pack(&p, 1, file.data(), size) == size, "sidecar packs");
+    sidecar::Peer out[8]; int n = 0; char why[120] = {};
+    check(sidecar::Unpack(file.data(), size, out, 8, &n, why, sizeof(why)) && n == 1, "sidecar unpacks");
+    check(!strcmp(out[0].name, "Tester") && out[0].cosmetics.nChar == 2 && out[0].cosmetics.stance == 1
+          && out[0].haveSkel && out[0].skel.n == 3 && out[0].skel.hash[2] == 9 && out[0].anchorEndUs == 3000000ull
+          && out[0].entryCount == 3 && out[0].entriesLen == need, "name, wardrobe, skeleton and anchor survive");
+    check(replaysync::InjectBuffer(101, out[0].entries, out[0].entriesLen, out[0].entryCount, nullptr), "the unpacked history injects");
+    State s{};
+    check(replaysync::SampleAt(101, 2500000ull, s) && fabsf(s.bodyPos[0] - 250.f) < 1.f, "sampling half a second before the anchor interpolates");
+    // tampering
+    file[0] ^= 1;
+    check(!sidecar::Unpack(file.data(), size, out, 8, &n, why, sizeof(why)), "a wrong magic is refused");
+    file[0] ^= 1;
+    check(!sidecar::Unpack(file.data(), size - 5, out, 8, &n, why, sizeof(why)), "a truncated file is refused");
+    file[6] ^= 1;
+    check(!sidecar::Unpack(file.data(), size, out, 8, &n, why, sizeof(why)) && strstr(why, "wire") != nullptr, "another wire major is refused, and named");
+    file[6] ^= 1;
+    { std::vector<uint8_t> bad(stream); bad[0] = 0; bad[1] = 0x10;   // an entry length past the buffer
+      check(!replaysync::InjectBuffer(102, bad.data(), (uint32_t)bad.size(), 3, nullptr), "a corrupt entry stream is refused"); }
+    replaysync::CancelSync(100); replaysync::CancelSync(101);
+    check(!replaysync::HasBuffer(100) && !replaysync::HasBuffer(101), "cancel drops an injected buffer");
     return ok;
 }
 
@@ -1660,6 +1739,7 @@ int main(int argc, char**) {
     if (!skelPrintCheck()) { printf("\nSKEL PRINT FAIL\n"); return 1; }
     if (!internCheck()) { printf("\nINTERN FAIL\n"); return 1; }
     if (!wireVersionCheck()) { printf("\nWIRE VERSION FAIL\n"); return 1; }
+    if (!sidecarCheck()) { printf("\nSIDECAR FAIL\n"); return 1; }
     printf("%-13s %8s %8s %8s %6s %7s %7s %7s %7s\n",
            "profile", "outEwma", "outMax", "delay", "alpha", "starve", "resync", "extrap", "verdict");
     bool allPass = true;

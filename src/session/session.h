@@ -159,6 +159,21 @@ bool SetPeerReplaySync(int peerId, bool on);
 // 0 off, 1 transferring, 2 ready (showing), 3 failed -- for the menu row / logging.
 int  PeerReplaySyncState(int peerId);
 
+// ---- SAVED REPLAYS. The peers being driven from a synced history in the local editor right now,
+// in the form the sidecar keeps (replication/sidecar.h): what a save needs to bring them back.
+// `anchorEndUs` is their history time at the END of the replay timeline. Returns how many were filled.
+struct SavedPeer {
+    int               peerIdx = -1;
+    char              name[40] = {};
+    repl::CosmeticSet cosmetics;
+    bool              haveWear = false;
+    repl::WearSet     wear;
+    bool              haveSkel = false;
+    repl::SkelPrint   skel;
+    uint64_t          anchorEndUs = 0;
+};
+int SyncedPeersForSave(SavedPeer* out, int cap);
+
 // ---- DROPPED OBJECTS (Session's object dropper -- LB off the board). See game/dropper.h for the
 // model. The policy is the "Dropped Objects" pause-menu row, and it decides ONLY what happens to the
 // sets everyone had SAVED before the session; live placements always replicate above Off.

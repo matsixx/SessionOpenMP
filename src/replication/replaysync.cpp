@@ -293,32 +293,70 @@ static void readyFree(ReadyBuf& r) { delete[] r.blob; delete[] r.idx; r = ReadyB
 // Parse the completed blob into a timestamp index. Every offset is re-validated against the blob we
 // actually assembled; timestamps must be non-decreasing (the sender wrote them oldest-first) or the
 // buffer is rejected outright.
-static bool finishIncoming(void (*logf)(const char*)) {
-    ReadyBuf* slot = readyFor(g_in.peerIdx);
+// `buf` is TAKEN on success (the ready buffer owns it from then on) and left with the caller on
+// failure. Shared by the transfer's completion and the sidecar's injection.
+static bool buildReady(int peerIdx, uint8_t* buf, uint32_t total, uint32_t entryCount,
+                       const char* what, void (*logf)(const char*)) {
+    if (!buf || entryCount == 0 || entryCount > 0x100000u) return false;
+    ReadyBuf* slot = readyFor(peerIdx);
     if (!slot) for (auto& r : g_ready) if (!r.used) { slot = &r; break; }
     if (!slot) return false;
     readyFree(*slot);
-    ReadyBuf::Entry* idx = new ReadyBuf::Entry[g_in.entryCount];
+    ReadyBuf::Entry* idx = new ReadyBuf::Entry[entryCount];
     uint32_t w = 0, n = 0;
     uint64_t prevUs = 0;
-    while (w + 10 <= g_in.total && n < g_in.entryCount) {
-        const uint16_t len = rU16(g_in.buf + w);
-        const uint64_t us  = rU64(g_in.buf + w + 2);
-        if (len == 0 || len > 2048 || w + 10u + len > g_in.total || us < prevUs) break;
+    while (w + 10 <= total && n < entryCount) {
+        const uint16_t len = rU16(buf + w);
+        const uint64_t us  = rU64(buf + w + 2);
+        if (len == 0 || len > 2048 || w + 10u + len > total || us < prevUs) break;
         idx[n].off = w + 10; idx[n].len = len; idx[n].us = us;
         prevUs = us; n++; w += 10u + len;
     }
-    if (n != g_in.entryCount || w != g_in.total || n < 2) { delete[] idx; return false; }
-    slot->used = true; slot->peerIdx = g_in.peerIdx;
-    slot->blob = g_in.buf; g_in.buf = nullptr;        // ownership moves
+    if (n != entryCount || w != total || n < 2) { delete[] idx; return false; }
+    slot->used = true; slot->peerIdx = peerIdx;
+    slot->blob = buf;
     slot->idx = idx; slot->count = n;
     slot->oldestUs = idx[0].us; slot->newestUs = idx[n - 1].us;
     if (logf) { char m[160];
-        snprintf(m, sizeof(m), "[sync] peer %d replay history complete: %u snapshots covering %.0f s",
-                 g_in.peerIdx, n, (double)(slot->newestUs - slot->oldestUs) / 1e6);
+        snprintf(m, sizeof(m), "[sync] peer %d replay history %s: %u snapshots covering %.0f s",
+                 peerIdx, what, n, (double)(slot->newestUs - slot->oldestUs) / 1e6);
         logf(m); }
     return true;
 }
+
+static bool finishIncoming(void (*logf)(const char*)) {
+    if (!buildReady(g_in.peerIdx, g_in.buf, g_in.total, g_in.entryCount, "complete", logf)) return false;
+    g_in.buf = nullptr;                               // ownership moved into the ready buffer
+    return true;
+}
+
+uint32_t ExportBuffer(int peerIdx, uint8_t* out, uint32_t cap, uint32_t* entryCountOut) {
+    ReadyBuf* r = readyFor(peerIdx);
+    if (!r || r->count < 2) return 0;
+    uint32_t need = 0;
+    for (uint32_t i = 0; i < r->count; i++) need += 10u + r->idx[i].len;
+    if (entryCountOut) *entryCountOut = r->count;
+    if (!out) return need;
+    if (cap < need) return 0;
+    uint32_t w = 0;
+    for (uint32_t i = 0; i < r->count; i++) {
+        wU16(out + w, r->idx[i].len); wU64(out + w + 2, r->idx[i].us);
+        memcpy(out + w + 10, r->blob + r->idx[i].off, r->idx[i].len);
+        w += 10u + r->idx[i].len;
+    }
+    return w;
+}
+
+bool InjectBuffer(int peerIdx, const uint8_t* entries, uint32_t total, uint32_t entryCount,
+                  void (*logf)(const char*)) {
+    if (!entries || total == 0 || total > kMaxTotal) return false;
+    uint8_t* copy = new uint8_t[total];
+    memcpy(copy, entries, total);
+    if (!buildReady(peerIdx, copy, total, entryCount, "loaded from a saved replay", logf)) { delete[] copy; return false; }
+    return true;
+}
+
+bool HasBuffer(int peerIdx) { ReadyBuf* r = readyFor(peerIdx); return r && r->count >= 2; }
 
 static void sendSimple(int peerIdx, uint8_t type, uint32_t reqId) {
     uint8_t p[9];

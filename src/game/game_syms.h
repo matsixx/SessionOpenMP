@@ -135,6 +135,15 @@ using GetConcHandlesFn  = void  (*)(void* soundBase, void* outTArray);
 // lens logic update themselves. Early-outs if the type is already the active one.
 using SetCamTypeFn      = void  (*)(void* replayCamera, uint8_t type);
 using GetReplayMgrFn    = void* (*)();      // ASessionReplayManager::GetInstance()
+// ---- SAVED REPLAYS (the peer sidecar; loader hooks, session/replay_ghosts.h).
+// AReplayManager::SaveReplay(const FString& name) / LoadReplayInternal(const FString& name, const
+// FString& folder) -> bool. Extra register args are forwarded untouched: the hook only observes.
+using ReplaySaveFn      = uintptr_t (*)(void* mgr, const void* nameFStr, uintptr_t a3, uintptr_t a4);
+using ReplayLoadIntFn   = uintptr_t (*)(void* mgr, const void* nameFStr, const void* folderFStr, uintptr_t a4);
+// AReplayManager::GetReplayFilename(FString& out, const FString& name, const FString& folder): the
+// full path the game reads or writes (ProjectSavedDir + folder + "/" + name + extension, or the
+// folder verbatim when it is a real path). Called, never hooked; the out FString's data is FMemory.
+using ReplayFilenameFn  = void* (*)(void* outFStr, const void* nameFStr, const void* folderFStr);
 // ---- THE GAME'S OWN PAUSE MENU ---------------------------------------------------------------------
 // Session's menus are NOT blueprint graphs: a page is a `UMenuPageDefinition` data asset holding a
 // `TArray<FMenuPageItemDefinition>`, and `UMenuPage` turns that array into one `UMenuPageItem` widget
@@ -396,6 +405,9 @@ struct Syms {
     // ---- the rolling-sound concurrency fix + the replay-camera look-at target.
     GetConcHandlesFn GetConcHandles    = nullptr;
     GetReplayMgrFn   ReplayMgrInstance = nullptr;
+    ReplaySaveFn     ReplaySave        = nullptr;   // hooked, never called
+    ReplayLoadIntFn  ReplayLoadInt     = nullptr;   // hooked, never called
+    ReplayFilenameFn ReplayFilename    = nullptr;
     SetCamTypeFn     ReplayCamSetType  = nullptr;
     // HOOKED, never called: ASkaterCharacter::OnReplayModeChanged -- see the sig's comment.
     void*            SkaterReplayMode  = nullptr;
@@ -534,6 +546,10 @@ uint8_t LocalReplayMode();
 // instance). False when the manager or instance is not up. Timeline END (cur == total) is the
 // moment playback was entered; the session maps that to peers' transferred history windows.
 bool ReplayPlayTime(float* cur, float* total);
+// The range of the timeline a SAVE writes, in ReplayPlayTime's own seconds: [start, end] of `total`.
+// The same arithmetic as AReplayManager::ComputePackContextInfo -- a set marker is converted by
+// (RealTotalPlayTime - TotalPlayTime) and clamped to the timeline; an unset one is the timeline's edge.
+bool ReplayClipRange(float* start, float* end, float* total);
 uint8_t LastLiveReplayMode();               // the most recent non-playback mode (default 1)
 // The game's own per-skater replay-mode transition, via the loader's trampoline. Used to RESTORE a
 // proxy the playback machinery touched -- its mesh's GlobalAnimRateScale is zeroed while its
@@ -830,6 +846,10 @@ namespace off {
     constexpr int kReplayMgrActiveInst = 0x278;   // FReplayManagerInstanceData*
     constexpr int kReplayInstCurTime   = 0x8d4;   // CurrentPlayTime  (float, seconds into the timeline)
     constexpr int kReplayInstTotalTime = 0x8dc;   // TotalPlayTime    (float, timeline length)
+    constexpr int kReplayInstRealTotal = 0x8e4;   // RealTotalPlayTime (float; clip times are in THIS scale)
+    // FReplayKeyframeHandler (at +0 of the instance): the editor's clip markers, -1 = not set.
+    constexpr int kReplayInstClipStart = 0x5f4;   // KeyframeHandler._clipStartTime
+    constexpr int kReplayInstClipEnd   = 0x5f8;   // KeyframeHandler._clipEndTime
     // USkinnedMeshComponent::VisibilityBasedAnimTickOption (PDB +0x604). 3 = OnlyTickPoseWhenRendered:
     // an unrendered mesh skips anim update+evaluation entirely, which is where a proxy's per-frame
     // cost lives. bRecentlyRendered includes the shadow passes, so a peer whose shadow you can see
@@ -1137,6 +1157,12 @@ namespace off {
     // (+0x4f0) -> actor root.
     constexpr int kBoardFlipper       = 0x4e8;   // ASkateboardEx::_flipper -- the deck you can SEE
     constexpr int kBoardTruckBack     = 0x4f0;   // ASkateboardEx::_truckBack -- first fallback
+    // The articulated parts (replication.h, wire minor 4). Each is a UStaticMeshComponent*.
+    constexpr int kBoardTruckFront    = 0x500;   // ASkateboardEx::_truckFront
+    constexpr int kBoardWheelBL       = 0x510;   // ASkateboardEx::_wheelBackLeft
+    constexpr int kBoardWheelBR       = 0x518;   // ASkateboardEx::_wheelBackRight
+    constexpr int kBoardWheelFL       = 0x520;   // ASkateboardEx::_wheelFrontLeft
+    constexpr int kBoardWheelFR       = 0x528;   // ASkateboardEx::_wheelFrontRight
     // Board breakage (PDB: pdbmembers ASkateboardEx). The state byte is what BreakBoard_Internal
     // stores and RebuildBrokenBoard clears, so transporting it covers every break/repair path.
     constexpr int kBoardBrokenState   = 0x3f1;   // ASkateboardEx::_currentBrokenBoardState (u8, 0=intact)

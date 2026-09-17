@@ -96,6 +96,10 @@ setting decides your own wait, not theirs.
 visibly working rather than hung.
 * Watching someone scrub is smooth at full rate (1.0.0-rc1), and a scrubbing player animates on your screen
 rather than freezing.
+* **Saved replays keep the players you synced** (1.1.12). Saving writes a `.ompsync` file beside the
+replay; loading it brings them back at the right moment of your clip, in a session or not. It is local:
+the file has to travel with the replay.
+* **Trucks lean and wheels turn on replayed players** (1.1.12).
 
 ## World objects
 
@@ -117,6 +121,12 @@ with the sessions browser, players, connection and options as real menu pages.
 and **`update.bat`**, a readable PowerShell updater that installs the latest release over your copy and
 keeps your settings (0.7.0b).
 * **Version mismatches are visible** in the browser before you join (0.7.0b).
+
+## For modders
+
+* **A modding API** (1.1.12). Other mods can send their own data between players over OpenMP's connection,
+from a UE4SS C++ mod (`sdk/omp_mod_api.h`) or a UE4SS Lua mod (an `OpenMP` table, no DLL needed). Named
+channels, join and leave events, and one agreed authority for shared state. Guide: `docs/modding-api.md`.
 
 ## Performance and networking
 

@@ -192,6 +192,10 @@ public:
     // even though its owner is far off, and a distant owner must still not be paying for body
     // physics just because their board is at your feet. One number could not answer both.
     void       SetBoardNear(bool near) { boardNear_ = near; }
+    // Pose the trucks and wheels from the transported articulation whenever the board is STAMPED.
+    // The replay drives ask for it (a replayed board is always stamped, and it is what the camera is
+    // on); a far-off live board does not, since nothing of it is visible at that range.
+    void       SetArticulate(bool on) { articulate_ = on; }
     static ProxyTuning& Tuning();
 
     // ---- visuals handshake with the cosmetics layer -------------------------------------------------
@@ -242,6 +246,16 @@ private:
     uint64_t   bornMs_ = 0, lastTryMs_ = 0, lastDriveUs_ = 0;
     int        tries_ = 0;
     bool       refreshed_ = false, repOff_ = false, boardRepOff_ = false, tickOff_ = false;
+    void*      tagsClearedBoard_ = nullptr;   // the board whose replay tags were cleared (see clearReplayTags)
+    // ---- articulation (ApplyArticulation). The rest mounts are captured per BOARD, before the first
+    // write to it: wheel i relative to its truck, which a simulating past can only leave off by a
+    // spin phase (invisible), never by truck lean.
+    bool       articulate_ = false;
+    void*      artRestBoard_ = nullptr;
+    float      artMount_[4][4] = {{0,0,0,1},{0,0,0,1},{0,0,0,1},{0,0,0,1}};   // BL, BR, FL, FR vs their truck
+    bool       artSaid_ = false;
+    float      artErrDeg_ = -1.f;             // the first write's read-back error; -1 = never applied
+    void       ApplyArticulation(const repl::State& s, void* bd);
     bool       boardHidden_ = false, simOn_ = false, boardLogged_ = false;
     bool       present_ = true;           // false = concealed because the peer is in another level
     bool       noCollide_ = false;        // see SetNoCollide

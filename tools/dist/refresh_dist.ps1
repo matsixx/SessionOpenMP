@@ -76,7 +76,11 @@ $rootData = @(
     # if the two files it needs are not in the download. They are tiny and they are GPL --
     # shipping them costs nothing and makes the documented path actually walkable.
     @{ From = Join-Path $Root "tools\relay\relay_main.cpp";            To = "relay\src\relay_main.cpp" },
-    @{ From = Join-Path $Root "src\transport\relay_proto.h";           To = "relay\src\relay_proto.h" }
+    @{ From = Join-Path $Root "src\transport\relay_proto.h";           To = "relay\src\relay_proto.h" },
+    # FOR MODDERS: the public header and its guide (docs\modding-api.md is the same text). Shipped so
+    # somebody who only ever downloads the zip can still build against the API it contains.
+    @{ From = Join-Path $Root "sdk\omp_mod_api.h";      To = "modding\omp_mod_api.h" },
+    @{ From = Join-Path $Root "docs\modding-api.html";  To = "modding\modding-api.html" }
 )
 
 # Mods\ is an ALLOWLIST: only the folders in $mods survive, and inside each one only dlls\.

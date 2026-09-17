@@ -84,6 +84,8 @@ namespace omp { namespace repl {
 //           Y and Z are the last two this namespace has; the next wire change wants a version field.
 //   OMPZ -> THE LAST LETTER, and it is spent on not needing letters again. The snapshot now carries
 //           a two-byte VERSION right behind the magic, and this alphabet is closed for snapshots.
+//   OMPm -> CLAIMED by the mod channel (session/modapi.cpp) -- the first lowercase letter; never a
+//           snapshot value
 //
 // THE VERSION RULE, from OMPZ on. Two bytes: MAJOR then MINOR.
 //   * MAJOR describes the FIXED layout -- everything a reader parses positionally. Move, resize or
@@ -106,6 +108,8 @@ namespace omp { namespace repl {
 //          WITHDRAWN in 1.1.8 and kept as `spare1` (always 0) so the layout does not move
 //   1.2 -> `trickSerial` + `paSerial` (1.1.8): the owner's SetTrick count and body-physics state,
 //          one byte each (trick_pulse.h, pa_state.h)
+//   1.3 -> no bytes: announces the mod channel lane (session/modapi.h), sent only to 1.3+ peers
+//   1.4 -> the board's articulation: artOk, then truckB/truckF/wheelBL when it is set (1 or 13 bytes)
 // The cost is two bytes on a packet of several hundred. The thing it buys is that "one of you needs
 // to update or you will not see each other" stops being the answer to every future wire change.
 static const uint32_t kMagic = 0x5A504D4Fu; // "OMPZ"
@@ -317,7 +321,9 @@ static void limbRead(Rd& r, uint8_t mode, float* p, const float* body) {
 // Bytes written AFTER the audio section -- the appended fields of minor >= 1. Both the pose slice and
 // the audio sizing reserve them, or a cap that the audio fills exactly leaves no room for the
 // trailer and the whole packet fails, which is what the codec gate caught the first time.
-static const int kTrailBytes = 3;   // minor 1: spare1 (was the grace flag); minor 2: trickSerial, paSerial
+// minor 1: spare1 (was the grace flag); minor 2: trickSerial, paSerial; minor 4: artOk + three quats.
+// Reserved at its MAXIMUM: the articulation is 1 byte when absent and 13 when present.
+static const int kTrailBytes = 3 + 13;
 
 int Pack(const State& s, uint64_t senderUs, uint8_t* out, int cap, int* poseWrote) {
     if (poseWrote) *poseWrote = 0;
@@ -523,6 +529,11 @@ int Pack(const State& s, uint64_t senderUs, uint8_t* out, int cap, int* poseWrot
     w.u8(s.spare1);                              // always 0 since 1.1.8: a 1.1.6/1.1.7 reader takes bit 0 as grace
     w.u8(s.trickSerial);                         // minor 2
     w.u8(s.paSerial);                            // minor 2
+    {                                            // minor 4
+        const uint8_t art = s.artOk >= 2 ? 2 : (s.artOk == 1 ? 1 : 0);
+        w.u8(art);
+        if (art) { w.u32(qPack(s.truckB)); w.u32(qPack(s.truckF)); w.u32(qPack(s.wheelBL)); }
+    }
     return w.ok ? w.n : 0;
 }
 
@@ -716,6 +727,13 @@ bool Unpack(const uint8_t* d, int len, State& out, uint64_t* senderUs) {
     // ---- APPENDED FIELDS, each gated on the minor that introduced it.
     if (wireMinor >= 1) out.spare1 = r.u8();     // a 1.1.6/1.1.7 sender's grace bit lands here and is ignored
     if (wireMinor >= 2) { out.trickSerial = r.u8(); out.paSerial = r.u8(); }
+    if (wireMinor >= 4) {
+        const uint8_t art = r.u8();
+        if (art) {
+            qUnpack(r.u32(), out.truckB); qUnpack(r.u32(), out.truckF); qUnpack(r.u32(), out.wheelBL);
+            out.artOk = art >= 2 ? 2 : 1;          // unit by construction of qUnpack
+        }
+    }
     if (!r.ok) return false;
     // Post-decode discipline: no packet field is an index or a pointer, and poses are range-checked,
     // so a hostile or corrupt packet can at worst move a proxy, never corrupt local state.

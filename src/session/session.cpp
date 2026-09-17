@@ -11,6 +11,8 @@
 // loads into. See LICENSE-EXCEPTION.txt.
 // SessionOpenMP -- session orchestration.
 #include "session.h"
+#include "modapi.h"
+#include "replay_ghosts.h"
 #include "../debug.h"
 #include "../transport/transport.h"
 #include "../game/game_syms.h"
@@ -298,6 +300,7 @@ uint8_t DropPolicy() { return g_dropPolicy; }
 
 void Init(void (*logf)(const char*)) {
     g_logf = logf;
+    modapi::SetLogger(logf);
     replaysync::SetSendFn(&Send);
     dropsync::SetSendFn(&Send);
 #ifdef OMP_VOICE
@@ -334,6 +337,7 @@ void ResetAll() {
     g_dropAdopted = false;
     dropsync::ResetAll();
     dropNewGeneration("session reset");
+    modapi::Reset();                                  // other mods' channels: everyone has left
 }
 // NOT ResetAll: this runs from the mod's destructor, i.e. DLL unload, where the game may already be
 // tearing itself down -- and Retire touches actors, the replay camera and the audio system. Hiding a
@@ -501,6 +505,11 @@ void OnPacket(int peerIdx, const uint8_t* data, int len, uint64_t nowUs) {
     // first: chunks arrive at hundreds per second mid-transfer.
     if (replaysync::IsSyncPacket(data, len)) {
         replaysync::OnPacket(peerIdx, data, len, nowUs, g_logf);
+        return;
+    }
+    // Other mods' messages (modapi.h). Routed ahead of the snapshot fallback like every lane.
+    if (modapi::IsPacket(data, len)) {
+        modapi::OnPacket(peerIdx, data, len, nowUs);
         return;
     }
     // ---- DROPPED OBJECTS. Routed before the snapshot path like every other lane: the snapshot
@@ -693,6 +702,10 @@ void OnPacket(int peerIdx, const uint8_t* data, int len, uint64_t nowUs) {
     }
     Slot* sl = slotFor(peerIdx, nowUs);
     if (!sl) return;
+    // The wire minor is the mod channel's capability signal: only a peer at kCapableMinor or later
+    // may be sent that lane (an older build would call it a version mismatch).
+    { uint8_t mj = 0, mn = 0;
+      if (repl::PeekWire(data, len, &mj, &mn) == repl::kWireOk) modapi::NoteSnapshot(peerIdx, mn); }
     // Interned names filled in HERE, before the state reaches the stream: named entries teach the
     // cache, nameless ones draw from it, and everything downstream still sees complete states.
     sl->nameCache.Resolve(s);
@@ -808,7 +821,44 @@ void RestoreHiddenAfterReplay(void (*logf)(const char*)) {
 bool IsProxyActor(void* actor) {
     if (!actor) return false;
     for (auto& s : g_slots) if (s.used && s.proxy.actor() == actor) return true;
-    return false;
+    return ghosts::IsGhostActor(actor);           // a saved replay's cast is ours too
+}
+
+int SyncedPeersForSave(SavedPeer* out, int cap) {
+    if (!out || cap <= 0 || game::LocalReplayMode() != 2 || !g_playbackEnteredUs) return 0;
+    int n = 0;
+    for (auto& s : g_slots) {
+        if (n >= cap) break;
+        // The same conditions that let the frame drive them: synced, complete, requested inside THIS
+        // playback (the offsets below are only meaningful then).
+        if (!s.used || !s.syncOn || !s.syncReqSentUs || s.syncReqSentUs < g_playbackEnteredUs) continue;
+        if (replaysync::PeerSyncState(s.peerIdx, nullptr) != replaysync::SyncState::Ready) continue;
+        const uint64_t newest = replaysync::BufferNewestUs(s.peerIdx);
+        if (!newest) continue;
+        SavedPeer& o = out[n];
+        o = SavedPeer{};
+        o.peerIdx = s.peerIdx;
+        strncpy_s(o.name, sizeof(o.name), (s.haveCosmetics && s.cosmetics.skaterName[0]) ? s.cosmetics.skaterName : "", _TRUNCATE);
+        if (s.haveCosmetics) o.cosmetics = s.cosmetics;
+        o.haveWear = s.haveWear; if (s.haveWear) o.wear = s.wear;
+        o.haveSkel = s.haveSkel; if (s.haveSkel) o.skel = s.skel;
+        // Frame samples at newest - ((req - entered) + (total - cur)). A SAVE writes only the editor's
+        // clip range [a, b] of that timeline (ComputePackContextInfo), so the loaded replay ENDS at b,
+        // not at `total`: the anchor is their time at cur == b. Anchoring on `total` showed the peer
+        // ahead by exactly what the end marker had cut off (field report, first sidecar round).
+        float clipA = 0, clipB = 0, total = 0;
+        const bool haveClip = game::ReplayClipRange(&clipA, &clipB, &total);
+        const uint64_t cut = haveClip && total > clipB ? (uint64_t)((double)(total - clipB) * 1e6) : 0;
+        const uint64_t lag = (s.syncReqSentUs - g_playbackEnteredUs) + cut;
+        o.anchorEndUs = newest > lag ? newest - lag : 0;
+        if (g_logf) { char m[220];
+            snprintf(m, sizeof(m), "[ghost] save: peer %d anchored at the clip end -- clip %.2f..%.2f of %.2f s%s"
+                     " (%.2f s cut from the end)", s.peerIdx, clipA, clipB, total,
+                     haveClip ? "" : " [clip range UNREADABLE, timeline end used]", (double)cut / 1e6);
+            g_logf(m); }
+        n++;
+    }
+    return n;
 }
 
 // ---- the body-feel bridge. Our own settings arrive from the tweaks module whenever they change;
@@ -2394,6 +2444,7 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
                         if (!advancing) rs.nLoops = 0;
                         rs.nEvents = 0; rs.bailing = 0; rs.replaying = 0;
                         s.proxy.SetNearLocal(false);      // the board STAMPS at the replayed pose
+                        s.proxy.SetArticulate(true);      // ...so its trucks and wheels come off the wire
                         s.proxy.SetBoardNear(false);
                         s.proxy.Apply(rs, nowMs, nowUs, g_logf);
                         if (advancing && tPos - s.syncAudioUs < 400000ull) {
@@ -2545,6 +2596,7 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
         // Nobody collides with a skater who is in the replay editor, and a skater in the editor
         // collides with nobody. Their reason travels (replaying); ours is local.
         s.proxy.SetNoCollide(out.replaying || g_ownNoCollide, g_logf);
+        s.proxy.SetArticulate(false);             // live: a near board simulates, a far one is out of sight
         s.proxy.Apply(out, nowMs, nowUs, g_logf);
         // Release the peer's one-shot sounds whose moment the playback clock has now reached. AFTER
         // Apply so they are placed against this frame's body pose, and drained from the stream's own
@@ -2616,6 +2668,9 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
         alive++;
     }
     g_st.proxiesAlive = alive;
+    // Other mods' channels: roster, announcements, outbox. LAST, so the actors it caches for other
+    // threads are the ones still standing after this frame's releases.
+    modapi::Frame(nowUs);
     // Published for pose::Capture, which runs during the NEXT frame's gather. One frame of latency on
     // a flag that changes when somebody opens a menu is not worth reordering the frame for.
     g_anyPeerReplaying = anyPeerReplaying;
