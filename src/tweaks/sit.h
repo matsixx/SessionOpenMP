@@ -32,6 +32,20 @@ void Sit_NoteReplayTick(void* replayManager);   // the AReplayManager whose Tick
 void Sit_WatchdogTick();
 bool Sit_PoseHeld();                         // the sit pose is on the skeleton right now (seated, or blending either way)
 bool Sit_EditorOpen();                       // the replay editor or the object dropper's prop editor is up
+
+// The board, out of the hand for a reason other than a seat (emote.cpp). ONE owner for "the board is out":
+// this module. A throw detaches it where it is and hands it to physics with a velocity; it comes back by
+// Sit_BoardBack, by the mount key, or by standing up from a seat taken while it lay there.
+bool Sit_BoardInHand(void* skater);             // on foot, carried: the board's own movement mode says so
+bool Sit_BoardThrow(void* skater, const float velW[3], const float spinRadW[3]);
+void Sit_BoardKick(const float velW[3], const float spinRadW[3]);   // the same velocity again, a frame on
+bool Sit_BoardOut();                            // thrown, and not back yet
+bool Sit_BoardWhere(float outW[3]);
+void Sit_BoardBack(const char* why);
+// What is under a point and what it is made of (EPhysicalSurface; 0 = default). The skater and the board are ignored.
+bool Sit_AttachKeepWorld(void* comp, void* parent, unsigned long long socketFName);      // props: GAME THREAD
+void Sit_DetachKeepWorld(void* comp);
+bool Sit_TraceSurface(void* skater, const float aW[3], const float bW[3], float hitW[3], int* surface);
 // GAME THREAD, for the camera module: the seated first-person view -- the eyes (world), the look (world
 // FQuat), the dolly weight 0..1 and the wanted FOV (0 = the game's). False = the camera is the game's.
 bool Sit_FirstPersonView(float eye[3], float look[4], float* weight, float* fov);

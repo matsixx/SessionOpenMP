@@ -26,6 +26,7 @@
 namespace omp { namespace modapi {
 
 // "OMPm". Every uppercase OMP? letter is claimed (see the ledger in replication.cpp); lowercase starts here.
+// Lowercase claimed so far: "OMPm" (this lane), "OMPr" (a player's radio stream, replication.cpp PackRadio).
 static const uint32_t kMagic       = 0x6D504D4Fu;
 static const uint8_t  kLaneVersion = 1;
 static const uint8_t  kKindList    = 1;

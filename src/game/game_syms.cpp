@@ -418,6 +418,60 @@ bool SkeletonBoneName(void* meshComp, int idx, char* out, int cap) {
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 
+void SkeletonDump(void* skaterActor, void (*logf)(const char*)) {
+    if (!skaterActor || !logf) return;
+    __try {
+        // OwnedComponents is a TSet: sparse-array data at +0, Num at +8, an allocation bitmap
+        // (inline up to 128 bits, else heap), 16-byte elements with the pointer at +0.
+        const uint8_t* set  = (const uint8_t*)skaterActor + off::kActorOwnedComps;
+        const uint8_t* data = *(const uint8_t* const*)set;
+        const int num     = *(const int*)(set + 8);
+        const int maxBits = *(const int*)(set + 0x2c);
+        const uint32_t* bits = (maxBits <= 128) ? (const uint32_t*)(set + 0x10)
+                                                : *(const uint32_t* const*)(set + 0x20);
+        if (!data || !bits || num <= 0 || num > 512) { logf("[skel] dump: no components to read"); return; }
+        int meshes = 0;
+        for (int i = 0; i < num; i++) {
+            if (!((bits[i >> 5] >> (i & 31)) & 1u)) continue;
+            void* c = *(void* const*)(data + (size_t)i * 16);
+            if (!c || ((uintptr_t)c & 7)) continue;
+            if (!IsObjectOfClass(c, "SkinnedMeshComponent")) continue;
+            meshes++;
+            void* skelMesh = *(void**)((uint8_t*)c + off::kMeshSkeletalMesh);
+            char comp[96] = {}, asset[128] = {};
+            ObjectName(c, comp, sizeof(comp));
+            if (skelMesh) ObjectName(skelMesh, asset, sizeof(asset));
+            const int bones = SkeletonBoneCount(c);
+            struct TArr { void* const* data; int32_t num; int32_t max; } ma{};
+            if (skelMesh) memcpy(&ma, (const uint8_t*)skelMesh + off::kSkelMeshMorphTargets, sizeof(ma));
+            if (!ma.data || ma.num < 0 || ma.num > 1024 || ma.max < ma.num) ma.num = 0;
+            char line[512];
+            snprintf(line, sizeof(line), "[skel] mesh '%s' asset '%s': %d bone(s), %d morph target(s)",
+                     comp, asset[0] ? asset : "(none)", bones, ma.num);
+            logf(line);
+            int at = 0, n = 0;
+            for (int b = 0; b < bones; b++) {
+                char nm[64];
+                if (!SkeletonBoneName(c, b, nm, sizeof(nm))) continue;
+                if (n == 0) at = snprintf(line, sizeof(line), "[skel]   bones from %d: ", b);
+                at += snprintf(line + at, sizeof(line) - (size_t)at, "%s%s", n ? ", " : "", nm);
+                if (++n == 12 || at > 400) { logf(line); n = 0; at = 0; }
+            }
+            if (n) logf(line);
+            at = 0; n = 0;
+            for (int k = 0; k < ma.num; k++) {
+                char nm[64];
+                if (!ma.data[k] || !ObjectName(ma.data[k], nm, sizeof(nm))) continue;
+                if (n == 0) at = snprintf(line, sizeof(line), "[skel]   morph targets from %d: ", k);
+                at += snprintf(line + at, sizeof(line) - (size_t)at, "%s%s", n ? ", " : "", nm);
+                if (++n == 12 || at > 400) { logf(line); n = 0; at = 0; }
+            }
+            if (n) logf(line);
+        }
+        if (!meshes) logf("[skel] dump: no skinned mesh component on the skater");
+    } __except (EXCEPTION_EXECUTE_HANDLER) { logf("[skel] dump faulted -- stopped"); }
+}
+
 // FMeshBoneInfo is { FName Name; int32 ParentIndex; } -- the parent sits at +8 of the 12-byte stride.
 int SkeletonBoneParents(void* meshComp, int16_t* out, int cap) {
     if (!meshComp || !out || cap <= 0) return 0;
@@ -780,6 +834,7 @@ bool FNameAscii(const void*, char* o, int c)  { if (o && c) o[0] = 0; return fal
 void* SkaterMeshOf(void*)      { return nullptr; }
 bool  ProbePhysAnim(void*, PhysAnimProbe*) { return false; }
 int   SkeletonBoneCount(void*) { return 0; }
+void  SkeletonDump(void*, void (*)(const char*)) {}
 int   SkeletonBoneParents(void*, int16_t*, int) { return 0; }
 bool  SkeletonBoneName(void*, int, char* o, int c) { if (o && c) o[0] = 0; return false; }
 int   SkeletonBoneHashes(void*, uint32_t*, int) { return 0; }

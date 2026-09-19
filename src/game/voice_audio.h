@@ -25,6 +25,7 @@ struct Ring {
     int  Level() const;                    // samples queued
     int  Write(const int16_t* s, int n);   // drops what does not fit
     int  Read(int16_t* out, int n);        // zero-fills past the level
+    void Skip(int n);                      // READER side: drop the n oldest (a stream that has drifted behind)
     void Clear();
 };
 
@@ -36,6 +37,11 @@ struct Voice {
     bool    playing = false;
     Ring    ring;
     bool    primed = false;          // the reader waits for a small buffer before it streams
+    // How much the reader waits for before it streams (voice: 60 ms), and -- for a CONTINUOUS stream (a
+    // player's radio) -- the level past which it has fallen behind the sender's clock and drops the oldest
+    // back to the cushion. 0 = never (voice: its bursts clear the ring between them anyway).
+    int     primeSamples = 2880;
+    int     trimAbove = 0;
 };
 
 // Resolve the classes and build the shared attenuation object. Cheap and idempotent; call each frame
@@ -51,5 +57,10 @@ void SetVolume(Voice& v, float volume);
 // The proxy actor died with its world (or the peer left): drop the component pointer WITHOUT
 // touching it. The wave survives (rooted) for the next spawn.
 void ProxyGone(Voice& v);
+// A wave for someone ELSE to play (SessionTweaks' radio spawns it on its own prop): made and fed exactly like a
+// voice's, but the component is theirs. Null until the engine side is ready. `Rewind` empties its ring and
+// re-primes, for a component that is (re)starting -- or the first second heard would be stale.
+void* EnsureWave(Voice& v, void (*logf)(const char*));
+void  Rewind(Voice& v);
 
 }}} // namespace omp::game::voice

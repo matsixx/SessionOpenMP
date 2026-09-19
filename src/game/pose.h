@@ -71,6 +71,9 @@ struct Tuning {
     bool trimBoardBones = true;
     uint32_t freshMs = 500;     // a pose older than this is ignored, so a quiet stream hands the
                                 // skeleton back to the proxy's own graph rather than freezing it
+    // How long the last stamped pose is faded out over when a pose is released, instead of being
+    // dropped in one frame. 0 restores the old hard cut. See Slot::outN for the measurement.
+    uint32_t releaseFadeMs = 250;
     // RETIRED (default false): re-stamp the last held pose over a proxy's skeleton during a local
     // replay. It served the live-view-while-scrubbing era, where fresh pose-lane packets always won
     // the race above and the hold only covered gaps. Today it has no beneficiary and one victim:
@@ -124,7 +127,9 @@ struct Stats {
     uint32_t mappedStamps = 0;   // frames stamped through a NAME map -- the correct path
     uint32_t sweeps = 0;         // slice sets that COMPLETED: without these a pose is never usable
     uint32_t wiped = 0;          // a pose-less frame cleared a pose that had completed
+    uint32_t fadeFrames = 0;     // frames the last pose was blended out over instead of dropped
     uint32_t noSlice = 0;        // pose frames that carried no slice for us at all
+    uint32_t noSlot = 0;         // a pose / fingerprint / hold REFUSED because every slot was taken: must stay 0
     uint8_t  liveN = 0;          // the newest slot's usable bone count (0 = nothing to stamp)
     uint8_t  sliceBones = 0;     // bones in the last slice: skeleton/this = frames per refresh
     uint8_t  mappedBones  = 0;   // how many of the local skeleton's bones that map resolves
@@ -164,6 +169,9 @@ void SetLogger(void (*logf)(const char*));   // for the throttled stale-pose lin
 void Note(void* mesh, const repl::State& s, uint64_t nowMs);
 // A peer's hold heartbeat for this mesh: while it is fresh, a pose-less snapshot does NOT release
 // the transported pose. `hold` false = released now.
+// A peer's hold. `hold` true: keep their last skeleton between sweeps for ttlMs (their heartbeat renews it).
+// FALSE: they have stopped holding -- and `ttlMs` is then how much longer to keep it anyway, which is the
+// caller's playback delay: the frames still to be played out are from BEFORE they stopped. See Note.
 void NoteHold(void* mesh, bool hold, uint32_t ttlMs);
 void Forget(void* mesh);
 // The world changed: every mesh a slot tracks is gone, and its ADDRESS is about to be reused. Drop

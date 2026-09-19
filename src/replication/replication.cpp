@@ -909,6 +909,43 @@ int UnpackVoice(const uint8_t* d, int len, uint16_t* seqOut, const uint8_t** fra
     return n;
 }
 
+// ---- a player's radio stream ("OMPr": lowercase, like the mod channel's "OMPm" -- every uppercase letter is taken)
+static const uint32_t kRadioMagic = 0x72504D4Fu;   // "OMPr"
+bool IsRadioPacket(const uint8_t* d, int len) {
+    if (!d || len < 4) return false;
+    uint32_t m = 0; memcpy(&m, d, 4);
+    return m == kRadioMagic;
+}
+int PackRadio(uint16_t seq, const uint8_t* const* frames, const int* lens, int n, uint8_t* out, int cap) {
+    if (!out || !frames || !lens || n <= 0 || n > kRadioMaxFrames) return 0;
+    Wr w{out, cap, 0, true};
+    w.u32(kRadioMagic);
+    w.u16(seq);
+    w.u8((uint8_t)n);
+    for (int i = 0; i < n; i++) {
+        if (lens[i] <= 0 || lens[i] > 255) return 0;
+        w.u8((uint8_t)lens[i]);
+        w.b(frames[i], lens[i]);
+    }
+    return w.ok ? w.n : 0;
+}
+int UnpackRadio(const uint8_t* d, int len, uint16_t* seqOut, const uint8_t** frames, int* lens, int maxFrames) {
+    if (!IsRadioPacket(d, len) || len < 7 || !frames || !lens) return 0;
+    Rd r{d, len, 4, true};
+    const uint16_t seq = r.u16();
+    int n = r.u8();
+    if (n <= 0 || n > kRadioMaxFrames || n > maxFrames) return 0;
+    for (int i = 0; i < n; i++) {
+        const int l = r.u8();
+        if (!r.ok || l <= 0 || r.n + l > len) return 0;
+        frames[i] = d + r.n; lens[i] = l;
+        r.n += l;
+    }
+    if (r.n != len) return 0;                        // nothing trailing: a stranger's bytes, taken exactly
+    if (seqOut) *seqOut = seq;
+    return n;
+}
+
 // One item: category, variant, instance, then a length-prefixed name. Names are the only variable part,
 // which is why the packer measures before it writes.
 static int cosColorSize(const CosmeticColor& c) {

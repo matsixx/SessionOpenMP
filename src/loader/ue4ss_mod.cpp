@@ -224,6 +224,7 @@ static void publishUi() {
     g_ui.lobby   = omp::LobbyStatus();
     g_ui.armed   = g_armed;
     g_ui.peers   = st.peers; g_ui.proxies = st.proxiesAlive; g_ui.pubHz = st.publishHz;
+    Chat_SetPresence(st.peers);
     // Read the bound endpoint back from the socket rather than echoing what was typed: a host should
     // see the port they ACTUALLY got, not the one they asked for.
     strncpy_s(g_ui.bound, (omp::Current() == omp::BK_UDP) ? omp::DirectBoundTo() : "", _TRUNCATE);
@@ -327,15 +328,28 @@ static void MpPump() {
     // menu, not behind the F1 panel or the code prompt, and only once a session is armed -- there is
     // nobody to talk to otherwise. Nothing else is needed here: the opening key press reaching the
     // text field a frame later is handled where it lands, by chat.cpp's send arming.
-    {
-        static bool enterHeld = false;
-        const bool edge = keyEdge(VK_RETURN, &enterHeld);
+    // The press itself is an EVENT from the window hook (chat.h says why it is not polled here).
+    if (Chat_TakeEnterPressed()) {
         // game::PauseMenuOpen() is always false in this mod (world pausing is off, and it tests the
         // paused-menu container) -- so PauseMenu_IsShown, read off the page widget itself, is what
         // actually keeps a hotkey from firing underneath an open menu.
-        if (edge && g_armed && !Chat_IsOpen() && !Overlay_Visible() && !game::PauseMenuOpen() &&
-            !PauseMenu_IsShown())
+        const bool menu = game::PauseMenuOpen() || PauseMenu_IsShown();
+        if (g_armed && !Chat_IsOpen() && !Overlay_Visible() && !menu) {
             Chat_SetOpen(true);
+        } else {
+            // Say which gate refused it. "Enter did nothing" has been reported and could not be
+            // answered from a log that did not mention the press.
+            static uint64_t lastSaidMs = 0;
+            const uint64_t ms = GetTickCount64();
+            if (ms - lastSaidMs > 2000) {
+                lastSaidMs = ms;
+                char m[160];
+                snprintf(m, sizeof(m), "[chat] Enter ignored: %s", !g_armed ? "not in a session"
+                         : Chat_IsOpen() ? "the box is already open" : Overlay_Visible() ? "the F1 panel or a prompt is up"
+                         : "the pause menu is up");
+                logLine(m);
+            }
+        }
     }
     // Anything the player typed goes out RELIABLE to every live peer, and is echoed locally at the
     // same moment -- our own line must appear whether or not anybody is listening.
@@ -461,6 +475,16 @@ static void MpPump() {
                 snprintf(m, sizeof(m), "[mp] pause: removed '%s'%s", nm, ban ? " and banned them" : "");
                 logLine(m);
             }
+            break;
+        }
+        case OVA_PROMOTE: {
+            char id[80] = {0}, nm[40] = {0};
+            if (!PauseMenu_TakePeerId(id, sizeof(id), nm, sizeof(nm)) || !id[0]) break;
+            char m[220];
+            snprintf(m, sizeof(m), omp::LobbyPromote(id)
+                         ? "[mp] pause: asked the service to make '%s' the host"
+                         : "[mp] pause: host transfer to '%s' refused -- not the host, or they already left", nm);
+            logLine(m);
             break;
         }
         case OVA_JOIN_INDEX: {
@@ -975,7 +999,10 @@ static void noteWorldChange() {
     const game::Syms& S = game::Get();
     void* w = nullptr;
     if (S.GetWorld) { __try { w = S.GetWorld(g_ownPawn); } __except (EXCEPTION_EXECUTE_HANDLER) {} }
-    if (w && g_lastWorld && w != g_lastWorld) { session::ForgetProxies(); ghosts::ForgetAll(); }
+    if (w && g_lastWorld && w != g_lastWorld) {
+        session::ForgetProxies(); ghosts::ForgetAll();
+        PauseMenu_ForgetPage();     // the old world's menu widget is gone; its address may be reused
+    }
     if (w) g_lastWorld = w;
 }
 
@@ -1163,10 +1190,10 @@ static void GameThreadFrame() {
                 snprintf(m, sizeof(m),
                          "[pose] cap=%u(%uB) noted=%u hook=%u applied=%u pfx=%u stale=%u skipCnt=%u"
                          " meshBones=%u faults=%u held=%u holdApplied=%u"
-                         " | sweeps=%u liveN=%u slice=%u wiped=%u noSlice=%u mapped=%u/%u",
+                         " | sweeps=%u liveN=%u slice=%u wiped=%u fade=%u noSlice=%u noSlot=%u mapped=%u/%u",
                          p.captured, p.bones, p.noted, p.hookCalls, p.applied, p.prefixStamps,
                          p.stale, p.skippedCount, p.meshBones, p.faults, p.held, p.holdApplied,
-                         p.sweeps, p.liveN, p.sliceBones, p.wiped, p.noSlice, p.mappedBones,
+                         p.sweeps, p.liveN, p.sliceBones, p.wiped, p.fadeFrames, p.noSlice, p.noSlot, p.mappedBones,
                          p.unmappedBones);
                 logLine(m);
                 // Measurement only, and silent outside replay playback: whether proxy anim graphs
@@ -1775,6 +1802,17 @@ extern "C" {
     OMP_MOD_API int  OmpSession_PeerBodyPhysicsOn() { return MpPrefs_PeerBodyPhysics() ? 1 : 0; }
     // The pose hold: SessionTweaks says its sitting pose is on the local skeleton (or no longer is).
     OMP_MOD_API void OmpSession_SetOwnPoseHold(int on) { omp::session::SetOwnPoseHold(on != 0); }
+    // THE RADIO STREAM (SessionTweaks' radio prop: one app from its owner's PC, played from the prop). The
+    // capture, the lane and the decoding are here; the prop, the ask to be sent a stream, and the component
+    // that plays it are SessionTweaks'. A bridge like the ones above -- not the public mod API.
+    OMP_MOD_API int   OmpRadio_Version() { return 1; }
+    OMP_MOD_API int   OmpRadio_Sources(uint32_t* pids, char* names, int nameCap, int cap) { return omp::session::RadioSources(pids, names, nameCap, cap); }
+    OMP_MOD_API int   OmpRadio_StreamStart(uint32_t pid, const char* name) { return omp::session::RadioStreamStart(pid, name); }
+    OMP_MOD_API void  OmpRadio_StreamStop() { omp::session::RadioStreamStop(); }
+    OMP_MOD_API int   OmpRadio_StreamState(char* why, int cap) { return omp::session::RadioStreamState(why, cap); }
+    OMP_MOD_API void  OmpRadio_SetListener(int player, int wanted) { omp::session::RadioSetListener(player, wanted != 0); }
+    OMP_MOD_API void* OmpRadio_PeerWave(int player, int rewind) { return omp::session::RadioPeerWave(player, rewind != 0); }
+    OMP_MOD_API int   OmpRadio_PeerStreaming(int player) { return omp::session::RadioPeerStreaming(player); }
 
     // THE MOD CHANNEL -- the PUBLIC API for other mods (sdk/omp_mod_api.h, docs/modding-api.md).
     // Unlike the OmpSession_ bridges above, which exist for SessionTweaks and may change, these are a

@@ -80,6 +80,11 @@ enum {
     BRUSH_NAME   = 0x50,    // FSlateBrush::ResourceName
     BRUSH_HANDLE = 0x70,    // FSlateBrush::ResourceHandle (16 B): the renderer's cache
     OA_OBJECTS   = 0x10,    // FUObjectArray::ObjObjects: chunks +0, MaxElements +0x10, NumElements +0x14, MaxChunks +0x18
+    UOBJ_INDEX   = 0x0c,    // UObjectBase::InternalIndex: its slot in that table
+    OAI_SIZE     = 0x18,    // FUObjectItem: Object +0, Flags +8, ClusterRootIndex +0xc, SerialNumber +0x10
+    OAI_FLAGS    = 0x08,
+    OAI_SERIAL   = 0x10,
+    OAI_DEAD     = (1 << 28) | (1 << 29),    // EInternalObjectFlags: Unreachable, PendingKill
     VIS_COLLAPSED = 1, VIS_HITTEST_INVISIBLE = 3,
     MAX_ROWS     = 6,
 };
@@ -187,7 +192,8 @@ static void* g_rowClass = nullptr; static char g_rowName[80] = "";
 static void* g_settings = nullptr;      // the UTRXPluginSettings default object: it owns the icon table
 static void* g_classFix = nullptr;      // the class of UClass, for telling a UObject from a plain struct
 static int   g_iconSaid = 0;
-struct Row { void* w; char label[96]; char button; void* glyph; bool shown; };
+struct Row { void* w; char label[96]; char button; void* glyph; bool shown; SitObjRef ref; };
+static SitObjRef g_rowClassRef = { nullptr, 0, 0, nullptr };
 static Row   g_rows[MAX_ROWS];
 static int   g_nRows = 0, g_laidOut = 0;    // widgets built (the pool), and the count they are stacked for
 static void* g_builtFor = nullptr;
@@ -196,6 +202,68 @@ static int   g_faults = 0, g_tries = 0, g_scanned = 0, g_reported = 0, g_glyphSa
 static int   g_gateLog = 0;          // SitPromptGateLog: 1/s line saying what the bar was told and what it is
 static uint64_t g_gateMs = 0;
 static char  g_status[128] = "idle";
+
+// ------------------------------------------------------------------ is it still the object we were given?
+// THE CRASH THIS ANSWERS (1.1.12 field test): a fatal in the garbage collector, reading 0x100000c, half
+// a minute after a map change. That address is offset 0xc of an "object" at 0x01000000 -- one byte, 1,
+// at byte 3 of an otherwise empty pointer slot. UWidget::Visibility is at +0xc3, byte 3 of the slot at
+// +0xc0, and 1 is Collapsed: we had collapsed a widget that no longer existed. The pools below kept
+// their widgets until a DIFFERENT skater turned up, and with NO skater -- the frames of a level change
+// -- they re-collapsed every one of them, every frame. By then the level that made them was gone and
+// their memory belonged to new objects; each call wrote its 1 into one of those, and the collector
+// found it on its next pass. So nothing kept across frames is touched on the strength of a pointer.
+static const uint8_t* ObjItem(int index) {
+    if (!g_objArray || index < 0) return nullptr;
+    const uint8_t* ch = g_objArray + OA_OBJECTS;
+    uint8_t** chunks = *(uint8_t** const*)(ch + 0x00);
+    const int maxElems = *(const int*)(ch + 0x10), num = *(const int*)(ch + 0x14), maxChunks = *(const int*)(ch + 0x18);
+    if (!chunks || maxChunks <= 0 || index >= num) return nullptr;
+    const int per = maxElems / maxChunks;
+    if (per <= 0) return nullptr;
+    const uint8_t* chunk = chunks[index / per];
+    return chunk ? chunk + (size_t)(index % per) * OAI_SIZE : nullptr;
+}
+bool SitUI_CanVerify() { return g_objArray != nullptr; }
+// An engine FWeakObjectPtr is this table's index and the serial the slot had: the object, or null if it
+// has gone or the slot is somebody else's now. (A hit result names its physical material this way.)
+void* SitUI_ResolveWeak(int index, int serial) {
+    if (!g_objArray || index < 0 || serial == 0) return nullptr;
+    __try {
+        const uint8_t* item = ObjItem(index);
+        if (!item || *(const int32_t*)(item + OAI_SERIAL) != serial) return nullptr;
+        if (*(const int32_t*)(item + OAI_FLAGS) & OAI_DEAD) return nullptr;
+        return *(void* const*)item;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+}
+void SitUI_Track(SitObjRef* ref, void* obj) {
+    if (!ref) return;
+    ref->obj = nullptr; ref->index = -1; ref->serial = 0; ref->cls = nullptr;
+    if (!obj) return;
+    __try {
+        const int index = *(const int32_t*)((const uint8_t*)obj + UOBJ_INDEX);
+        const uint8_t* item = ObjItem(index);
+        // Without the table the reference is still kept, unverifiable: SitUI_Alive then answers for the
+        // pointer alone, and the callers drop everything whenever there is no skater (see the pumps).
+        if (g_objArray && (!item || *(void* const*)item != obj)) return;
+        ref->index  = index;
+        ref->serial = item ? *(const int32_t*)(item + OAI_SERIAL) : 0;
+        ref->cls    = *(void* const*)((const uint8_t*)obj + UOBJ_CLASS);
+        ref->obj    = obj;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { ref->obj = nullptr; }
+}
+bool SitUI_Alive(const SitObjRef* ref) {
+    if (!ref || !ref->obj) return false;
+    if (!g_objArray) return true;
+    __try {
+        const uint8_t* item = ObjItem(ref->index);
+        if (!item || *(void* const*)item != ref->obj) return false;             // freed, or the slot is someone else's
+        if (*(const int32_t*)(item + OAI_FLAGS) & OAI_DEAD) return false;       // on its way out
+        // A serial number is only handed out once something takes a weak pointer, so none at the time we
+        // looked proves nothing; one that has since changed is a different object in the same slot.
+        if (ref->serial && *(const int32_t*)(item + OAI_SERIAL) != ref->serial) return false;
+        return *(void* const*)((const uint8_t*)ref->obj + UOBJ_CLASS) == ref->cls;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
 
 static void Widen(const char* a, wchar_t* w, int cap) {
     int i = 0; for (; a[i] && i < cap - 1; i++) w[i] = (wchar_t)(unsigned char)a[i]; w[i] = 0;
@@ -245,6 +313,7 @@ static ControllerTypeFn ResolveControllerType() {
 }
 static void Learn(void* cls, const char* nb) {
     g_rowClass = cls;
+    SitUI_Track(&g_rowClassRef, cls);
     snprintf(g_rowName, sizeof(g_rowName), "%s", nb);
     void* outer = *(void**)((uint8_t*)cls + UOBJ_OUTER);
     char pk[128] = "";
@@ -262,7 +331,7 @@ static void LoadByPath() {
         if (!c) c = g_load(nullptr, nullptr, wp, nullptr, 0, nullptr, true, nullptr);
         char cn[80] = "";
         if (c) GrindPop_FNameToString((const uint8_t*)c + UOBJ_NAME, cn, sizeof(cn));
-        if (c && IsBpName(cn)) { g_rowClass = c; snprintf(g_rowName, sizeof(g_rowName), "%s", cn);
+        if (c && IsBpName(cn)) { g_rowClass = c; SitUI_Track(&g_rowClassRef, c); snprintf(g_rowName, sizeof(g_rowName), "%s", cn);
                                  TwkLog("[situi] button class loaded from %s", g_rowPath); }
     } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; }
 }
@@ -326,6 +395,7 @@ static const char* KeyNameFor(char button) {
         case 'Y': return "Gamepad_FaceButton_Top";
         case 'L': return "Gamepad_DPad_Left";
         case 'R': return "Gamepad_DPad_Right";
+        case 'T': return "Gamepad_RightTrigger";          // a Rage's throw (emote.cpp)
         default:  return nullptr;
     }
 }
@@ -464,6 +534,8 @@ static bool BuildRow(int i, int count, void* skater, void* pc) {
         if (g_setDesired) g_setDesired(w, Pack2(g_barW, g_barH));
         if (g_btnEnable) g_btnEnable(w, true);
         g_setVis(w, VIS_COLLAPSED);
+        SitUI_Track(&r.ref, w);
+        if (!r.ref.obj) { TwkLog("[situi] entry %d is not in the object table as itself -- not kept", i); return false; }
         r.w = w;
         TwkLog("[situi] entry %d at (%.0f, %.0f) of %.0fx%.0f, scale %.2f", i, x, y, g_vpW, g_vpH, g_vpScaleV);
         return true;
@@ -479,9 +551,25 @@ static void ShowRow(Row& r, bool on, bool force = false) {
     __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; r.w = nullptr; }
 }
 
+// Forgotten, never touched: whatever they were, they are the engine's now.
+static void DropRows(const char* why) {
+    if (g_nRows && why) TwkLog("[situi] the bar's %d widgets forgotten: %s", g_nRows, why);
+    for (int i = 0; i < MAX_ROWS; i++) { g_rows[i].w = nullptr; g_rows[i].ref.obj = nullptr; }
+    g_nRows = 0; g_builtFor = nullptr; g_reported = 0; g_laidOut = 0; g_tries = 0;
+}
+static bool RowsAlive() {
+    for (int i = 0; i < g_nRows; i++) if (g_rows[i].w && !SitUI_Alive(&g_rows[i].ref)) return false;
+    return true;
+}
+static void CheckRowClass() {
+    if (g_rowClass && !SitUI_Alive(&g_rowClassRef)) { TwkLog("[situi] the button class was unloaded -- looked up again"); g_rowClass = nullptr; }
+}
 void SitUI_PumpFrame(void* skater, bool show, const SitPromptEntry* entries, int count) {
     if (!g_ok || !g_on) return;
     if (count > MAX_ROWS) count = MAX_ROWS;
+    // FIRST, before anything reads or writes them: are they still the widgets that were built? They are
+    // made together and die together, so one that is not settles it for all (see SitUI_Alive's note).
+    if (g_nRows && !RowsAlive()) DropRows("no longer the objects they were (the level that made them is gone)");
     // The widgets are dropped, never touched, ONLY on a new skater: the level that made them is gone
     // and the engine owns what it collected. A change in how many entries are asked for is NOT that.
     // Dropping the references on a count change left the old widgets in the viewport with new ones
@@ -494,15 +582,16 @@ void SitUI_PumpFrame(void* skater, bool show, const SitPromptEntry* entries, int
     // another road), and the early return below then meant nothing ever hid them: the bar stayed on
     // screen for the whole editor session. So hide them and KEEP them -- only a different, NON-NULL
     // skater means the level that made them is gone.
-    if (skater && skater != g_builtFor) {
-        for (int i = 0; i < MAX_ROWS; i++) g_rows[i].w = nullptr;
-        g_nRows = 0; g_builtFor = nullptr; g_reported = 0; g_laidOut = 0; g_tries = 0;
-    }
+    if (skater && skater != g_builtFor) DropRows(nullptr);
     if (!skater) {
+        // No skater is an editor holding the pawn -- or a level change. Hiding is only safe because every
+        // row was just verified; in a build where nothing can be verified they are forgotten instead.
+        if (!SitUI_CanVerify()) { DropRows("no skater, and this build cannot verify them"); return; }
         for (int i = 0; i < g_nRows; i++) ShowRow(g_rows[i], false, true);
         return;
     }
     if (g_nRows < count && show && count > 0) {
+        CheckRowClass();
         if (!g_rowClass) LoadByPath();
         // The scan also finds the settings object the icon table lives on, which no ini path can
         // supply -- so it runs whenever either is still missing, not only when the class is.
@@ -577,7 +666,287 @@ void SitUI_PumpFrame(void* skater, bool show, const SitPromptEntry* entries, int
 
 void SitUI_HideNow() {
     if (!g_ok || !g_on) return;
+    if (g_nRows && (!SitUI_CanVerify() || !RowsAlive())) { DropRows("gone by the time they were to be hidden"); return; }
     for (int i = 0; i < g_nRows; i++) ShowRow(g_rows[i], false, true);
+}
+
+// ------------------------------------------------------------------ free labels (the radial menu)
+// void UWidget::SetVisibility(ESlateVisibility) -- the BASE one. SIG_SET_VIS above is UUserWidget's
+// override, which reads members a plain panel does not have; a sub-widget must go through this.
+static const char* SIG_WIDGET_SET_VIS =
+    "40 53 48 83 EC 50 0F B6 DA 48 8D 54 24 20 88 99 C3 00 00 00 E8 ?? ?? ?? ?? 4C 8B 44 24 20 4D 85 C0 ?? ?? 8B CB 84 DB ?? ??";
+// void UWidget::SetRenderOpacity(float). UE::MovieScene::SetRenderOpacity(UObject*, float) is the same
+// bytes and the same effect, so whichever the scan lands on first is right.
+static const char* SIG_WIDGET_SET_OPACITY =
+    "40 53 48 83 EC 40 0F 29 74 24 30 48 8D 54 24 20 0F 28 F1 F3 0F 11 B1 C4 00 00 00 E8 ?? ?? ?? ?? 48 8B 4C 24 20 48 85 C9";
+// void UTextBlock::SetColorAndOpacity(FSlateColor) -- the struct is 40 bytes, so it arrives by
+// pointer; the callee destroys it, which is nothing for one whose linked-colour pointer is null.
+// What is lit is said with COLOUR. Fading the rest instead made every entry hard to read over play.
+static const char* SIG_TEXT_SET_COLOR =
+    "40 53 48 83 EC 60 48 8B D9 48 89 7C 24 78 48 81 C1 50 01 00 00 48 8B FA E8 ?? ?? ?? ?? 48 83 BB 98 02 00 00 00 0F 84 ?? ?? ?? ??";
+typedef void (*WidgetSetOpacityFn)(void* self, float opacity);
+typedef void (*TextSetColorFn)(void* self, const void* slateColor40);
+static SetVisFn           g_widgetVis  = nullptr;
+static WidgetSetOpacityFn g_setOpacity = nullptr;
+static TextSetColorFn     g_textColor  = nullptr;
+static bool               g_freeLooked = false;
+
+enum { MAX_FREE = 12, BP_IMAGE_PANEL = 0x330 /* PBP_UIGamePadButton_C::ButtonImagePanel: the glyph */,
+       BTN_TEXT_BLOCK = 0x300 /* UUIGamePadButton::_buttonTextBlock (UTextBlock*) */,
+       TB_FONT = 0x188 /* UTextBlock::Font (FSlateFontInfo) */, FONT_OUTLINE_SIZE = 0x10, FONT_OUTLINE_COLOR = 0x20,
+       FONT_SIZE = 0x48, TB_SHADOW_OFFSET = 0x268, TB_SHADOW_COLOR = 0x270,
+       UOBJ_FLAGS = 0x08, RF_CDO_OR_ARCHETYPE = 0x30, USTRUCT_SUPER = 0x40,
+       ITEM_FLAGS = 0x08, ITEM_DEAD = (1 << 28) | (1 << 29) /* unreachable, pending kill */ };
+struct FreeRow { void* w; char label[64]; float x, y; int lit; bool shown; SitObjRef ref; };
+static FreeRow g_free[MAX_FREE];
+static int     g_nFree = 0, g_freeTries = 0, g_freeFrame = 0;
+static void*   g_freeFor = nullptr;
+static bool    g_freeWasShown = false;
+// How wide a character of the button's label draws, in Slate units. The widget right-aligns its label
+// against its slot, so centring a label on a point needs its width, and nothing reports one.
+static float   g_freeCharW = 16.0f, g_freeDim = 0.9f, g_freeTextScale = 1.3f;
+void SitUI_SetFreeMetrics(float charW, float dim) { if (charW > 1.0f) g_freeCharW = charW; if (dim > 0.0f) g_freeDim = dim; }
+
+static void FreeResolve() {
+    if (g_freeLooked) return;
+    g_freeLooked = true;
+    g_widgetVis  = (SetVisFn)TwkScanExe(SIG_WIDGET_SET_VIS);
+    g_setOpacity = (WidgetSetOpacityFn)TwkScanExe(SIG_WIDGET_SET_OPACITY);
+    g_textColor  = (TextSetColorFn)TwkScanExe(SIG_TEXT_SET_COLOR);
+    TwkLog("[situi] free labels: sub-widget visibility %s, opacity %s, text colour %s", g_widgetVis ? "ok" : "MISSING (the glyph stays)",
+           g_setOpacity ? "ok" : "MISSING (no dimming)", g_textColor ? "ok" : "MISSING (the lit entry is not tinted)");
+}
+static bool BuildFree(int i, void* skater, void* pc) {
+    FreeRow& r = g_free[i];
+    r.w = nullptr; r.label[0] = 0; r.x = r.y = -1.0e9f; r.lit = -1; r.shown = false;
+    if (!g_rowClass || g_vpW <= 0.0f) return false;
+    __try {
+        void* w = g_create(skater, g_rowClass, pc);
+        if (!w) return false;
+        // THE LOOK IS WRITTEN BEFORE THE WIDGET REACHES THE SCREEN. Created, the text block is only a
+        // UObject holding properties; its Slate half is built by AddToViewport, which reads them. So an
+        // outline, a larger size and a shadow cost four plain writes here and no engine call at all.
+        // A label over play has nothing behind it, and a black outline is what makes it readable on a
+        // bright floor and a dark one alike.
+        if (uint8_t* t = *(uint8_t**)((uint8_t*)w + BTN_TEXT_BLOCK)) {
+            *(int32_t*)(t + TB_FONT + FONT_OUTLINE_SIZE) = 2;
+            float* oc = (float*)(t + TB_FONT + FONT_OUTLINE_COLOR); oc[0] = oc[1] = oc[2] = 0.0f; oc[3] = 1.0f;
+            int32_t* size = (int32_t*)(t + TB_FONT + FONT_SIZE);
+            if (*size > 4 && *size < 96) *size = (int32_t)((float)*size * g_freeTextScale + 0.5f);
+            float* so = (float*)(t + TB_SHADOW_OFFSET); so[0] = so[1] = 2.0f;
+            float* sc = (float*)(t + TB_SHADOW_COLOR);  sc[0] = sc[1] = sc[2] = 0.0f; sc[3] = 0.9f;
+        }
+        g_addVp(w, g_zOrder + 1);
+        if (g_setAlign) g_setAlign(w, Pack2(0.0f, 0.0f));
+        g_setPos(w, Pack2(-4000.0f, -4000.0f), false);          // off screen until it is given a place
+        if (g_setDesired) g_setDesired(w, Pack2(g_barW, g_barH));
+        if (g_btnEnable) g_btnEnable(w, true);
+        void* glyph = *(void**)((uint8_t*)w + BP_IMAGE_PANEL);
+        if (glyph && g_widgetVis) g_widgetVis(glyph, VIS_COLLAPSED);
+        g_setVis(w, VIS_COLLAPSED);
+        SitUI_Track(&r.ref, w);
+        if (!r.ref.obj) { TwkLog("[situi] free label %d is not in the object table as itself -- not kept", i); return false; }
+        r.w = w;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; r.w = nullptr; return false; }
+}
+static void ShowFree(FreeRow& r, bool on, bool force) {
+    if (!r.w || (r.shown == on && !force) || !g_setVis) return;
+    r.shown = on;
+    __try { g_setVis(r.w, on ? VIS_HITTEST_INVISIBLE : VIS_COLLAPSED); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; r.w = nullptr; }
+}
+bool SitUI_Viewport(void* skater, float* w, float* h) {
+    if (!g_ok || !skater) return false;
+    MeasureViewport(skater);
+    if (w) *w = g_vpW;
+    if (h) *h = g_vpH;
+    return g_vpW > 1.0f && g_vpH > 1.0f;
+}
+static void DropFree(const char* why) {
+    if (g_nFree && why) TwkLog("[situi] the %d free labels forgotten: %s", g_nFree, why);
+    for (int i = 0; i < MAX_FREE; i++) { g_free[i].w = nullptr; g_free[i].ref.obj = nullptr; }
+    g_nFree = 0; g_freeFor = nullptr; g_freeTries = 0; g_freeWasShown = false;
+}
+static bool FreeAlive() {
+    for (int i = 0; i < g_nFree; i++) if (g_free[i].w && !SitUI_Alive(&g_free[i].ref)) return false;
+    return true;
+}
+// Off the screen NOW, for an owner whose pump has stopped (see Radial_OnInputKey). Verified first, like
+// every other touch: after a level change there is nothing left to hide and nothing may be written.
+void SitUI_HideFreeNow() {
+    if (!g_ok || !g_nFree) return;
+    if (!SitUI_CanVerify() || !FreeAlive()) { DropFree("gone by the time they were to be hidden"); return; }
+    for (int i = 0; i < g_nFree; i++) ShowFree(g_free[i], false, true);
+    g_freeWasShown = false;
+}
+void SitUI_PumpFree(void* skater, bool show, const SitFreeLabel* labels, int count) {
+    if (!g_ok) return;
+    if (count > MAX_FREE) count = MAX_FREE;
+    if (count < 0 || !labels) { count = 0; show = false; }
+    // The same order as the bar, for the same reason: verified first, and only then read or written.
+    if (g_nFree && !FreeAlive()) DropFree("no longer the objects they were (the level that made them is gone)");
+    if (skater && skater != g_freeFor) DropFree(nullptr);
+    if (!skater) {
+        if (!SitUI_CanVerify()) { DropFree("no skater, and this build cannot verify them"); return; }
+        for (int i = 0; i < g_nFree; i++) ShowFree(g_free[i], false, true);
+        g_freeWasShown = false; return;
+    }
+    if (g_nFree < count && show) {
+        FreeResolve();
+        CheckRowClass();
+        if (!g_rowClass) LoadByPath();
+        if (!g_rowClass || !g_settings) ScanForClass(skater);
+        if (!g_rowClass || g_freeTries++ > 3) return;
+        void* pc = nullptr;
+        __try { pc = *(void**)((uint8_t*)skater + PAWN_CTRL); } __except (EXCEPTION_EXECUTE_HANDLER) { pc = nullptr; }
+        if (!pc) return;
+        MeasureViewport(skater);
+        g_freeFor = skater;
+        for (int i = g_nFree; i < count; i++) { if (!BuildFree(i, skater, pc)) break; g_nFree = i + 1; }
+        TwkLog("[situi] free labels: %d built of %d wanted (viewport %.0fx%.0f, scale %.2f)", g_nFree, count, g_vpW, g_vpH, g_vpScaleV);
+    }
+    if (!g_nFree) return;
+    g_freeFrame++;
+    const bool force = (g_freeFrame % 30) == 0 || show != g_freeWasShown;
+    g_freeWasShown = show;
+    for (int i = 0; i < g_nFree; i++) {
+        FreeRow& r = g_free[i];
+        const bool on = show && i < count && labels[i].label && labels[i].label[0];
+        if (on && r.w) {
+            const SitFreeLabel& L = labels[i];
+            if (strcmp(L.label, r.label) != 0 && g_btnText) {
+                uint8_t ft[24];
+                if (MakeText(L.label, ft)) {
+                    __try { g_btnText(r.w, ft); snprintf(r.label, sizeof(r.label), "%s", L.label); r.x = -1.0e9f; }
+                    __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; }
+                }
+            }
+            if (L.x != r.x || L.y != r.y) {
+                // The label's right edge sits on the slot's right edge, so the slot is put half a
+                // label to the right of the wanted centre.
+                const float half = (float)strlen(r.label) * g_freeCharW * 0.5f;
+                __try { g_setPos(r.w, Pack2(L.x + half - g_barW, L.y - g_barH * 0.5f), false); r.x = L.x; r.y = L.y; }
+                __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; r.w = nullptr; }
+            }
+            const int lit = L.lit ? 1 : 0;
+            if (r.w && lit != r.lit) {
+                __try {
+                    if (g_setOpacity) g_setOpacity(r.w, lit ? 1.0f : g_freeDim);
+                    void* text = *(void**)((uint8_t*)r.w + BTN_TEXT_BLOCK);
+                    if (text && g_textColor) {
+                        // FSlateColor: the colour, the rule byte (0 = use this colour), a null link.
+                        struct { float rgba[4]; uint8_t rule; uint8_t pad[7]; void* link[2]; } col = {};
+                        if (lit) { col.rgba[0] = 1.0f;  col.rgba[1] = 0.74f; col.rgba[2] = 0.16f; }   // the game's amber
+                        else     { col.rgba[0] = 0.92f; col.rgba[1] = 0.92f; col.rgba[2] = 0.92f; }
+                        col.rgba[3] = 1.0f;
+                        g_textColor(text, &col);
+                    }
+                    r.lit = lit;
+                } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; }
+            }
+        }
+        ShowFree(r, on, force);
+    }
+}
+
+// ------------------------------------------------------------------ looking things up in the object array
+// The class of UClass: the fixpoint any object's Class chain ends at.
+static void* ClassFixpoint(void* seed) {
+    if (g_classFix) return g_classFix;
+    if (!seed) return nullptr;
+    void* fix = *(void**)((uint8_t*)seed + UOBJ_CLASS);
+    for (int hop = 0; fix && hop < 8; hop++) { void* up = *(void**)((uint8_t*)fix + UOBJ_CLASS); if (up == fix) break; fix = up; }
+    g_classFix = fix;
+    return fix;
+}
+struct ObjWalk { uint8_t** chunks; int num, perChunk; };
+static bool ObjWalkBegin(ObjWalk& w) {
+    if (!g_objArray) return false;
+    const uint8_t* ch = g_objArray + OA_OBJECTS;
+    w.chunks = *(uint8_t***)(ch + 0x00);
+    const int maxElems = *(const int*)(ch + 0x10), maxChunks = *(const int*)(ch + 0x18);
+    w.num = *(const int*)(ch + 0x14);
+    if (!w.chunks || w.num <= 0 || maxChunks <= 0) return false;
+    w.perChunk = maxElems / maxChunks;
+    return w.perChunk > 0;
+}
+// A NATIVE class object is one whose own class is the fixpoint; those are few, so naming them is cheap.
+static void* FindNativeClass(const char* name, void* seed) {
+    void* fix = ClassFixpoint(seed);
+    ObjWalk w;
+    if (!fix || !name || !ObjWalkBegin(w)) return nullptr;
+    for (int i = 0; i < w.num; i++) {
+        uint8_t* chunk = w.chunks[i / w.perChunk];
+        if (!chunk) continue;
+        uint8_t* obj = *(uint8_t**)(chunk + (size_t)(i % w.perChunk) * 24);
+        if (!obj || *(void**)(obj + UOBJ_CLASS) != fix) continue;
+        char nb[80];
+        if (GrindPop_FNameToString(obj + UOBJ_NAME, nb, sizeof(nb)) && !strcmp(nb, name)) return obj;
+    }
+    return nullptr;
+}
+void* SitUI_LoadObject(const char* path) {
+    if (!path || !path[0] || (!g_find && !g_load)) return nullptr;
+    __try {
+        wchar_t wp[200]; Widen(path, wp, 200);
+        void* o = g_find ? g_find(nullptr, (void*)-1, wp, false) : nullptr;
+        if (!o && g_load) o = g_load(nullptr, nullptr, wp, nullptr, 0, nullptr, true, nullptr);
+        return o;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; return nullptr; }
+}
+void* SitUI_FindInstanceOf(const char* nativeClassName, void* seed, void* exclude) {
+    __try {
+        void* want = FindNativeClass(nativeClassName, seed);
+        ObjWalk w;
+        if (!want || !ObjWalkBegin(w)) return nullptr;
+        // Most objects share a handful of classes, so the answer per class is remembered: the walk up
+        // the super chain then runs a few thousand times rather than once per object.
+        struct { void* cls; int is; } memo[256] = {};
+        for (int i = 0; i < w.num; i++) {
+            uint8_t* chunk = w.chunks[i / w.perChunk];
+            if (!chunk) continue;
+            const uint8_t* item = chunk + (size_t)(i % w.perChunk) * 24;
+            uint8_t* obj = *(uint8_t* const*)item;
+            if (!obj || (*(const int32_t*)(item + ITEM_FLAGS) & ITEM_DEAD)) continue;
+            void* cls = *(void**)(obj + UOBJ_CLASS);
+            if (!cls) continue;
+            auto& m = memo[((uintptr_t)cls >> 4) & 255];
+            if (m.cls != cls) {
+                m.cls = cls; m.is = 0;
+                void* c = cls;
+                for (int hop = 0; c && hop < 16; hop++) { if (c == want) { m.is = 1; break; } c = *(void**)((uint8_t*)c + USTRUCT_SUPER); }
+            }
+            if (!m.is || obj == exclude || (*(const uint32_t*)(obj + UOBJ_FLAGS) & RF_CDO_OR_ARCHETYPE)) continue;
+            return obj;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; }
+    return nullptr;
+}
+int SitUI_LogInstancesOf(const char* nativeClassName, void* seed, int cap, const char* tag) {
+    int found = 0;
+    __try {
+        void* want = FindNativeClass(nativeClassName, seed);
+        ObjWalk w;
+        if (!want || !ObjWalkBegin(w)) { TwkLog("[%s] no native class named %s", tag, nativeClassName); return 0; }
+        char line[480]; int at = 0, n = 0;
+        for (int i = 0; i < w.num; i++) {
+            uint8_t* chunk = w.chunks[i / w.perChunk];
+            if (!chunk) continue;
+            uint8_t* obj = *(uint8_t**)(chunk + (size_t)(i % w.perChunk) * 24);
+            if (!obj || *(void**)(obj + UOBJ_CLASS) != want) continue;
+            found++;
+            if (found > cap) continue;
+            char nb[80];
+            if (!GrindPop_FNameToString(obj + UOBJ_NAME, nb, sizeof(nb))) continue;
+            if (n == 0) at = snprintf(line, sizeof(line), "[%s] %s: ", tag, nativeClassName);
+            at += snprintf(line + at, sizeof(line) - (size_t)at, "%s%s", n ? ", " : "", nb);
+            if (++n == 8 || at > 380) { TwkLog("%s", line); n = 0; at = 0; }
+        }
+        if (n) TwkLog("%s", line);
+        TwkLog("[%s] %s: %d loaded%s", tag, nativeClassName, found, found > cap ? " (list capped)" : "");
+    } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; }
+    return found;
 }
 const char* SitUI_Status() { return g_status; }
 

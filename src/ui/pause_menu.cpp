@@ -439,6 +439,8 @@ static int       g_playerRowPids[kMaxLobbyRows];                // transport ind
 static char      g_playerRowNames[kMaxLobbyRows][40];
 static uint8_t   g_kickRow[0x90], g_banRow[0x90];
 static uint64_t  g_kickKey = 0, g_banKey = 0;
+static uint8_t   g_promoteRow[0x90];     // "Transfer host", on PG_PLAYER, host only
+static uint64_t  g_promoteKey = 0;
 static uint8_t   g_tpRow[0x90];          // "Teleport to them", on PG_PLAYER
 static uint64_t  g_tpKey = 0;
 static int       g_tpAt  = -1;           // widget index within the last build; -1 = not on this page
@@ -881,8 +883,12 @@ static void buildRows() {
     if (!buildRow(g_tpRow, "OmpTeleport", "Teleport to them",
                   "Go to where they are standing, on your end only", &g_tpKey))
         g_tpKey = 0;
+    // Same for the host transfer: a failure here costs that one row, not the page.
+    if (!buildRow(g_promoteRow, "OmpPromote", "Transfer host",
+                  "Make them the host of this session. You stay in it as a guest.", &g_promoteKey))
+        g_promoteKey = 0;
     if (!buildRow(g_playersOpenRow, "OmpPlayers", "Players",
-                  "Kick or ban someone from the game you are hosting", &g_playersOpenKey) ||
+                  "Everyone in your session", &g_playersOpenKey) ||
         !buildRow(g_kickRow, "OmpKick", "Kick from this session",
                   "Remove them now. They can join again afterwards.", &g_kickKey) ||
         !buildRow(g_banRow, "OmpBan", "Ban from your sessions",
@@ -1039,6 +1045,7 @@ static bool pageOnScreen(void* page) {
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 bool PauseMenu_IsShown() { return g_lastPage && pageOnScreen(g_lastPage); }
+void PauseMenu_ForgetPage() { g_lastPage = nullptr; }
 
 static uint32_t browseSig() {
     const int st = omp::BrowseStatus();
@@ -1451,8 +1458,8 @@ static const TArrayHdr* chooseArray(void* page, const TArrayHdr* items, TArrayHd
             snprintf(value, sizeof(value), "%s",
                      Ban_Is(id) ? "BANNED" : omp::session::VoiceIsMuted(pid) ? "MUTED"
                                            : (label[0] ? label : (theirMap[0] ? theirMap : " ")));
-            snprintf(desc, sizeof(desc), "%s", hosting ? "Select to mute, kick or ban this player"
-                                                       : "Select to mute this player; only the host can remove anyone");
+            snprintf(desc, sizeof(desc), "%s", hosting ? "Select to mute, kick, ban or make this player the host"
+                                                       : "Select to mute or teleport to this player");
             uint8_t* row = g_playerRows + (size_t)r * off::kItemSize;
             if (!buildInfoRow(row, key, g_playerRowNames[r], desc, value,
                               &g_playerRowKeys[r], &g_playerOptText[r])) continue;
@@ -1466,16 +1473,14 @@ static const TArrayHdr* chooseArray(void* page, const TArrayHdr* items, TArrayHd
         }
         add(g_mpRows + (size_t)(kMpRowCount - 1) * off::kItemSize, true);   // Back
     } else if (g_page == PG_PLAYER) {
+        // Kick, ban and the host transfer are the HOST'S rows and are simply not on a guest's page:
+        // EOS refuses all three from anyone but the lobby owner, so offering them was only ever a
+        // button that explains why it does nothing. No player is exempt from any of them (banlist.h).
         const bool hosting   = omp::LobbyIsHost();
         const bool banned    = Ban_Is(g_selPeerId);
-        // Say WHY a row will not do anything, on the row itself. A button that silently declines is
-        // indistinguishable from a broken one. The only reason left is "you are not the host" -- no
-        // player is exempt from either action (banlist.h).
-        setRowStatus(g_kickRow, hosting ? "Remove them from your session now"
-                                        : "You are not the host of this session");
+        setRowStatus(g_kickRow, "Remove them from your session now");
         setRowStatus(g_banRow,  banned ? "Already on your ban list"
-                                       : (hosting ? "Remove them and never host them again"
-                                                  : "Adds them to your ban list for sessions you host"));
+                                       : "Remove them and never host them again");
         g_muteAt = -1; g_tpAt = -1;
         if (g_muteKey) {                 // anyone can mute anyone; it is applied on your end only
             *(int32_t*)(g_muteRow + off::kItemMultiStart) = omp::session::VoiceIsMuted(g_selPid) ? 1 : 0;
@@ -1489,8 +1494,11 @@ static const TArrayHdr* chooseArray(void* page, const TArrayHdr* items, TArrayHd
                                        : "They are on a different map right now");
             g_tpAt = n; add(g_tpRow, true);
         }
-        add(g_kickRow, true);
-        add(g_banRow, true);
+        if (hosting) {
+            add(g_kickRow, true);
+            add(g_banRow, true);
+            if (g_promoteKey) add(g_promoteRow, true);
+        }
         add(g_mpRows + (size_t)(kMpRowCount - 1) * off::kItemSize, true);   // Back
     } else if (g_page == PG_BROWSE) {
         g_lobbyRowCount = 0;
@@ -2229,13 +2237,15 @@ static bool handleConfirm(void* page, void* params) {
             return true;
         }
         const bool kick = (itemKey == g_kickKey), ban = (itemKey == g_banKey);
-        if (kick || ban) {
+        const bool promote = (g_promoteKey && itemKey == g_promoteKey);
+        if (kick || ban || promote) {
             strncpy_s(g_actPeerId,   g_selPeerId,   _TRUNCATE);
             strncpy_s(g_actPeerName, g_selPeerName, _TRUNCATE);
             InterlockedExchange(&g_havePeerAction, 1);
-            post(ban ? OVA_BAN : OVA_KICK);
+            post(promote ? OVA_PROMOTE : ban ? OVA_BAN : OVA_KICK);
             char m[200];
-            snprintf(m, sizeof(m), "[menu] pause: %s '%s'", ban ? "BAN" : "KICK", g_selPeerName);
+            snprintf(m, sizeof(m), "[menu] pause: %s '%s'",
+                     promote ? "TRANSFER HOST to" : ban ? "BAN" : "KICK", g_selPeerName);
             log(m);
             g_page = PG_PLAYERS;
             queueSwap(page, "Players", false, true);

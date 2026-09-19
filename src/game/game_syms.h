@@ -641,6 +641,11 @@ int   SkeletonBoneParents(void* meshComp, int16_t* out, int cap);
 // One bone's name, for diagnostics. Allocates an FString through the engine and leaks it, exactly as
 // every other name read here does -- so call it from one-shot logging, never per frame.
 bool  SkeletonBoneName(void* meshComp, int idx, char* out, int cap);
+// ONE-SHOT DIAGNOSTIC: every skinned mesh the skater wears -- its component, its asset, its bones by
+// name and its morph targets by name. Asked once to learn whether a head carries anything a mouth
+// could be driven through (a jaw bone, a blend shape). Leaks a name string per bone like every other
+// name read here: call it on a skeleton change, never per frame.
+void  SkeletonDump(void* skaterActor, void (*logf)(const char*));
 bool LocalSkaterName(void* pawn, char* out, int cap);   // gi -> FSkaterInstance::SkaterName
 bool LocalMapName(void* pawn, char* out, int cap);      // the UWorld object's own name
 // ---- pretty map labels. The internal level name is what travels, but it is a long asset name and
@@ -710,6 +715,7 @@ namespace off {
     // merges to 95 where the stock body is 70.
     constexpr int kMeshSkeletalMesh     = 0x480;
     constexpr int kSkelMeshRefSkeleton  = 0x1b0;
+    constexpr int kSkelMeshMorphTargets = 0x190;  // USkeletalMesh::MorphTargets (TArray<UMorphTarget*>)
     constexpr int kRefSkelFinalBoneInfo = 0x20;
     constexpr int kRefSkelFinalBonePose = 0x30;  // TArray<FTransform>, parent-relative bind pose (PDB)
     constexpr int kMeshBoneInfoStride   = 12;    // FMeshBoneInfo { FName Name; int32 ParentIndex; }

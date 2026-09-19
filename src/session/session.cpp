@@ -28,11 +28,12 @@
 #ifdef OMP_VOICE
 #include "../game/voice_audio.h"
 #include "../voice/voice_capture.h"
+#include "../voice/radio_capture.h"
 #include "mutelist.h"
 #include <opus.h>
 #else
 namespace omp { namespace game { namespace voice {
-struct Voice { void* comp = nullptr; void* compActor = nullptr; bool playing = false; };
+struct Voice { void* comp = nullptr; void* compActor = nullptr; bool playing = false; int primeSamples = 0, trimAbove = 0; };
 inline void ProxyGone(Voice& v) { v.comp = nullptr; v.compActor = nullptr; v.playing = false; }
 inline void Stop(Voice&) {}
 }}}
@@ -47,6 +48,18 @@ struct VoiceRx {
     bool     seqValid = false;
     uint64_t lastUs = 0;                 // last frame: the silence timeout and "talking"
     bool     seen = false;               // first-frames line printed
+};
+// A player's RADIO STREAM, as heard here -- and, on the owner's side, whether that player asked for ours.
+// The wave and its ring are ours; the COMPONENT that plays it is SessionTweaks' (on their radio prop), so
+// nothing here spawns or stops a sound.
+struct RadioRx {
+    game::voice::Voice voice;
+    void*    dec = nullptr;              // OpusDecoder*, created on the first frame, kept
+    uint16_t seq = 0;                    // the LAST frame's sequence
+    bool     seqValid = false;
+    uint64_t lastUs = 0;
+    bool     seen = false;
+    uint64_t wantUntilUs = 0;            // OWNER side: send them our stream until then (they re-ask every few s)
 };
 }}
 #ifdef _WIN32
@@ -73,8 +86,10 @@ struct Slot {
     // (say, a millisecond stamped from nowUs against a GetTickCount64 millisecond) underflows the
     // unsigned subtraction, which reads as an enormous quiet time and releases every slot the frame
     // after it opens. Session liveness is nowUs, end to end.
-    uint64_t    lastPacketUs = 0;
+    uint64_t    lastPacketUs = 0;        // last SKATER SNAPSHOT: drives the proxy (hold, then nothing)
+    uint64_t    lastAnyUs = 0;           // last packet of ANY lane: proof their game is running
     bool        quietHandled = false;
+    bool        idleAnnounced = false;   // "no skater updates but still here" said once per idle spell
     // ---- cosmetics: their look, and whether this proxy is currently wearing it.
     repl::CosmeticSet cosmetics;
     repl::WearSet     wear;               // their board's scuffs; applied to the proxy's materials
@@ -82,6 +97,7 @@ struct Slot {
     repl::BodyFeelSet bodyFeel;          // the peer's SessionTweaks riding-body knobs (ver 0 = none)
     // proximity voice: the engine-side sound, their decoder, the frame sequence, and the mute
     VoiceRx     vrx;                     // their voice, as heard here
+    RadioRx     rrx;                     // their radio stream, as heard here (and whether they want ours)
     bool        voiceMuted = false, voiceMuteChecked = false;
     bool        poseHeld = false;        // their OMPS hold, for the one-line edge log
     bool        haveCosmetics = false;
@@ -195,6 +211,8 @@ static void voiceResetPeer(Slot& s) {
     s.vrx.seqValid = false; s.vrx.lastUs = 0; s.vrx.seen = false;
     s.voiceMuteChecked = false; s.voiceMuted = false;
     game::voice::ProxyGone(s.vrx.voice);
+    s.rrx.seqValid = false; s.rrx.lastUs = 0; s.rrx.seen = false; s.rrx.wantUntilUs = 0;
+    game::voice::ProxyGone(s.rrx.voice);        // the ring: nothing of the last player's stream is heard
 }
 static Config g_cfg;
 static Stats  g_st;
@@ -305,6 +323,7 @@ void Init(void (*logf)(const char*)) {
     dropsync::SetSendFn(&Send);
 #ifdef OMP_VOICE
     voice::Capture_Init(logf);           // the microphone thread; idle until the mode says otherwise
+    radiocap::Init(logf);                // a radio's app capture; no thread until a stream starts
 #endif
 }
 
@@ -365,7 +384,8 @@ static Slot* slotFor(int peerIdx, uint64_t nowUs) {
     for (auto& s : g_slots) {
         if (s.used) continue;
         s.stream.Reset(); s.proxy.Forget(); voiceResetPeer(s);          // nothing carries across to a new peer
-        s.used = true; s.peerIdx = peerIdx; s.lastPacketUs = nowUs; s.quietHandled = false;
+        s.used = true; s.peerIdx = peerIdx; s.lastPacketUs = nowUs; s.lastAnyUs = nowUs;
+        s.quietHandled = false; s.idleAnnounced = false;
         { const char* id = PeerIdStr(peerIdx); strncpy_s(s.peerId, id ? id : "", _TRUNCATE); s.orphaned = false; }
         memset(&s.cosmetics, 0, sizeof(s.cosmetics));   // padding too -- it is memcmp'd for changes
         s.haveCosmetics = false; s.wornForActor = nullptr; s.peerReplaying = false;
@@ -499,8 +519,15 @@ static void applyDropUpdate(Slot& s, const dropsync::Update& up, int peerIdx, ui
 }
 
 static void voiceOnPacket(int peerIdx, const uint8_t* data, int len, uint64_t nowUs);
+static void radioOnPacket(int peerIdx, const uint8_t* data, int len, uint64_t nowUs);
 void OnPacket(int peerIdx, const uint8_t* data, int len, uint64_t nowUs) {
     if (!g_cfg.enabled) return;
+    // ANY packet is proof of life. The skater stream drives the proxy and its silence is handled in
+    // Frame (hold the pose, and eventually release) -- but a game that has stopped streaming while
+    // still sending its other lanes (its dropped objects every few seconds, voice, chat) is running
+    // and in the lobby. A tabbed-out game does exactly that. Releasing on stream silence alone made
+    // such a player leave and rejoin every dropMs: the next lane packet reopened the slot.
+    for (auto& s : g_slots) if (s.used && s.peerIdx == peerIdx) { s.lastAnyUs = nowUs; break; }
     // Replay-sync protocol traffic (requests for and chunks of a peer's own state history). Checked
     // first: chunks arrive at hundreds per second mid-transfer.
     if (replaysync::IsSyncPacket(data, len)) {
@@ -547,6 +574,8 @@ void OnPacket(int peerIdx, const uint8_t* data, int len, uint64_t nowUs) {
     // 60 Hz snapshot stays small and self-contained.
     // Voice: the most frequent lane while anyone talks, so it is routed before the rare ones.
     if (repl::IsVoicePacket(data, len)) { voiceOnPacket(peerIdx, data, len, nowUs); return; }
+    // A player's radio stream: only ever sent to us because our radio asked for it.
+    if (repl::IsRadioPacket(data, len)) { radioOnPacket(peerIdx, data, len, nowUs); return; }
     // A peer's pose hold (sitting): keep their last transported skeleton between the sweeps.
     if (repl::IsPoseHoldPacket(data, len)) {
         bool hold = false; uint16_t ttl = 0;
@@ -554,9 +583,19 @@ void OnPacket(int peerIdx, const uint8_t* data, int len, uint64_t nowUs) {
         Slot* hs = slotFor(peerIdx, nowUs);
         if (!hs) return;
         void* hm = hs->proxy.actor() ? game::SkaterMeshOf(hs->proxy.actor()) : nullptr;
-        if (hm) game::pose::NoteHold(hm, hold, ttl);
-        if (hold != hs->poseHeld && g_logf) { hs->poseHeld = hold; char m[100];
-            snprintf(m, sizeof(m), "[pose] peer %d %s", peerIdx, hold ? "holds their pose (sitting)" : "released their pose");
+        // A RELEASE IS PLAYED OUT, NOT OBEYED ON ARRIVAL (pose.cpp Note): everything else about them is
+        // applied from the interpolated stream, which is this far behind. Letting go on arrival cut the
+        // last of their blend-out and snapped the skeleton.
+        uint32_t keepMs = ttl;
+        if (!hold) {
+            const float d = hs->stream.stats().delayMs;
+            const float k = (d > 0.0f ? d : 0.0f) + 40.0f;               // + a publish gap of margin
+            keepMs = (uint32_t)(k > 400.0f ? 400.0f : k);
+        }
+        if (hm) game::pose::NoteHold(hm, hold, keepMs);
+        if (hold != hs->poseHeld && g_logf) { hs->poseHeld = hold; char m[140];
+            if (hold) snprintf(m, sizeof(m), "[pose] peer %d holds their pose (sitting)", peerIdx);
+            else snprintf(m, sizeof(m), "[pose] peer %d released their pose -- held %u ms more, until the playback catches up", peerIdx, keepMs);
             g_logf(m); }
         return;                                      // NOT a snapshot: no stream push, no liveness
     }
@@ -710,6 +749,12 @@ void OnPacket(int peerIdx, const uint8_t* data, int len, uint64_t nowUs) {
     // cache, nameless ones draw from it, and everything downstream still sees complete states.
     sl->nameCache.Resolve(s);
     sl->stream.Push(s, senderUs, nowUs);
+    if (sl->idleAnnounced && g_logf) {
+        sl->idleAnnounced = false;
+        char m[140]; snprintf(m, sizeof(m), "[session] peer %d skater updates resumed after %llus",
+                              peerIdx, (unsigned long long)(sinceUs(nowUs, sl->lastPacketUs) / 1000000));
+        g_logf(m);
+    }
     sl->lastPacketUs = nowUs;
     sl->quietHandled = false;
     g_st.received++;
@@ -868,7 +913,17 @@ static bool              g_ownBodyFeelDirty = false;
 // ---- the pose hold (sitting). SessionTweaks says "my skeleton is posed outside the graph"; the
 // pose lane then captures every tick, Frame thins the sweeps to on-change + 1 Hz, and the OMPS
 // heartbeat below tells receivers to keep the last skeleton in between.
+// "then" was at least `gapUs` ago. A packet is stamped when the wire is pumped, which happens AFTER
+// the frame's own timestamp was taken, so a stamp can sit a few microseconds in this frame's future;
+// an unsigned subtraction then wraps to a value that trips every timeout (field: the peer's sound
+// was stopped on the very frame it started, sixty times a second, and nothing was ever heard).
+static inline bool olderThan(uint64_t nowUs, uint64_t thenUs, uint64_t gapUs) {
+    return nowUs > thenUs && nowUs - thenUs > gapUs;
+}
 static bool     g_ownPoseHold = false;
+// While a pose is held and MOVING, when the drivers last went out instead of a slice of skeleton (see the publish).
+static uint64_t g_holdBlobUs = 0;
+static const uint64_t kHoldBlobUs = 150000ull;      // 150 ms: the most the receiver's graph may fall behind
 static int8_t   g_ownHeadYaw = 0, g_ownHeadPitch = 0;   // rides every snapshot; see repl::State::headYaw
 static uint64_t g_holdBeatUs = 0;
 static int      g_holdOffLeft = 0;
@@ -1446,7 +1501,9 @@ static void dropFrame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, int nPeers,
     int  rankedAgainst = 0, canonicalPeer = -1;
     uint64_t lowestKey = myKey;
     for (auto& s : g_slots) {
-        if (!s.used || s.away || sinceUs(nowUs, s.lastPacketUs) >= dropUs) continue;
+        // Present = still sending SOMETHING. Their object table rides its own lane, so a peer whose
+        // skater stream has paused (tabbed out) still holds their place here.
+        if (!s.used || s.away || sinceUs(nowUs, s.lastAnyUs) >= dropUs) continue;
         anyPresent = true;
         if (hostKnown) {
             const char* theirId = PeerIdStr(s.peerIdx);
@@ -1633,14 +1690,6 @@ static void dropFrame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, int nPeers,
 static float    g_voiceVolume  = 1.0f;
 static uint64_t g_voiceNowUs   = 0;
 static bool     g_voiceSaidOn  = false;
-
-// "then" was at least `gapUs` ago. A packet is stamped when the wire is pumped, which happens AFTER
-// the frame's own timestamp was taken, so a stamp can sit a few microseconds in this frame's future;
-// an unsigned subtraction then wraps to a value that trips every timeout (field: the peer's sound
-// was stopped on the very frame it started, sixty times a second, and nothing was ever heard).
-static inline bool olderThan(uint64_t nowUs, uint64_t thenUs, uint64_t gapUs) {
-    return nowUs > thenUs && nowUs - thenUs > gapUs;
-}
 
 static Slot* slotByPeer(int peerIdx) {
     for (auto& s : g_slots) if (s.used && s.peerIdx == peerIdx) return &s;
@@ -1886,9 +1935,129 @@ bool VoiceTalking(int peerId) {
     return s && s->vrx.voice.playing && s->vrx.lastUs && !olderThan(g_voiceNowUs, s->vrx.lastUs, 300000ull);
 }
 bool VoiceSelfTalking() { return voice::Capture_Speaking(); }
+
+// ============================================================================ a player's radio stream
+// SessionTweaks' radio prop can play, instead of the game's own songs, ONE APP from its owner's PC
+// (voice/radio_capture: Windows' process loopback, Opus music 48 kbps mono). Here that stream goes out and
+// comes in. It is sent ONLY to a player who ASKED for it -- their radio is built in their world, playing
+// ours, and not muted -- so a player who is not listening costs nothing, and no build that cannot read the
+// lane is ever sent one. The ask travels on the radio's own mod channel (SessionTweaks), and arrives here
+// through RadioSetListener; it lapses unless renewed (8 s). Frames go three to a packet (60 ms), unreliable
+// (reliable on shared memory, as voice). On arrival they are decoded into the player's ring, which a
+// SessionTweaks audio component on THEIR RADIO plays: a 200 ms cushion (relays jitter), trimmed back to it
+// past 600 ms (two sound cards never quite agree on 48 kHz, and a stream never pauses to catch up).
+static uint32_t g_radioTx = 0, g_radioRx = 0;
+static void radioSend(uint16_t seq, const uint8_t* const* fp, const int* fl, int n, uint64_t nowUs, int nPeers) {
+    uint8_t pkt[900];
+    const int len = repl::PackRadio(seq, fp, fl, n, pkt, sizeof(pkt));
+    if (len <= 0) return;
+    PeerStats ps;
+    for (int i = 0; i < nPeers; i++) {
+        if (!GetStats(i, &ps) || ps.state == 5) continue;
+        Slot* s = slotByPeer(i);
+        if (!s || !s->rrx.wantUntilUs || nowUs >= s->rrx.wantUntilUs || !sameMapAsUs(*s)) continue;
+        Send(i, pkt, len, Current() == BK_SHM);
+        g_radioTx += (uint32_t)n;
+    }
+}
+static void radioFrame(uint64_t nowUs, int nPeers) {
+    // out: whatever the capture encoded since last frame, three frames to a packet. The queue is ALWAYS
+    // drained -- nobody listening just means nothing is sent -- so what goes out is never stale.
+    uint8_t fb[3][256]; const uint8_t* fp[3]; int fl[3];
+    uint16_t seq0 = 0; int n = 0;
+    auto flush = [&]() { if (n > 0) radioSend(seq0, fp, fl, n, nowUs, nPeers); n = 0; };
+    for (int guard = 0; guard < 24; guard++) {
+        uint16_t sq = 0;
+        const int len = radiocap::Pop(fb[n], sizeof(fb[0]), &sq);
+        if (len <= 0) break;
+        if (n > 0 && sq != (uint16_t)(seq0 + n)) { uint8_t keep[256]; memcpy(keep, fb[n], (size_t)len); flush(); memcpy(fb[0], keep, (size_t)len); }
+        if (n == 0) seq0 = sq;
+        fp[n] = fb[n]; fl[n] = len; n++;
+        if (n == 3) flush();
+    }
+    flush();
+    static uint64_t lastSaidUs = 0; static uint32_t lastTx = 0, lastRx = 0;
+    if ((g_radioTx != lastTx || g_radioRx != lastRx) && (!lastSaidUs || olderThan(nowUs, lastSaidUs, 10000000ull))) {
+        lastSaidUs = nowUs;
+        if (g_logf) { char m[160]; snprintf(m, sizeof(m), "[radio] stream frames in the last 10 s: sent %u, received %u", g_radioTx - lastTx, g_radioRx - lastRx); g_logf(m); }
+        lastTx = g_radioTx; lastRx = g_radioRx;
+    }
+}
+static void radioOnPacket(int peerIdx, const uint8_t* data, int len, uint64_t nowUs) {
+    if (!g_cfg.enabled) return;
+    uint16_t seq = 0; const uint8_t* frames[repl::kRadioMaxFrames]; int lens[repl::kRadioMaxFrames];
+    const int n = repl::UnpackRadio(data, len, &seq, frames, lens, repl::kRadioMaxFrames);
+    if (n <= 0) return;
+    Slot* s = slotFor(peerIdx, nowUs);
+    if (!s) return;
+    RadioRx& r = s->rrx;
+    if (!r.dec) {
+        int err = 0;
+        r.dec = opus_decoder_create(48000, 1, &err);
+        if (err != OPUS_OK || !r.dec) { r.dec = nullptr; return; }
+    }
+    r.voice.primeSamples = 9600;                 // 200 ms before it plays
+    r.voice.trimAbove = 28800;                   // ...and never more than 600 ms behind
+    if (!r.seen && g_logf) { r.seen = true; char m[100]; snprintf(m, sizeof(m), "[radio] peer %d: their radio stream is arriving", peerIdx); g_logf(m); }
+    OpusDecoder* dec = (OpusDecoder*)r.dec;
+    int16_t pcm[960];
+    if (r.seqValid) {
+        const uint16_t d = (uint16_t)(seq - r.seq);
+        if (d == 0 || d > 32768) return;         // a duplicate, or older than what we have: late is worthless here
+        const int gap = (int)d - 1;
+        if (gap > 0 && gap <= 5) for (int g = 0; g < gap; g++) { const int got = opus_decode(dec, nullptr, 0, pcm, 960, 0); if (got > 0) r.voice.ring.Write(pcm, got); }
+    }
+    for (int i = 0; i < n; i++) {
+        const int got = opus_decode(dec, frames[i], lens[i], pcm, 960, 0);
+        if (got > 0) r.voice.ring.Write(pcm, got);
+    }
+    r.seq = (uint16_t)(seq + n - 1); r.seqValid = true; r.lastUs = nowUs;
+    g_radioRx += (uint32_t)n;
+}
+// ---- SessionTweaks' side of it (OmpRadio_* exports). Game thread.
+int RadioSources(uint32_t* pids, char* names, int nameCap, int cap) {
+    radiocap::RequestSources();
+    radiocap::Source src[12];
+    int n = radiocap::Sources(src, cap < 12 ? cap : 12);
+    for (int i = 0; i < n; i++) {
+        if (pids) pids[i] = src[i].pid;
+        if (names && nameCap > 0) snprintf(names + (size_t)i * (size_t)nameCap, (size_t)nameCap, "%s", src[i].name);
+    }
+    return n;
+}
+int  RadioStreamStart(uint32_t pid, const char* name) { if (!pid) return 0; radiocap::Start(pid, name); return 1; }
+void RadioStreamStop() { radiocap::Stop(); }
+int  RadioStreamState(char* why, int cap) { return radiocap::State(why, cap); }
+void RadioSetListener(int peerIdx, bool wanted) {
+    Slot* s = slotByPeer(peerIdx);
+    if (!s) return;
+    const bool was = s->rrx.wantUntilUs != 0;
+    s->rrx.wantUntilUs = wanted ? g_voiceNowUs + 8000000ull : 0;
+    if (was != wanted && g_logf) { char m[100]; snprintf(m, sizeof(m), "[radio] peer %d %s our stream", peerIdx, wanted ? "is listening to" : "stopped listening to"); g_logf(m); }
+}
+void* RadioPeerWave(int peerIdx, bool rewind) {
+    Slot* s = slotByPeer(peerIdx);
+    if (!s) return nullptr;
+    void* w = game::voice::EnsureWave(s->rrx.voice, g_logf);
+    if (w && rewind) game::voice::Rewind(s->rrx.voice);
+    return w;
+}
+int RadioPeerStreaming(int peerIdx) {
+    Slot* s = slotByPeer(peerIdx);
+    return s && s->rrx.lastUs && !olderThan(g_voiceNowUs, s->rrx.lastUs, 1000000ull) ? 1 : 0;
+}
 #else
 static void voiceOnPacket(int, const uint8_t*, int, uint64_t) {}
 static void voiceFrame(void*, uint64_t, int, int) {}
+static void radioOnPacket(int, const uint8_t*, int, uint64_t) {}
+static void radioFrame(uint64_t, int) {}
+int   RadioSources(uint32_t*, char*, int, int) { return 0; }
+int   RadioStreamStart(uint32_t, const char*) { return 0; }
+void  RadioStreamStop() {}
+int   RadioStreamState(char* why, int cap) { if (why && cap) why[0] = 0; return 0; }
+void  RadioSetListener(int, bool) {}
+void* RadioPeerWave(int, bool) { return nullptr; }
+int   RadioPeerStreaming(int) { return 0; }
 void VoiceSetMuted(int, bool) {}
 bool VoiceIsMuted(int) { return false; }
 bool VoiceTalking(int) { return false; }
@@ -1970,6 +2139,16 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
             // describable as "the apartment" -- the log should say which world that is.
             if (g_logf) { char m[140]; snprintf(m, sizeof(m), "[session] now in world '%s'",
                           g_ownMap[0] ? g_ownMap : "(unknown)"); g_logf(m); }
+        }
+    }
+
+    // ---- what our own rig is made of (debug::rigDump), once per pawn, after the world has settled
+    // (the garments merge in during the settle window). Peers or not.
+    if (debug::Get().rigDump) {
+        static void* dumpedFor = nullptr;
+        if (ownPawn && ownPawn != dumpedFor && nowMs >= g_settleUntilMs) {
+            dumpedFor = ownPawn;
+            game::SkeletonDump(ownPawn, g_logf);
         }
     }
 
@@ -2106,7 +2285,19 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
             if (own.poseN && game::pose::CapturedForHoldOnly(own)) {
                 static float lastRot[repl::kPoseMaxBones][4], lastPos[repl::kPoseMaxBones][3];
                 static uint8_t lastN = 0; static uint64_t lastSweepUs = 0;
-                if (!holdSweeping) {
+                // ONE PUBLISH IN EVERY kHoldBlobUs CARRIES THE DRIVERS INSTEAD. A packet with a skeleton in it has
+                // no room for the anim blob (700 B + 273 B + header > the 1 KB wire), so a pose that MOVES -- an
+                // emote -- used to send a skeleton in every single packet and no drivers at all for its whole
+                // length (field-measured 2026-09-19: the viewer was handed 112 skeletons/s, one per frame). The
+                // receiver's own animation graph is then frozen at whatever it had when the pose began, and the
+                // moment the pose is released it resumes from there: the end-of-emote twitch, and only at the END
+                // (at the start both sides are still in step). Between sweeps -- never inside one, a half-sent
+                // skeleton is never usable -- a driver packet goes out instead, so the graph the receiver falls
+                // back on is never more than this far behind. It costs a few of the pose's refreshes a second.
+                if (!holdSweeping && olderThan(nowUs, g_holdBlobUs, kHoldBlobUs)) {
+                    g_holdBlobUs = nowUs;
+                    own.poseN = 0;                                       // the drivers, the feet and the hands this tick
+                } else if (!holdSweeping) {
                     bool changed = own.poseN != lastN;
                     for (int b = 0; b < own.poseN && !changed; b++) {
                         float dq = 0.0f, dp = 0.0f;
@@ -2121,7 +2312,7 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
                         memcpy(lastPos, own.posePos, sizeof(float) * 3 * (size_t)own.poseN);
                     } else own.poseN = 0;                                // drivers this tick
                 }
-            } else holdSweeping = false;
+            } else { holdSweeping = false; g_holdBlobUs = 0; }
             if (own.poseN) {
                 own.animLen = 0;
                 // ...and the FEET and HANDS with them, for the same reason and the same 6 bones.
@@ -2225,6 +2416,7 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
     // ---- 1.3 VOICE: our microphone's frames out to the players in our level, and the silence
     // timeout on everyone else's.
     voiceFrame(ownPawn, nowUs, nPeers, sendable);
+    radioFrame(nowUs, nPeers);
     // ---- 1.3b POSE HOLD heartbeat: 4 Hz while our pose is held, and three releases on the way out.
     if (sendable > 0) {
         if (g_ownPoseHold) {
@@ -2281,6 +2473,7 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
                     mineSk.n = (uint8_t)sn;
                     const bool changed = !haveLastSkel || lastSkel.n != mineSk.n ||
                                          memcmp(lastSkel.hash, mineSk.hash, sizeof(uint32_t) * (size_t)sn) != 0;
+                    const bool rigChanged = changed && haveLastSkel;   // a wardrobe change, not the first look
                     const bool heartbeat = !lastSkelSendUs || sinceUs(nowUs, lastSkelSendUs) > 10000000ull;
                     if (changed || heartbeat || g_skelResend) {
                         uint8_t pkt[520];
@@ -2293,7 +2486,11 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
                             lastSkelSendUs = nowUs; g_skelResend = false;
                             if (changed && g_logf) { char m[120];
                                 snprintf(m, sizeof(m), "[pose] published our skeleton: %d bones", sn);
-                                g_logf(m); }
+                                g_logf(m);
+                                // The first look was dumped when the pawn settled (Frame); this is a
+                                // change of outfit, which can bring bones of its own.
+                                if (rigChanged && debug::Get().rigDump) game::SkeletonDump(ownPawn, g_logf);
+                            }
                         }
                     }
                 }
@@ -2374,7 +2571,10 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
         // Same rule as their props: nothing of theirs is destroyed while the local player is in
         // replay playback (the recorder's pool would keep a null entry -- see the drop apply).
         // The condition stays true, so the release happens the frame after playback ends.
-        const bool gone = departed || s.orphaned || quietForUs > dropUs;
+        // Silence means EVERY lane silent. A paused skater stream alone is not a departure: their
+        // other lanes keep arriving from a game that is still running (see OnPacket).
+        const uint64_t silentForUs = sinceUs(nowUs, s.lastAnyUs);
+        const bool gone = departed || s.orphaned || (quietForUs > dropUs && silentForUs > dropUs);
         if (gone && game::LocalReplayMode() == 2) continue;
         if (gone) {
             s.proxy.Destroy(g_logf);    // out of the level entirely; Forget only drops pointers
@@ -2390,7 +2590,7 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
                 if (s.orphaned) snprintf(m, sizeof(m), "[session] a replaced player's slot released");
                 else if (departed) snprintf(m, sizeof(m), "[session] peer %d released (they left)", s.peerIdx);
                 else          snprintf(m, sizeof(m), "[session] peer %d released (quiet %llums, no goodbye)",
-                                       s.peerIdx, (unsigned long long)(quietForUs / 1000));
+                                       s.peerIdx, (unsigned long long)(silentForUs / 1000));
                 g_logf(m); }
             continue;
         }
@@ -2398,6 +2598,12 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
             // Sender stopped. Stop the board simulating -- no board may simulate without a writer --
             // and HOLD the last pose; a stalled sender is never extrapolated into the distance.
             if (!s.quietHandled) { s.quietHandled = true; s.proxy.OnQuiet(g_logf); }
+            if (quietForUs > dropUs && !s.idleAnnounced) {
+                s.idleAnnounced = true;
+                if (g_logf) { char m[200]; snprintf(m, sizeof(m), "[session] peer %d: no skater updates for "
+                              "%llus but their game is still sending -- keeping them (tabbed out?)",
+                              s.peerIdx, (unsigned long long)(quietForUs / 1000000)); g_logf(m); }
+            }
             if (s.proxy.actor()) alive++;
             continue;
         }

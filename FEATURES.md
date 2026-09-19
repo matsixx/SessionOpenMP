@@ -36,6 +36,7 @@ prebuilt binary in the package, and runs on Windows or Linux.
 * **Hide my IP address** -- on by default. Traffic goes through Epic's relays so peers never see your
 address; off is a direct connection, which is faster.
 * **Ban list**, per player, kept between sessions.
+* **Transfer host** to another player from the Players page, without ending the session (1.1.12).
 
 ## Skating together
 

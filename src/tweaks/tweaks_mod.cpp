@@ -52,6 +52,9 @@
 #include "camera_height.h"
 #include "cam_fp.h"
 #include "sit.h"
+#include "radial.h"
+#include "emote.h"
+#include "radio.h"
 #include "pop_probe.h"
 #include "body_feel.h"
 #include "proxy_body_feel.h"
@@ -62,7 +65,7 @@
 #include "ue4ss_abi.h"
 #include "ui/menu_ext.h"
 
-#define TWEAKS_VERSION "3.19.379"
+#define TWEAKS_VERSION "3.19.380"
 #define TWK_WIDEN(x) STR(x)   // STR() prepends L before the macro expands; expand first
 
 // ------------------------------------------------------------------ log (own file, fresh per launch)
@@ -106,6 +109,8 @@ static void saveSettings() {
     BodyFeel_SaveConfig(buf, sizeof(buf));
     CameraHeight_SaveConfig(buf, sizeof(buf));
     Sit_SaveConfig(buf, sizeof(buf));
+    Radial_SaveConfig(buf, sizeof(buf));
+    Radio_SaveConfig(buf, sizeof(buf));
     Upscale_SaveConfig(buf, sizeof(buf));
     MaxDetail_SaveConfig(buf, sizeof(buf));
     f = fopen(g_iniPath, "w");
@@ -147,6 +152,9 @@ static void readConfig(const char* dir) {
     BodyFeel_ReadConfig(buf);
     CameraHeight_ReadConfig(buf);
     Sit_ReadConfig(buf);
+    Radial_ReadConfig(buf);
+    Emote_ReadConfig(buf);
+    Radio_ReadConfig(buf);
     Upscale_ReadConfig(buf);
     MaxDetail_ReadConfig(buf);
     // No ini yet: write one holding the defaults just loaded. Without the multiplayer mod there is
@@ -180,6 +188,7 @@ static void resetAllDefaults() {
     BodyFeel_ResetDefaults();
     CameraHeight_ResetDefaults();
     Sit_ResetDefaults();
+    Radial_ResetDefaults();
     Upscale_ResetDefaults();
     MaxDetail_ResetDefaults();
     TwkLog("[tweaks] settings reset to defaults");
@@ -221,7 +230,7 @@ static void drawSection(const OmpMenuApi* api, void*) {
     static DrawFn const kFeet[]   = { FootPlace_DrawMenu, FootSteer_DrawMenu };
     static DrawFn const kCamera[] = { CameraHeight_DrawMenu };
     static DrawFn const kCloth[]  = { ClothMerge_DrawMenu, ClothSim_DrawMenu };
-    static DrawFn const kSit[]    = { Sit_DrawMenu };
+    static DrawFn const kSit[]    = { Sit_DrawMenu, Radial_DrawMenu };
     static DrawFn const kGfx[]    = { MaxDetail_DrawMenu };
     #define TWK_GROUP(title, arr) group(title, arr, (int)(sizeof(arr) / sizeof(arr[0])))
     TWK_GROUP("Pop control",    kPop);
@@ -324,6 +333,7 @@ static const char* const kTwkSitMaxLedge = "TwkSitMaxLedge";
 static const char* const kTwkSitReach    = "TwkSitReach";
 static const char* const kTwkSitLean     = "TwkSitLean";
 static const char* const kTwkHeadLook    = "TwkHeadLook";
+static const char* const kTwkRadial      = "TwkRadial";
 // "Style settings"
 static const char* const kTwkArmLoose   = "TwkBodyArmLoosePct";
 static const char* const kTwkArmHold    = "TwkBodyArmHoldPct";
@@ -429,6 +439,7 @@ static void pageValue(const char* key, int iv, float fv, void*) {
     else if (!strcmp(key, kTwkSitReach))    Sit_SetReachCm(fv);
     else if (!strcmp(key, kTwkSitLean))     Sit_SetLeanDeg(fv);
     else if (!strcmp(key, kTwkHeadLook))    Sit_SetHeadLook(iv != 0);
+    else if (!strcmp(key, kTwkRadial))      Radial_SetEnabled(iv != 0);
     else if (!strcmp(key, kTwkArmLoose))   BodyFeel_SetArmLoosePct(fv);
     else if (!strcmp(key, kTwkArmHold))    BodyFeel_SetArmHoldPct(fv);
     else if (!strcmp(key, kTwkArmDamp))    BodyFeel_SetArmDampPct(fv);
@@ -524,6 +535,7 @@ static int pageGet(const char* key, int* oi, float* of, void*) {
     else if (!strcmp(key, kTwkSitReach))    { *of = Sit_ReachCm();                      return 1; }
     else if (!strcmp(key, kTwkSitLean))     { *of = Sit_LeanDeg();                      return 1; }
     else if (!strcmp(key, kTwkHeadLook))    { *oi = Sit_HeadLook() ? 1 : 0;             return 1; }
+    else if (!strcmp(key, kTwkRadial))      { *oi = Radial_Enabled() ? 1 : 0;           return 1; }
     else if (!strcmp(key, kTwkArmLoose))   { *of = BodyFeel_ArmLoosePct();    return 1; }
     else if (!strcmp(key, kTwkArmHold))    { *of = BodyFeel_ArmHoldPct();     return 1; }
     else if (!strcmp(key, kTwkArmDamp))    { *of = BodyFeel_ArmDampPct();     return 1; }
@@ -809,6 +821,8 @@ static const OmpPageItem2 kTwkSitItems[] = {
       nullptr, nullptr, -25.0f, 25.0f, 1.0f },
     { OMP_ITEM_TOGGLE, kTwkHeadLook,    "Head follows the camera",
       "Off the board, the head turns to look where the camera looks -- as far as a neck goes, then it holds, then it comes back" },
+    { OMP_ITEM_TOGGLE, kTwkRadial,      "Radial menu",
+      "Off the board, click the right stick for a wheel of things to do: point with the right stick, A to pick, B to go back. You can keep walking" },
 };
 static const OmpPageItem2 kTwkPopItems[] = {
     { OMP_ITEM_TOGGLE, kTwkPop,       "Pop control scheme",
@@ -938,7 +952,12 @@ void Tweaks_PumpFrame() {
     Upscale_PumpFrame();             // render-scale console variables + the FSR health line
     MaxDetail_PumpFrame();           // ...and the detail variables, held against the settings screen
     Sit_PumpFrame();                 // the sit/stand state machine
-    Twk_SetPoseHold(Sit_PoseHeld()); // a seated skeleton travels to other players as a held pose (SessionOpenMP)
+    Radial_PumpFrame();              // the radial menu (after sit: it borrows the prompt bar)
+    Emote_PumpFrame();               // gestures (after the radial menu, which is what asks for them)
+    Radio_PumpFrame();               // the radio prop (after the gestures: it is put where the carry pose wants it)
+    // A skeleton posed outside the animation graph travels to other players as a held pose
+    // (SessionOpenMP): a seat, or a gesture -- fingers and all, for as long as it lasts.
+    Twk_SetPoseHold(Sit_PoseHeld() || Emote_PoseHeld());
     ProxyBodyFeel_PumpFrame();       // the same riding body on remote players' proxies, with THEIR settings (SessionOpenMP bridge)
     if (g_dirty && (LONGLONG)GetTickCount64() - g_dirtyMs > 2000) {
         InterlockedExchange(&g_dirty, 0);
@@ -994,6 +1013,7 @@ public:
         CameraHeight_Install();
         Upscale_Install();
         Sit_Install();
+        Radial_Install();
         RunOut_Install();
         PopProbe_Install();
         // Registration is attempted once now (host usually loaded already; mods.txt order) and

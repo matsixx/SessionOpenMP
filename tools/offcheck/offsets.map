@@ -118,6 +118,7 @@ kCapsuleHalfHeight             UCapsuleComponent::CapsuleHalfHeight
 kCompPos                       USceneComponent::ComponentToWorld.Translation
 kMeshAnimTickOption            USkinnedMeshComponent::VisibilityBasedAnimTickOption
 kSkelMeshRefSkeleton           USkeletalMesh::RefSkeleton
+kSkelMeshMorphTargets          USkeletalMesh::MorphTargets
 kRefSkelFinalBonePose          FReferenceSkeleton::FinalRefBonePose
 kRefSkelFinalBoneInfo          FReferenceSkeleton::FinalRefBoneInfo
 kMeshBoneSpaceData             USkeletalMeshComponent::BoneSpaceTransforms
@@ -652,3 +653,82 @@ kBodyResponses                 FBodyInstance::CollisionResponses   # ResponseToC
 kBodyActorHandle               FBodyInstance::ActorHandle
 kBodyCollisionEnabled          FBodyInstance::CollisionEnabled
 kCompBodyInstance              UPrimitiveComponent::BodyInstance
+
+# -- src/tweaks/radial.cpp: the wheel's closet and board, built on a skate shop of our own --
+SHOP_BOARD_ROOT                ASkateShop::_customizationSkateboardRoot
+SHOP_SKATER_ROOT               ASkateShop::_customizationSkaterRoot
+SHOP_CAMERA                    ASkateShop::_skateShopCamera
+SHOP_CAM_APPAREL               ASkateShop::_skateShopSkaterApparelCamera
+SHOP_CAM_GEAR                  ASkateShop::_skateShopSkateboardGearCamera
+SHOP_CAM_DIY                   ASkateShop::_skateShopDIYCamera
+SHOP_CUSTOM_BP                 ASkateShop::_characterCustomization_Blueprint
+SHOP_MENU_BP                   ASkateShop::_menuPageContainerBlueprint
+SHOP_ROOT_PAGE                 ASkateShop::_skateShopRootPage
+SHOP_OBJ_ROOT                  ASkateShop::_objectPlacementRoot
+SHOP_COLLIDER                  ASkateShop::_collidingSkater
+SHOP_PROMPT                    ASkateShop::_interactionPrompt
+SHOP_MENU                      ASkateShop::_skateShopMenu
+SHOP_PROMPT_DUE                ASkateShop::_isDisplayPromptRequired
+SHOP_APPAREL_BASE              ASkateShop::_skaterApparelCameraBasePosition
+SHOP_BOARD_BASE                ASkateShop::_skateboardBasePosition
+SHOPMENU_GRID                  USkateShopMenuPageContainer::_gridWidget
+SHOPMENU_ACTOR                 USkateShopMenuPageContainer::_characterCustomization
+SHOPMENU_CATEGORY              USkateShopMenuPageContainer::_cachedCategoryID
+SHOPMENU_CAN_BUY               USkateShopMenuPageContainer::_isPurchaseAvailable
+GRID_COLUMNS                   UWidgetCustomizationGrid::_numberOfColumns
+GRID_ITEM_COUNT                UWidgetCustomizationGrid::_itemCount
+CUSTOM_MODE                    ACharacterCustomization::_currentMode
+CUSTOM_LIST_OK                 ACharacterCustomization::_cachedCharacterTypeFilter
+CUSTOM_LIST_KEY                ACharacterCustomization::_cachedCategoryFilter
+CUSTOM_ITEM_NONE               ACharacterCustomization::_customizationItemNone
+CUSTOM_BOARD                   ACharacterCustomization::_customizationSkateboard
+CHILD_ACTOR                    UChildActorComponent::ChildActor
+COMP_MOBILITY                  USceneComponent::Mobility
+MENU_ROOT_PAGE                 UMenuPageContainer::_rootPageDefinition
+MENU_FLAGS                     UMenuPageContainer::_pauseGame      # the first of four one-byte flags read as a run
+MENU_FREEZED                   UMenuPageContainer::_inputsFreezed
+PAGE_ITEMS                     UMenuPageDefinition::_menuItems
+ITEM_SUBPAGE                   FMenuPageItemDefinition::_subPageDefinition
+ITEM_SIZE                      -                                   # sizeof(FMenuPageItemDefinition): a stride
+
+# -- src/tweaks/sit_ui.cpp: SitUI_Alive, the weak-pointer check on every object kept across frames --
+UOBJ_INDEX                     UObjectBase::InternalIndex
+OAI_FLAGS                      FUObjectItem::Flags
+OAI_SERIAL                     FUObjectItem::SerialNumber
+OAI_SIZE                       -                                   # sizeof(FUObjectItem): a stride
+
+# -- the board's movement component (sit.cpp, emote.cpp). BM_MODE was 0x188 -- a delegate -- for as long as
+# it went unmapped; it is here so that cannot happen twice.
+BD_MOVECOMP                    ASkateboardEx::_skateboardMovement
+BM_MODE                        USkateboardExMovementComponent::_movementMode
+# the reference pose (emote.cpp): where the board lies flat, so which face of the deck is its top can be asked
+RS_FINAL_INFO                  FReferenceSkeleton::FinalRefBoneInfo
+RS_FINAL_POSE                  FReferenceSkeleton::FinalRefBonePose
+# the board that is DRAWN (emote.cpp MeasureBoard): separate static meshes, and what PlaceInHand does to the socket
+SKM_READ                       USkinnedMeshComponent::CurrentReadComponentTransforms
+BD_FLIPPER                     ASkateboardEx::_flipper
+BD_TRUCK_B                     ASkateboardEx::_truckBack
+BD_TRUCK_F                     ASkateboardEx::_truckFront
+BD_WHEEL_BL                    ASkateboardEx::_wheelBackLeft
+BM_FOOT_LOCSC                  USkateboardExMovementComponent::_onFootBoardAnimLocationScale
+BM_FOOT_RELOF                  USkateboardExMovementComponent::_onFootBoardAnimLocationRelOffset
+BM_FOOT_ROTSC                  USkateboardExMovementComponent::_onFootBoardAnimRotationScale
+AC_CLASS_OVR                   UAudioComponent::SoundClassOverride
+AC_VOLUME                      UAudioComponent::VolumeMultiplier
+SMA_COMP                       AStaticMeshActor::StaticMeshComponent
+STM_BOUNDS                     UStaticMesh::ExtendedBounds
+MSD_SONGS                      UMusicStationDefinition::_songList
+SONG_WAVE                      USongDefinition::_soundWave
+SND_DURATION                   USoundBase::Duration
+BM_HAND_REVRS                  USkateboardExMovementComponent::_flipperInHandReversed
+
+# -- the board tap's sound (emote.cpp) and what the ground is made of (sit.cpp's Sit_TraceSurface)
+BD_AUDIO_DATA                  ASkateboardEx::_audioData
+BD_ROOT_MESH                   ASkateboardEx::_root
+AD_GROUND_HIT                  USkateboardAudioDataAsset::_groundImpactSoundCue
+AD_BOARD_HIT                   USkateboardAudioDataAsset::_boardHitOffBoardSoundCue
+AD_HIT_MAXVOL                  USkateboardAudioDataAsset::_maximumVolumeBoardHitSound
+AD_HIT_PITCH0                  USkateboardAudioDataAsset::_minimumPitchBoardHitSound
+HIT_PHYSMAT                    FHitResult::PhysMaterial
+PM_SURFACE                     UPhysicalMaterial::SurfaceType
+QP_RETURN_PM                   FCollisionQueryParams::bReturnPhysicalMaterial

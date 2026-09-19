@@ -53,6 +53,82 @@ static uint8_t* scanRange(uint8_t* base, size_t len, const char* sig) {
     }
     return nullptr;
 }
+// A HOOKED FUNCTION IS INVISIBLE IN MEMORY. A signature is a function's first bytes, and hooking one (MinHook)
+// rewrites exactly those with a jump. SessionOpenMP hooks several engine calls this mod also calls -- its audio
+// funnel, from the moment a co-op session starts -- so a lookup made after that found nothing (field 2026-09-19:
+// "The radio is not available in this build", the radio's first use being in a session; solo it had worked).
+// So a signature missing in memory is looked for again in the exe AS IT IS ON DISK (mapped read-only, once),
+// where nobody has touched it. The address is the same function in memory; calling it goes through whoever
+// hooked it, exactly as the game's own calls do.
+static const uint8_t* diskImage() {
+    static const uint8_t* view = nullptr;
+    static bool tried = false;
+    if (tried) return view;
+    tried = true;
+    wchar_t path[MAX_PATH];
+    if (!GetModuleFileNameW(nullptr, path, MAX_PATH)) return nullptr;
+    HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return nullptr;
+    HANDLE m = CreateFileMappingW(f, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    CloseHandle(f);
+    if (!m) return nullptr;
+    view = (const uint8_t*)MapViewOfFile(m, FILE_MAP_READ, 0, 0, 0);
+    CloseHandle(m);                                        // the view keeps the mapping alive
+    return view;
+}
+// The nth match in the ON-DISK exe, as the address of the same bytes in memory; null if none.
+static uint8_t* scanDisk(const char* sig, int nth) {
+    const uint8_t* file = diskImage();
+    uint8_t* base = (uint8_t*)GetModuleHandleA(nullptr);
+    if (!file || !base) return nullptr;
+    const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)file;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return nullptr;
+    const IMAGE_NT_HEADERS* nt = (const IMAGE_NT_HEADERS*)(file + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return nullptr;
+    const IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
+    for (int i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+        if (!(sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+        uint8_t* at = (uint8_t*)file + sec[i].PointerToRawData;
+        const size_t raw = sec[i].SizeOfRawData < sec[i].Misc.VirtualSize ? sec[i].SizeOfRawData : sec[i].Misc.VirtualSize;
+        uint8_t* start = at; size_t left = raw;
+        while (uint8_t* hit = scanRange(at, left, sig)) {
+            if (nth-- == 0) return base + sec[i].VirtualAddress + (size_t)(hit - start);
+            const size_t used = (size_t)(hit - at) + 1;
+            at += used; left -= used;
+        }
+    }
+    return nullptr;
+}
+static void saidFromDisk(const char* sig, const uint8_t* at) {
+    char head[40]; snprintf(head, sizeof(head), "%.30s", sig);
+    TwkLog("[tweaks] signature '%s...' found in the exe on DISK at exe+%llx (hooked in memory -- by OpenMP's audio funnel, usually)",
+           head, (unsigned long long)(at - (const uint8_t*)GetModuleHandleA(nullptr)));
+}
+// The nth match, 0 = the first, in address order. ONLY for byte-identical twins that are both wanted
+// (a linear and an angular form of one setter): which is which is then an ORDER bet, and every signature
+// used this way must be listed in tools/offcheck/sigs.expect with how the order was verified.
+// THE DISK IS ASKED FIRST HERE: with one twin hooked in memory, a memory scan would find only the other and
+// hand it back as the first -- the wrong one, silently. On disk both are always there, in their true order.
+uint8_t* TwkScanExeNth(const char* sig, int nth) {
+    HMODULE hExe = GetModuleHandleA(nullptr);
+    if (!hExe || nth < 0) return nullptr;
+    if (uint8_t* d = scanDisk(sig, nth)) return d;
+    uint8_t* base = (uint8_t*)hExe;
+    IMAGE_DOS_HEADER* dos = (IMAGE_DOS_HEADER*)base;
+    IMAGE_NT_HEADERS* nt  = (IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+    IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
+    for (int i = 0; i < nt->FileHeader.NumberOfSections; i++) {
+        if (!(sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+        uint8_t* at = base + sec[i].VirtualAddress;
+        size_t left = sec[i].Misc.VirtualSize;
+        while (uint8_t* hit = scanRange(at, left, sig)) {
+            if (nth-- == 0) return hit;
+            const size_t used = (size_t)(hit - at) + 1;
+            at += used; left -= used;
+        }
+    }
+    return nullptr;                                        // no exe on disk to read (never seen): memory, as before
+}
 uint8_t* TwkScanExe(const char* sig) {
     HMODULE hExe = GetModuleHandleA(nullptr);
     if (!hExe) return nullptr;
@@ -64,7 +140,9 @@ uint8_t* TwkScanExe(const char* sig) {
         if (!(sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
         if (uint8_t* hit = scanRange(base + sec[i].VirtualAddress, sec[i].Misc.VirtualSize, sig)) return hit;
     }
-    return nullptr;
+    uint8_t* hit = scanDisk(sig, 0);
+    if (hit) saidFromDisk(sig, hit);
+    return hit;
 }
 
 // ---- the whose-skater seam (see the header) ----------------------------------------------------

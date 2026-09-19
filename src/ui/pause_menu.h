@@ -66,6 +66,9 @@ void PauseMenu_Publish(const MpUiState* s); // game thread -> what the injected 
 // Is the pause page this code last built still realised on screen? Read off the widget's own Slate
 // handle -- the game's IsPauseMenuDisplayed is always false with world pausing disabled.
 bool PauseMenu_IsShown();
+// The world changed: whatever page was last built belongs to a menu that no longer exists, and its
+// memory may already hold something else. Forget it rather than read it.
+void PauseMenu_ForgetPage();
 int  PauseMenu_TakeAction();                // game thread; returns OvAction and clears it
 int  PauseMenu_TakeJoinIndex();             // the browse index that OVA_JOIN_INDEX refers to
 // Who OVA_KICK / OVA_BAN refer to. An IDENTITY, never a row position: the roster rebuilds live, so an

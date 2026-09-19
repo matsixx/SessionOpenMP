@@ -38,6 +38,14 @@ struct Flags {
     // its EVALUATION is usable. If a peer skates live under this flag, the driver lane works in
     // replay and the pose lane can shrink to the sender side only. Both clients need it on.
     bool replayDriverTest = false;
+    // Both ends log the SAME quantity every frame around a pose -- the rendered skeleton's first
+    // bones, each one's yaw and how far it moved since the last frame -- from pose start to 2 s past
+    // the end. Turn it on in BOTH games, do one emote, and the frame where the two logs part company
+    // is the fault, named by bone and by how far it jumped. This is what found the end-of-pose twitch
+    // (the viewer moved 137 degrees on one bone in one frame; the sender moved 2) after two plausible
+    // fixes had missed it. A line per frame per proxy, so it stays off.
+    // NOTE: on ONE PC both clients share GetTickCount64, so the two logs align exactly.
+    bool poseTwitch       = false;
     // The level's-own-props handover, traced leg by leg: claimed locally, published, received,
     // driving. That state machine spans two machines, and three rounds went on guessing which leg
     // was missing before it was written -- the feature is unfinished, so it will be wanted again.
@@ -48,6 +56,11 @@ struct Flags {
     // weight IS the visible body physics). We never enable it on a proxy; whether the Blueprint does
     // so on a wire-driven skater decides if a peer's body-feel settings could be re-run locally.
     bool paProbe          = false;
+    // One-shot dump of the local skater's rig -- every skinned mesh with its bones and morph targets
+    // by name -- once the world settles, and again on a change of outfit while others are connected.
+    // Answered "can the head do lip sync" (no: the head is one bone, no morph targets); kept for
+    // the next question about what the rig carries.
+    bool rigDump          = false;
 };
 
 // Header-only: one shared instance across every translation unit that includes this.

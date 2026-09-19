@@ -54,6 +54,7 @@ namespace eosb {
     void SetLobbyCode(const char*); const char* LobbyCode(); const char* MakeLobbyCode(char*, int);
     bool LobbyJoinByCode(const char*);
     const char* PeerIdStr(int); bool LobbyIsHost(); bool LobbyKick(const char*);
+    bool LobbyPromote(const char*);
     const char* LobbyOwnerId();
     int InitState();
     int BrowseCount(); bool BrowseAt(int, LobbyInfo*); bool LobbyJoinAt(int);
@@ -292,5 +293,6 @@ bool LobbyOwnershipKnowable(){ return g_cur == BK_EOS; }
 // IS readiness for them. Only EOS has a state to poll.
 int InitState(){ return (g_cur == BK_EOS) ? eosb::InitState() : (g_cur == BK_NONE ? 0 : 2); }
 bool LobbyKick(const char* id){ return (g_cur == BK_EOS) && eosb::LobbyKick(id); }
+bool LobbyPromote(const char* id){ return (g_cur == BK_EOS) && eosb::LobbyPromote(id); }
 
 } // namespace omp

@@ -50,6 +50,8 @@
 #include "pop_probe.h"       // PopProbe_SkaterManualBits -- the skater's manual latch, for the probe
 #include "run_out.h"         // RunOut_BailCalls -- did the game's own catch verdict Bail inside SetCatchOrient
 #include "sit.h"             // Sit_OnInputKey -- the sit key rides this hook
+#include "radial.h"          // Radial_OnInputKey -- and so do the radial menu's keys
+#include "sit_ui.h"          // SitUI_Track / SitUI_Alive -- is the skater we remember still that skater
 #include <cmath>
 
 static bool CatchIsGoofy();   // defined with the catch-orient hook, used by the flick log above it
@@ -797,7 +799,23 @@ static bool AutoCatchActive()
 // a broken feature rather than a disabled probe.
 static void* g_lastSkater = nullptr;
 static void* g_localIh    = nullptr;    // the local skater's InputHandler, captured beside it
-void* CatchTweaks_Skater() { return g_lastSkater; }
+// A DEAD SKATER IS NEVER HANDED OUT. g_lastSkater is only ever SET, from a hook in the skater's own
+// code -- so once the level went, and for as long as no new skater ran that code, every module was given
+// the old one: a second or two on a new map, and FOR GOOD in the apartment, which has no skater at all.
+// Field report: the radial menu left open across a trip to the apartment never saw "a new skater", its
+// on-foot test read freed memory and passed, and its key hook went on swallowing A and B -- nothing in
+// the apartment could be selected. So the skater is remembered the way the engine's weak pointers
+// remember (see SitUI_Alive) and this answers null the moment it is no longer that object. This only
+// READS: it is polled from more than one thread.
+// It fails OPEN: a skater that could not be tracked at all is handed out as before -- answering null
+// for ever would switch every module off, silently.
+static SitObjRef g_lastSkaterRef = { nullptr, 0, 0, nullptr };
+static bool      g_skaterUntracked = false;
+void* CatchTweaks_Skater() {
+    void* sk = g_lastSkater;
+    if (!sk || g_skaterUntracked) return sk;
+    return (g_lastSkaterRef.obj == sk && SitUI_Alive(&g_lastSkaterRef)) ? sk : nullptr;
+}
 void* CatchTweaks_LocalInputHandler() { return g_localIh; }
 
 // Is AUTO catch the live setting? The over/under-rotation work below is manual-only: on auto the
@@ -1264,6 +1282,14 @@ static bool hkCanCatchOrient(void* self, void* b, void* c, void* d) {
     if (self) {
         void* s = twkP(self, IAH_SKATER);                                          // twkP is SEH-safe
         if (s && !Twk_IsProxy(s)) {
+            // A new skater can stand at the old one's very address, so "the same pointer" does not
+            // excuse this: the reference is taken again whenever it no longer proves itself.
+            if (s != g_lastSkaterRef.obj || !SitUI_Alive(&g_lastSkaterRef)) {
+                SitUI_Track(&g_lastSkaterRef, s);
+                const bool untracked = g_lastSkaterRef.obj != s;
+                if (untracked && !g_skaterUntracked) TwkLog("[catch] the skater could not be tracked in the object table -- handed out unverified, as before");
+                g_skaterUntracked = untracked;
+            }
             g_lastSkater = s;
             void* ih = twkP(self, IAH_INPUT_HANDLER);
             if (ih) g_localIh = ih;
@@ -2479,7 +2505,75 @@ typedef bool (*InputKeyFn)(void*, void*, int, float, bool);
 static InputKeyFn g_origInputKey  = nullptr;
 static void*      g_startInputKey = nullptr;
 
+// HOW FAR A KEY IS HELD, asked of the engine. An emote's throw wants the right trigger as an ANALOGUE value, and
+// it does not come through the hook below: what arrives here for a trigger is only its "pressed" past 0.12 (the
+// field: every pull "reached 1.00", because the press was all there was to go by). But every key's current
+// value sits in this same UPlayerInput's key-state map, whatever backend read the pad -- XInput, Steam, or the
+// game's own reader for a DualSense -- and UPlayerInput::GetKeyValue hands it over.
+//   float UPlayerInput::GetKeyValue(FKey) const     Epic 0x308b010 / Steam 0x304db80, unique in both
+//   FName::FName(const ANSICHAR*, EFindName)        the co-op module's FNameCtor, verified in both by symcheck
+// The FKey is 24 bytes by hidden pointer (FName + a TSharedPtr to its details); the map looks a key up by NAME
+// alone, so one with null details is a whole key, and the callee's destructor of it has nothing to release.
+// The UPlayerInput is remembered from the hook and WATCHED (it dies with its controller on a level change).
+static const char* SIG_PI_GET_KEY_VALUE =
+    "40 53 48 83 EC 30 0F 29 74 24 20 48 8B DA 4C 8B C2 48 89 7C 24 48 48 8D B9 60 02 00 00 48 8B CF 48 8D 54 24 40 E8 ?? ?? ?? ??";
+static const char* SIG_FNAME_CTOR =
+    "48 89 5C 24 08 57 48 83 EC 30 41 8B F8 4C 8B CA 48 8B D9 48 85 D2 ?? ?? 48 C7 C0 FF FF FF FF 90";
+typedef float (*PiKeyValueFn)(void* playerInput, void* fkeyByValue);
+typedef void  (*FNameCtorFn)(void* outName, const char* s, int findType);
+static PiKeyValueFn g_piKeyValue = nullptr;
+static FNameCtorFn  g_fnameCtor  = nullptr;
+static bool         g_piLooked   = false;
+static void*        g_playerInput = nullptr, *g_piRefused = nullptr;
+static SitObjRef    g_playerInputRef = { nullptr, 0, 0, nullptr };
+static uint64_t     g_fnRTAxis = 0;
+static void PiLook() {
+    if (g_piLooked) return;
+    g_piLooked = true;
+    g_piKeyValue = (PiKeyValueFn)TwkScanExe(SIG_PI_GET_KEY_VALUE);
+    g_fnameCtor  = (FNameCtorFn)TwkScanExe(SIG_FNAME_CTOR);
+    TwkLog("[catch] analogue keys: GetKeyValue %s, FName %s", g_piKeyValue ? "ok" : "MISSING", g_fnameCtor ? "ok" : "MISSING");
+}
+// An FName from a string. add = intern it if it is not there yet (an asset's path: ONE name per call site, never
+// a player's text); else only found. false = not to be had.
+bool CatchTweaks_MakeName(const char* s, bool add, unsigned long long* out) {
+    PiLook();
+    if (!g_fnameCtor || !s || !out) return false;
+    uint64_t nm = 0;
+    __try { g_fnameCtor(&nm, s, add ? 1 : 0); } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    *out = nm;
+    return nm != 0;
+}
+bool CatchTweaks_RightTrigger(float* out) {
+    if (out) *out = 0.0f;
+    PiLook();
+    if (!g_piKeyValue || !g_fnameCtor || !g_playerInput || !SitUI_Alive(&g_playerInputRef)) return false;
+    __try {
+        if (!g_fnRTAxis) {
+            uint64_t nm = 0;
+            g_fnameCtor(&nm, "Gamepad_RightTriggerAxis", 0 /* FNAME_Find: it is never ADDED from here */);
+            if (!nm) return false;
+            g_fnRTAxis = nm;
+        }
+        uint64_t fkey[3] = { g_fnRTAxis, 0, 0 };
+        const float v = g_piKeyValue(g_playerInput, fkey);
+        if (!(v >= -0.01f && v <= 1.5f)) return false;
+        if (out) *out = v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { g_piKeyValue = nullptr; return false; }
+}
 static bool hkInputKey(void* self, void* key, int ev, float amt, bool pad) {
+    if (self != g_playerInput && self != g_piRefused) {       // a new one (a level change): watched, or -- once -- refused
+        g_playerInput = self; SitUI_Track(&g_playerInputRef, self);
+        if (!g_playerInputRef.obj) { g_piRefused = self; g_playerInput = nullptr; }
+    }
+    {   // The radial menu is asked first: while it is open A and B are its own, not the seat's or the
+        // game's, and the camera's stick reaches the game as zero.
+        float a2 = amt;
+        const int r = Radial_OnInputKey(key, ev, &a2);
+        if (r == 1) return true;
+        if (r == 2) return g_origInputKey(self, key, ev, a2, pad);
+    }
     // The sit key is decided first: a face button, never a stick, and it only claims a press while
     // the skater is off the board (sit.cpp). Swallowed press and release so no bound action fires.
     if (Sit_OnInputKey(key, ev)) return true;

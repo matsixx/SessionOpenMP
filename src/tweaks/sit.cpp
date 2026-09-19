@@ -51,9 +51,11 @@
 #include "catch_tweaks.h"   // CatchTweaks_Skater
 #include "foot_place.h"     // FootPlace_AnimInstance
 #include "sit_ui.h"         // the on-screen prompt, built from the game's own widgets
+#include "radial.h"         // Radial_Open: the radial menu borrows the prompt bar
 #include "grind_pop.h"      // GrindPop_FNameToString
 #include "scoop_speed.h"    // ScoopSpeed_StickRaw: the right stick, for the look
 #include "camera_height.h"  // CameraHeight_ViewForward: where the camera looks, for the head that follows it
+#include "emote.h"          // Emote_OnFlip / Emote_Watchdog: gestures ride this module's pose seam
 #include <psapi.h>          // the SessionOpenMP bridge is found by export name
 #include "MinHook.h"
 
@@ -123,8 +125,15 @@ enum {
     CH_MOVE       = 0x288,   // ACharacter::CharacterMovement
     CH_CAPSULE    = 0x290,   // ACharacter::CapsuleComponent
     BD_MOVECOMP   = 0x298,   // ASkateboardEx::_skateboardMovement, whose PlaceInHand does the carry
-    BM_MODE       = 0x188,   // ...its movement mode byte, read only: 9 is "in hand". WRITING it is a
-                             // trap -- see the note on EnableRagDoll below.
+    BM_MODE       = 0x534,   // ...its _movementMode byte (ESkateboardMovementMode), read only: 5 is ON FOOT,
+                             // "in hand" -- StartNewPostPhysics' jump table sends 5, and only 5, to
+                             // PostPhysOnFoot = PlaceInHand; the field said the same (1 riding -> 5 stepping
+                             // off). NOT 9: that number came with the wrong offset below and was never true.
+                             // WRITING it is a trap -- see the note on EnableRagDoll below.
+                             // (Was 0x188 until 3.19.380: that is a delegate, it read 128 for ever, and
+                             // nothing noticed because this module only ever LOGS it. It was unmapped in
+                             // offcheck, which is the whole reason it survived. Mapped now.)
+    BM_ON_FOOT    = 5,       // ESkateboardMovementMode: on foot. A value, not an offset (offcheck: '-')
     BD_IFACE      = 0x280,   // the board's interface sub-object: what EnableRagDoll is called on
     SC_C2W        = 0x1c0,   // USceneComponent::ComponentToWorld (FTransform: quat, +0x10 pos, +0x20 scale)
     CAP_HALF      = 0x468,   // UCapsuleComponent::CapsuleHalfHeight
@@ -152,6 +161,14 @@ enum {
     SC_MOBILITY   = 0x14f,   // 0 static, 1 stationary, 2 movable -- a teleport does nothing unless movable
     ACT_HIDDEN    = 0x58,    // AActor::bHidden
     HIT_SIZE      = 136, HIT_IMPACT = 0x18, HIT_IMPACT_N = 0x30,
+    HIT_PHYSMAT   = 0x60,    // FHitResult::PhysMaterial (a weak pointer: object index, then serial)
+    PM_SURFACE    = 0x60,    // UPhysicalMaterial::SurfaceType (EPhysicalSurface, 1 B)
+    QP_RETURN_PM  = 0x13,    // FCollisionQueryParams::bReturnPhysicalMaterial -- off by default, and then PhysMaterial is empty
+    BD_ROOT_MESH  = 0x290,   // ASkateboardEx::_root (UStaticMeshComponent*): the actor's root -- NOT one of the bodies a loose board is made of
+    BD_FLIPPER    = 0x4e8,   // ASkateboardEx::_flipper: the DECK of a loose board. With the five below, the SEVEN bodies
+    BD_TRUCK_B    = 0x4f0,   //   ..._truckBack        ASkateboardEx::SetPhysicsLinearVelocity (0xf9bfa0) drives -- its part
+    BD_TRUCK_F    = 0x500,   //   ..._truckFront       getters read out of the interface vtable at board+0x288, 2026-09-19.
+    BD_WHEEL_BL   = 0x510,   //   ..._wheelBackLeft, then BackRight, FrontLeft, FrontRight, 8 apart
     QP_SIZE       = 112,
 };
 enum { MAX_BONES = 200 };
@@ -244,6 +261,17 @@ static SetSimFn   g_setSim   = nullptr;
 static BoardSimFn g_boardSim = nullptr;
 static RagDollFn  g_ragOn  = nullptr;
 static RagDollFn  g_ragOff = nullptr;
+// void UPrimitiveComponent::SetPhysicsAngularVelocityInRadians / SetPhysicsLinearVelocity(FVector (by
+// pointer), bool bAddToCurrent, FName bone). BYTE-IDENTICAL TWINS, 0x50 apart, the angular one FIRST in
+// both builds (Epic 0x2ed85a0 / 0x2ed85f0, Steam 0x2e9b080 / 0x2e9b0d0; verified against the Epic PDB
+// 2026-09-18): they differ only in the FBodyInstance call they forward to. Both are wanted, so they are
+// taken by ORDER -- listed in tools/offcheck/sigs.expect, to be re-verified by hand after any update.
+// Flipped, a throw would spin madly and go nowhere: wrong, visibly, and harmless (same arguments).
+static const char* SIG_SET_PHYS_VELOCITY =
+    "48 89 5C 24 08 57 48 83 EC 20 48 8B 01 41 0F B6 D8 48 8B FA 41 B0 01 49 8B D1 FF 90 ?? ?? ?? ?? 48 85 C0 "
+    "?? ?? 41 B1 01 44 0F B6 C3 48 8B D7 48 8B C8 E8 ?? ?? ?? ?? 48 8B 5C 24 30 48 83 C4 20 5F C3";
+typedef void (*SetVelocityFn)(void* prim, const float* vec3, bool addToCurrent, uint64_t boneName);
+static SetVelocityFn g_setAngVel = nullptr, g_setLinVel = nullptr;
 typedef void (*PlaceInHandFn)(void* moveComp, void* a, void* b, void* c);
 static PlaceInHandFn g_origPlaceInHand = nullptr;
 static void*         g_placeAt = nullptr;
@@ -632,6 +660,37 @@ static bool Trace(void* world, V3 a, V3 b, V3* pt, V3* nrm) {
     if (!ok) return false;
     if (pt)  *pt  = *(const V3*)(hit + HIT_IMPACT);
     if (nrm) *nrm = *(const V3*)(hit + HIT_IMPACT_N);
+    return true;
+}
+
+// What is under a point, and what it is MADE of (EPhysicalSurface; 0 = the default surface): for a sound
+// that should be the one that ground makes. The skater and the board are not "the ground".
+bool Sit_TraceSurface(void* skater, const float a[3], const float b[3], float hitW[3], int* surface) {
+    if (surface) *surface = 0;
+    if (!g_trace || !g_getWorld || !skater) return false;
+    alignas(16) uint8_t hit[HIT_SIZE]; memset(hit, 0, sizeof(hit));
+    alignas(16) uint8_t qp[QP_SIZE];   memset(qp, 0, sizeof(qp));
+    qp[QP_RETURN_PM] = 1; qp[0x15] = 1;
+    *(int*)(qp + 0x48) = 0; *(int*)(qp + 0x4c) = 8;
+    int nIgn = 0;
+    const int me = twkI(skater, UOBJ_INDEX);
+    void* bd = twkP(skater, SK_BOARD);
+    const int bi = bd ? twkI(bd, UOBJ_INDEX) : -1;
+    if (me > 0) *(uint32_t*)(qp + 0x50 + 4 * nIgn++) = (uint32_t)me;
+    if (bi > 0) *(uint32_t*)(qp + 0x50 + 4 * nIgn++) = (uint32_t)bi;
+    *(int*)(qp + 0x68) = nIgn; *(int*)(qp + 0x6c) = 4;
+    uint8_t rp[32]; memset(rp, 2, sizeof(rp));
+    bool ok = false;
+    __try {
+        void* world = g_getWorld(skater);
+        if (!world) return false;
+        ok = g_trace(world, hit, a, b, g_channel, qp, rp);
+        if (!ok) return false;
+        if (hitW) memcpy(hitW, hit + HIT_IMPACT, 12);
+        const int idx = *(const int*)(hit + HIT_PHYSMAT), ser = *(const int*)(hit + HIT_PHYSMAT + 4);
+        void* pm = SitUI_ResolveWeak(idx, ser);
+        if (pm && surface) *surface = *(const uint8_t*)((const uint8_t*)pm + PM_SURFACE);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; return false; }
     return true;
 }
 
@@ -1357,6 +1416,9 @@ static void __fastcall hkFlip(void* mesh) {
             }
         }
     }
+    // Gestures ride the same seam (one DLL cannot hook an address twice), AFTER the seat's own pose so
+    // an emote sits on top of it. It guards itself: its own mesh, its own pump's heartbeat, the editors.
+    if (mesh) Emote_OnFlip(mesh);
     g_origFlip(mesh);
 }
 
@@ -1381,6 +1443,13 @@ static void __fastcall hkPlaceInHand(void* moveComp, void* a, void* b, void* c) 
 // is remembered and put back when you stand, so nothing about the board is left changed: no item to
 // pick up again, nothing that can roll away while the game thinks you are still carrying it.
 static void* g_board = nullptr, *g_boardComp = nullptr, *g_boardParent = nullptr;
+// A board that is out of the hand can stay out across a LEVEL CHANGE, and ReleaseBoard writes through
+// these pointers. So both are remembered the way the engine's weak pointers do (SitUI_Alive) and a
+// release whose board is gone forgets it without a touch. A thrown board lies about far longer than a
+// seat lasts, which is what made this matter.
+static SitObjRef g_boardRef = { nullptr, 0, 0, nullptr }, g_boardCompRef = { nullptr, 0, 0, nullptr };
+static bool  g_boardThrown = false;      // out because it was THROWN (emote.cpp), not because of a seat
+static volatile LONG g_swallowMount = 0; // the Y that fetched a thrown board: its release is not the game's either
 static uint64_t g_boardSocket = 0;
 static float g_boardRel[9];              // location, rotation and scale, as they were
 static V3    g_boardPut = { 0.0f, 0.0f, 0.0f };   // where we put it, to see whether it stayed
@@ -1390,7 +1459,14 @@ static float Rand01() { g_rand = g_rand * 1664525u + 1013904223u; return (float)
 static float RandRange(float a, float b) { return a + (b - a) * Rand01(); }
 
 static void RestBoard(void* skater, const V3& seatPoint, const V3& facing, bool ledge, float groundDz) {
-    g_boardResting = false; g_board = nullptr; g_boardComp = nullptr; g_boardMoveComp = nullptr;
+    // Already out -- thrown -- and still where it landed: the seat takes it over as it lies. Capturing it
+    // again here would record "no parent" as the thing to put it back on, and it could never be held again.
+    if (g_boardResting && g_boardThrown && SitUI_Alive(&g_boardRef) && SitUI_Alive(&g_boardCompRef)) {
+        g_boardThrown = false;
+        TwkLog("[sit] the board is already out (thrown): left where it lies, and picked up when you stand");
+        return;
+    }
+    g_boardResting = false; g_boardThrown = false; g_board = nullptr; g_boardComp = nullptr; g_boardMoveComp = nullptr;
     if (!g_boardRest || !g_detach || !g_teleport || !g_setSim || !skater) return;
     __try {
         void* board = twkP(skater, SK_BOARD);
@@ -1426,6 +1502,7 @@ static void RestBoard(void* skater, const V3& seatPoint, const V3& facing, bool 
         else                 g_setSim(comp, true);
         g_boardMoveComp = twkP(board, BD_MOVECOMP);
         g_board = board; g_boardComp = comp; g_boardResting = true;
+        SitUI_Track(&g_boardRef, board); SitUI_Track(&g_boardCompRef, comp);
         g_boardPut = at; g_boardWatch = 1;
         const float* w = (const float*)((const uint8_t*)comp + SC_C2W);
         char bn[64] = "?", cn[64] = "?";
@@ -1443,7 +1520,12 @@ static void RestBoard(void* skater, const V3& seatPoint, const V3& facing, bool 
     } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; g_boardResting = false; g_boardMoveComp = nullptr; }
 }
 static void ReleaseBoard() {
-    if (!g_boardResting || !g_boardComp) { g_boardResting = false; g_boardMoveComp = nullptr; return; }
+    if (!g_boardResting || !g_boardComp) { g_boardResting = false; g_boardThrown = false; g_boardMoveComp = nullptr; return; }
+    if (!SitUI_Alive(&g_boardRef) || !SitUI_Alive(&g_boardCompRef)) {
+        TwkLog("[sit] the board that was out is gone (its level went) -- forgotten, never touched");
+        g_boardResting = false; g_boardThrown = false; g_board = nullptr; g_boardComp = nullptr; g_boardMoveComp = nullptr;
+        return;
+    }
     __try {
         if (g_ragOff && g_board)        g_ragOff((uint8_t*)g_board + BD_IFACE);
         else if (g_boardSim && g_board)  g_boardSim(g_board, false, false);
@@ -1454,7 +1536,109 @@ static void ReleaseBoard() {
         const uint8_t keepRelative[4] = { 0, 0, 0, 0 };
         if (g_attach && g_boardParent) g_attach(g_boardComp, g_boardParent, keepRelative, g_boardSocket);
     } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; }
-    g_boardResting = false; g_board = nullptr; g_boardComp = nullptr; g_boardMoveComp = nullptr;
+    g_boardResting = false; g_boardThrown = false; g_board = nullptr; g_boardComp = nullptr; g_boardMoveComp = nullptr;
+}
+
+// ---- the board, THROWN (emote.cpp's Rage). The same letting-go as a seat's, from where it is in the hand
+// and with a velocity: detached, handed to the game's own rag-doll, PlaceInHand refused while it is out.
+// One owner for "the board is out of the hand" -- this module -- so a seat and a throw cannot both hold it.
+// A LOOSE BOARD IS SEVEN BODIES, NOT ONE: the deck, two trucks and four wheels, each simulating, held together
+// by constraints. Two field rounds of Rage "threw" it at 8-12 m/s and found it a metre away: the velocity was
+// given to the actor's ROOT, which is not one of the seven, and the seven stayed where they were let go of.
+// The game's own ASkateboardEx::SetPhysicsLinearVelocity gives all seven the same velocity; this does that
+// and the spin too, each part moving as a point of one turning body (v + w x r about the deck), so the
+// constraints have nothing to fight.
+static int BoardVelocity(const float vel[3], const float spinRad[3]) {
+    if (!g_board || !g_setLinVel || !SitUI_Alive(&g_boardRef)) return 0;
+    int done = 0;
+    __try {
+        static const int kParts[7] = { BD_FLIPPER, BD_TRUCK_B, BD_TRUCK_F, BD_WHEEL_BL, BD_WHEEL_BL + 8, BD_WHEEL_BL + 16, BD_WHEEL_BL + 24 };
+        void* deck = twkP(g_board, BD_FLIPPER);
+        if (!deck) return 0;
+        const float* dw = (const float*)((const uint8_t*)deck + SC_C2W);
+        const float cx = dw[4], cy = dw[5], cz = dw[6];
+        const float wx = spinRad ? spinRad[0] : 0.0f, wy = spinRad ? spinRad[1] : 0.0f, wz = spinRad ? spinRad[2] : 0.0f;
+        for (int i = 0; i < 7; i++) {
+            void* part = twkP(g_board, kParts[i]);
+            if (!part) continue;
+            const float* pw = (const float*)((const uint8_t*)part + SC_C2W);
+            const float rx = pw[4] - cx, ry = pw[5] - cy, rz = pw[6] - cz;
+            const float v[3] = { vel[0] + (wy * rz - wz * ry), vel[1] + (wz * rx - wx * rz), vel[2] + (wx * ry - wy * rx) };
+            g_setLinVel(part, v, false, 0);
+            if (g_setAngVel && spinRad) g_setAngVel(part, spinRad, false, 0);
+            done++;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; }
+    return done;
+}
+// ---- attach / detach, for a prop (radio.cpp): the calls the rested board uses. keepWorld = it stays where it
+// is and only gains a parent; socket = a bone's FName (0 = none). GAME THREAD.
+bool Sit_AttachKeepWorld(void* comp, void* parent, uint64_t socket) {
+    if (!g_attach || !comp || !parent) return false;
+    const uint8_t keepWorld[4] = { 1, 1, 1, 0 };
+    __try { return g_attach(comp, parent, keepWorld, socket); } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; return false; }
+}
+void Sit_DetachKeepWorld(void* comp) {
+    if (!g_detach || !comp) return;
+    const uint8_t keepWorld[4] = { 1, 1, 1, 0 };
+    __try { g_detach(comp, keepWorld); } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; }
+}
+bool Sit_BoardInHand(void* skater) {
+    if (!skater || g_boardResting) return false;
+    void* bd = twkP(skater, SK_BOARD);
+    void* mv = bd ? twkP(bd, BD_MOVECOMP) : nullptr;
+    return mv && twkB(mv, BM_MODE) == BM_ON_FOOT;
+}
+bool Sit_BoardOut() { return g_boardResting && g_boardThrown; }
+// WHERE THE DECK IS -- not the actor's root: that is not one of the seven bodies a loose board is made of, and it
+// stays where the board was let go of (the field: thrown at 15 m/s, flew, and "1 m away" by the log a second on).
+bool Sit_BoardWhere(float outW[3]) {
+    if (!g_boardResting || !g_boardComp || !SitUI_Alive(&g_boardCompRef) || !SitUI_Alive(&g_boardRef)) return false;
+    __try {
+        void* deck = g_board ? twkP(g_board, BD_FLIPPER) : nullptr;
+        const float* w = (const float*)((const uint8_t*)(deck ? deck : g_boardComp) + SC_C2W);
+        outW[0] = w[4]; outW[1] = w[5]; outW[2] = w[6]; return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+void Sit_BoardKick(const float vel[3], const float spinRad[3]) { if (Sit_BoardOut()) BoardVelocity(vel, spinRad); }
+void Sit_BoardBack(const char* why) {
+    if (!Sit_BoardOut()) return;               // not out, or a SEAT has it: standing up is what returns that one
+    ReleaseBoard();
+    TwkLog("[sit] the thrown board is back in hand (%s)", why ? why : "-");
+}
+static bool LetGoOfBoard(void* skater) {
+    __try {
+        void* board = twkP(skater, SK_BOARD);
+        void* comp = board ? twkP(board, ACT_ROOT) : nullptr;
+        if (!board || !comp) return false;
+        SitUI_Track(&g_boardRef, board); SitUI_Track(&g_boardCompRef, comp);
+        if (!g_boardRef.obj || !g_boardCompRef.obj) return false;          // a board that cannot be watched is not let go of
+        g_boardParent = twkP(comp, SC_ATTACH_PARENT);
+        g_boardSocket = *(const uint64_t*)((const uint8_t*)comp + SC_ATTACH_SOCKET);
+        memcpy(g_boardRel + 0, (const uint8_t*)comp + SC_REL_LOC,   12);
+        memcpy(g_boardRel + 3, (const uint8_t*)comp + SC_REL_ROT,   12);
+        memcpy(g_boardRel + 6, (const uint8_t*)comp + SC_REL_SCALE, 12);
+        const uint8_t keepWorld[4] = { 1, 1, 1, 0 };
+        g_detach(comp, keepWorld);                                          // from where it is: in the throwing hand
+        *(unsigned char*)((uint8_t*)comp + SC_MOBILITY) = 2;
+        if (g_ragOn)         g_ragOn((uint8_t*)board + BD_IFACE);
+        else if (g_boardSim) g_boardSim(board, true, false);
+        else                 g_setSim(comp, true);
+        g_boardMoveComp = twkP(board, BD_MOVECOMP);
+        g_board = board; g_boardComp = comp; g_boardResting = true; g_boardThrown = true; g_boardWatch = 0;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; g_boardResting = false; g_boardThrown = false; g_boardMoveComp = nullptr; return false; }
+}
+bool Sit_BoardThrow(void* skater, const float vel[3], const float spinRad[3]) {
+    if (!g_detach || !g_attach || !skater || g_boardResting || g_sitting) return false;
+    if (!g_ragOn && !g_boardSim && !g_setSim) return false;
+    if (!Sit_BoardInHand(skater) || !LetGoOfBoard(skater)) return false;
+    const int parts = BoardVelocity(vel, spinRad);
+    TwkLog("[sit] board THROWN: %.0f cm/s (%.0f %.0f %.0f), spin %.1f rad/s -- given to %d of its 7 bodies%s", sqrtf(vel[0] * vel[0] + vel[1] * vel[1] + vel[2] * vel[2]),
+           vel[0], vel[1], vel[2], sqrtf(spinRad[0] * spinRad[0] + spinRad[1] * spinRad[1] + spinRad[2] * spinRad[2]), parts,
+           g_setLinVel ? "" : " (NO velocity call in this build: it just drops)");
+    return true;
 }
 
 // ------------------------------------------------------------------ sit / stand (game thread)
@@ -1503,6 +1687,7 @@ void Sit_WatchdogTick() {
 }
 void Sit_NoteReplayTick(void* replayManager) {
     Sit_WatchdogTick();                          // this tick survives the replay editor; the pump does not
+    Emote_Watchdog();                            // ...and an emote whose clock has stopped is let go of here
     if (!replayManager) return;
     LONG mode = 0;
     __try { mode = *(const unsigned char*)((const unsigned char*)replayManager + RM_MODE); }
@@ -2059,7 +2244,10 @@ void Sit_PumpFrame() {
         // ...and one of them may have just run us over. After the refresh (their speed is this frame's)
         // and before the look, which the stand-up makes moot anyway.
         if (g_sitting && g_alpha > 0.5f) { const Peer* hit = WhoHitUs(); if (hit) BailFromHit(hit); }
-        if (src == LOOK_STICK) {
+        // THE STICK IS NOT THE HEAD'S WHILE THE WHEEL IS UP (or an emote has it): this reads the pad RAW, so the
+        // zero the radial hands the game never reached it -- seated at the eyes, picking an emote swung the view.
+        if (src == LOOK_STICK && (Radial_Busy() || Emote_WantsStick())) { /* held where it is */ }
+        else if (src == LOOK_STICK) {
             float sx = 0.0f, sy = 0.0f;
             if (ScoopSpeed_StickRaw(true, &sx, &sy)) {
                 if (g_lookInvert & 1) sx = -sx;
@@ -2254,7 +2442,13 @@ void Sit_PumpFrame() {
             }
         }
         const bool showBar = g_on && g_ok && g_sitting && !InReplay() && !InPropEditor();
-        SitUI_PumpFrame(sk, showBar, entries, ne);
+        // A HELD EMOTE HAS THE BAR: it stays until B, and while it is up B is its own (the radial's key hook sees to
+        // that) -- so "Change how you sit" would be a lie. Standing, this is the only bar there is.
+        SitPromptEntry em[2];
+        const int nem = (g_on && g_ok && !InReplay() && !InPropEditor()) ? Emote_Prompts(em, 2) : 0;
+        if (Radial_Open()) { /* the wheel owns the bar while it is up */ }
+        else if (nem > 0) SitUI_PumpFrame(sk, true, em, nem);
+        else SitUI_PumpFrame(sk, showBar, entries, ne);
         {   // Did the pump reach here at all? If the bar is stuck on screen and this line STOPS while an
             // editor is open, nothing is hiding it because nothing is running: Tweaks_PumpFrame rides
             // InputHandler::Tick, which an editor can stop.
@@ -2277,7 +2471,7 @@ void Sit_PumpFrame() {
                 static int last = -1;
                 const int now = twkB(mv, BM_MODE);
                 if (now != last) {
-                    TwkLog("[sit] board movement mode %d -> %d%s", last, now, now == 9 ? " (in hand: the game mutes its audio here)" : "");
+                    TwkLog("[sit] board movement mode %d -> %d%s", last, now, now == BM_ON_FOOT ? " (on foot: the board is in hand)" : "");
                     last = now;
                 }
             }
@@ -2329,6 +2523,12 @@ bool Sit_OnInputKey(const void* key, int ev) {
     const int kind = KeyKind(key);
     if (!kind) return false;
     if (InReplay() || InPropEditor()) return false;   // their exit button, not ours
+    // A seat nobody is servicing owns no keys. The pump rides the SKATER'S tick and this hook does not, so
+    // a seat held when the level went to one with no skater (the apartment) is never stood up, and would
+    // go on swallowing B, X, Y and the view key there. Only passed through, never stood up from here:
+    // standing writes to the skater, and that skater is gone. (Same rule, same reason: Radial_OnInputKey.)
+    if (g_sitting && g_pumpMs && (LONGLONG)GetTickCount64() - g_pumpMs > 2000) return false;
+    if (Radial_Busy() && !g_sitting) return false;    // the radial menu, or the store it opened, owns the buttons
     if (kind == 2) {                                                    // the view key: ours only while seated
         if (!g_sitting || !g_fpOn) return false;
         if (ev == 0) InterlockedExchange(&g_reqView, 1);
@@ -2345,6 +2545,15 @@ bool Sit_OnInputKey(const void* key, int ev) {
         // game's own mount request, and a sit must not start under the mount animation -- the same
         // stuck state from the other side -- so it holds the sit key off for the length of one.
         if (g_sitting) return true;
+        // A board that was THROWN stays where it landed until it is asked for: Y puts it back in the hand, and
+        // that press does nothing else -- the way the game's own Y does when getting on is blocked. The next
+        // Y gets on it as it always has. (The release, and any repeats, of that press are swallowed with it.)
+        if (kind == 5) {
+            if (ev == 0) {
+                if (Sit_BoardOut()) { Sit_BoardBack("the mount key"); g_swallowMount = 1; return true; }
+                g_swallowMount = 0;                                     // a fresh press with no board out is always the game's
+            } else if (g_swallowMount) { if (ev == 1) g_swallowMount = 0; return true; }
+        }
         if (kind == 5 && ev == 0 && OnFoot(CatchTweaks_Skater())) g_mountUntilMs = GetTickCount64() + 1200;
         return false;
     }
@@ -2536,6 +2745,8 @@ void Sit_Install() {
     g_boardSim = (BoardSimFn)TwkScanExe(SIG_BOARD_SIM);
     g_ragOn  = (RagDollFn)TwkScanExe(SIG_RAGDOLL_ON);
     g_ragOff = (RagDollFn)TwkScanExe(SIG_RAGDOLL_OFF);
+    g_setAngVel = (SetVelocityFn)TwkScanExeNth(SIG_SET_PHYS_VELOCITY, 0);     // the twins, by order: see the signature's note
+    g_setLinVel = (SetVelocityFn)TwkScanExeNth(SIG_SET_PHYS_VELOCITY, 1);
     if (!g_flipAt || !g_trace || !g_setMode || !g_getWorld) {
         TwkLog("[sit] %s%s%s%s-- sitting unavailable (game updated?)",
                g_flipAt ? "" : "FlipEditableSpaceBases sig NOT FOUND ", g_trace ? "" : "LineTraceSingleByChannel sig NOT FOUND ",

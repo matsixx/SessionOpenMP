@@ -103,6 +103,57 @@ target_link_libraries(omp_shmtest PRIVATE omp_transport omp_replication)
 add_executable(omp_udptest tools/udptest/udp_main.cpp)
 target_link_libraries(omp_udptest PRIVATE omp_transport omp_replication)
 
+# SessionTweaks' emotes are geometry nobody can see from the source: which way a palm faces, whether a fist
+# closes toward the palm, whether a dance leaves the feet where they were. Judged on a made-up skeleton with
+# the game's own bone names, no game behind it. emote.cpp is compiled INTO the test, its callers stubbed.
+if(MSVC)
+    add_executable(omp_emotetest tools/emotetest/emote_test.cpp)
+    target_include_directories(omp_emotetest PRIVATE src src/tweaks)
+endif()
+
+# What a lobby costs on the wire, from the REAL packer and the session's own send rules. A measurement, not a
+# gate: it prints the table (omp_wirecost).
+add_executable(omp_wirecost tools/wirecost/wire_cost.cpp)
+target_include_directories(omp_wirecost PRIVATE src)
+target_link_libraries(omp_wirecost PRIVATE omp_replication)
+
+# SessionTweaks' signature search finds a function somebody has HOOKED (OpenMP's audio funnel hooks engine calls
+# tweaks also calls): the real tweaks_common.cpp, one of this test's own functions hooked the way MinHook does.
+if(MSVC)
+    add_executable(omp_scantest tools/scantest/scan_test.cpp src/tweaks/tweaks_common.cpp)
+    target_include_directories(omp_scantest PRIVATE src/tweaks src)
+endif()
+
+# The radio's message (src/tweaks/radio_wire.h): it is a stranger's bytes, so what is believed and what is dropped is
+# checked here, with no game behind it.
+add_executable(omp_radiotest tools/radiotest/radio_test.cpp)
+target_include_directories(omp_radiotest PRIVATE src/tweaks src)
+target_link_libraries(omp_radiotest PRIVATE omp_replication)
+
+# The release FADE's arithmetic (src/game/pose_blend.h): letting go of a transported pose used to be a
+# one-frame step, which every watcher saw as a twitch at the end of an emote. The fade that replaced it
+# has two ways to reproduce that symptom -- discontinuity with the stamp, and the long way round the
+# quaternion hypersphere -- so both are gated here, with no game behind it.
+add_executable(omp_posetest tools/posetest/pose_test.cpp)
+target_include_directories(omp_posetest PRIVATE src)
+
+# Two EOS SDKs in one process: the game's own, and ours loaded beside it under another name (the mod no
+# longer overwrites the game's -- that broke Epic DLC). Links NO import library on purpose: both copies are
+# loaded by full path and bound by name, which is the whole point.  omp_eosdual <game's dll> <our dll>
+if(MSVC)
+    add_executable(omp_eosdual tools/eosdual/eos_dual.cpp)
+    target_include_directories(omp_eosdual PRIVATE src ${EOS_SDK}/Include)
+    # ...and the MECHANISM: the mod's own eos_sideload.cpp, linked the way main.dll is (the import library +
+    # /DELAYLOAD), making ordinary EOS_* calls with the game's SDK already in the process.  omp_eosbind <game's dll>
+    add_executable(omp_eosbind tools/eosdual/eos_bind.cpp src/transport/eos_sideload.cpp)
+    target_include_directories(omp_eosbind PRIVATE src ${EOS_SDK}/Include)
+    target_link_libraries(omp_eosbind PRIVATE ${EOS_SDK}/Lib/EOSSDK-Win64-Shipping.lib delayimp)
+    target_link_options(omp_eosbind PRIVATE "/DELAYLOAD:EOSSDK-Win64-Shipping.dll")
+    add_custom_command(TARGET omp_eosbind POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${EOS_SDK}/Bin/EOSSDK-Win64-Shipping.dll" "$<TARGET_FILE_DIR:omp_eosbind>/OMP_EOSSDK-Win64-Shipping.dll")
+endif()
+
 # The relay, end to end: this test LAUNCHES omp_relay and three real clients, so it depends on that
 # binary existing beside it.
 add_executable(omp_relaytest tools/relaytest/relay_test_main.cpp)
@@ -127,6 +178,7 @@ if(EXISTS "${UE4SS_LIB}")
     target_sources(omp_mod PRIVATE
         src/transport/transport.cpp
         src/transport/eos_transport.cpp
+        src/transport/eos_sideload.cpp       # OUR EOS SDK beside the game's: see the /DELAYLOAD below
         src/transport/shm_transport.cpp
         src/transport/udp_transport.cpp
         src/transport/relay_transport.cpp
@@ -157,9 +209,21 @@ if(EXISTS "${UE4SS_LIB}")
         src/session/replay_ghosts.cpp
         src/loader/lua_api.cpp
         src/game/voice_audio.cpp
-        src/voice/voice_capture.cpp)
+        src/voice/voice_capture.cpp
+        src/voice/radio_capture.cpp)      # a player's radio: ONE app's sound, captured and streamed
     target_include_directories(omp_mod PRIVATE "${EOS_SDK}/Include")
     target_link_libraries(omp_mod PRIVATE "${UE4SS_LIB}" "${EOS_SDK}/Lib/EOSSDK-Win64-Shipping.lib")
+    # THE GAME'S EOS SDK IS NEVER OVERWRITTEN (that broke Epic DLC). main.dll's EOS imports are DELAY-LOADED, and
+    # src/transport/eos_sideload.cpp binds them to our own copy, shipped under another name beside main.dll:
+    #     Mods/SessionOpenMP/dlls/OMP_EOSSDK-Win64-Shipping.dll
+    # So main.dll loads with NO EOS dll to be found by name, and never binds to the game's by accident. Only this
+    # target: the standalone tools (omp_ping ...) have no game beside them and link EOS the ordinary way.
+    target_compile_definitions(omp_mod PRIVATE OMP_EOS_SIDELOAD)
+    target_link_options(omp_mod PRIVATE "/DELAYLOAD:EOSSDK-Win64-Shipping.dll")
+    target_link_libraries(omp_mod PRIVATE delayimp)
+    add_custom_command(TARGET omp_mod POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${EOS_SDK}/Bin/EOSSDK-Win64-Shipping.dll" "$<TARGET_FILE_DIR:omp_mod>/OMP_EOSSDK-Win64-Shipping.dll")
 
     # ---- the in-game menu: ImGui on a hooked Present, MinHook for the hook itself.
     # Both are compiled straight INTO omp_mod rather than linked as libraries, so they inherit its /MD
@@ -203,6 +267,18 @@ if(EXISTS "${UE4SS_LIB}")
         target_include_directories(omp_mod PRIVATE "${opus_SOURCE_DIR}/include")
         target_link_libraries(omp_mod PRIVATE opus ole32)
         target_compile_definitions(omp_mod PRIVATE OMP_VOICE=1)   # session.cpp's voice half; the tools' library build has none
+        # The radio's app capture, tested for real: a copy of the test plays a tone, the other captures that
+        # process alone and measures it. /MD like opus. Makes a faint beep; needs Windows 11 (or 10 build 20348+).
+        add_executable(omp_radiocaptest tools/radiocaptest/radio_cap_test.cpp src/voice/radio_capture.cpp)
+        set_target_properties(omp_radiocaptest PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
+        target_include_directories(omp_radiocaptest PRIVATE src "${opus_SOURCE_DIR}/include")
+        target_link_libraries(omp_radiocaptest PRIVATE opus ole32)
+        # A MEASUREMENT, not a gate: streaming an app also plays it out of the streamer's own speakers.
+        # Can the source be silenced LOCALLY and still be captured? Answered with a tone, not guessed at.
+        add_executable(omp_radiosolo tools/radiosolo/radio_solo.cpp src/voice/radio_capture.cpp)
+        set_target_properties(omp_radiosolo PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
+        target_include_directories(omp_radiosolo PRIVATE src "${opus_SOURCE_DIR}/include")
+        target_link_libraries(omp_radiosolo PRIVATE opus ole32)
         set(MINHOOK_SRC "${minhook_SOURCE_DIR}")
     endif()
 
@@ -289,6 +365,9 @@ if(EXISTS "${UE4SS_LIB}")
             src/tweaks/upscale_fsr.cpp
             src/tweaks/sit.cpp
             src/tweaks/sit_ui.cpp
+            src/tweaks/radial.cpp
+            src/tweaks/emote.cpp
+            src/tweaks/radio.cpp
             ${MINHOOK_SRC}/src/buffer.c
             ${MINHOOK_SRC}/src/hook.c
             ${MINHOOK_SRC}/src/trampoline.c

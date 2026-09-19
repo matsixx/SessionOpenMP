@@ -16,3 +16,17 @@ SIG_ADDFORCE  2   # FBodyInstance::AddForce and ::AddTorqueInRadians have byte-i
                   # -- same shape, same four arguments, 0x4f bytes each. Verified against the Epic
                   # PDB 2026-09-01: first match 0x2e47b50 = AddForce, second 0x2e47e40 =
                   # AddTorqueInRadians. body_feel.cpp takes the first, which is the right one.
+
+SIG_WIDGET_SET_OPACITY  2   # UWidget::SetRenderOpacity and UE::MovieScene::SetRenderOpacity(UObject*,
+                  # float) are the same bytes for their whole 0x79 length and have the same effect
+                  # and the same (object, float) arguments -- the free function is the member inlined.
+                  # Verified against the Epic PDB 2026-09-18: 0x27bb390 = the MovieScene one, 0x27bb410 =
+                  # the member. ORDER DOES NOT MATTER HERE: either match is the right call.
+
+SIG_SET_PHYS_VELOCITY  2   # UPrimitiveComponent::SetPhysicsAngularVelocityInRadians and ::SetPhysicsLinearVelocity
+                  # are the same bytes for their whole 0x42 length (they differ only in the FBodyInstance call
+                  # they forward to, which is a wildcarded rel32). BOTH ARE WANTED: sit.cpp takes the first as
+                  # the angular one and the second (TwkScanExeNth 1) as the linear one. Verified against the
+                  # Epic PDB 2026-09-18: 0x2ed85a0 = angular, 0x2ed85f0 = linear; Steam 0x2e9b080 / 0x2e9b0d0,
+                  # the same order and the same 0x50 apart. ORDER MATTERS: flipped, a thrown board spins madly
+                  # and goes nowhere (same arguments, so nothing crashes). Re-verify after any update.

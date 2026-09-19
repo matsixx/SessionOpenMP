@@ -31,6 +31,7 @@
 #include "tweaks_mod.h"
 #include "pop_probe.h"       // the injection experiment's two write points in this module's tick hook
 #include "catch_tweaks.h"    // CatchTweaks_LocalInputHandler: whose tick is this
+#include "radial.h"          // Radial_TickSticks: the same tick buffer, for the radial menu
 #include <cmath>
 #include "MinHook.h"
 
@@ -431,6 +432,8 @@ static void* hkInputTick(void* self, double a, double b, void* d) {
         // Mode 4: `d` is the tick's stick buffer (see PopProbe_TickSticks) -- rewritten in place,
         // within this call only, before the game derives anything from it.
         PopProbe_TickSticks((float*)d);
+        // The radial menu: the right stick points at an entry, and is zero to the game while it is open.
+        Radial_TickSticks((float*)d);
     }
     Tweaks_PumpFrame();                           // menu-registration retry etc. (shell)
     void* ret = nullptr;

@@ -11,6 +11,7 @@
 // loads into. See LICENSE-EXCEPTION.txt.
 #include <cmath>
 #include "pose.h"
+#include "pose_blend.h"
 #include "game_syms.h"
 #include "proxy.h"
 #include "../session/session.h"
@@ -32,7 +33,13 @@ Stats   GetStats() { return g_st; }
 
 // The transported pose, keyed by the MESH that has to wear it -- the same shape as the anim post-pass
 // registry, and for the same reason: the hook sees a component, not a proxy.
-static const int kSlots = 8;
+// ONE PER PEER THE SESSION CAN HOLD (session.cpp kMaxPeers = 16; the anim post-pass registry beside this one,
+// proxy.cpp kAnimSlots, is 16 too). IT WAS 8, and a slot is never given back while its proxy lives -- so in a
+// lobby of ten, the ninth proxy on every machine had NO transported pose at all: not their sit, not their bail's
+// rag-doll, not an emote. Worse for a pose that MOVES (an emote, a carried prop): its packets carry the skeleton
+// INSTEAD of the drivers, so that viewer got neither -- a frozen, broken-looking skater (field, 2026-09-19:
+// peers=9). Every refusal is COUNTED now (Stats::noSlot): it was silent.
+static const int kSlots = 16;
 struct Slot {
     void*    mesh = nullptr;
     uint8_t  n = 0;                       // TRANSPORTED pose (0 = none in hand)
@@ -73,6 +80,21 @@ struct Slot {
     bool     holdPing = false;
     uint32_t holdTtlMs = 0;
     uint64_t holdUntilMs = 0;
+    // ...and their RELEASE, which must not be obeyed on arrival: see Note.
+    bool     holdRelease = false;
+    uint32_t holdReleaseMs = 0;
+    // THE RELEASE FADE. The stamp is a hard overwrite, so letting go of a pose was a step function:
+    // the transported skeleton one frame, the graph's own evaluation at full strength the next. The
+    // graph has been running underneath the whole time and is nowhere near the posed skeleton, so
+    // that step is a visible snap -- measured 2026-09-19 at 48-137 degrees on a single bone in a
+    // single frame, against 2 degrees on the sender at the same instant. So the last stamped pose is
+    // kept and faded out over `releaseFadeMs` instead. Local bone order (it is copied back out of the
+    // component-space buffer after stamping), so the fade needs no bone map of its own.
+    uint8_t  outN = 0;
+    float    outRot[kPoseMaxBones][4];
+    float    outPos[kPoseMaxBones][3];
+    bool     outArm = false;      // Note saw the release; Apply starts the clock in ITS own timebase
+    uint64_t outStartMs = 0;
 };
 static Slot g_slots[kSlots];
 // A slot is claimed by ADDRESS, and UE hands addresses back: a proxy dies with its world, a new
@@ -112,6 +134,92 @@ static uint8_t* compSpace(void*, bool, int*) { return nullptr; }
 // SENDER
 // =====================================================================================================
 // The copy itself, no gate: both public entry points funnel here.
+// =====================================================================================================
+// A MEASUREMENT (2026-09-19): THE END-OF-POSE TWITCH.
+// Two fixes -- the release waiting for the playback, and drivers interleaved into a moving pose -- were both real
+// bugs and NEITHER stopped it, and the receiver's own counters say the pose lane never drops, goes stale or
+// re-stamps during a pose. So both ends now log THE SAME QUANTITY, every frame, from the moment a pose starts
+// until 2 s after it ends: the rendered skeleton's first few bones (yaw of each, and how far each MOVED since the
+// last frame). The sender's line is what the player sees; the receiver's is what the watcher sees. Lay the two
+// side by side and the frame where they part company IS the twitch -- and which bone and how far.
+//   [posedbg] me  t=... pose=1 yaw0=.. yaw1=.. yaw2=.. d0=.. d1=.. d2=.. move=..
+//   [posedbg] rx0 t=... pose=1 stamped=1 ...
+// Off by default: `omp::debug::Get().poseTwitch` (debug.h) turns it on, in BOTH games.
+namespace {
+struct DbgPrev { void* mesh = nullptr; float yaw[6] = {}; float pos[6][3] = {}; bool have = false; uint64_t lastMs = 0; uint64_t untilMs = 0; };
+DbgPrev g_dbgMine, g_dbgPeer[kSlots];
+// ---- THE RELEASE FADE (see Slot::outN).
+// Keep what was last STAMPED, in this mesh's own bone order, straight out of the component-space
+// buffer we just wrote: whatever mapping produced it is already baked in, so the fade never needs a
+// bone map and can never disagree with the stamp about which bone is which.
+void keepStamped(Slot* sl, const uint8_t* cs, int num) {
+    const int n = num < kPoseMaxBones ? num : kPoseMaxBones;
+    __try {
+        for (int b = 0; b < n; b++) {
+            const uint8_t* t = cs + (size_t)b * off::kTransformStride;
+            memcpy(sl->outRot[b], t + off::kTransformRotOff, 16);
+            memcpy(sl->outPos[b], t + off::kTransformPosOff, 12);
+        }
+        sl->outN = (uint8_t)n;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { sl->outN = 0; }
+}
+// Blend the kept pose back OVER the graph's own evaluation at weight w (1 = the pose, 0 = the graph).
+// Per-bone on component-space transforms -- exactly what the hard stamp does at w = 1, so w sliding
+// 1 -> 0 is continuous with it by construction.
+void blendKept(Slot* sl, uint8_t* cs, int num, float w) {
+    const int n = (num < (int)sl->outN ? num : (int)sl->outN);
+    __try {
+        for (int b = 0; b < n; b++) {
+            uint8_t* t = cs + (size_t)b * off::kTransformStride;
+            float* q = (float*)(t + off::kTransformRotOff);
+            float* p = (float*)(t + off::kTransformPosOff);
+            blendQuat(q, sl->outRot[b], w);         // shortest-arc; gated in omp_posetest
+            blendVec3(p, sl->outPos[b], w);
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { sl->outN = 0; }
+}
+
+float dbgYaw(const float* q) {
+    return atan2f(2.0f * (q[3] * q[2] + q[0] * q[1]), 1.0f - 2.0f * (q[1] * q[1] + q[2] * q[2])) * 57.2957795f;
+}
+// One line for one skeleton, from a component-space buffer. `tag` names the end; `flags` is whatever that end
+// wants to say about this frame (a pose live, a stamp written).
+void dbgLine(DbgPrev& p, const char* tag, void* mesh, const uint8_t* cs, int num, bool live, const char* flags, uint64_t nowMs) {
+    if (!debug::Get().poseTwitch || !cs || num <= 0 || !g_logf) return;
+    if (live) p.untilMs = nowMs + 2000;                       // ...and for two seconds after it ends
+    if (!live && (!p.untilMs || nowMs > p.untilMs)) { p.have = false; return; }
+    if (p.mesh != mesh) { p.mesh = mesh; p.have = false; }
+    if (nowMs == p.lastMs) return;                            // the seam can fire twice in a frame
+    const int n = num < 6 ? num : 6;
+    float yaw[6] = {}, mv[6] = {}; float worst = 0.0f; int worstB = 0;
+    __try {
+        for (int b = 0; b < n; b++) {
+            const float* q = (const float*)(cs + (size_t)b * off::kTransformStride + off::kTransformRotOff);
+            const float* v = (const float*)(cs + (size_t)b * off::kTransformStride + off::kTransformPosOff);
+            yaw[b] = dbgYaw(q);
+            if (p.have) {
+                float dy = yaw[b] - p.yaw[b];
+                while (dy > 180.0f) dy -= 360.0f;
+                while (dy < -180.0f) dy += 360.0f;
+                mv[b] = dy;
+                const float dp = sqrtf((v[0]-p.pos[b][0])*(v[0]-p.pos[b][0]) + (v[1]-p.pos[b][1])*(v[1]-p.pos[b][1]) + (v[2]-p.pos[b][2])*(v[2]-p.pos[b][2]));
+                if (fabsf(dy) > fabsf(worst)) { worst = dy; worstB = b; }
+                if (dp > fabsf(worst)) { worst = dp; worstB = b; }
+            }
+            p.yaw[b] = yaw[b];
+            for (int k = 0; k < 3; k++) p.pos[b][k] = v[k];
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    const bool had = p.have;
+    p.have = true; p.lastMs = nowMs;
+    if (!had) return;
+    char m[300];
+    snprintf(m, sizeof(m), "[posedbg] %s t=%llu %s yaw=%.1f/%.1f/%.1f d=%.2f/%.2f/%.2f worst=%.2f@%d",
+             tag, (unsigned long long)nowMs, flags, yaw[0], yaw[1], yaw[2], mv[0], mv[1], mv[2], worst, worstB);
+    g_logf(m);
+}
+} // namespace
+
 static bool captureInto(void* mesh, State& s) {
 #ifdef _WIN32
     int num = 0;
@@ -146,6 +254,7 @@ static bool captureInto(void* mesh, State& s) {
             memcpy(s.posePos[b], t + off::kTransformPosOff, 12);
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) { g_st.faults++; s.poseN = 0; return false; }
+    dbgLine(g_dbgMine, "me ", mesh, cs, num, g_localHold, g_localHold ? "pose=1" : "pose=0", GetTickCount64());
     s.poseN = (uint8_t)n;
     g_st.captured++; g_st.bones = (uint8_t)n;
     // The blob and the feet must be dropped: 700 B of bones + 273 B of drivers + feet + header
@@ -207,6 +316,7 @@ bool CaptureFromPawn(void* pawn, State& s) {
     return captureInto(mesh, s);
 }
 
+
 // =====================================================================================================
 // RECEIVER
 // =====================================================================================================
@@ -230,7 +340,7 @@ bool SetPeerSkeleton(void* mesh, const uint32_t* hashes, int n) {
         // the caller has already marked the peer fed. A slot is inert until a pose is written.
         if (!hashes || n <= 0) return false;                  // nothing to remember: do not claim
         for (auto& c : g_slots) if (!c.mesh) { sl = &c; break; }
-        if (!sl) return false;                                // all busy: the caller retries
+        if (!sl) { g_st.noSlot++; return false; }             // all busy: the caller retries
         claimSlot(sl, mesh);
     }
     if (!hashes || n <= 0) { sl->peerN = 0; sl->mapReady = false; sl->mapBuiltFor = nullptr; return true; }
@@ -255,9 +365,22 @@ void Note(void* mesh, const State& s, uint64_t nowMs) {
         // it moves, and the OMPS heartbeat says "keep what you have".
         Slot* sl = slotFor(mesh);
         if (sl) {
-            if (sl->holdPing) { sl->holdUntilMs = nowMs + sl->holdTtlMs; sl->holdPing = false; }
+            // THE RELEASE WAITS FOR THE PLAYBACK. Poses and drivers are applied from the INTERPOLATED stream,
+            // which runs a jitter buffer behind arrival; the hold packets are not in that stream and land at
+            // once. Obeyed on arrival, "I am done holding" dropped the pose while the frames still being played
+            // out were from the middle of the sender's blend-out -- the last 50-250 ms of it never shown, so the
+            // skeleton jumped to whatever the proxy's own graph had. Field 2026-09-19, every pose, sitting
+            // included: "right before their pose ends, their body turns/twitches"; invisible to the sender, who
+            // has no buffer. So a release is filed as "hold it this much longer" (session.cpp passes the
+            // stream's own delay) and the pose is let go when the playback has caught up with it.
+            if (sl->holdRelease) { sl->holdRelease = false; sl->holdPing = false; sl->holdUntilMs = sl->n ? nowMs + sl->holdReleaseMs : 0; }
+            else if (sl->holdPing) { sl->holdUntilMs = nowMs + sl->holdTtlMs; sl->holdPing = false; }
             if (sl->n && sl->holdUntilMs && nowMs < sl->holdUntilMs) { sl->freshMs = nowMs; return; }
             if (sl->n) g_st.wiped++;      // a completed pose thrown away by a pose-less frame
+            // Hand the skeleton back over `releaseFadeMs` rather than in one frame. Armed here and
+            // clocked in Apply: this runs on the network path, and only Apply's timebase is the one
+            // the fade is measured in.
+            if (sl->n && sl->outN) sl->outArm = true;
             sl->n = 0; sl->freshMs = 0;
         }
         return;
@@ -265,7 +388,7 @@ void Note(void* mesh, const State& s, uint64_t nowMs) {
     Slot* sl = slotFor(mesh);
     if (!sl) {
         for (auto& c : g_slots) if (!c.mesh) { sl = &c; break; }
-        if (!sl) return;
+        if (!sl) { g_st.noSlot++; return; }
         claimSlot(sl, mesh);
     }
     const int total = s.poseN < kPoseMaxBones ? s.poseN : kPoseMaxBones;
@@ -310,11 +433,11 @@ void NoteHold(void* mesh, bool hold, uint32_t ttlMs) {
     if (!sl) {
         if (!hold) return;
         for (auto& c : g_slots) if (!c.mesh) { sl = &c; break; }
-        if (!sl) return;
+        if (!sl) { g_st.noSlot++; return; }
         claimSlot(sl, mesh);
     }
-    if (hold) { sl->holdPing = true; sl->holdTtlMs = ttlMs; }
-    else      { sl->holdPing = false; sl->holdUntilMs = 0; }   // the next pose-less snapshot releases
+    if (hold) { sl->holdPing = true; sl->holdTtlMs = ttlMs; sl->holdRelease = false; }
+    else      { sl->holdRelease = true; sl->holdReleaseMs = ttlMs; }   // ...once the playback has caught up (Note)
 }
 
 // Our bone index -> the SENDER's, by NAME. Two players' merged skeletons agree on names and on
@@ -393,6 +516,11 @@ void OnFinalizeBones(void* mesh, uint64_t nowMs) {
     const bool haveFresh = sl->n && !(nowMs > sl->freshMs && nowMs - sl->freshMs > g_tun.freshMs);
     if (sl->n && !haveFresh) {
         g_st.stale++;
+        // A pose going stale hands the skeleton back exactly as abruptly as a release does -- same
+        // snap, different cause -- so it fades out too. Armed only on the way in: `outStartMs` is set
+        // once the fade begins and `outN` is cleared once it ends, so neither can re-arm it and hold
+        // the fade at full weight forever.
+        if (sl->outN && !sl->outStartMs) sl->outArm = true;
         // Field logs showed stale climbing into the thousands while observing a scrubbing peer;
         // believed benign (a PAUSED scrubber publishes no fresh pose), but believed is not known --
         // one throttled line makes the cause readable instead of inferred.
@@ -433,6 +561,9 @@ void OnFinalizeBones(void* mesh, uint64_t nowMs) {
                 }
                 g_st.applied++; g_st.mappedStamps++;
             } __except (EXCEPTION_EXECUTE_HANDLER) { g_st.faults++; }
+            keepStamped(sl, cs, num);       // ...so the release has something to fade out of
+            sl->outArm = false; sl->outStartMs = 0;
+            { char f[40]; snprintf(f, sizeof(f), "pose=1 stamped=1"); dbgLine(g_dbgPeer[(int)(sl - g_slots)], "rx ", mesh, cs, num, true, f, nowMs); }
             return;
         }
         // ---- BY INDEX. No fingerprint (a peer on an older build), or their names matched nothing.
@@ -450,8 +581,33 @@ void OnFinalizeBones(void* mesh, uint64_t nowMs) {
             }
             g_st.applied++;
         } __except (EXCEPTION_EXECUTE_HANDLER) { g_st.faults++; }
+        keepStamped(sl, cs, num);           // ...so the release has something to fade out of
+        sl->outArm = false; sl->outStartMs = 0;
+        dbgLine(g_dbgPeer[(int)(sl - g_slots)], "rx ", mesh, cs, num, true, "pose=1 stamped=1", nowMs);
         return;
     }
+    // NOT stamped this frame: the graph's own pose is what this proxy wears -- but if a pose was just
+    // released, it is faded out from underneath rather than dropped (see Slot::outN). The first fade
+    // frame is what was already on screen, so there is nothing to step over; by the last one the
+    // graph owns the skeleton outright.
+    bool faded = false;
+    if (sl->outN && g_tun.releaseFadeMs) {
+        if (sl->outArm) { sl->outArm = false; sl->outStartMs = nowMs; }
+        if (sl->outStartMs) {
+            const uint64_t age = nowMs > sl->outStartMs ? nowMs - sl->outStartMs : 0;
+            if (age >= g_tun.releaseFadeMs) { sl->outStartMs = 0; sl->outN = 0; }
+            else {
+                const float u = (float)age / (float)g_tun.releaseFadeMs;
+                blendKept(sl, cs, num, fadeWeight(u));
+                g_st.fadeFrames++;
+                faded = true;
+            }
+        }
+    }
+    // The frames after a release are exactly the ones the twitch was in, so they are logged too
+    // (for two seconds -- see dbgLine).
+    dbgLine(g_dbgPeer[(int)(sl - g_slots)], "rx ", mesh, cs, num, false,
+            sl->n ? "pose=1 stamped=0" : (faded ? "pose=0 fading=1" : "pose=0 stamped=0"), nowMs);
 
     if (!g_tun.holdInLocalReplay) return;
 

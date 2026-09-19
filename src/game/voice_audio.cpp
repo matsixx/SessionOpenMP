@@ -74,6 +74,11 @@ int Ring::Read(int16_t* out, int n) {
     return got;
 }
 void Ring::Clear() { tail = head; }
+void Ring::Skip(int n) {
+    const int have = Level();
+    if (n > have) n = have;
+    if (n > 0) tail = (tail + n) % kCap;
+}
 
 // ---- engine objects --------------------------------------------------------------------------------
 static void*  g_waveClass  = nullptr;
@@ -88,7 +93,7 @@ static bool   g_saidReady  = false, g_saidFail = false;
 static void (*g_logf)(const char*) = nullptr;
 
 // wave -> its Voice, for the audio thread. Written on the game thread before the component plays.
-enum { kMaxVoices = 16 };
+enum { kMaxVoices = 32 };          // 16 peers' voices + 16 peers' radio streams
 static void*  volatile g_mapWave[kMaxVoices];
 static Voice* volatile g_mapVoice[kMaxVoices];
 
@@ -115,11 +120,14 @@ static int32_t __fastcall GeneratePCM(void* wave, uint8_t* pcm, int32_t samplesN
     if (!v) { memset(pcm, 0, (size_t)n * 2); return n * 2; }
     Ring& r = v->ring;
     if (!v->primed) {
-        // a three-frame cushion (60 ms): frames arrive on the game's ~17 ms tick, so two frames
-        // was one late tick from running dry at the start of every burst
-        if (r.Level() >= 2880) v->primed = true;
+        // a three-frame cushion (60 ms) for a voice: frames arrive on the game's ~17 ms tick, so two
+        // frames was one late tick from running dry at the start of every burst. A radio stream asks for more.
+        if (r.Level() >= v->primeSamples) v->primed = true;
         else { memset(pcm, 0, (size_t)n * 2); return n * 2; }
     }
+    // A CONTINUOUS stream drifts: the sender's sound card and ours never quite agree on 48 kHz, and a stream
+    // that is never interrupted never clears. Fallen too far behind, it drops the oldest back to its cushion.
+    if (v->trimAbove > 0 && r.Level() > v->trimAbove) r.Skip(r.Level() - v->primeSamples);
     const int got = r.Read(out, n);
     if (got < n) v->primed = false;                      // ran dry: re-cushion before the next stretch
     return n * 2;
@@ -366,6 +374,11 @@ void ProxyGone(Voice& v) {
     v.comp = nullptr; v.compActor = nullptr; v.playing = false;
     v.ring.Clear(); v.primed = false;
 }
+void* EnsureWave(Voice& v, void (*logf)(const char*)) {
+    if (!Ready(logf) || !ensureWave(v)) return nullptr;
+    return v.wave;
+}
+void Rewind(Voice& v) { v.ring.Clear(); v.primed = false; }
 #else
 bool Ready(void (*)(const char*)) { return false; }
 void SetRange(float) {}
@@ -373,6 +386,8 @@ bool Start(Voice&, void*, float, void (*)(const char*)) { return false; }
 void Stop(Voice&) {}
 void SetVolume(Voice&, float) {}
 void ProxyGone(Voice& v) { v.comp = nullptr; v.compActor = nullptr; v.playing = false; }
+void* EnsureWave(Voice&, void (*)(const char*)) { return nullptr; }
+void Rewind(Voice&) {}
 #endif
 
 }}} // namespace omp::game::voice

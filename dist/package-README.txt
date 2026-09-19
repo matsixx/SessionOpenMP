@@ -16,11 +16,20 @@ INSTALL
 1. Find your game's Win64 folder (the one with SessionGame-Win64-Shipping.exe):
    Steam:  <Steam>\steamapps\common\Session\SessionGame\Binaries\Win64
    Epic:   <Epic>\SessionSkateSim\SessionGame\Binaries\Win64
-2. Copy EVERYTHING from this zip into that folder.
-   Say YES when asked to replace EOSSDK-Win64-Shipping.dll -- the mod needs a
-   newer version of that file than the game ships. (If Steam ever "verifies
-   file integrity" it will restore the old one; just copy it in again.)
+2. Copy EVERYTHING from this zip into that folder. Nothing of the game's is
+   replaced.
 3. Launch the game normally.
+
+INSTALLED AN OLDER VERSION? (DLC NOT WORKING ON EPIC)
+-----------------------------------------------------
+Versions before this one asked you to replace the game's own
+EOSSDK-Win64-Shipping.dll. On the Epic version that stops DLC from working.
+This version does not touch that file -- it loads its own copy from
+Mods\SessionOpenMP\dlls instead -- but it cannot put the game's original back.
+Do that once, after installing this version:
+   Epic :  Library > Session > Manage > Verify
+   Steam:  Properties > Installed Files > Verify integrity of game files
+Verifying does not remove the mod. The F1 menu tells you if this is needed.
 
 UPDATING
 --------
@@ -111,8 +120,9 @@ Send these files from the Win64 folder:
 UNINSTALL
 ---------
 Delete dwmapi.dll from the Win64 folder -- that alone disables everything.
-To fully restore, also delete UE4SS.dll, UE4SS-settings.ini, the Mods
-folder, and verify game files (restores the original EOSSDK dll).
+To fully restore, also delete UE4SS.dll, UE4SS-settings.ini and the Mods
+folder. (Only if you ever installed a version that replaced
+EOSSDK-Win64-Shipping.dll: verify game files to restore the original.)
 
 LICENSE
 -------

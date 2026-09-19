@@ -208,6 +208,10 @@ const char* LobbyOwnerId();
 // on one that merely does not know YET.
 bool LobbyOwnershipKnowable();
 bool        LobbyKick(const char* peerId);   // async; false = not hosting / no such member
+// Hand the session to another member. Same authority rule as kick: only the current owner may ask.
+// Async -- LobbyIsHost() flips once the service confirms, through the same ownership refresh that
+// host migration uses, so nothing may assume the transfer happened because this returned true.
+bool        LobbyPromote(const char* peerId);
 bool        LobbyBrowse();                   // start an async search that KEEPS its results
 int         BrowseStatus();                  // 0 idle, 1 searching, 2 results ready, -1 failed
 int         BrowseCount();

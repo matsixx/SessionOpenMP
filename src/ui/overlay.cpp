@@ -45,6 +45,7 @@
 #include "mp_prefs.h"
 #include "chat.h"
 #include "nameplates.h"
+#include "../transport/eos_sideload.h"      // GameSdkWasReplaced: an older install overwrote the game's EOS file
 #include "theme.h"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
@@ -173,7 +174,13 @@ static LRESULT CALLBACK hkWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         case WM_KEYDOWN: case WM_KEYUP: case WM_SYSKEYDOWN: case WM_SYSKEYUP: case WM_CHAR:
             return 0;
         }
-    } else if (m == WM_KEYUP || m == WM_SYSKEYUP) {
+    } else {
+        // A fresh Enter that reached the game (bit 30 = it was already down: an auto-repeat) is the
+        // chat's open key. Reported, not acted on: the game frame decides whether the box may open.
+        // Here rather than polled there -- see chat.h.
+        if (m == WM_KEYDOWN && w == VK_RETURN && !(l & (1 << 30))) Chat_NoteEnterPressed();
+    }
+    if (!capturing && (m == WM_KEYUP || m == WM_SYSKEYUP)) {
         // RELEASES ALWAYS REACH IMGUI, capturing or not. The capture gate opens and closes
         // MID-KEYSTROKE: the Escape that closes the chat is delivered while capturing, the box closes
         // on it, and the matching KEYUP then arrives with the gate shut -- which leaves ImGui
@@ -516,6 +523,22 @@ static void buildUI() {
         // ---- SESSION: the ways in and out of one.
         if (ImGui::BeginTabItem("Session")) {
         ImGui::Spacing();
+        {   // AN OLDER INSTALL OF THIS MOD OVERWROTE THE GAME'S OWN EOS FILE, and on Epic that stops DLC working.
+            // The mod no longer touches it (ours is loaded beside it), but only the player can put the game's
+            // back -- so they are told here, where they will see it, until they have.
+            static int replaced = 0; static char ver[64] = ""; static ULONGLONG nextMs = 0;
+            const ULONGLONG nowMs = GetTickCount64();
+            if (!replaced && nowMs >= nextMs) { nextMs = nowMs + 5000; replaced = omp::eosb::GameSdkWasReplaced(ver, sizeof(ver)) ? 1 : 0; }
+            if (replaced) {
+                ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 520.0f);
+                ImGui::TextColored(ImVec4(1.0f, 0.55f, 0.35f, 1.0f), "Your game's own EOS file was replaced by an older SessionOpenMP install.");
+                ImGui::TextWrapped("On the Epic version this stops your DLC from working. The mod does not need that file replaced any "
+                                   "more. To fix it, verify the game's files once: Epic -- Library > Session > Manage > Verify. "
+                                   "Steam -- Properties > Installed Files > Verify integrity. Multiplayer keeps working either way.");
+                ImGui::PopTextWrapPos();
+                ImGui::Separator();
+            }
+        }
         // ---- ONLINE. The only mode a player is expected to use, so it leads.
         ImGui::Text("Online (another player, another PC)");
         ImGui::TextDisabled("Signs in to Epic's relay. Both players load the same map, one Hosts.");
@@ -708,8 +731,8 @@ static void renderD3D11(IDXGISwapChain* sc) {
     ImGui_ImplDX11_NewFrame(); ImGui_ImplWin32_NewFrame(); ImGui::NewFrame();
     buildUI();
     buildPrompt();
-    Chat_Draw();
     Nameplates_Draw();
+    Chat_Draw();                 // after the plates: a name must not land on top of the talk
     ImGui::Render();
     g_ctx11->OMSetRenderTargets(1, &g_rtv11, nullptr);
     ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
@@ -743,8 +766,8 @@ static void renderD3D12(IDXGISwapChain* sc) {
     ImGui_ImplDX12_NewFrame(); ImGui_ImplWin32_NewFrame(); ImGui::NewFrame();
     buildUI();
     buildPrompt();
-    Chat_Draw();
     Nameplates_Draw();
+    Chat_Draw();                 // after the plates: a name must not land on top of the talk
     ImGui::Render();
     // by the time buffer idx comes around again its previous frame is done (Present-throttled)
     g_alloc12[idx]->Reset();

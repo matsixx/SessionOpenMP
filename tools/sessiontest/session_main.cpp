@@ -295,6 +295,25 @@ int main() {
     st = session::GetStats();
     check(st.peers == 3, "quiet peer NOT released (still within dropMs)");
 
+    // ---- the skater stream stays silent past dropMs, but ANOTHER lane keeps arriving (a game that
+    // is tabbed out still sends its dropped objects, voice, chat): the slot must NOT be released.
+    printf("\nstream silent past dropMs, other lanes still arriving\n");
+    {
+        uint8_t hold[32];
+        const int hn = repl::PackPoseHold(false, 1000, hold, sizeof(hold));
+        for (int i = 0; i < 2000; i++) {            // ~33 s: peer 1 sends only a pose-hold packet each second
+            feed(0, us, us); feed(2, us, us);
+            if (i % 60 == 0) session::OnPacket(1, hold, hn, us);
+            session::Frame(pawn(), us, msClock(us), gatherOwn);
+            us += step;
+        }
+        int used = 0;
+        for (int i = 0; i < session::PeerSlots(); i++) if (session::PeerAt(i, nullptr, 0, nullptr, nullptr)) used++;
+        check(used == 3, "peer still sending on another lane keeps its slot past dropMs");
+        st = session::GetStats();
+        check(st.peers == 2, "...but is not counted as streaming");
+    }
+
     // ---- and now long enough to be released
     printf("\nquiet peer exceeds dropMs\n");
     for (int i = 0; i < 2000; i++) {                // ~33 s

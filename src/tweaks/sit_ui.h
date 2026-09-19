@@ -30,3 +30,36 @@ const char* SitUI_Status();
 // InputHandler::Tick, which the replay and prop editors stop -- so the bar has to be hidden from
 // whatever is still ticking, or it stays on screen for as long as the editor is open.
 void SitUI_HideNow();
+
+// ---- FREE LABELS (the radial menu). The same button widget with its glyph collapsed -- an entry on a
+// wheel is a word, not a button to press -- placed wherever the caller says: x, y are where the label's
+// CENTRE should be, in Slate units from the viewport's top-left. `lit` is the selected look; the rest
+// are dimmed. Pool rules are the bar's: built once per skater, hidden rather than destroyed. Up to 12.
+struct SitFreeLabel { const char* label; float x, y; bool lit; };
+void SitUI_PumpFree(void* skater, bool show, const SitFreeLabel* labels, int count);
+void SitUI_HideFreeNow();                       // for an owner whose pump has stopped; verified before any touch
+bool SitUI_Viewport(void* skater, float* w, float* h);      // Slate units; false when it cannot be measured
+// How wide one character of a label draws (Slate units) and how faint an unlit label is (0..1). The
+// widget reports neither, so the caller's layout owns the numbers.
+void SitUI_SetFreeMetrics(float charW, float dim);
+// An instance whose class is, or derives from, the NATIVE class the engine names this way (no A/U
+// prefix: "SkateShop"). Default objects and archetypes are never returned. Null when there is none.
+// ONE-OFF USE: it walks the whole object array, which is a few milliseconds.
+// `exclude` is skipped, so a caller that made one of its own can still ask for the level's.
+void* SitUI_FindInstanceOf(const char* nativeClassName, void* seed, void* exclude);
+// An object by its full path ("/Game/Dir/Asset.Asset_C"): found if it is loaded, else loaded now --
+// which blocks, so it belongs on a button press and never in a frame.
+void* SitUI_LoadObject(const char* path);
+
+// A game object kept across frames, remembered the way the engine's own weak pointers do -- by its slot
+// in the global object table -- so it can be asked "are you still the object I was given?" before it is
+// touched. A pointer alone cannot answer that: a level change frees the object and hands its memory to
+// something else, and a write through the old pointer then lands in the new owner. SitUI_Alive is false
+// for a null reference, for an object that is gone, replaced or on its way out, and on any fault.
+struct SitObjRef { void* obj; int index; int serial; void* cls; };
+void SitUI_Track(SitObjRef* ref, void* obj);
+bool SitUI_Alive(const SitObjRef* ref);
+void* SitUI_ResolveWeak(int objectIndex, int serialNumber);   // an engine FWeakObjectPtr: the object, or null
+bool SitUI_CanVerify();                         // false: no object table in this build, nothing can be checked
+// Diagnostic: log the names of the loaded objects of exactly this native class, up to `cap`.
+int   SitUI_LogInstancesOf(const char* nativeClassName, void* seed, int cap, const char* tag);

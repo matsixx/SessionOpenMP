@@ -33,3 +33,7 @@ void  CatchSound_SetVolumePct(float pct);
 bool CatchSound_ObjName(const void* obj, char* out, int cap);
 // Raw-FName -> text (a bone name is an FName inside a struct, not a UObject). Same cache and rules.
 bool CatchSound_FNameText(const void* fname, char* out, int cap);
+// A one-shot through UReplayAudioManager::SpawnSoundAttached (in the replay, and so to other players).
+void* CatchSound_SpawnAttached(void* cue, void* attachTo, float vol, float pitch);
+void* CatchSound_FindSound(const char* shortName);
+void* CatchSound_FindObject(const char* shortName, const char* classNameHas);   // any LOADED object; its class's name must contain this      // a LOADED sound cue/wave by name, or null (emote.cpp: the clap)

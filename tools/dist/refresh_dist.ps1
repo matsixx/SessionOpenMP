@@ -153,6 +153,18 @@ try {
         Write-Host ("  data: Mods\{0}" -f $d.To)
     }
 
+    # ---- OUR EOS SDK: beside main.dll, under ITS OWN NAME. The package used to carry
+    # EOSSDK-Win64-Shipping.dll at the zip root, to be copied OVER the game's own -- which put the game on an
+    # SDK it was not built for and broke DLC on Epic. main.dll now delay-loads EOS and binds to this file
+    # instead (src/transport/eos_sideload.cpp), so the game's file is never touched: it must NOT be in the zip.
+    $eosSrc = Join-Path $Root "build\Release\OMP_EOSSDK-Win64-Shipping.dll"
+    if (-not (Test-Path $eosSrc)) { throw "REFUSING to write the zip -- $eosSrc is missing (build omp_mod): without it the EOS backend cannot load" }
+    $eosDst = Join-Path $stage "Mods\SessionOpenMP\dlls\OMP_EOSSDK-Win64-Shipping.dll"
+    Copy-Item $eosSrc $eosDst -Force
+    Write-Host "  eos: Mods\SessionOpenMP\dlls\OMP_EOSSDK-Win64-Shipping.dll (ours, beside the game's)"
+    $oldEos = Join-Path $stage "EOSSDK-Win64-Shipping.dll"
+    if (Test-Path $oldEos) { Remove-Item $oldEos -Force; Write-Host "  removed EOSSDK-Win64-Shipping.dll from the zip root (the game's file is no longer replaced)" -ForegroundColor Yellow }
+
     # ---- prune Mods\ to the allowlist.
     $modsDir = Join-Path $stage "Mods"
     if (-not (Test-Path $modsDir)) { throw "Mods\ missing from the zip -- refusing to write a broken package" }

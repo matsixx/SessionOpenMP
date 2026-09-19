@@ -51,6 +51,7 @@ static inline void* twkP(const void* p, int off) {
 
 // Byte-signature scan over the exe's executable sections ("??" = wildcard).
 uint8_t* TwkScanExe(const char* sig);
+uint8_t* TwkScanExeNth(const char* sig, int nth);   // twins that are BOTH wanted; see tweaks_common.cpp and sigs.expect
 
 // World-space Z of an actor (UE units = cm), or -999999 when unreadable. PDB-confirmed:
 // AActor+0x130 RootComponent, USceneComponent+0x1c0 ComponentToWorld (FTransform: quat 16B,

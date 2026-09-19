@@ -422,6 +422,14 @@ int  PackVoice(uint16_t seq, const uint8_t* const* frames, const int* lens, int 
 bool IsVoicePacket(const uint8_t* data, int len);
 // The frame count; `frames` point INTO `data`.
 int  UnpackVoice(const uint8_t* data, int len, uint16_t* seqOut, const uint8_t** frames, int* lens, int maxFrames);
+// A player's RADIO STREAM ("OMPr"): the audio they chose on their PC, played from their radio prop. The voice lane's
+// layout under its own tag -- u16 frame seq, u8 count, count x (u8 len, Opus bytes) -- so nothing that reads voice
+// can mistake it for a voice. Sent ONLY to a player who asked for it (their radio is playing it), so no build
+// that cannot read it is ever sent one.
+enum { kRadioMaxFrames = 4 };
+int  PackRadio(uint16_t seq, const uint8_t* const* frames, const int* lens, int n, uint8_t* out, int cap);
+bool IsRadioPacket(const uint8_t* data, int len);
+int  UnpackRadio(const uint8_t* data, int len, uint16_t* seqOut, const uint8_t** frames, int* lens, int maxFrames);
 
 // ---- POSE HOLD: "keep my last transported skeleton". Sent while the sender's pose is a HELD one
 // (sitting: quasi-static, so the skeleton itself goes out only when it moves or once a second),

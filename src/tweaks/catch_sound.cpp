@@ -318,6 +318,48 @@ static void* ResolveCue() {
     return o;
 }
 
+// The same wrapper, for another module's one-shot (emote.cpp's board tap): recorded into the replay and
+// carried to other players exactly as the catch sound is. Returns the UAudioComponent, or null.
+// A LOADED sound, by its short name (ANY_PACKAGE), or null. Not cached here: the caller watches what it keeps.
+// ANY loaded object by its short name (ANY_PACKAGE), or null; `classHas` must be part of its class's name.
+void* CatchSound_FindObject(const char* name, const char* classHas) {
+    if (!g_staticFind || !name || !name[0]) return nullptr;
+    wchar_t wide[96];
+    int i = 0;
+    for (; name[i] && i < 95; i++) wide[i] = (wchar_t)(uint8_t)name[i];
+    wide[i] = 0;
+    void* o = nullptr;
+    __try { o = g_staticFind(nullptr, (void*)(intptr_t)-1, wide, 0); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { o = nullptr; }
+    if (!o) return nullptr;
+    char cls[64];
+    if (!NameOf(twkP(o, OBJ_CLASS), cls, sizeof(cls))) return nullptr;
+    if (classHas && classHas[0] && !strstr(cls, classHas)) return nullptr;
+    return o;
+}
+void* CatchSound_FindSound(const char* name) {
+    if (!g_staticFind || !name || !name[0]) return nullptr;
+    wchar_t wide[64];
+    int i = 0;
+    for (; name[i] && i < 63; i++) wide[i] = (wchar_t)(uint8_t)name[i];
+    wide[i] = 0;
+    void* o = nullptr;
+    __try { o = g_staticFind(nullptr, (void*)(intptr_t)-1, wide, 0); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { o = nullptr; }
+    if (!o) return nullptr;
+    char cls[64];
+    if (!NameOf(twkP(o, OBJ_CLASS), cls, sizeof(cls)) || !strstr(cls, "Sound")) return nullptr;
+    return o;
+}
+void* CatchSound_SpawnAttached(void* cue, void* attachTo, float vol, float pitch) {
+    if (!g_spawnAtt || !cue || !attachTo) return nullptr;
+    if (vol > 4.0f) vol = 4.0f;
+    const float zero[3] = { 0.0f, 0.0f, 0.0f };
+    __try {
+        return g_spawnAtt(cue, attachTo, 0 /*NAME_None*/, zero, zero, 0 /*KeepRelativeOffset*/, false, vol, pitch, 0.0f,
+                          nullptr, nullptr, true /*autoDestroy: a one-shot*/);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+}
 // Attached to the skater's root, through the REPLAY wrapper: recorded into the replay, captured by
 // OpenMP's funnel for peer sync, audible locally -- one call, all three.
 static bool PlayCatchCue(void* skater) {

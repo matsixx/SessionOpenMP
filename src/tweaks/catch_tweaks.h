@@ -39,6 +39,10 @@ int  CatchTweaks_ManualMode();                     // the ECatchMode value meani
 // from the pump (catch_sound's catch-edge watch). Null until the first CanCatchOrient call.
 void* CatchTweaks_Skater();
 void* CatchTweaks_LocalInputHandler();   // the local skater's InputHandler, null until first seen
+// The right trigger as the ENGINE has it, 0..1, whatever read the pad. false = not to be had (no player input seen
+// yet, or this build lacks the call): the caller falls back to the trigger's press.
+bool  CatchTweaks_RightTrigger(float* out);
+bool  CatchTweaks_MakeName(const char* s, bool add, unsigned long long* out);      // an FName (8 B) from a string
 // The highest skater world-Z (cm) seen in the last ~1.5 s, sampled per frame from the
 // CanCatchOrient hook -- run_out computes the drop height of the air that is ending as
 // (this - live Z). -999999 = no fresh samples (no catch-system activity, e.g. a trickless fall).

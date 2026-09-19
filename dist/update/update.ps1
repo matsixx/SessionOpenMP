@@ -280,6 +280,22 @@ try {
         else                    { Say  "  mods.txt: kept your existing choices" }
     }
 
+    # An OLDER install overwrote the game's own EOSSDK-Win64-Shipping.dll with ours. The mod no longer needs that
+    # (it loads its own copy from Mods\SessionOpenMP\dlls), and on Epic the overwritten file stops DLC working.
+    # Only the store can put the game's original back, so this can only say so.
+    $gameEos = Join-Path $dir "EOSSDK-Win64-Shipping.dll"
+    $ourEos  = Join-Path $dir "Mods\SessionOpenMP\dlls\OMP_EOSSDK-Win64-Shipping.dll"
+    if ((Test-Path $gameEos) -and (Test-Path $ourEos)) {
+        if ((Get-FileHash $gameEos -Algorithm SHA256).Hash -eq (Get-FileHash $ourEos -Algorithm SHA256).Hash) {
+            Write-Host ""
+            Warn "The game's own EOSSDK-Win64-Shipping.dll is still the copy an older SessionOpenMP put there."
+            Say  "  On Epic this stops DLC working. Verify the game's files once to restore it:"
+            Say  "    Epic : Library > Session > Manage > Verify"
+            Say  "    Steam: Properties > Installed Files > Verify integrity of game files"
+            Say  "  Multiplayer keeps working either way -- the mod no longer uses that file."
+        }
+    }
+
     Write-Host ""
     Good "Updated to SessionOpenMP $latest."
     Say  "  Release notes: https://github.com/$Repo/releases/tag/$latestTag"

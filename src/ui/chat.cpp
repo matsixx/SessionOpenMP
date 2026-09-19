@@ -20,6 +20,8 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
+#include <float.h>
 
 namespace {
 
@@ -32,7 +34,7 @@ const int kTextLen  = 160;
 struct Line {
     char     name[kNameLen] = {};
     char     text[kTextLen] = {};
-    uint64_t atMs = 0;
+    uint64_t atUs = 0;
     bool     mine = false;
     bool     system = false;
 };
@@ -42,18 +44,29 @@ int        g_head = 0;          // next write slot
 int        g_count = 0;
 
 std::atomic<bool> g_open{false};
+std::atomic<bool> g_typing{false};
+std::atomic<bool> g_enterPending{false};
+std::atomic<int>  g_players{0};
 // The press that OPENS the box is still physically down when the box appears, and ImGui's text field
 // sees it on its very next frame -- which would send an empty line and close again instantly. A send
 // is therefore accepted only once Enter has been observed UP since opening. A fact, not a timer.
 std::atomic<bool> g_sendArmed{false};
+std::atomic<bool> g_justOpened{false};   // set on open (game thread), consumed by the draw
 
 // Typed lines waiting for the game thread. A tiny queue rather than one slot: a fast typist can send
 // twice inside one game tick, and dropping the second is a bug the player would never understand.
 const int kOutMax = 8;
 char       g_out[kOutMax][kTextLen];
 int        g_outN = 0;
+char       g_lastSent[kTextLen] = {};   // render thread only: Up recalls it
 
-uint64_t nowMs() { return GetTickCount64(); }
+// Microseconds from the performance counter. Both threads stamp and age with THIS clock: the tick
+// count's 16 ms grain shows as steps in a 180 ms fade.
+uint64_t nowUs() {
+    static const LARGE_INTEGER freq = [] { LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
+    LARGE_INTEGER c; QueryPerformanceCounter(&c);
+    return (uint64_t)((double)c.QuadPart * 1e6 / (double)freq.QuadPart);
+}
 
 void pushLine(const char* name, const char* text, bool mine, bool system) {
     if (!text || !*text) return;
@@ -62,24 +75,259 @@ void pushLine(const char* name, const char* text, bool mine, bool system) {
     l = Line{};
     if (name) strncpy_s(l.name, name, _TRUNCATE);
     strncpy_s(l.text, text, _TRUNCATE);
-    l.atMs = nowMs();
+    l.atUs = nowUs();
     l.mine = mine;
     l.system = system;
     g_head = (g_head + 1) % kMaxLines;
     if (g_count < kMaxLines) g_count++;
 }
 
+// ---- one line, drawn the same way on both surfaces ------------------------------------------------
+float snapf(float v)  { return floorf(v + 0.5f); }
+float smooth(float t) { t = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t); return t * t * (3.0f - 2.0f * t); }
+ImU32 tint(const ImVec4& c, float a) { return ImGui::GetColorU32(ImVec4(c.x, c.y, c.z, c.w * a)); }
+
+// The name stays on the first line and the text runs to the right of it, continuation lines indented
+// under the text's own start -- what makes a wrapped line still read as ONE person talking. A name
+// too long for that puts the text on the next line rather than squeezing it into a column. A system
+// line has no name; a short rule stands in front of it instead.
+struct LineLayout { float textX = 0, textY = 0, h = 0; };
+LineLayout measure(ImFont* font, float size, float width, const char* name, const char* text, bool system) {
+    LineLayout L;
+    const float gap = snapf(size * 0.45f);
+    if (system) {
+        L.textX = snapf(size * 1.0f);
+    } else if (name && name[0]) {
+        const float nameW = font->CalcTextSizeA(size, FLT_MAX, 0.0f, name).x;
+        if (nameW + gap <= width * 0.45f) L.textX = snapf(nameW + gap);
+        else                              L.textY = snapf(size * 1.15f);
+    }
+    float wrapW = width - L.textX; if (wrapW < size) wrapW = size;
+    L.h = snapf(L.textY + font->CalcTextSizeA(size, FLT_MAX, wrapW, text).y);
+    return L;
+}
+// `shadow` > 0 draws the text over play with no panel behind it: the nameplates' dark rim, exactly
+// -- the same four passes at the same alpha -- so a name over a head and a line of chat read as one
+// treatment. Inside the open box the panel does that job and the text is drawn plain.
+void shadowText(ImDrawList* dl, ImFont* font, float size, ImVec2 at, ImU32 col, const char* s,
+                float wrapW, float shadow) {
+    if (shadow > 0.005f) {
+        const float rim = (size >= 18.0f) ? 2.0f : 1.0f;
+        const ImU32 dark = ImGui::GetColorU32(ImVec4(0, 0, 0, shadow));
+        dl->AddText(font, size, ImVec2(at.x - rim, at.y), dark, s, nullptr, wrapW);
+        dl->AddText(font, size, ImVec2(at.x + rim, at.y), dark, s, nullptr, wrapW);
+        dl->AddText(font, size, ImVec2(at.x, at.y - rim), dark, s, nullptr, wrapW);
+        dl->AddText(font, size, ImVec2(at.x, at.y + rim), dark, s, nullptr, wrapW);
+    }
+    dl->AddText(font, size, at, col, s, nullptr, wrapW);
+}
+void drawLine(ImDrawList* dl, ImFont* font, float size, ImVec2 at, float width, const LineLayout& L,
+              const char* name, const char* text, bool mine, bool system, float alpha, float shadow) {
+    const ThemePalette& T = Theme();
+    float wrapW = width - L.textX; if (wrapW < size) wrapW = size;
+    if (system) {
+        const float rule = snapf(size * 0.6f), mid = snapf(at.y + size * 0.55f);
+        if (shadow > 0.005f)
+            dl->AddRectFilled(ImVec2(at.x - 1.0f, mid - 1.0f), ImVec2(at.x + rule + 1.0f, mid + 2.0f),
+                              ImGui::GetColorU32(ImVec4(0, 0, 0, shadow)));
+        dl->AddRectFilled(ImVec2(at.x, mid), ImVec2(at.x + rule, mid + 1.0f), tint(T.system, alpha * 0.8f));
+        shadowText(dl, font, size, ImVec2(at.x + L.textX, at.y), tint(T.system, alpha), text, wrapW, shadow);
+        return;
+    }
+    if (name && name[0]) shadowText(dl, font, size, at, tint(mine ? T.accent : T.other, alpha), name, 0.0f, shadow);
+    shadowText(dl, font, size, ImVec2(at.x + L.textX, at.y + L.textY), tint(T.text, alpha), text, wrapW, shadow);
+}
+
+// What a frame draws: copied out from under the lock, with each line's fade and growth resolved.
+struct Shown { char name[kNameLen]; char text[kTextLen]; float alpha, grow; bool mine, system; };
+
+// ---- CLOSED: recent talk over play. No window (chat.h says why) and no panel either -- a box in
+// the corner pulls the eye while skating; a dark rim on the glyphs keeps them readable instead. The
+// lines are laid out here, bottom-anchored, from measured heights -- exact every frame. A new line
+// grows in from nothing and a faded one shrinks away, so the block above never jumps.
+void drawClosed(const Shown* shown, int n) {
+    ImGuiIO& io = ImGui::GetIO();
+    if (n <= 0 || io.DisplaySize.x < 1.0f || io.DisplaySize.y < 1.0f) return;
+    Theme_Push(false);
+    ImFont* font = ImGui::GetFont();
+    const float sc   = io.FontGlobalScale > 0.01f ? io.FontGlobalScale : 1.0f;
+    // The font's own size times the global scale -- what a window would report -- read directly
+    // because no window is current here.
+    const float size = snapf(font->FontSize * sc);
+    const float w = snapf(g_tune.width * sc), gap = snapf(5.0f * sc);
+    const float x0 = snapf(g_tune.marginX * sc);
+    const float y1 = snapf(io.DisplaySize.y - g_tune.marginY * sc);
+
+    LineLayout L[kMaxLines];
+    float total = 0.0f, peak = 0.0f;
+    for (int i = 0; i < n; i++) {
+        L[i] = measure(font, size, w, shown[i].name, shown[i].text, shown[i].system);
+        total += (L[i].h + (i ? gap : 0.0f)) * shown[i].grow;
+        if (shown[i].alpha > peak) peak = shown[i].alpha;
+    }
+    if (peak <= 0.005f || total <= 0.5f) { Theme_Pop(); return; }
+
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+    const float rim = 3.0f;                              // room for the rim and shadow at the edges
+    float y = snapf(y1 - total);
+    for (int i = 0; i < n; i++) {
+        const Shown& s = shown[i];
+        y += (i ? gap : 0.0f) * s.grow;
+        const float hh = L[i].h * s.grow;
+        if (hh < 0.5f) continue;
+        const bool partial = s.grow < 0.999f;
+        if (partial) dl->PushClipRect(ImVec2(x0 - rim, snapf(y) - rim), ImVec2(x0 + w + rim, snapf(y + hh)), true);
+        if (s.alpha > 0.005f)
+            drawLine(dl, font, size, ImVec2(x0, snapf(y)), w, L[i], s.name, s.text, s.mine, s.system, s.alpha,
+                     s.alpha * g_tune.shadowAlpha);
+        if (partial) dl->PopClipRect();
+        y += hh;
+    }
+    Theme_Pop();
+}
+
+// Up recalls the last line sent (a typo is easier to fix than to retype); Down clears the field.
+int historyCb(ImGuiInputTextCallbackData* d) {
+    if (d->EventFlag != ImGuiInputTextFlags_CallbackHistory) return 0;
+    if (d->EventKey == ImGuiKey_UpArrow && g_lastSent[0]) {
+        d->DeleteChars(0, d->BufTextLen);
+        d->InsertChars(0, g_lastSent);
+    } else if (d->EventKey == ImGuiKey_DownArrow) {
+        d->DeleteChars(0, d->BufTextLen);
+    }
+    return 0;
+}
+
+// ---- OPEN: the box. A fixed-width window at the same anchor: header, a scrolling history drawn by
+// the same line renderer, the field, and the keys that work.
+void drawOpen(const Shown* shown, int n) {
+    ImGuiIO& io = ImGui::GetIO();
+    if (io.DisplaySize.x < 1.0f || io.DisplaySize.y < 1.0f) return;
+    const ThemePalette& T = Theme();
+    const float sc = io.FontGlobalScale > 0.01f ? io.FontGlobalScale : 1.0f;
+    const float w = snapf(g_tune.width * sc), histH = snapf(g_tune.height * sc), padX = snapf(16.0f * sc);
+
+    ImGui::SetNextWindowPos(ImVec2(snapf(g_tune.marginX * sc), snapf(io.DisplaySize.y - g_tune.marginY * sc)),
+                            ImGuiCond_Always, ImVec2(0.0f, 1.0f));
+    ImGui::SetNextWindowSize(ImVec2(w, 0.0f), ImGuiCond_Always);
+    // AlwaysAutoResize OVERRIDES SetNextWindowSize: constrain the WIDTH to exactly `w` and let the
+    // height follow the content, which is fixed (the history child has a set height), so it settles on
+    // the first frame and never moves again.
+    ImGui::SetNextWindowSizeConstraints(ImVec2(w, 0.0f), ImVec2(w, 1.0e6f));
+    const ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize
+                                 | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar
+                                 | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize
+                                 | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav;
+
+    Theme_Push(true);                                   // opaque: it owns the keyboard
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(padX, snapf(12.0f * sc)));
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,   ImVec2(snapf(8.0f * sc), snapf(6.0f * sc)));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding,  ImVec2(snapf(12.0f * sc), snapf(7.0f * sc)));
+
+    static char buf[kTextLen] = {};
+    if (ImGui::Begin("##ompchat", nullptr, flags)) {
+        ImFont* font = ImGui::GetFont();
+        const float size = ImGui::GetFontSize();
+
+        // ---- header: what this is, and who is here
+        ImGui::TextColored(T.dim, "SESSION CHAT");
+        {
+            const int others = g_players.load();
+            char who[40];
+            snprintf(who, sizeof(who), "%d ONLINE", others + 1);
+            ImGui::SameLine(w - padX - ImGui::CalcTextSize(who).x);
+            ImGui::TextColored(T.dim, "%s", who);
+        }
+        ImGui::Separator();
+
+        // ---- history
+        ImGui::BeginChild("##omphist", ImVec2(0.0f, histH), ImGuiChildFlags_None,
+                          ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav);
+        {
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            const float W = ImGui::GetContentRegionAvail().x;
+            if (n == 0) ImGui::TextColored(T.dim, "Nothing said yet.");
+            for (int i = 0; i < n; i++) {
+                const Shown& s = shown[i];
+                const ImVec2 p = ImGui::GetCursorScreenPos();
+                const LineLayout L = measure(font, size, W, s.name, s.text, s.system);
+                drawLine(dl, font, size, ImVec2(snapf(p.x), snapf(p.y)), W, L, s.name, s.text, s.mine, s.system, 1.0f, 0.0f);
+                ImGui::Dummy(ImVec2(W, L.h));
+            }
+            // Stick to the end unless the player has scrolled up to read.
+            if (g_justOpened.load() || ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 1.0f) ImGui::SetScrollHereY(1.0f);
+        }
+        ImGui::EndChild();
+        ImGui::Separator();
+
+        // ---- the field
+        ImGui::SetNextItemWidth(-1.0f);
+        if (!ImGui::IsAnyItemActive() && !ImGui::IsMouseClicked(0)) ImGui::SetKeyboardFocusHere();
+        const bool sent = ImGui::InputText("##ompchatin", buf, sizeof(buf),
+                                           ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_CallbackHistory,
+                                           historyCb);
+        {   // the accent edge: lit while there is something to send
+            const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+            ImGui::GetWindowDrawList()->AddRectFilled(a, ImVec2(a.x + snapf(3.0f * sc), b.y),
+                                                      tint(T.accent, buf[0] ? 1.0f : 0.35f));
+        }
+        g_typing = buf[0] != 0;      // every drawn frame: the flag tracks the buffer exactly
+        // Arm once the key that opened the box is up (both Enters -- the field accepts either).
+        if (!ImGui::IsKeyDown(ImGuiKey_Enter) && !ImGui::IsKeyDown(ImGuiKey_KeypadEnter))
+            g_sendArmed = true;
+        if (sent && g_sendArmed.load()) {
+            // Trim: a line of spaces is not a message, and trailing space is invisible noise on
+            // everyone else's screen.
+            char* p = buf; while (*p == ' ') p++;
+            int len = (int)strlen(p); while (len > 0 && p[len - 1] == ' ') p[--len] = 0;
+            if (len > 0) {
+                strncpy_s(g_lastSent, p, _TRUNCATE);
+                std::lock_guard<std::mutex> lk(g_mx);
+                if (g_outN < kOutMax) { strncpy_s(g_out[g_outN], p, _TRUNCATE); g_outN++; }
+            }
+            buf[0] = 0; g_typing = false;
+            g_open = false;                       // Enter sends AND closes, like every game chat
+        }
+        // repeat=false: a close is an EVENT, never something a held key should keep doing.
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) { buf[0] = 0; g_typing = false; g_open = false; }
+
+        // ---- the keys, and the room left when it starts to matter
+        auto hint = [&](const char* key, const char* what, bool first) {
+            if (!first) ImGui::SameLine(0.0f, snapf(18.0f * sc));
+            ImGui::TextColored(T.text, "%s", key);
+            ImGui::SameLine(0.0f, snapf(5.0f * sc));
+            ImGui::TextColored(T.dim, "%s", what);
+        };
+        hint("ENTER", "send", true);
+        hint("ESC", "close", false);
+        hint("UP", "last line", false);
+        const int len = (int)strlen(buf);
+        if (len >= kTextLen - 40) {
+            char c[24];
+            snprintf(c, sizeof(c), "%d/%d", len, kTextLen - 1);
+            ImGui::SameLine(w - padX - ImGui::CalcTextSize(c).x);
+            ImGui::TextColored(len >= kTextLen - 1 ? T.warn : T.dim, "%s", c);
+        }
+    }
+    ImGui::End();
+    ImGui::PopStyleVar(3);
+    Theme_Pop();
+    g_justOpened = false;
+}
+
 } // namespace
 
 ChatTuning& Chat_Tuning() { return g_tune; }
-static std::atomic<bool> g_typing{false};
 bool Chat_IsOpen()   { return g_open.load(); }
 bool Chat_IsTyping() { return g_open.load() && g_typing.load(); }   // closed box can never be typing
 
 void Chat_SetOpen(bool open) {
-    if (open && !g_open.load()) g_sendArmed = false;   // wait for the opening key to come up
+    if (open && !g_open.load()) { g_sendArmed = false; g_justOpened = true; }   // wait for the opening key to come up
     g_open = open;
 }
+void Chat_NoteEnterPressed() { g_enterPending = true; }
+bool Chat_TakeEnterPressed() { return g_enterPending.exchange(false); }
+void Chat_SetPresence(int players) { g_players = players < 0 ? 0 : players; }
 
 void Chat_Push(const char* name, const char* text, bool mine) { pushLine(name, text, mine, false); }
 void Chat_System(const char* text) { pushLine(nullptr, text, false, true); }
@@ -94,140 +342,53 @@ bool Chat_Take(char* out, int cap) {
     return out[0] != 0;
 }
 
-
 bool Chat_HasVisible() {
     if (!g_tune.enabled) return false;
     if (g_open.load()) return true;
-    const uint64_t t = nowMs();
-    const float keep = g_tune.fadeAfterSec + g_tune.fadeOverSec;
+    const uint64_t t = nowUs();
+    const float keep = g_tune.fadeAfterSec + g_tune.fadeOverSec + g_tune.collapseSec;
     std::lock_guard<std::mutex> lk(g_mx);
     if (g_count <= 0) return false;
     const Line& newest = g_lines[(g_head + kMaxLines - 1) % kMaxLines];
-    return (float)(t - newest.atMs) / 1000.0f <= keep;
+    return (float)((double)(t - newest.atUs) * 1e-6) <= keep;
 }
 
 void Chat_Draw() {
     if (!g_tune.enabled) return;
     const bool open = g_open.load();
-    const uint64_t t = nowMs();
+    const uint64_t t = nowUs();
 
     // Snapshot under the lock, draw outside it: the game thread must never wait on a frame.
-    struct Shown { char name[kNameLen]; char text[kTextLen]; float alpha; bool mine, system; };
     Shown shown[kMaxLines];
     int nShown = 0;
     {
         std::lock_guard<std::mutex> lk(g_mx);
         const int first = (g_count < kMaxLines) ? 0 : g_head;
-        for (int k = 0; k < g_count; k++) {
+        // Closed, only the newest few are drawn: skip the rest before they are even measured.
+        int start = 0;
+        if (!open && g_count > g_tune.maxShownIdle) start = g_count - g_tune.maxShownIdle;
+        const float hold = g_tune.fadeAfterSec, fade = g_tune.fadeOverSec > 0.01f ? g_tune.fadeOverSec : 1.0f;
+        const float grow = g_tune.appearSec > 0.01f ? g_tune.appearSec : 0.01f;
+        const float shrink = g_tune.collapseSec > 0.01f ? g_tune.collapseSec : 0.01f;
+        for (int k = start; k < g_count; k++) {
             const Line& l = g_lines[(first + k) % kMaxLines];
-            float a = 1.0f;
+            float a = 1.0f, g = 1.0f;
             if (!open) {
-                // Closed: recent talk still shows, then fades. This is what makes chat usable while
-                // skating -- you read without stopping, and the screen goes clean on its own.
-                const float age = (float)(t - l.atMs) / 1000.0f;
-                if (age > g_tune.fadeAfterSec + g_tune.fadeOverSec) continue;
-                if (age > g_tune.fadeAfterSec)
-                    a = 1.0f - (age - g_tune.fadeAfterSec) / (g_tune.fadeOverSec > 0.01f ? g_tune.fadeOverSec : 1.0f);
+                // Closed: recent talk still shows, then fades, then gives its height back. This is
+                // what makes chat usable while skating -- you read without stopping, and the screen
+                // goes clean on its own.
+                const float age = (float)((double)(t - l.atUs) * 1e-6);
+                if (age > hold + fade + shrink) continue;
+                if (age < grow) { g = smooth(age / grow); a = g; }
+                else if (age > hold + fade) { a = 0.0f; g = 1.0f - smooth((age - (hold + fade)) / shrink); }
+                else if (age > hold) a = 1.0f - (age - hold) / fade;
             }
-            if (nShown >= kMaxLines) break;
             Shown& s = shown[nShown++];
             memcpy(s.name, l.name, sizeof(s.name));
             memcpy(s.text, l.text, sizeof(s.text));
-            s.alpha = a; s.mine = l.mine; s.system = l.system;
+            s.alpha = a; s.grow = g; s.mine = l.mine; s.system = l.system;
         }
     }
-    if (!open) {
-        if (nShown == 0) return;                                   // nothing to say: draw nothing at all
-        if (nShown > g_tune.maxShownIdle) {                        // keep only the newest few
-            const int drop = nShown - g_tune.maxShownIdle;
-            memmove(shown, shown + drop, sizeof(Shown) * (size_t)(nShown - drop));
-            nShown -= drop;
-        }
-    }
-
-    ImGuiIO& io = ImGui::GetIO();
-    const float sc = io.FontGlobalScale > 0.01f ? io.FontGlobalScale : 1.0f;
-    const float w  = g_tune.width * sc;
-    const float h  = (open ? g_tune.height : 0.0f) * sc;
-
-    ImGui::SetNextWindowPos(ImVec2(g_tune.marginX * sc,
-                                   io.DisplaySize.y - g_tune.marginY * sc),
-                            ImGuiCond_Always, ImVec2(0.0f, 1.0f));
-    ImGui::SetNextWindowSize(ImVec2(w, 0), ImGuiCond_Always);
-    // AlwaysAutoResize OVERRIDES SetNextWindowSize, so without this the panel grows to fit the longest
-    // line and runs off the screen. Constrain the WIDTH to exactly `w` and leave the height free: the
-    // box hugs its content vertically, and text has a hard right edge to wrap against.
-    ImGui::SetNextWindowSizeConstraints(ImVec2(w, 0.0f), ImVec2(w, 1.0e6f));
-
-    ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize
-                           | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar
-                           | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize
-                           | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav;
-    if (!open) flags |= ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoBackground;
-
-    const ThemePalette& T = Theme();
-    Theme_Push(open);                                   // opaque while typing, translucent while idle
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14 * sc, 12 * sc));
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing,   ImVec2(8 * sc, 5 * sc));
-
-    if (ImGui::Begin("##ompchat", nullptr, flags)) {
-        if (open) {
-            ImGui::TextColored(T.dim, "SESSION CHAT");
-            ImGui::Separator();
-            ImGui::BeginChild("##omphist", ImVec2(0, h), false,
-                              ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav);
-        }
-        for (int i = 0; i < nShown; i++) {
-            const Shown& s = shown[i];
-            const ImVec4 nameCol = s.system ? T.system : (s.mine ? T.accent : T.other);
-            // Wrap at the window's right edge. The name stays on the first line and continuation
-            // lines indent under the start of the message, which is what makes a wrapped chat line
-            // still read as ONE person talking.
-            ImGui::PushTextWrapPos(0.0f);
-            if (s.system) {
-                ImGui::TextColored(ImVec4(T.system.x, T.system.y, T.system.z, s.alpha), "%s", s.text);
-            } else {
-                ImGui::TextColored(ImVec4(nameCol.x, nameCol.y, nameCol.z, s.alpha), "%s", s.name[0] ? s.name : "?");
-                ImGui::SameLine(0, 6 * sc);
-                ImGui::TextColored(ImVec4(T.text.x, T.text.y, T.text.z, s.alpha), "%s", s.text);
-            }
-            ImGui::PopTextWrapPos();
-        }
-        if (open) {
-            // Stick to the bottom unless the player has scrolled up to read.
-            if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 1.0f) ImGui::SetScrollHereY(1.0f);
-            ImGui::EndChild();
-
-            ImGui::Separator();
-
-            static char buf[kTextLen] = {};
-            ImGui::SetNextItemWidth(-1.0f);
-            if (!ImGui::IsAnyItemActive() && !ImGui::IsMouseClicked(0)) ImGui::SetKeyboardFocusHere();
-            const bool sent = ImGui::InputText("##ompchatin", buf, sizeof(buf),
-                                               ImGuiInputTextFlags_EnterReturnsTrue);
-            g_typing = buf[0] != 0;      // every drawn frame: the flag tracks the buffer exactly
-            // Arm once the key that opened the box is up (both Enters -- the field accepts either).
-            if (!ImGui::IsKeyDown(ImGuiKey_Enter) && !ImGui::IsKeyDown(ImGuiKey_KeypadEnter))
-                g_sendArmed = true;
-            if (sent && g_sendArmed.load()) {
-                // Trim: a line of spaces is not a message, and trailing space is invisible noise on
-                // everyone else's screen.
-                char* p = buf; while (*p == ' ') p++;
-                int n = (int)strlen(p); while (n > 0 && p[n - 1] == ' ') p[--n] = 0;
-                if (n > 0) {
-                    std::lock_guard<std::mutex> lk(g_mx);
-                    if (g_outN < kOutMax) { strncpy_s(g_out[g_outN], p, _TRUNCATE); g_outN++; }
-                }
-                buf[0] = 0; g_typing = false;
-                g_open = false;                       // Enter sends AND closes, like every game chat
-            }
-            // repeat=false: a close is an EVENT, never something a held key should keep doing.
-            if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) { buf[0] = 0; g_typing = false; g_open = false; }
-            ImGui::TextColored(T.dim, "ENTER send    ESC cancel");
-        }
-    }
-    ImGui::End();
-
-    ImGui::PopStyleVar(2);
-    Theme_Pop();
+    if (open) drawOpen(shown, nShown);
+    else      drawClosed(shown, nShown);
 }

@@ -94,6 +94,14 @@ void VoiceSetLoopback(bool on);           // "Hear yourself": our own frames, pl
 // ---- pose hold. SessionTweaks tells us its sitting pose is on the skeleton; that skeleton then
 // travels (thinned to on-change) and peers keep the last one between sweeps.
 void SetOwnPoseHold(bool on);
+// A player's radio stream (SessionTweaks' radio prop plays one app from its owner's PC). Game thread.
+int   RadioSources(uint32_t* pids, char* names, int nameCap, int cap);   // the apps with sound open, playing first
+int   RadioStreamStart(uint32_t pid, const char* name);                   // capture that app; 1 = asked for
+void  RadioStreamStop();
+int   RadioStreamState(char* why, int cap);                               // 0 off, 1 starting, 2 live, -1 failed
+void  RadioSetListener(int peerIdx, bool wanted);                        // OWNER: this player's radio is playing ours
+void* RadioPeerWave(int peerIdx, bool rewind);                           // LISTENER: the wave their stream plays into
+int   RadioPeerStreaming(int peerIdx);                                    // their frames arrived in the last second
 bool VoiceLoopback();
 const Config& GetConfig();
 Stats GetStats();

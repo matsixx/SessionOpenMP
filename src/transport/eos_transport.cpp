@@ -21,6 +21,7 @@
 #include <time.h>
 #include "transport.h"
 #include "eos_creds.h"
+#include "eos_sideload.h"      // our SDK, loaded beside the game's (the mod target only: OMP_EOS_SIDELOAD)
 // Macro-only, no dependencies: the mod version is written in exactly one place and the lobby ad
 // advertises that same string rather than keeping a second copy in step.
 #include "../ui/version_tag.h"
@@ -479,14 +480,18 @@ static volatile LONG g_browseState = 0;     // 0 idle, 1 searching, 2 ready, -1 
 static uint64_t nowMs() { return GetTickCount64(); }
 // ---- ASYNCHRONOUS SIGN-IN --------------------------------------------------------------------------
 // NOTHING here may block, and no SDK call may leave the game thread. Session ships its OWN EOS
-// integration (Engine/Plugins/Online/EOSShared), so `EOSSDK-Win64-Shipping.dll` is ALREADY loaded when
-// this runs -- EOS_Initialize returning EOS_AlreadyConfigured is the proof, and Windows binds our
-// import to the module already in the process. It is ONE SDK, shared with the game, and the game ticks
-// it from FEOSSDKManager::Tick on the GAME thread every frame. A second thread busy-ticking the
-// platform (which is what a blocking sign-in needs) puts two threads inside that one SDK and corrupts
-// it under the game's own tick -- an intermittent access violation inside FEOSSDKManager::Tick.
-// So sign-in is STARTED here and POLLED from Tick, and there is no transport thread at all.
+// integration (Engine/Plugins/Online/EOSShared) on its OWN SDK, 1.13, which the game ticks from
+// FEOSSDKManager::Tick on the game thread.
+// HISTORY, because the rule came from it: this mod used to be installed OVER the game's SDK file, so there
+// was ONE SDK in the process, shared -- EOS_Initialize answered EOS_AlreadyConfigured, and a second thread
+// busy-ticking our platform (what a blocking sign-in needs) put two threads inside that one SDK and
+// corrupted it under the game's tick (an intermittent access violation inside FEOSSDKManager::Tick). It
+// also put the GAME on an SDK it was not built for, and on Epic that broke players' DLC.
+// NOW the game's SDK is left alone and ours is loaded BESIDE it (eos_sideload.h): two SDKs, two states,
+// EOS_Initialize answers EOS_Success. The rule stays anyway -- one thread, the game's, and nothing blocks:
+// sign-in is STARTED here and POLLED from Tick, and there is no transport thread at all.
 static volatile LONG g_initState = 0;      // 0 idle, 1 signing in, 2 ready, 3 failed
+static bool          g_sdkUp = false;      // EOS_Initialize answered: the only state in which EOS_Shutdown may be called
 static uint64_t      g_initDeadlineMs = 0;
 static const uint64_t kLoginTimeoutMs = 15000;
 static const uint64_t kBrowseTimeoutMs = 15000;   // generous: a cold search over a relay is slow
@@ -1118,6 +1123,25 @@ bool Init(bool forceRelays) {
         return true;                       // STARTED, not finished -- Tick resolves it
     }
     if (!g_plat) {
+#ifdef OMP_EOS_SIDELOAD
+        // OUR SDK, OR NO EOS AT ALL. main.dll's EOS imports are delay-loaded and bound to our own copy of the
+        // SDK; without it no EOS_* function may be called (there is no module behind the thunks), and the
+        // game's own SDK must never stand in for it.
+        char why[320];
+        if (!SideloadReady(why, sizeof(why))) {
+            Log("[eos] EOS is unavailable: %s", why);
+            Log("[eos] (looked for %s) -- Direct connect (UDP) and same-PC play still work.", SideloadPath()[0] ? SideloadPath() : "?");
+            return false;
+        }
+        Log("[eos] our SDK: %s", SideloadPath());
+        char gameVer[64];
+        if (GameSdkWasReplaced(gameVer, sizeof(gameVer))) {
+            Log("[eos] WARNING: the GAME'S OWN EOS SDK reports %s -- that is OUR version, not the 1.13 Session ships.", gameVer);
+            Log("[eos] WARNING: an older SessionOpenMP install overwrote EOSSDK-Win64-Shipping.dll in the game's Win64 folder.");
+            Log("[eos] WARNING: On Epic this breaks DLC. Fix: verify the game files (Epic: Library > Session > Manage > Verify;");
+            Log("[eos] WARNING: Steam: Properties > Installed Files > Verify integrity). The mod no longer needs that file replaced.");
+        } else if (gameVer[0]) Log("[eos] the game's own SDK is %s, untouched", gameVer);
+#endif
         Log("=== SessionOpenMP transport (EOS %s) ===", EOS_GetVersion());
 
         EOS_InitializeOptions io{};
@@ -1128,6 +1152,10 @@ bool Init(bool forceRelays) {
         if (r != EOS_EResult::EOS_Success && r != EOS_EResult::EOS_AlreadyConfigured) {
             Log("[eos] EOS_Initialize failed: %s", EOS_EResult_ToString(r)); return false;
         }
+        // AlreadyConfigured means the SDK we are talking to was initialised by SOMEBODY ELSE: the game. With our
+        // own copy that cannot happen -- so if it does, we are inside the game's SDK and must say so.
+        if (r == EOS_EResult::EOS_AlreadyConfigured) Log("[eos] NOTE: EOS was already configured -- this is an SDK SHARED with the game, not our own copy");
+        g_sdkUp = true;
 
         // A source build with no credentials of its own gets the placeholder header CMake generated
         // from eos_creds.h.template. Say so plainly here: EOS_Platform_Create would otherwise fail
@@ -1256,7 +1284,7 @@ void Shutdown() {
         for (int i = 0; i < 12; i++) { EOS_Platform_Tick(g_plat); Sleep(8); }
     }
     if (g_plat) { EOS_Platform_Release(g_plat); g_plat = nullptr; }
-    EOS_Shutdown();
+    if (g_sdkUp) { EOS_Shutdown(); g_sdkUp = false; }      // never an SDK that did not come up: the call has no module behind it then
 }
 
 // Stop being the active wire WITHOUT killing what cannot be rebuilt (see Init). Leaves the lobby and
@@ -1290,6 +1318,34 @@ bool LobbyKick(const char* peerId) {
     o.LobbyId = g_lobbyId; o.LocalUserId = g_me; o.TargetUserId = target;
     Log("[lobby] kicking %s", peerId);
     EOS_Lobby_KickMember(g_lobbyH, &o, nullptr, onKickMember);
+    return true;
+}
+
+// HOST TRANSFER. The owner hands the lobby to a member who is still in it. Nothing here flips our own
+// status: the service confirms with a PROMOTED member-status event on every client, and the ownership
+// refresh that host migration already relies on moves us to guest and them to host. The refresh in
+// the callback is only a second chance at the same read, for the case where the event is late.
+static void EOS_CALL onPromoteMember(const EOS_Lobby_PromoteMemberCallbackInfo* d) {
+    Log("[lobby] host transfer: %s", EOS_EResult_ToString(d->ResultCode));
+    NoteAuthResult(d->ResultCode, "promote");
+    if (d->ResultCode == EOS_EResult::EOS_Success) refreshOwnership();
+}
+bool LobbyPromote(const char* peerId) {
+    if (!g_plat || !g_me || !peerId || !*peerId) return false;
+    if (!LobbyIsHost()) { Log("[lobby] host transfer refused: we are not the host of this session"); return false; }
+    // Only to someone who is actually here. A departed entry keeps its id in the table, and asking the
+    // service to promote somebody who left is a guaranteed refusal that reads as a broken button.
+    bool present = false;
+    for (int i = 0; i < g_nPeers; i++)
+        if (!_stricmp(g_peers[i].idStr, peerId)) { present = (g_peers[i].st.state != 5); break; }
+    if (!present) { Log("[lobby] host transfer refused: %s is not in the session", peerId); return false; }
+    EOS_ProductUserId target = EOS_ProductUserId_FromString(peerId);
+    if (!target) return false;
+    EOS_Lobby_PromoteMemberOptions o{};
+    o.ApiVersion = EOS_LOBBY_PROMOTEMEMBER_API_LATEST;
+    o.LobbyId = g_lobbyId; o.LocalUserId = g_me; o.TargetUserId = target;
+    Log("[lobby] transferring host to %s", peerId);
+    EOS_Lobby_PromoteMember(g_lobbyH, &o, nullptr, onPromoteMember);
     return true;
 }
 

@@ -40,6 +40,7 @@ enum OvAction {
     // Moderation of YOUR OWN session (EOS grants kick only to the lobby owner):
     OVA_KICK,            // remove the selected player from the session this instance hosts
     OVA_BAN,             // ...and never host them again (PauseMenu_TakePeerId supplies who)
+    OVA_PROMOTE,         // hand the session to the selected player; we become a guest in it
     OVA_SET_NAME,        // open the name box (a menu page cannot take text itself)
     // Direct UDP -- no Epic at all. F1 ONLY: joining needs a typed address, and the game's pause menu
     // has no text-entry widget (see mp_name.h). The address is set through omp::SetDirectEndpoint
