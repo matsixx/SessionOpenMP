@@ -131,6 +131,7 @@ char             g_lookWhy[96] = "Radio: not ready";
 // ---- settings
 int   g_on = 1;
 float g_volume = 0.40f;                       // RadioVolumePct: x1 was "very loud" (the field). The start for every radio; the wheel moves each
+float g_volumeOthers = 0.10f;                 // RadioVolumeOthersPct: ...and what SOMEONE ELSE'S starts at
 float g_rangeMax = 12000.0f;                  // RadioRangeCm: how far a radio at FULL volume carries (120 m)
 float g_rangeMin = 800.0f;                    // RadioRangeMinCm: ...and how far one turned right down does (8 m)
 float g_falloffStart = 0.45f;                 // RadioFalloffStartPct: full volume out to this much of the range
@@ -294,7 +295,11 @@ void* SongWave(void* station, int i) {
     void* song = list ? twkP(list, i * 8) : nullptr;
     return song ? twkP(song, SONG_WAVE) : nullptr;
 }
-float VolumeOf(const Radio& r) { return r.volumeSet ? r.volume : g_volume; }
+// SOMEONE ELSE'S RADIO STARTS QUIETER THAN YOUR OWN. You chose to put yours down and you know what is on
+// it; theirs is something you walked past, and in a busy lobby there may be several. So an untouched radio
+// of a peer's starts at RadioVolumeOthersPct rather than your own level -- turn any of them up or down from
+// the wheel and that one keeps whatever you gave it.
+float VolumeOf(const Radio& r) { return r.volumeSet ? r.volume : (r.player < 0 ? g_volume : g_volumeOthers); }
 void StopSound(Radio& r) {
     // The component is spawned with autoDestroy FALSE (see SpawnOn), so stopping is ours to do. It is
     // attached to the radio's own component and dies with the prop, so a stopped one left behind costs a
@@ -695,6 +700,8 @@ void Radio_ReadConfig(const char* buf) {
     if (g_rangeMax < 100.0f) g_rangeMax = 100.0f;
     if (g_rangeMin < 50.0f)  g_rangeMin = 50.0f;
     if (g_rangeMin > g_rangeMax) g_rangeMin = g_rangeMax;
+    const int vo = TwkIniIntQuiet(buf, "RadioVolumeOthersPct", 10);
+    g_volumeOthers = (float)(vo < 0 ? 0 : vo > 200 ? 200 : vo) / 100.0f;
     const int v = TwkIniIntQuiet(buf, "RadioVolumePct", 40);
     g_volume = (float)(v < 0 ? 0 : v > 400 ? 400 : v) / 100.0f;
     TwkIniStr(buf, "RadioMesh", g_meshPath, sizeof(g_meshPath), kMeshPath);
@@ -793,8 +800,7 @@ bool Radio_WheelTake(int i, bool* keepOpen) {
         // they were playing at; the new default reaches only radios that appear later.
         if (t->player < 0) {
             if (!g_mine.volumeSet) { g_mine.volume = g_volume; g_mine.volumeSet = true; }
-            for (Radio& o : g_remote) if (o.used && !o.volumeSet) { o.volume = g_volume; o.volumeSet = true; }
-            g_volume = t->volume; TwkMarkDirty();
+            g_volume = t->volume; TwkMarkDirty();   // theirs read g_volumeOthers, so this cannot reach them
         }
         bool applied = false;
         if (g_audioVolume && t->sound && SitUI_Alive(&t->sref) && !g_attenMissingSaid) {
