@@ -35,6 +35,13 @@ void MpPrefs_Init(const char* dir, void (*logf)(const char*));
 bool MpPrefs_HideAddress();
 void MpPrefs_SetHideAddress(bool on);
 
+// ---- THE RELEASE NOTES on the start menu. On, they stay on screen for as long as that menu is up
+// and come down when you leave it. Off, they never appear. A preference rather than a once-per-build
+// popup because every button a controller has at a menu already belongs to the game -- there is no key
+// to open them with that the menus do not already use.
+bool MpPrefs_ShowChangelog();
+void MpPrefs_SetShowChangelog(bool on);
+
 // ---- FLOATING PLAYER NAMES + SPEECH BUBBLES (ui/nameplates.h).
 // Stored here because they are the player's own settings and have to survive a restart; the
 // game-thread publish copies them into the live tuning every frame, so a change from either menu
@@ -120,4 +127,7 @@ unsigned MpPrefs_Generation();
 // silently becomes a stranger (the same rule that makes shm key on its SLOT and not on a PID).
 // Random rather than derived from anything about the machine: it should identify an install to the
 // people it plays with, and say nothing about the person to anyone else.
+// The build whose What's New notes have already been shown. Empty on a fresh install -- which is why a
+// fresh install sees them once too: somebody arriving new still wants to know what is in here.
+const char* MpPrefs_SeenVersion();   void MpPrefs_SetSeenVersion(const char* v);
 const char* MpPrefs_PeerId();

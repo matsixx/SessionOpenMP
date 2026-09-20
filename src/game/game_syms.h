@@ -213,6 +213,15 @@ using MemFreeFn         = void  (*)(void* p);
 // exes. A unique CALL SITE is sig'd instead and the target decoded from its `E8 rel32` -- reading the
 // displacement rather than wildcarding it, the same identity rule pointed the other way.
 using TextFromNameFn    = void* (*)(void* outFText, const void* fname);
+// FText::FromString(const FString&) -- hidden return pointer in rcx, the FString in rdx.
+using TextFromStringFn  = void* (*)(void* outFText, const void* fstring);
+// UImage::SetColorAndOpacity -- the tint the image is multiplied by (FLinearColor, by pointer).
+using ImageSetColorFn   = void  (*)(void* image, const void* linearColor);
+// USizeBox::SetHeightOverride / ::SetMaxDesiredHeight -- the value arrives in xmm1.
+using SizeBoxSetFloatFn = void  (*)(void* sizeBox, float value);
+// float UPlayerInput::GetKeyValue(FKey) -- the FKey goes by pointer; see the table entry.
+using KeyValueFn        = float (*)(void* playerInput, const void* fkey);
+using WidgetVoidFn      = void  (*)(void* widget);   // UWidget::SetKeyboardFocus
 // ---- WORLD -> SCREEN, for the floating player names (nameplates.h) ---------------------------------
 // APlayerController::ProjectWorldLocationToScreenWithDistance(this, const FVector* world,
 //   FVector* outScreenXY_and_Distance, bool bViewportRelative) -> bool.
@@ -267,6 +276,22 @@ using SetScalarParamFn = void (*)(void* mid, uint64_t nameFName, float value);
 using BoardRefreshVisFn = void (*)(void* boardActor);
 // UWidget::SetIsEnabled(bool). Greys the widget and blocks its input; the row stays on the page.
 using CompDestroyFn     = void  (*)(void* comp, bool promoteChildren);   // UActorComponent::DestroyComponent
+// ---- UMG. Enough to put one of the GAME'S OWN widget blueprints on screen with our text in it.
+using WidgetCreateFn    = void* (*)(void* worldContext, void* widgetClass, void* owningPlayer);  // UWidgetBlueprintLibrary::Create
+using WidgetAddViewFn   = void  (*)(void* userWidget, int zOrder);                               // UUserWidget::AddToViewport
+using WidgetTreeFindFn  = void* (*)(void* widgetTree, const void* nameFName);                    // UWidgetTree::FindWidget
+using TextSetTextFn     = void  (*)(void* textBlock, const void* fText);                         // UTextBlock::SetText
+using WidgetRemoveFn    = void  (*)(void* userWidget);                                           // UUserWidget::RemoveFromParent
+// Placing a widget that was added to the VIEWPORT. FVector2D is two floats and goes in a register
+// pair, so it is passed as a packed 8-byte value, not by pointer.
+using WidgetVec2Fn      = void  (*)(void* userWidget, unsigned long long xy, bool removeDpiScale);
+using WidgetVec2NoFlagFn= void  (*)(void* userWidget, unsigned long long xy);
+// ESlateVisibility: 0 Visible, 1 Collapsed, 2 Hidden, 3 HitTestInvisible, 4 SelfHitTestInvisible.
+using WidgetSetVisFn    = void  (*)(void* widget, unsigned char slateVisibility);
+// FAnchors is four floats {Min.X, Min.Y, Max.X, Max.Y}, passed BY POINTER (it is 16 bytes).
+// Min == Max is a POINT anchor, which is what makes a slot's offsets mean position+size rather
+// than margins from the parent's edges.
+using SlotAnchorsFn     = void  (*)(void* canvasSlot, const float* anchorsMinXYMaxXY);
 using WidgetSetEnabledFn = void (*)(void* widget, bool enabled);
 // Peer body trim (peer_bodies.cpp): the body-level knobs behind a proxy's physical animation.
 // FBodyInstance::SetInstanceSimulatePhysics takes three bools in 4.26 and two in 4.25; passing three
@@ -460,6 +485,15 @@ struct Syms {
     void*            IntroUiRange      = nullptr;   // ASessionPlayerController::CreateIntroUI
     void*            PauseInitRange    = nullptr;   // UPauseMenuPageContainer::NativeOnInitialized
     TextFromNameFn   TextFromName      = nullptr;   // decoded from MenuTextSite's trailing E8, not sig'd
+    // FText FText::FromString(const FString&) -- decoded from TextFromStringSite's trailing E8.
+    // The way past FName's 1024-character NAME_SIZE for widget text. It COPIES the string (verified
+    // from the disassembly), so the caller still owns and frees the FString it passes.
+    TextFromStringFn TextFromString    = nullptr;
+    ImageSetColorFn  ImageSetColor     = nullptr;   // tints a UImage; see the panel's background
+    SizeBoxSetFloatFn SizeBoxSetHeight    = nullptr;   // the news article's description box
+    SizeBoxSetFloatFn SizeBoxSetMaxHeight = nullptr;
+    KeyValueFn       PlayerInputKeyValue = nullptr;  // how far a pad key is held, from the engine
+    WidgetVoidFn     WidgetSetFocus    = nullptr;   // UWidget::SetKeyboardFocus
     SFOFn            StaticFindObject  = nullptr;
     void*            RenameObj         = nullptr;   // UObject::Rename -- hooked, never called directly
     void*            AnimUpdate        = nullptr;   // USkaterAnimInstance::NativeUpdateAnimation --
@@ -492,6 +526,21 @@ struct Syms {
     void*                BcastPaEnable  = nullptr;
     void*                TransitOpenMap = nullptr;        // UTransitMapWidget::SetOpenTransitMap -- custom_maps.cpp hooks it
     CompDestroyFn        CompDestroy    = nullptr;        // UActorComponent::DestroyComponent -- audio.cpp, a stopped loop
+    WidgetCreateFn       WidgetCreate       = nullptr;   // the game's own panels, with our words in them
+    WidgetAddViewFn      WidgetAddToViewport= nullptr;
+    WidgetTreeFindFn     WidgetTreeFind     = nullptr;
+    TextSetTextFn        TextBlockSetText   = nullptr;
+    WidgetRemoveFn       WidgetRemoveParent = nullptr;
+    WidgetVec2Fn         WidgetSetPosInVp   = nullptr;
+    WidgetVec2NoFlagFn   WidgetSetSizeInVp  = nullptr;
+    WidgetVec2NoFlagFn   WidgetSetAlignInVp = nullptr;
+    WidgetSetVisFn       WidgetSetVisible   = nullptr;
+    WidgetVec2NoFlagFn   SlotSetSize        = nullptr;   // UCanvasPanelSlot::SetSize
+    SlotAnchorsFn        SlotSetAnchors     = nullptr;   // UCanvasPanelSlot::SetAnchors
+    WidgetSetVisFn       TextSetAutoWrap    = nullptr;   // UTextBlock::SetAutoWrapText(bool)
+    WidgetRemoveFn       TextSyncProps      = nullptr;   // UTextBlock::SynchronizeProperties
+    WidgetSetVisFn       ScaleBoxSetStretch = nullptr;   // UScaleBox::SetStretch(EStretch)
+    WidgetVec2NoFlagFn   SlotSetPosition    = nullptr;   // UCanvasPanelSlot::SetPosition
     WidgetSetEnabledFn   WidgetSetEnabled = nullptr;    // grey a menu row out (UWidget::SetIsEnabled)
     // Peer body trim (peer_bodies.h): cutting a proxy's physical animation down to what can be seen.
     // All optional -- without them a peer simply keeps the whole simulated asset, as before.
@@ -1006,6 +1055,32 @@ namespace off {
     // (PDB: CreateIntroUI 0xf84090 size 0x199, UPauseMenuPageContainer::NativeOnInitialized
     // 0x107a8a0 size 0x32a).
     constexpr int kIntroUiLen         = 0x199;
+    // "Is there a local pawn" WITHOUT a session and without walking GUObjectArray: game instance ->
+    // its first local player -> that player's controller -> its pawn. Three pointer reads, so it can
+    // be asked every frame; the mod's own g_ownPawn is only maintained while a session is armed and
+    // is null the rest of the time, which is not the same question (field 2026-09-20).
+    constexpr int kGiLocalPlayers     = 0x38;    // UGameInstance::LocalPlayers (TArray<ULocalPlayer*>)
+    constexpr int kPlayerController   = 0x30;    // UPlayer::PlayerController
+    constexpr int kControllerPawn     = 0x250;   // AController::Pawn
+    constexpr int kPcPlayerInput      = 0x348;   // APlayerController::PlayerInput
+    // THE TITLE SCREEN, as a live pointer. ASessionPlayerController::_introUI is the widget
+    // CreateIntroUI makes -- that function's first act is to compare this against null, which is what
+    // stops it building a second one. Non-null and visible = the title screen is on screen. This is
+    // the fact every earlier attempt was trying to infer from events and from whether a pawn existed;
+    // the title screen HAS a pawn (field 2026-09-20), so that never could have worked.
+    constexpr int kPcIntroUI          = 0x670;   // ASessionPlayerController::_introUI
+    constexpr int kImageColor         = 0x1a0;   // UImage::ColorAndOpacity (FLinearColor) -- READ to
+                                                 // keep the blueprint's own alpha when tinting
+    constexpr int kSScrollDesired     = 0x340;   // SScrollBox::DesiredScrollOffset (float)
+    constexpr int kUserWidgetTree     = 0x1d8;   // UUserWidget::WidgetTree (PDB)
+    constexpr int kWidgetSlot         = 0x28;    // UWidget::Slot (PDB)
+    constexpr int kSlotParent         = 0x28;    // UPanelSlot::Parent -- the widget that CONTAINS it
+    // UTextLayoutWidget, the PARENT of UTextBlock -- which is why neither is on UTextBlock itself.
+    // WrapTextAt is a hard wrap width in slate units and OVERRIDES the slot's width when non-zero,
+    // which is what kept the notes wrapping narrow inside a box twice their width. 0 = wrap to the
+    // widget's own width. There is no compiled setter for it, so it is written directly.
+    constexpr int kTextWrapAt         = 0x110;   // UTextLayoutWidget::WrapTextAt (float)
+    constexpr int kTextAutoWrap       = 0x10d;   // UTextLayoutWidget::AutoWrapText (bool)
     constexpr int kPauseInitLen       = 0x32a;
     // ---- COSMETICS. A skater's look is NOT on the skater: ASkaterCharacterBase::RefreshVisuals reads
     // it off the GAME INSTANCE, so there is one cosmetic identity per PROCESS and dressing a proxy

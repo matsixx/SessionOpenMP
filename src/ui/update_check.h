@@ -30,4 +30,17 @@ bool UpdateCheck_NewerAvailable(char* latestOut, int cap);
 // compares EQUAL, because equal is silence and silence is the safe answer.
 int UpdateCheck_CompareVersions(const char* a, const char* b);
 
+// ---- THE RELEASE NOTES THEMSELVES, straight from the GitHub releases -----------------------------
+// The same one-shot worker also asks for the release LIST and keeps each release's tag and body, so
+// the What's New panel shows what is actually published rather than a copy kept in sync by hand.
+// Newest first, drafts and pre-releases skipped. Zero until the answer lands, and zero forever if it
+// never does -- callers fall back to the notes baked into the binary.
+int  UpdateCheck_NotesCount();
+// Copies release `i`'s version and body out. The body is plain text: GitHub's markdown is reduced to
+// lines and bullets when it is stored, because the panel is a single text block.
+bool UpdateCheck_NoteAt(int i, char* verOut, int verCap, char* bodyOut, int bodyCap);
+// Goes up ONCE, when the notes arrive. Lets a panel already showing the baked fallback replace itself
+// with the real thing instead of waiting for the next launch.
+unsigned UpdateCheck_NotesGeneration();
+
 } }  // namespace omp::ui

@@ -16,6 +16,11 @@
 kActorRole                     AActor::Role
 kActorRootComp                 AActor::RootComponent
 kCapsuleHalfHeight             UCapsuleComponent::CapsuleHalfHeight
+# "is the title screen up" without a session (ue4ss_mod.cpp IntroUiUp)
+kGiLocalPlayers                UGameInstance::LocalPlayers
+kPlayerController              UPlayer::PlayerController
+kControllerPawn                AController::Pawn
+kPcIntroUI                     ASessionPlayerController::_introUI
 kReplayMgrInputCtl             AReplayManager::_replayInputController
 kInputCtlCamera                AReplayInputController::_replayCamera
 kReplayCamLookAt               AReplayCamera::_lookAtTarget

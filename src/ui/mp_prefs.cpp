@@ -25,6 +25,7 @@ static int   g_syncSeconds = MPSYNC_SEC_DEFAULT;
 // The default is the SAFE one. A player who has never opened the menu gets their address hidden;
 // turning it off is a deliberate act by someone who wants the latency back.
 static bool     g_hideAddress = true;
+static bool     g_showChangelog = true;   // the release notes, up for as long as the start menu is
 static unsigned g_gen = 0;
 static char     g_peerId[33] = {0};      // 32 hex chars + terminator; empty until Init
 
@@ -52,6 +53,7 @@ static int      g_voiceRange  = 25;
 static int      g_voiceVol    = 100;
 static int      g_voiceSens   = 50;
 static char     g_voiceDevice[200] = {0};
+static char     g_seenVersion[32]  = {0};   // the build whose What's New has been shown
 // OFF by default: sharing the level's own furniture is unfinished, and the setting exists so it
 // cannot take the working half down with it.
 
@@ -68,6 +70,8 @@ static void saveAll() {
     }
     fprintf(f, "# SessionOpenMP preferences. Delete a line to return it to its default.\n");
     fprintf(f, "HideAddress=%d\n", g_hideAddress ? 1 : 0);
+    fprintf(f, "# The release notes on the start menu: 0 off, 1 on.\n");
+    fprintf(f, "ShowChangelog=%d\n", g_showChangelog ? 1 : 0);
     fprintf(f, "# Player names above heads: 0 off, 1 only while off your board, 2 always.\n");
     fprintf(f, "NameMode=%d\n", g_nameMode);
     fprintf(f, "SyncSeconds=%d\n", g_syncSeconds);
@@ -87,6 +91,8 @@ static void saveAll() {
     fprintf(f, "VoiceSensitivity=%d\n", g_voiceSens);
     fprintf(f, "# The microphone: a Windows endpoint id from the Voice chat page; empty = the default device.\n");
     fprintf(f, "VoiceDevice=%s\n", g_voiceDevice);
+    fprintf(f, "# The build whose What's New has been shown. Clear it to see the notes again.\n");
+    fprintf(f, "SeenVersion=%s\n", g_seenVersion);
     fprintf(f, "# The level's own props (benches, barriers): 0 leave them alone, 1 share them.\n");
     // PeerId is an IDENTITY, not a preference: deleting the line makes this install a different
     // person to everyone who has played with it. Written last, with a warning above it.
@@ -113,6 +119,13 @@ const char* MpPrefs_PeerId() { return g_peerId; }
 
 bool     MpPrefs_HideAddress() { return g_hideAddress; }
 unsigned MpPrefs_Generation()  { return g_gen; }
+
+bool MpPrefs_ShowChangelog() { return g_showChangelog; }
+void MpPrefs_SetShowChangelog(bool on) {
+    if (g_showChangelog == on) return;            // a no-op write must not churn the file
+    g_showChangelog = on;
+    saveAll();
+}
 
 void MpPrefs_SetHideAddress(bool on) {
     if (g_hideAddress == on) return;              // a no-op write must not churn the file or the gen
@@ -185,6 +198,13 @@ void MpPrefs_SetVoiceSensitivity(int pct) {
     g_voiceSens = pct;
     saveAll();
 }
+const char* MpPrefs_SeenVersion() { return g_seenVersion; }
+void MpPrefs_SetSeenVersion(const char* v) {
+    if (!v) v = "";
+    if (strcmp(v, g_seenVersion) == 0) return;
+    strncpy_s(g_seenVersion, v, _TRUNCATE);
+    saveAll();
+}
 const char* MpPrefs_VoiceDevice() { return g_voiceDevice; }
 void MpPrefs_SetVoiceDevice(const char* id) {
     if (!id) id = "";
@@ -253,6 +273,7 @@ void MpPrefs_Init(const char* dir, void (*logf)(const char*)) {
             // for this preference zero is the LESS safe value, so "corrupt file" must not silently
             // mean "stop hiding my address".
             if (!_stricmp(key, "HideAddress")) g_hideAddress = (val[0] != '0');
+            else if (!_stricmp(key, "ShowChangelog")) g_showChangelog = (val[0] != '0');
             else if (!_stricmp(key, "NameMode"))    g_nameMode    = clampI(atoi(val), MPNAME_OFF, MPNAME_ALWAYS);
             else if (!_stricmp(key, "SyncSeconds")) g_syncSeconds = clampI(atoi(val), MPSYNC_SEC_MIN, MPSYNC_SEC_MAX);
             else if (!_stricmp(key, "NameDistM"))   g_nameDistM   = clampI(atoi(val), MPNAME_DIST_MIN, MPNAME_DIST_MAX);
@@ -266,6 +287,7 @@ void MpPrefs_Init(const char* dir, void (*logf)(const char*)) {
             else if (!_stricmp(key, "VoiceVolume"))      g_voiceVol   = clampI(atoi(val), MPVOICE_VOL_MIN, MPVOICE_VOL_MAX);
             else if (!_stricmp(key, "VoiceSensitivity")) g_voiceSens  = clampI(atoi(val), 0, 100);
             else if (!_stricmp(key, "VoiceDevice"))      strncpy_s(g_voiceDevice, val, _TRUNCATE);
+            else if (!_stricmp(key, "SeenVersion"))      strncpy_s(g_seenVersion, val, _TRUNCATE);
             else if (!_stricmp(key, "PeerId")) {
                 // Only accept a well-formed one. A truncated or hand-edited id would still "work"
                 // right up until it collided with somebody, which is the worst time to find out.

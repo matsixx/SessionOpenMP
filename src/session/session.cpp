@@ -923,7 +923,16 @@ static inline bool olderThan(uint64_t nowUs, uint64_t thenUs, uint64_t gapUs) {
 static bool     g_ownPoseHold = false;
 // While a pose is held and MOVING, when the drivers last went out instead of a slice of skeleton (see the publish).
 static uint64_t g_holdBlobUs = 0;
-static const uint64_t kHoldBlobUs = 150000ull;      // 150 ms: the most the receiver's graph may fall behind
+// 0 = OFF, and off is the default again. This was added as the second of two speculative fixes for the
+// end-of-emote twitch and NEITHER was the cause -- that was the stamp having no weight, cured by the
+// release fade. It stayed anyway, and it costs a fifth of the pose refresh rate on every moving pose:
+// at a 30 Hz publish it takes ~6.7 of 30 updates a second to send drivers instead of the skeleton.
+// Field 2026-09-20: "all the emotes and sitting used to look good" -- this is what changed, and it was
+// never what made 10+ players work (that was the pose table going from 8 slots to 16, which costs
+// nothing). The receiver's graph now only has to be right at the moment of RELEASE, and drivers resume
+// at full rate the instant a pose ends, several updates before the 250 ms fade finishes.
+// Set to 150000 to restore it if a frozen graph mid-emote ever turns out to matter for something else.
+static const uint64_t kHoldBlobUs = 0;
 static int8_t   g_ownHeadYaw = 0, g_ownHeadPitch = 0;   // rides every snapshot; see repl::State::headYaw
 static uint64_t g_holdBeatUs = 0;
 static int      g_holdOffLeft = 0;
@@ -931,10 +940,19 @@ void SetOwnHeadLook(float yawDeg, float pitchDeg) {
     auto q = [](float d) -> int8_t { if (!(d > -120.f)) d = d < 0.f ? -120.f : 0.f; if (d > 120.f) d = 120.f; return (int8_t)(d < 0.f ? d - 0.5f : d + 0.5f); };
     g_ownHeadYaw = q(yawDeg); g_ownHeadPitch = q(pitchDeg);
 }
+// SessionTweaks turns a proxy's head toward this while they are OFF THE BOARD (sit.cpp's proxy head
+// block, "HeadFollowsCamera"). An EMOTE is off the board -- and a transported pose ALREADY carries the
+// sender's real head, the emote's own HeadTurn included, stamped straight onto the skeleton. Answering
+// here while that is true gets the same turn applied TWICE: measured 2026-09-20 as a rock-steady extra
+// 50.3 degrees about the pitch axis on a watched head, i.e. "it's looking in the direction they are
+// looking but it's allowing over rotation", emotes and the radio carry only. Sitting was always fine
+// because a seated head turn comes from this look alone, with nothing in the pose to double it.
+// 0 = "do not turn this head", which is exactly right: the pose owns it.
 int ProxyHeadLook(void* actor, float* yawDeg, float* pitchDeg) {
     if (!actor) return 0;
     for (auto& s : g_slots) {
         if (!s.used || s.proxy.actor() != actor) continue;
+        if (game::pose::PoseDrivingActorHead(actor)) return 0;
         return s.proxy.HeadLook(yawDeg, pitchDeg);   // 1 off the board, 2 riding
     }
     return 0;
@@ -2328,7 +2346,7 @@ void Frame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, GatherFn gatherOwn) {
                 // (at the start both sides are still in step). Between sweeps -- never inside one, a half-sent
                 // skeleton is never usable -- a driver packet goes out instead, so the graph the receiver falls
                 // back on is never more than this far behind. It costs a few of the pose's refreshes a second.
-                if (!holdSweeping && olderThan(nowUs, g_holdBlobUs, kHoldBlobUs)) {
+                if (kHoldBlobUs && !holdSweeping && olderThan(nowUs, g_holdBlobUs, kHoldBlobUs)) {
                     g_holdBlobUs = nowUs;
                     own.poseN = 0;                                       // the drivers, the feet and the hands this tick
                 } else if (!holdSweeping) {

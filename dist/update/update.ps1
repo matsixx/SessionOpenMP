@@ -169,21 +169,62 @@ if ($Check) {
     exit 0
 }
 
-# ---------------------------------------------------------------- 4. the game must be closed
-# Only THIS install matters: someone with two copies installed can update one while playing the
-# other. If the running process will not tell us its path (it can refuse when elevated), assume it
-# is the one we are about to write to and stop -- overwriting a loaded DLL fails halfway.
-$blocking = $false
+# ---------------------------------------------------------------- 4. is the game running?
+# It no longer has to be closed. Windows will not let you OVERWRITE a DLL that a process has mapped,
+# but it will happily let you RENAME one: the running game keeps the old file open under its new
+# name, and the new file takes the original name for the next launch. That is what Copy-Replacing
+# below does, and it is why this can run with the game open.
+# Only THIS install matters -- someone with two copies installed can update one while playing the
+# other. If the running process will not tell us its path (it can refuse when elevated), assume it is
+# the one we are about to write to.
+$gameRunning = $false
 foreach ($p in @(Get-Process -Name "SessionGame-Win64-Shipping" -ErrorAction SilentlyContinue)) {
     $exe = ""
     try { $exe = $p.Path } catch { $exe = "" }
-    if ($exe -eq "") { $blocking = $true; break }
-    if ($exe.ToLower().StartsWith($dir.ToLower())) { $blocking = $true; break }
+    if ($exe -eq "") { $gameRunning = $true; break }
+    if ($exe.ToLower().StartsWith($dir.ToLower())) { $gameRunning = $true; break }
 }
-if ($blocking) {
+if ($gameRunning) {
     Write-Host ""
-    Warn "Session is running from this folder. Close the game and run this again -- its files are locked while it is open."
-    exit 1
+    Warn "Session is running. The files will be updated anyway -- close and re-open your game"
+    Warn "afterwards to actually use the new version."
+}
+
+# Copy over a file that something may have open. The plain copy is tried first, because when nothing
+# holds the file that is all this needs to be. If it is locked, the old one is renamed out of the way
+# and the new one put in its place; the renamed file cannot be deleted until the process that has it
+# lets go, so it is left for the next run to sweep up (see Clear-OldFiles).
+function Copy-Replacing {
+    param([string]$From, [string]$To)
+    try {
+        Copy-Item $From $To -Force -ErrorAction Stop
+        return $true
+    } catch {
+        if (-not (Test-Path $To)) { throw }          # not a lock: a real failure, let it out
+    }
+    $aside = "$To.omp-old-" + [Guid]::NewGuid().ToString("N").Substring(0, 8)
+    try {
+        Move-Item $To $aside -Force -ErrorAction Stop
+        Copy-Item $From $To -Force -ErrorAction Stop
+        try { Remove-Item $aside -Force -ErrorAction Stop } catch { }   # still mapped: next run gets it
+        return $true
+    } catch {
+        # Put it back rather than leaving the install without the file at all.
+        if ((Test-Path $aside) -and -not (Test-Path $To)) {
+            try { Move-Item $aside $To -Force -ErrorAction Stop } catch { }
+        }
+        throw
+    }
+}
+
+# Sweep up files a previous run renamed aside while the game had them open.
+function Clear-OldFiles {
+    param([string]$Root)
+    $n = 0
+    foreach ($f in @(Get-ChildItem $Root -Recurse -File -Filter "*.omp-old-*" -ErrorAction SilentlyContinue)) {
+        try { Remove-Item $f.FullName -Force -ErrorAction Stop; $n++ } catch { }
+    }
+    return $n
 }
 
 # ---------------------------------------------------------------- 5. get the package
@@ -247,10 +288,12 @@ try {
 
         $dstDir = Split-Path $dst
         if (-not (Test-Path $dstDir)) { New-Item -ItemType Directory -Path $dstDir -Force | Out-Null }
-        Copy-Item $_.FullName $dst -Force
+        Copy-Replacing $_.FullName $dst | Out-Null
         $copied++
     }
     Good "$copied file(s) updated"
+    $swept = Clear-OldFiles $dir
+    if ($swept -gt 0) { Say "  cleaned up $swept file(s) left behind by an earlier update" }
     foreach ($k in $kept) { Say "  kept your $k" }
 
     # ------------------------------------------------------------ 8. mods.txt, merged not replaced
@@ -299,6 +342,10 @@ try {
     Write-Host ""
     Good "Updated to SessionOpenMP $latest."
     Say  "  Release notes: https://github.com/$Repo/releases/tag/$latestTag"
+    if ($gameRunning) {
+        Write-Host ""
+        Warn "Close and re-open your game to use it."
+    }
 }
 finally {
     if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }

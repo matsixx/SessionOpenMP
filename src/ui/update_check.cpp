@@ -43,6 +43,29 @@ namespace omp { namespace ui {
 // 0 = still asking or never asked, 1 = we are current (or could not tell), 2 = there is a newer one.
 static volatile LONG g_state = 0;
 static char          g_latest[32] = {0};        // written by the worker BEFORE g_state goes to 2
+
+// ---- the published release notes ----------------------------------------------------------------
+// Filled by the same worker, from the release LIST. Sized for what the panel can hold rather than for
+// what GitHub sends: the text goes into the widget through an FName, whose limit is 1024 characters
+// for the WHOLE page, so keeping more than this would only be thrown away later.
+// kNoteBody is per release and generous on purpose: the panel used to be capped by FName's 1024
+// characters for the WHOLE page, so storing more than a few hundred was pointless. FText::FromString
+// removed that ceiling, and what governs now is how many lines the box draws -- so a release is kept
+// whole and the panel decides how much of it to use.
+enum { kMaxNotes = 6, kNoteBody = 2048, kNoteVer = 32, kListBytes = 262144 };
+static char          g_noteVer[kMaxNotes][kNoteVer] = {};
+static char          g_noteBody[kMaxNotes][kNoteBody] = {};
+static volatile LONG g_noteCount = 0;           // written LAST: a reader seeing n can read n entries
+static volatile LONG g_noteGen   = 0;
+
+int UpdateCheck_NotesCount() { return (int)InterlockedCompareExchange(&g_noteCount, 0, 0); }
+unsigned UpdateCheck_NotesGeneration() { return (unsigned)InterlockedCompareExchange(&g_noteGen, 0, 0); }
+bool UpdateCheck_NoteAt(int i, char* verOut, int verCap, char* bodyOut, int bodyCap) {
+    if (i < 0 || i >= UpdateCheck_NotesCount()) return false;
+    if (verOut  && verCap  > 0) { strncpy(verOut,  g_noteVer[i],  (size_t)verCap  - 1); verOut[verCap - 1]   = 0; }
+    if (bodyOut && bodyCap > 0) { strncpy(bodyOut, g_noteBody[i], (size_t)bodyCap - 1); bodyOut[bodyCap - 1] = 0; }
+    return true;
+}
 static volatile LONG g_started = 0;
 
 // ---- version comparison ------------------------------------------------------------------------
@@ -115,6 +138,112 @@ static bool extractTag(const char* body, char* out, int cap) {
     return n > 0;
 }
 
+// ---- the release list --------------------------------------------------------------------------
+// Still no JSON library, for the reason above: this reads two keys out of a document we do not
+// control, and a scan for them is less code and less risk than parsing the whole thing. The array
+// arrives newest-first, so the order it is stored in is the order it is shown in.
+
+// A JSON string value, unescaped, from just after its opening quote. Returns where it ended.
+static const char* jsonString(const char* p, char* out, int cap) {
+    int n = 0;
+    while (*p && *p != '"') {
+        char c = *p++;
+        if (c == '\\' && *p) {
+            const char e = *p++;
+            switch (e) {
+                case 'n': c = '\n'; break;
+                case 'r': continue;                     // CRLF from GitHub: keep the \n, drop the \r
+                case 't': c = ' ';  break;
+                case 'u': for (int k = 0; k < 4 && *p; k++) p++; c = ' '; break;   // not worth decoding
+                default:  c = e;    break;              // \" \\ \/ are themselves
+            }
+        }
+        if (n < cap - 1) out[n++] = c;
+    }
+    out[n] = 0;
+    return p;
+}
+
+// GitHub markdown -> what a single text block can render. Headings and emphasis markers are dropped,
+// `code` loses its backticks, [text](url) keeps the text, and runs of blank lines collapse. Lines are
+// kept whole: the panel wraps them itself.
+static void plainify(const char* in, char* out, int cap) {
+    int n = 0;
+    bool atLineStart = true, lastWasBlank = true;
+    for (const char* p = in; *p && n < cap - 1; ) {
+        if (*p == '\n') {
+            p++;
+            if (lastWasBlank) continue;                 // never two blank lines in a row
+            out[n++] = '\n';
+            atLineStart = true; lastWasBlank = true;
+            continue;
+        }
+        if (atLineStart) {
+            while (*p == ' ' || *p == '\t') p++;
+            while (*p == '#' || *p == '>') p++;         // heading / quote markers
+            while (*p == ' ') p++;
+            if (*p == '*' || *p == '+') { const char* q = p + 1; if (*q == ' ') { p++; out[n++] = '-'; } }
+            atLineStart = false;
+            if (!*p) break;
+        }
+        if (*p == '*' || *p == '`' || *p == '_') { p++; continue; }      // emphasis / code markers
+        if (*p == '[') {                                                 // [text](url) -> text
+            const char* close = strchr(p, ']');
+            if (close && close[1] == '(') {
+                for (const char* q = p + 1; q < close && n < cap - 1; q++) out[n++] = *q;
+                const char* end = strchr(close, ')');
+                p = end ? end + 1 : close + 1;
+                lastWasBlank = false;
+                continue;
+            }
+        }
+        out[n++] = *p++;
+        lastWasBlank = false;
+    }
+    // If the cap cut it, cut back to the last COMPLETE line: a stored body ending mid-word would be
+    // rendered as though it were a whole bullet.
+    if (n >= cap - 1) { while (n > 0 && out[n - 1] != '\n') n--; }
+    while (n > 0 && (out[n - 1] == '\n' || out[n - 1] == ' ')) n--;      // no trailing blank line
+    out[n] = 0;
+}
+
+static void parseReleases(const char* json) {
+    int found = 0;
+    const char* p = json;
+    while (found < kMaxNotes) {
+        const char* tagKey = strstr(p, "\"tag_name\"");
+        if (!tagKey) break;
+        // This release's slice of the document: up to the next release's tag, so a key found below
+        // cannot belong to a different entry.
+        const char* next = strstr(tagKey + 10, "\"tag_name\"");
+        char ver[kNoteVer] = {0};
+        const char* q = strchr(tagKey + 10, '"');
+        if (q) jsonString(q + 1, ver, sizeof(ver));
+        p = tagKey + 10;
+        if (!ver[0]) continue;
+        // Drafts and pre-releases are not what anybody means by "what's new".
+        const char* draft = strstr(tagKey, "\"draft\":true");
+        const char* pre   = strstr(tagKey, "\"prerelease\":true");
+        if ((draft && (!next || draft < next)) || (pre && (!next || pre < next))) continue;
+        const char* bodyKey = strstr(tagKey, "\"body\"");
+        if (!bodyKey || (next && bodyKey > next)) continue;
+        const char* b = strchr(bodyKey + 6, '"');
+        if (!b) continue;
+        static char raw[8192];
+        jsonString(b + 1, raw, sizeof(raw));
+        if (!raw[0]) continue;
+        // A leading "v" is the tag's, not the version's: the panel says 1.2.1, like everything else.
+        const char* vshow = (ver[0] == 'v' || ver[0] == 'V') ? ver + 1 : ver;
+        strncpy(g_noteVer[found], vshow, kNoteVer - 1);
+        plainify(raw, g_noteBody[found], kNoteBody);
+        if (g_noteBody[found][0]) found++;
+    }
+    if (found > 0) {
+        InterlockedExchange(&g_noteCount, found);       // count LAST: the entries are written first
+        InterlockedIncrement(&g_noteGen);
+    }
+}
+
 static DWORD WINAPI worker(LPVOID) {
     HINTERNET ses = nullptr, con = nullptr, req = nullptr;
     char body[16384];
@@ -149,6 +278,39 @@ static DWORD WINAPI worker(LPVOID) {
         }
         body[total] = 0;
         got = total > 0;
+    }
+    if (req) WinHttpCloseHandle(req);
+    req = nullptr;
+
+    // ---- SECOND REQUEST: the release LIST, for the notes the What's New panel shows.
+    // A separate request rather than reading the notes out of the one above, because the two want
+    // different things: "am I out of date" must use /releases/latest, which EXCLUDES drafts and
+    // pre-releases, and swapping it for the list would start announcing a pre-release as an update.
+    // Bodies are prose and there are several of them, so the buffer is heap rather than stack.
+    if (con) {
+        char* list = (char*)malloc(kListBytes);
+        DWORD n = 0;
+        if (list) {
+            req = WinHttpOpenRequest(con, L"GET",
+                                     L"/repos/matsixx/SessionOpenMP/releases?per_page=6",
+                                     nullptr, WINHTTP_NO_REFERER,
+                                     WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE);
+            if (req && WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                                          WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+                WinHttpReceiveResponse(req, nullptr)) {
+                DWORD avail = 0;
+                while (WinHttpQueryDataAvailable(req, &avail) && avail > 0 && n < kListBytes - 1) {
+                    DWORD want = avail;
+                    if (want > kListBytes - 1 - n) want = kListBytes - 1 - n;
+                    DWORD read = 0;
+                    if (!WinHttpReadData(req, list + n, want, &read) || !read) break;
+                    n += read;
+                }
+                list[n] = 0;
+                if (n > 0) parseReleases(list);
+            }
+            free(list);
+        }
     }
     if (req) WinHttpCloseHandle(req);
     if (con) WinHttpCloseHandle(con);

@@ -46,6 +46,11 @@ struct Flags {
     // fixes had missed it. A line per frame per proxy, so it stays off.
     // NOTE: on ONE PC both clients share GetTickCount64, so the two logs align exactly.
     bool poseTwitch       = false;
+    // ONE LINE A SECOND: the head bone as we stamp it vs the head bone as it was actually PUBLISHED
+    // (rendered). A gap between them means something writes the head after the pose does, and says by
+    // how many degrees. This is what found the doubled head turn on 2026-09-20 -- it proved the
+    // published pose differed from BOTH the graph and our stamp, which named a third writer.
+    bool headProbe        = false;
     // The level's-own-props handover, traced leg by leg: claimed locally, published, received,
     // driving. That state machine spans two machines, and three rounds went on guessing which leg
     // was missing before it was written -- the feature is unfinished, so it will be wanted again.

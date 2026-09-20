@@ -23,6 +23,8 @@
 #include "mp_prefs.h"
 #include "../voice/voice_capture.h"    // the microphone's state, for the voice page
 #include "version_tag.h"
+#include "trx_popup.h"        // the update row reports through the game's own popup
+#include "update_check.h"      // ...and only appears when there is something to install
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
@@ -352,6 +354,17 @@ static uint8_t   g_nameRow[0x90];
 static FTextBlob g_nameOpt;
 static uint64_t  g_nameKey = 0;
 static const int kMpNameAfter = 0;       // first thing on the page: it is who you ARE in the session
+// "Update" -- only on the multiplayer page, only when GitHub says there is a newer release, and only
+// on a HELD button. A version mismatch is the worst failure this project has (two people connect and
+// simply cannot see each other), so the fix belongs one press away from where they notice it.
+static uint8_t   g_updateRow[0x90];
+static uint64_t  g_updateKey = 0;
+
+// The release notes on the start menu: on by default, off for anyone who does not want them.
+static uint8_t   g_notesRow[0x90];
+static FTextBlob g_notesOpt[2];
+static uint64_t  g_notesKey = 0;
+static int       g_notesAt = -1;
 static uint8_t   g_privacyRow[0x90];
 static FTextBlob g_privacyOpt[2];
 static uint64_t  g_privacyKey = 0;
@@ -476,6 +489,12 @@ static uint64_t  g_guestRootKeys[kMaxGuestPages];
 static uint64_t  g_guestItemKeys[kMaxGuestPages][OMP_PAGEITEM_MAX];
 static bool      g_rowsBuilt = false;
 static uint64_t  g_pauseKey  = 0;                       // FName("PauseMenuPage")
+// HOW MANY TIMES THE IN-GAME PAUSE PAGE HAS BEEN BUILT. The game has TWO menus that look alike to
+// everything else in the mod -- the start menu (the one with the skater behind it) and the in-game
+// pause menu -- and this is the one fact that separates them: only the second is the page whose key
+// is "PauseMenuPage". Read by the loader to keep the release notes off the pause menu.
+static volatile unsigned g_pausePageBuilds = 0;
+unsigned PauseMenu_PausePageBuilds() { return g_pausePageBuilds; }
 
 // A ZERO-INITIALISED FText IS NOT AN EMPTY FText -- it is a null pointer with a crash attached.
 // `UMenuPageContainer::HandlePageItemSelectionChanged` takes the item's `_longDescription`
@@ -710,6 +729,49 @@ static void stampTemplate(uint8_t* row) {
     *(float*)(row + 0x60) = d;
 }
 
+// ---- RUNNING THE UPDATER --------------------------------------------------------------------------
+// update.bat sits beside the game executable, which is also our own working reference point: the exe's
+// own directory, asked of Windows rather than guessed or stored.
+//
+// THE GAME IS NOT RESTARTED FOR YOU, and that is deliberate. Relaunching Session means going through
+// Steam or Epic -- the executable does not start correctly on its own, and a mod silently spawning a
+// store client, or the game a second time, is not something to do behind somebody's back. So this
+// starts the updater and then says, in the game's own popup, that the game has to be restarted. The
+// updater itself can now run with the game open (it renames locked files aside), so nothing is lost
+// by leaving that last step to the player.
+static void RunUpdater() {
+    char exe[MAX_PATH] = {0};
+    if (!GetModuleFileNameA(nullptr, exe, MAX_PATH)) { log("[menu] update: could not find the game folder"); return; }
+    if (char* slash = strrchr(exe, '\\')) *(slash + 1) = 0;
+    char bat[MAX_PATH];
+    snprintf(bat, sizeof(bat), "%supdate.bat", exe);
+    if (GetFileAttributesA(bat) == INVALID_FILE_ATTRIBUTES) {
+        log("[menu] update: update.bat is not next to the game executable");
+        omp::ui::TrxPopup_Show("Update", "update.bat could not be found next to the game. "
+                                         "Download the new version from the releases page instead.", "OK", log);
+        return;
+    }
+    // Its OWN console window, and not waited on: the updater downloads and can take a while, and the
+    // game thread is the one asking. Started in the game folder so the script finds the install.
+    STARTUPINFOA si{}; si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+    char cmd[MAX_PATH + 64];
+    snprintf(cmd, sizeof(cmd), "cmd.exe /c \"\"%s\"\"", bat);
+    const BOOL ok = CreateProcessA(nullptr, cmd, nullptr, nullptr, FALSE,
+                                   CREATE_NEW_CONSOLE, nullptr, exe, &si, &pi);
+    if (ok) { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); }
+    char m[MAX_PATH + 64];
+    snprintf(m, sizeof(m), "[menu] update: %s %s", ok ? "started" : "COULD NOT START", bat);
+    log(m);
+    if (ok)
+        omp::ui::TrxPopup_Show("Updating",
+                               "The updater is running in its own window.\n\n"
+                               "When it says it is done, close and re-open your game.", "OK", log);
+    else
+        omp::ui::TrxPopup_Show("Update", "The updater could not be started. Run update.bat from your "
+                                         "Session folder instead.", "OK", log);
+}
+
 static void buildRows() {
     if (g_rowsBuilt) return;
     g_rowsBuilt = true;                                  // one attempt; a failure disables, never retries
@@ -737,6 +799,31 @@ static void buildRows() {
         if (!buildToggleRow(g_privacyRow, it, &g_privacyKey, g_privacyOpt)) {
             g_privacyKey = 0;
             log("[menu] could not build the privacy row -- the toggle is F1-only this run");
+        }
+    }
+    // The update row. HELD, not pressed: it closes the game's files out from under a running install
+    // and there is no undo, so it gets the same deliberate hold the stock "Exit to desktop" has.
+    // -1 in the delay field means "the same hold as Exit to desktop" (see stampTemplate).
+    if (buildRow(g_updateRow, "OmpUpdate", "Update",
+                 "Download and install the newest SessionOpenMP. Hold to confirm; you will need to "
+                 "restart the game afterwards.", &g_updateKey)) {
+        *(float*)(g_updateRow + 0x60) = -1.0f;
+        stampTemplate(g_updateRow);
+    } else {
+        g_updateKey = 0;
+    }
+    // The release-notes toggle. Same independent-failure rule as the privacy row above.
+    {
+        GuestItem it{};
+        strncpy_s(it.key,      "OmpChangelog", _TRUNCATE);
+        strncpy_s(it.label,    "Show what's new", _TRUNCATE);
+        strncpy_s(it.desc,     "The SessionOpenMP release notes, on the start menu. "
+                               "Off: they never appear.", _TRUNCATE);
+        strncpy_s(it.offLabel, "Off", _TRUNCATE);
+        strncpy_s(it.onLabel,  "On",  _TRUNCATE);
+        if (!buildToggleRow(g_notesRow, it, &g_notesKey, g_notesOpt)) {
+            g_notesKey = 0;
+            log("[menu] could not build the release-notes row");
         }
     }
     // The player-names page. Every row here fails INDEPENDENTLY -- a key left at 0 is simply never
@@ -1274,6 +1361,7 @@ static const TArrayHdr* chooseArray(void* page, const TArrayHdr* items, TArrayHd
     }
 
     if (key != g_pauseKey) return items;                 // not the pause menu: never touched
+    g_pausePageBuilds++;                                 // "the IN-GAME pause page, specifically, was built"
     g_lastPage = page;                                   // only ever used by the bounded browse poll
     // A rebuild of the root page that this code did not ask for means the game re-activated it (the
     // menu was opened, or navigation returned here) -- so the fake sub-page is no longer on screen.
@@ -1318,7 +1406,14 @@ static const TArrayHdr* chooseArray(void* page, const TArrayHdr* items, TArrayHd
         // The roster goes on EVERY row of this page, so the right-hand panel keeps showing it no
         // matter which row the player happens to be sitting on.
         buildRosterText();
-        g_privacyAt = -1; g_dropAt = -1; g_peerBodyAt = -1;
+        g_privacyAt = -1; g_dropAt = -1; g_peerBodyAt = -1; g_notesAt = -1;
+        // ABOVE EVERYTHING, and only when there is actually something to install. It goes first
+        // because playing on an old version is the thing that wastes people's evening: the lobby
+        // connects and the other player is invisible.
+        if (g_updateKey && omp::ui::UpdateCheck_NewerAvailable(nullptr, 0)) {
+            setRowRoster(g_updateRow);
+            add(g_updateRow, true);
+        }
         for (int i = 0; i < kMpRowCount; i++) {
             uint8_t* row = g_mpRows + (size_t)i * off::kItemSize;
             setRowRoster(row);
@@ -1362,7 +1457,7 @@ static const TArrayHdr* chooseArray(void* page, const TArrayHdr* items, TArrayHd
         // independent-failure rule -- a key left at 0 is simply never added, so one broken control
         // still leaves the others usable.
         buildRosterText();
-        g_privacyAt = -1; g_dropAt = -1; g_peerBodyAt = -1;
+        g_privacyAt = -1; g_dropAt = -1; g_peerBodyAt = -1; g_notesAt = -1;
         if (g_namesOpenKey) add(g_namesOpenRow, true);
         if (g_dropKey) {
             // The value goes on the DEFINITION here (so the row reads right even if the stamp is
@@ -1377,6 +1472,7 @@ static const TArrayHdr* chooseArray(void* page, const TArrayHdr* items, TArrayHd
         }
         if (g_voiceOpenKey) add(g_voiceOpenRow, true);
         if (g_privacyKey) { g_privacyAt = n; add(g_privacyRow, true); }
+        if (g_notesKey)   { g_notesAt   = n; add(g_notesRow,   true); }
         add(g_mpRows + (size_t)(kMpRowCount - 1) * off::kItemSize, true);       // the shared Back row
     } else if (g_page == PG_VOICE) {
         // Voice chat. Option indices go on the definition (so a row reads right even if the stamp is
@@ -1649,6 +1745,15 @@ static void stampValues(void* page) {
                 S.MenuMultiSetIndex(widget, MpPrefs_HideAddress() ? 1 : 0);
         }
         g_privacyAt = -1;                                 // one shot per build, like the guest pass
+    }
+    // The release-notes toggle, same page and same argument as the privacy toggle.
+    if (g_notesAt >= 0 && S.MenuMultiSetIndex) {
+        const TArrayHdr* pw = (const TArrayHdr*)((uint8_t*)page + off::kPageItemWidgets);
+        if (pw->data && g_notesAt < pw->num) {
+            if (void* widget = ((void**)pw->data)[g_notesAt])
+                S.MenuMultiSetIndex(widget, MpPrefs_ShowChangelog() ? 1 : 0);
+        }
+        g_notesAt = -1;
     }
     // The dropped-objects row, same page and same argument as the privacy toggle.
     if (g_dropAt >= 0 && S.MenuMultiSetIndex) {
@@ -2186,6 +2291,10 @@ static bool handleConfirm(void* page, void* params) {
         log("[menu] pause: opening the name box");
         return true;
     }
+    if (g_page == PG_MP && g_updateKey && itemKey == g_updateKey) {
+        RunUpdater();
+        return true;
+    }
     if (g_page == PG_OTHER && g_namesOpenKey && itemKey == g_namesOpenKey) {
         g_page = PG_NAMES;
         queueSwap(page, "Player names", false, true);
@@ -2393,6 +2502,16 @@ static bool handleValueChange(void* params, bool isSlider) {
                 MpPrefs_SetHideAddress(idx != 0);
                 char m[96];
                 snprintf(m, sizeof(m), "[menu] 'hide my address' -> %s", idx ? "On" : "Off");
+                log(m);
+            }
+            return true;
+        }
+        if (g_notesKey && k == g_notesKey && !isSlider) {
+            const int idx = *(const int32_t*)((const uint8_t*)params + off::kChangeParamsNew);
+            if ((idx != 0) != MpPrefs_ShowChangelog()) {
+                MpPrefs_SetShowChangelog(idx != 0);
+                char m[96];
+                snprintf(m, sizeof(m), "[menu] 'show what's new' -> %s", idx ? "On" : "Off");
                 log(m);
             }
             return true;

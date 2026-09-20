@@ -22,6 +22,13 @@
 namespace omp { namespace game {
 
 struct ProxyTuning {
+    // Stand the head look-at down while a TRANSPORTED pose drives a proxy. The look-at aims the head at
+    // a WORLD POINT carried in the driver blob (anim field 0x570, alpha 0x57c), and a MOVING pose sends
+    // the skeleton INSTEAD of that blob -- so no fresh point arrives for the whole emote, the blob goes
+    // stale, and the head keeps aiming where the player was looking when it started. They turn, the
+    // point ends up behind them, and the head follows it round. The transported pose already carries
+    // their real head, clamped as their own game clamped it. false restores the old behaviour.
+    bool  killLookAtWhilePosed = true;
     // Spawn NEVER at the sender's exact position: a Character spawn defaults to
     // AdjustIfPossibleButDontSpawnIfColliding and returns NULL inside another character.
     float spawnOffsetCm   = 200.0f;

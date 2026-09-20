@@ -56,6 +56,8 @@
 #include "replication/sidecar.h"
 #include "loader/lua_api.h"
 #include "ui/mp_prefs.h"
+#include "ui/whats_new.h"
+#include "ui/nacon_panel.h"
 #include "game/peer_bodies.h"      // the trim knobs the Peer body physics tier drives
 
 #include <cstdio>
@@ -70,6 +72,46 @@ static void logLine(const char* s) {
     SYSTEMTIME t; GetLocalTime(&t);
     if (g_log) { fprintf(g_log, "[%02d:%02d:%02d.%03d] %s\n", t.wHour, t.wMinute, t.wSecond, t.wMilliseconds, s); fflush(g_log); }
 }
+// The local player's controller, from the GAME rather than from our own tracking: game instance ->
+// first local player -> its controller. Works whether or not a session is armed, which is the whole
+// point -- the mod is inert until one is, so anything of ours that tracks the player is null on a
+// normal single-player launch.
+static void* LocalPlayerController() {
+    void* gi = VersionTag_GameInstance();
+    if (!gi) return nullptr;
+    __try {
+        struct TArr { void** data; int num, max; };
+        const TArr* lp = (const TArr*)((const uint8_t*)gi + omp::game::off::kGiLocalPlayers);
+        if (!lp->data || lp->num <= 0) return nullptr;
+        void* player = lp->data[0];
+        if (!player) return nullptr;
+        return *(void**)((uint8_t*)player + omp::game::off::kPlayerController);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+}
+// IS THE TITLE SCREEN ON SCREEN -- the one with the Session logo and the skater standing behind it.
+// Its widget hangs off the player controller, so this is a live answer with nothing to latch: the
+// pointer exists while the screen does. Visibility is checked too, in case it is kept and hidden
+// rather than destroyed (1 = Collapsed, 2 = Hidden).
+static bool IntroUiUp() {
+    void* pc = LocalPlayerController();
+    if (!pc) return false;
+    __try {
+        void* ui = *(void**)((uint8_t*)pc + omp::game::off::kPcIntroUI);
+        if (!ui) return false;
+        const unsigned char vis = *(const unsigned char*)((const uint8_t*)ui + omp::game::off::kWidgetVisibility);
+        return vis != 1 && vis != 2;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+// Is the IN-GAME PAUSE MENU on screen? ASessionPlayerController::IsPauseMenuDisplayed. Measured: this
+// is false on the start menu -- it went true only once the "PauseMenuPage" rows had been built -- so
+// it answers "paused mid-game", NOT "a menu is up".
+static bool MenuDisplayed() {
+    void* pc = LocalPlayerController();
+    if (!pc || !omp::game::Get().PauseMenuShown) return false;
+    __try { return omp::game::Get().PauseMenuShown(pc); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
+
 static uint64_t nowUs() {
     static LARGE_INTEGER f{}; if (!f.QuadPart) QueryPerformanceFrequency(&f);
     LARGE_INTEGER c; QueryPerformanceCounter(&c);
@@ -286,17 +328,61 @@ static void publishUi() {
     {
         static bool told = false;
         char latest[32] = {0};
-        if (!told && omp::ui::UpdateCheck_NewerAvailable(latest, sizeof(latest)) &&
-            VersionTag_SawMenu()) {
+        // ARE WE AT THE MAIN MENU -- as a STATE, not as an event.
+        // VersionTag_SawMenu() fires when the menu draws its VERSION LINE, which happens when the menu
+        // is BUILT, not every frame. Gating a per-frame poll on it means the poll essentially never
+        // runs: that is why "press Y for the notes" did nothing (field 2026-09-20). It also CONSUMES
+        // the flag, so two asks in one frame make the second one lie.
+        // So the event only ever SETS the state, and having a skater clears it: at the menu there is no
+        // pawn, and the moment one exists we are in the world and Y belongs to the game again.
+        // THE TITLE SCREEN, ASKED DIRECTLY. `ASessionPlayerController::_introUI` is the widget that
+        // screen IS, so "is it up" is a pointer read -- no event to latch, nothing to go stale, and it
+        // becomes false the instant the screen goes.
+        //
+        // Every earlier attempt inferred this instead, and each inference was wrong in its own way:
+        // the version line is drawn by BOTH the title screen and the pause menu so it cannot tell them
+        // apart; IsPauseMenuDisplayed is the in-game pause menu only and is false on the title screen;
+        // and "the player has a pawn" does not mean "in the game", because the title screen has one
+        // too -- it is a loaded level with the skater standing in it. All three were measured from
+        // field logs on 2026-09-20, the last one from a probe printing `pawn yes` over a screenshot of
+        // the title screen. Do not go back to any of them.
+        const bool introUp = IntroUiUp();
+        const bool pauseUp = MenuDisplayed();        // the IN-GAME pause menu, which is not this
+        const bool onMenu  = introUp && !pauseUp;
+        (void)VersionTag_SawMenu();                  // consumed so it cannot go stale; not used here
+        // SAY SO, ONCE PER CHANGE. Everything on this menu moment hangs off `onMenu`, and when
+        // something that depends on it does not appear there has been no way to tell "the menu was
+        // never seen" from "it was seen and the thing itself failed" -- which cost several rounds of
+        // guessing (2026-09-20). One line per transition answers that from the log alone.
+        // ...and it logs a change in ANY of the three, not just the conclusion. When the conclusion is
+        // wrong, what is needed is which INPUT was wrong, and a line that only reports the answer
+        // cannot say (2026-09-20: two rounds were spent because the pawn check was never exercised --
+        // it shipped alongside a second change that stopped the flag being raised at all).
+        {
+            static int said = -1;
+            const int now = (onMenu ? 1 : 0) | (introUp ? 2 : 0) | (pauseUp ? 4 : 0);
+            if (said != now) {
+                said = now;
+                char m[128];
+                snprintf(m, sizeof(m), "[menu] start menu %s (intro UI %s, in-game pause %s)",
+                         onMenu ? "IS up" : "is not up",
+                         introUp ? "up" : "not up", pauseUp ? "up" : "not up");
+                logLine(m);
+            }
+        }
+        bool updateNoticeRaised = false;
+        if (!told && onMenu && omp::ui::UpdateCheck_NewerAvailable(latest, sizeof(latest))) {
             char body[320];
+            // The instructions used to live here -- "close the game and run update.bat" -- and they
+            // are gone because that is no longer what you do: Multiplayer > Update installs it from
+            // inside the game. One place to send people beats a paragraph they have to follow.
             snprintf(body, sizeof(body),
                      "You have %s. The latest is %s.\n\n"
-                     "Close the game and run update.bat in your Session folder to update.\n\n"
-                     "Players on different versions can join the same session and never see each "
-                     "other, so it is worth doing before you play together.",
+                     "Go into Multiplayer options to update",
                      OMP_VERSION_STRING, latest);
             if (omp::ui::TrxPopup_Show("SessionOpenMP update available", body, "OK", logLine)) {
                 told = true;
+                updateNoticeRaised = true;
                 char m[128];
                 snprintf(m, sizeof(m), "[update] told the player about %s (running %s)",
                          latest, OMP_VERSION_STRING);
@@ -305,6 +391,12 @@ static void publishUi() {
             // Not shown yet? Leave `told` false and try on the next menu draw: the popup manager
             // may simply not be up, and there is no value in a warning that was swallowed.
         }
+        // WHAT'S NEW: up for as long as the start menu is, unless it is switched off in Other options.
+        // Skipped entirely on the frame an update notice goes up -- "you are out of date" is the more
+        // urgent of the two and a second box would fight it. Skipped rather than asked for with `want`
+        // false, so a panel already on screen is left alone instead of being torn down for one frame.
+        if (!updateNoticeRaised)
+            omp::ui::WhatsNew_KeepUp(onMenu && MpPrefs_ShowChangelog(), logLine);
     }
     Overlay_Publish(&g_ui);
     PauseMenu_Publish(&g_ui);      // same snapshot, second surface
@@ -1190,11 +1282,12 @@ static void GameThreadFrame() {
                 snprintf(m, sizeof(m),
                          "[pose] cap=%u(%uB) noted=%u hook=%u applied=%u pfx=%u stale=%u skipCnt=%u"
                          " meshBones=%u faults=%u held=%u holdApplied=%u"
-                         " | sweeps=%u liveN=%u slice=%u wiped=%u fade=%u noSlice=%u noSlot=%u mapped=%u/%u",
+                         " | sweeps=%u liveN=%u slice=%u wiped=%u fade=%u interp=%u/%ums noSlice=%u noSlot=%u mapped=%u/%u notSent=%u",
                          p.captured, p.bones, p.noted, p.hookCalls, p.applied, p.prefixStamps,
                          p.stale, p.skippedCount, p.meshBones, p.faults, p.held, p.holdApplied,
-                         p.sweeps, p.liveN, p.sliceBones, p.wiped, p.fadeFrames, p.noSlice, p.noSlot, p.mappedBones,
-                         p.unmappedBones);
+                         p.sweeps, p.liveN, p.sliceBones, p.wiped, p.fadeFrames,
+                         p.interpSweeps, (unsigned)(p.interpSpanMs + 0.5f), p.noSlice, p.noSlot, p.mappedBones,
+                         p.unmappedBones, p.untransported);
                 logLine(m);
                 // Measurement only, and silent outside replay playback: whether proxy anim graphs
                 // still UPDATE while the local player scrubs, and the state of the standard

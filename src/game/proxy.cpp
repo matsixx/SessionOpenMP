@@ -290,6 +290,7 @@ struct AnimSlot {
     void*    ai = nullptr;
     uint16_t len = 0;
     uint64_t freshMs = 0;
+    uint64_t posedMs = 0;      // a transported pose was driving this skeleton at this moment
     uint8_t  blob[320];
     // the TRICK PULSE (trick_pulse.h): an IsTrickPending write owed AFTER the blob, consumed there
     uint8_t  trickPulse = 0;
@@ -315,6 +316,11 @@ struct AnimSlot {
     uint64_t lastUpdMs = 0;
 };
 static AnimSlot g_animSlots[kAnimSlots];
+// A transported pose is driving this proxy RIGHT NOW. Set every frame from Apply -- not from
+// StoreAnimForPostPass, which only runs when a driver blob arrives, and a moving pose sends none.
+void NoteProxyPosed(Proxy* owner, uint64_t nowMs) {
+    for (auto& sl : g_animSlots) if (sl.owner == owner) { sl.posedMs = nowMs; return; }
+}
 
 static void StoreAnimForPostPass(Proxy* owner, void* ai, const repl::State& s, uint64_t nowMs, uint8_t trickPulse, uint8_t animReset) {
     if (!owner || !ai || !s.animLen || s.animLen > sizeof(AnimSlot::blob)) return;
@@ -369,6 +375,22 @@ void AnimPostApply(void* ai) {
         // proxy's anim state, and the slot going stale in 500 ms is not fast enough to stop the
         // first half-second of fresh blobs stamping over it.
         if (Proxy::Tuning().recordPeers && LocalReplayMode() == 2) return;
+        // ---- THE HEAD LOOK-AT, WHILE A TRANSPORTED POSE IS DRIVING THIS SKELETON.
+        // The look-at is a WORLD POINT the head aims at (anim field 0x570) with an alpha (0x57c). It
+        // rides the driver blob -- and a MOVING pose carries the skeleton INSTEAD of that blob, so no
+        // fresh point arrives for the whole emote. The blob then goes stale, the writes below stop, and
+        // the anim instance keeps aiming the head at wherever the player happened to be looking when
+        // the emote began. They turn; the frozen point ends up behind them; the head cranks round to
+        // keep staring at it. Field 2026-09-20: "it is looking in the direction they are looking but
+        // it's allowing over rotation", emotes and the carry only -- a SITTING pose is still, so its
+        // packets keep carrying the blob and its look-at never goes stale.
+        // The transported pose already contains the sender's real head, clamped exactly as their own
+        // game clamped it, so the look-at has nothing to add here and everything to break. Alpha 0
+        // hands the head to the pose. Written BEFORE the staleness return below, because the whole
+        // point is that the blob IS stale.
+        if (Proxy::Tuning().killLookAtWhilePosed && s.posedMs && GetTickCount64() - s.posedMs < 400) {
+            __try { *(float*)((uint8_t*)ai + 0x57c) = 0.0f; } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
         if (GetTickCount64() - s.freshMs > 500) return;      // stale stream: let the local graph run
 #ifdef _WIN32
         __try {
@@ -980,7 +1002,8 @@ void Proxy::Apply(const repl::State& s, uint64_t nowMs, uint64_t nowUs, void (*l
         void* pmesh = safePtr(actor_, off::kSkaterMesh);
         if (pmesh) pose::Note(pmesh, s, nowMs);
     }
-    if (s.animLen) {
+if (s.poseN) NoteProxyPosed(this, nowMs);   // the look-at must stand down while the pose drives
+        if (s.animLen) {
         void* pmesh = safePtr(actor_, off::kSkaterMesh);
         void* ai = pmesh ? safePtr(pmesh, off::kMeshAnimInstance) : nullptr;
         if (ai) { const uint8_t tp = trickPulse_, ar = animReset_; trickPulse_ = 0; animReset_ = 0;

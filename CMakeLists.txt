@@ -293,6 +293,9 @@ if(EXISTS "${UE4SS_LIB}")
             # always-on list because the popup hooks nothing but reaches the game instance the
             # version tag captured -- they are two halves of one thing.
             src/ui/trx_popup.cpp
+            src/ui/whats_new.cpp
+            src/ui/nacon_panel.cpp
+            src/ui/news_panel.cpp
             src/ui/update_check.cpp
             src/ui/mp_name.cpp
             # Chat (round 382). It IS an ImGui window, so it belongs to this block -- and so does the

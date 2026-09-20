@@ -37,6 +37,7 @@ void VersionTag_Install();   // game thread, from on_unreal_init (after MinHook 
 // its version at least once, which happens while the main menu is being built. This is the only
 // route to it that does not need an actor -- see the comment at the hook.
 void* VersionTag_GameInstance();
-// True ONCE per time the version line is drawn by a menu (intro or pause). Consumed by the reader,
-// so it answers "has the menu just been on screen" rather than "is it now".
+// True ONCE per time the version line is drawn by A MENU. It CANNOT tell the start menu from the
+// in-game pause menu -- the start menu is that same screen over a loaded level -- so do not use it to
+// mean "the start menu". See the note at its definition for what to ask instead.
 bool  VersionTag_SawMenu();

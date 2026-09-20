@@ -35,12 +35,16 @@ static GameVersionFn o_GameVersion = nullptr;
 
 // Is this return address inside one of the two functions that DISPLAY the version? Anything else --
 // notably UPlayerProfile::GetNewsSaveData -- gets the untouched string.
-static bool callerDisplays(const void* ret) {
+// WHICH of the two matters to the callers: the INTRO UI is the start menu, the PAUSE INIT is the
+// in-game pause menu. Anything that should only happen on the start menu has to tell them apart --
+// lumping them together let the pause menu count as "the start menu is up".
+enum { CALLER_OTHER = 0, CALLER_INTRO = 1, CALLER_PAUSE = 2 };
+static int callerDisplays(const void* ret) {
     const Syms& S = Get();
     const uint8_t* r = (const uint8_t*)ret;
-    if (S.IntroUiRange   && r >= (const uint8_t*)S.IntroUiRange   && r < (const uint8_t*)S.IntroUiRange   + off::kIntroUiLen)   return true;
-    if (S.PauseInitRange && r >= (const uint8_t*)S.PauseInitRange && r < (const uint8_t*)S.PauseInitRange + off::kPauseInitLen) return true;
-    return false;
+    if (S.IntroUiRange   && r >= (const uint8_t*)S.IntroUiRange   && r < (const uint8_t*)S.IntroUiRange   + off::kIntroUiLen)   return CALLER_INTRO;
+    if (S.PauseInitRange && r >= (const uint8_t*)S.PauseInitRange && r < (const uint8_t*)S.PauseInitRange + off::kPauseInitLen) return CALLER_PAUSE;
+    return CALLER_OTHER;
 }
 
 // Append the tag onto the FString the game just built. Done by hand rather than with FString::Printf
@@ -80,6 +84,13 @@ static void appendTag(void* outFString) {
 static void* g_gameInstance = nullptr;
 static volatile LONG g_onMenu = 0;
 void* VersionTag_GameInstance() { return g_gameInstance; }
+// "A MENU HAS JUST BEEN BUILT", and nothing finer than that -- it CANNOT tell the start menu from the
+// in-game pause menu, because the start menu IS the pause menu's screen shown over a loaded level, and
+// the caller it arrives from is the one named PauseInit. Filtering this to the intro UI to get "the
+// start menu" was wrong twice over: the intro is the Session logo on black, and the menu everyone
+// means never fired it at all (field 2026-09-20). Callers that need the difference ask
+// IsPauseMenuDisplayed and watch PauseMenu_PausePageBuilds -- see ue4ss_mod.cpp.
+// Consumed by the reader, so it answers "has a menu just been built" rather than "is one up now".
 bool  VersionTag_SawMenu()      { return InterlockedExchange(&g_onMenu, 0) != 0; }
 
 static void* hkGameVersion(void* gameInstance, void* outFString) {
@@ -87,9 +98,9 @@ static void* hkGameVersion(void* gameInstance, void* outFString) {
     if (gameInstance) g_gameInstance = gameInstance;
     // _ReturnAddress() here is the address in the ORIGINAL caller: MinHook's trampoline leaves the
     // real return address in place, which is what makes the caller filter possible at all.
-    const bool fromMenu = callerDisplays(_ReturnAddress());
-    if (fromMenu) InterlockedExchange(&g_onMenu, 1);
-    if (!g_dead && fromMenu) appendTag(outFString);
+    const int from = callerDisplays(_ReturnAddress());
+    if (from != CALLER_OTHER) InterlockedExchange(&g_onMenu, 1);
+    if (!g_dead && from != CALLER_OTHER) appendTag(outFString);
     return r;
 }
 

@@ -95,6 +95,25 @@ struct Slot {
     float    outPos[kPoseMaxBones][3];
     bool     outArm = false;      // Note saw the release; Apply starts the clock in ITS own timebase
     uint64_t outStartMs = 0;
+    // ---- BETWEEN WHOLE SWEEPS. The snapshot stream ALREADY knows how to blend a pose (InterpStates'
+    // pose branch), and on a 70-bone skater it does. It cannot on a 95-bone one: that skeleton needs two
+    // packets, so consecutive snapshots carry DIFFERENT SLICES, the guard
+    // (poseFirst == poseFirst && poseCount == poseCount) fails, and the pose steps. That guard is right --
+    // lerping one slice against another mixes unrelated bones -- so the blend has to happen where whole
+    // poses exist, which is HERE, after reassembly. Measured on a viewer: 33% of frames during a pose
+    // were an exact repeat of the previous one, against 0% on the sender.
+    // The last attempt at smoothing (pose.h Tuning, "TESTED AND REVERTED") failed because it read the
+    // COMPONENT-SPACE ARRAY as "last frame's pose" and the animator re-stomps that array every frame.
+    // These are OUR OWN copies of the last two finished sweeps; nothing is ever read back off the mesh.
+    uint8_t  interpN = 0;                   // bones in the pair below (0 = nothing to blend yet)
+    float    prevRot[kPoseMaxBones][4], prevPos[kPoseMaxBones][3];
+    float    curRot[kPoseMaxBones][4],  curPos[kPoseMaxBones][3];
+    float    blendT = 1.0f;                 // 0 = showing prev, 1 = showing cur
+    float    sweepMs = 0.0f;                // measured interval between sweeps, smoothed
+    uint64_t lastSweepMs = 0;
+    uint64_t lastStepMs = 0;                // Apply's clock, for advancing blendT
+    bool     saidNotSent = false;           // the un-stamped bones have been named once
+    int16_t  headIdx = -2;                  // -2 = not looked for yet, -1 = this mesh has no head bone
 };
 static Slot g_slots[kSlots];
 // A slot is claimed by ADDRESS, and UE hands addresses back: a proxy dies with its world, a new
@@ -177,6 +196,35 @@ void blendKept(Slot* sl, uint8_t* cs, int num, float w) {
             blendVec3(p, sl->outPos[b], w);
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) { sl->outN = 0; }
+}
+
+// Advance the sweep-to-sweep blend on Apply's own clock, and say whether there is a pair to blend.
+bool stepInterp(Slot* sl, uint64_t nowMs, int num) {
+    if (!g_tun.poseInterp || sl->interpN == 0 || (int)sl->interpN != (int)sl->n) return false;
+    if (num < (int)sl->interpN) return false;
+    // DO NOTHING WHEN THERE IS NOTHING TO FIX. When the sender's skeleton fits ONE packet -- which is
+    // what dropping the feet and hands during a held pose buys -- every snapshot carries the whole
+    // slice, the stream's own pose blend already applies (InterpStates' guard passes), and a sweep
+    // lands every frame. Blending on top of that would only hold the skeleton a frame behind for no
+    // gain. This engages for a SLICED skeleton, where sweeps are frames apart and the stream cannot.
+    if (sl->sweepMs > 0.0f && sl->sweepMs < g_tun.interpMinGapMs) return false;
+    const uint64_t last = sl->lastStepMs;
+    sl->lastStepMs = nowMs;
+    if (!last || nowMs <= last) return sl->blendT < 1.0f;
+    float dt = (float)(nowMs - last);
+    if (dt > 100.0f) dt = 100.0f;                        // a hitch must not jump the blend
+    const float span = sl->sweepMs > 0.0f ? sl->sweepMs : 33.0f;
+    g_st.interpSpanMs = span;                            // what the blend is actually spread over
+    sl->blendT += dt / span;
+    if (sl->blendT > 1.0f) sl->blendT = 1.0f;            // arrived: hold there until the next sweep
+    return true;
+}
+// The pose to stamp for the SENDER's bone `r`: the blend between the last two finished sweeps.
+void poseFor(const Slot* sl, int r, bool interp, float* q, float* p) {
+    if (!interp) { memcpy(q, sl->rot[r], 16); memcpy(p, sl->pos[r], 12); return; }
+    memcpy(q, sl->prevRot[r], 16); memcpy(p, sl->prevPos[r], 12);
+    blendQuat(q, sl->curRot[r], sl->blendT);
+    blendVec3(p, sl->curPos[r], sl->blendT);
 }
 
 float dbgYaw(const float* q) {
@@ -400,6 +448,41 @@ void Note(void* mesh, const State& s, uint64_t nowMs) {
     const int first = s.poseFirst;
     int cnt = s.poseCount;
     if (first >= total) { g_st.noSlice++; return; }
+    // A NEW SWEEP IS ABOUT TO OVERWRITE THE FINISHED ONE. Slices refresh `rot`/`pos` IN PLACE, so the
+    // instant before the first slice of the next sweep lands is the only moment this buffer holds one
+    // coherent skeleton: after it, bones 0..47 are the new sweep and the rest are still the old one.
+    // That is what gets kept as a blend endpoint -- never a half-updated mix.
+    if (g_tun.poseInterp && first == 0 && sl->n == (uint8_t)total) {
+        const int nb = total < kPoseMaxBones ? total : kPoseMaxBones;
+        if (sl->interpN == (uint8_t)nb) {
+            // PREV := WHAT IS ON SCREEN, not the last sweep. Poses land every ~25 ms and a frame is
+            // ~16, so the blend is typically two thirds finished when the next one arrives. Taking
+            // `cur` as the new start throws that last third away and jumps the skeleton forward by it
+            // -- once per pose, 40 times a second, which IS the chop this was built to remove. Field
+            // 2026-09-20: "still choppy", with interp/s == noted/s and span 25 ms proving the blend
+            // was running and therefore that the fault was in the handover, not in whether it ran.
+            for (int b = 0; b < nb; b++) {
+                blendQuat(sl->prevRot[b], sl->curRot[b], sl->blendT);
+                blendVec3(sl->prevPos[b], sl->curPos[b], sl->blendT);
+            }
+        } else {                                   // first pair: start ON the new pose, so nothing jumps
+            memcpy(sl->prevRot, sl->rot, sizeof(float) * 4 * (size_t)nb);
+            memcpy(sl->prevPos, sl->pos, sizeof(float) * 3 * (size_t)nb);
+        }
+        memcpy(sl->curRot, sl->rot, sizeof(float) * 4 * (size_t)nb);
+        memcpy(sl->curPos, sl->pos, sizeof(float) * 3 * (size_t)nb);
+        sl->interpN = (uint8_t)nb;
+        if (sl->lastSweepMs && nowMs > sl->lastSweepMs) {
+            const float iv = (float)(nowMs - sl->lastSweepMs);
+            // Smoothed, and bounded: a stall must not stretch the blend into a slow-motion crawl.
+            sl->sweepMs = sl->sweepMs > 0.0f ? sl->sweepMs * 0.7f + iv * 0.3f : iv;
+            if (sl->sweepMs > 250.0f) sl->sweepMs = 250.0f;
+            if (sl->sweepMs < 8.0f)   sl->sweepMs = 8.0f;
+        }
+        sl->lastSweepMs = nowMs;
+        sl->blendT = 0.0f;                         // ...and glide from the old one to this
+        g_st.interpSweeps++;
+    }
     if (first + cnt > total) cnt = total - first;
     if (cnt <= 0) { g_st.noSlice++; return; }
     memcpy(&sl->rot[first], &s.poseRot[first], sizeof(float) * 4 * (size_t)cnt);
@@ -419,6 +502,21 @@ void Note(void* mesh, const State& s, uint64_t nowMs) {
     g_st.liveN = sl->n;
     sl->freshMs = nowMs;                      // slices keep the stream alive even mid-sweep
     g_st.noted++;
+}
+bool PoseDrivingActorHead(void* actor) {
+    if (!g_tun.enabled || !actor) return false;
+    void* mesh = nullptr;
+#ifdef _WIN32
+    __try { mesh = *(void**)((uint8_t*)actor + off::kSkaterMesh); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+#endif
+    if (!mesh) return false;
+    const Slot* sl = slotFor(mesh);
+    if (!sl || !sl->n) return false;
+    // Fresh only: a pose that has gone stale hands the skeleton back to the graph, and the head-look
+    // should come back with it rather than leaving the head frozen.
+    const uint64_t now = GetTickCount64();
+    return !(sl->freshMs && now > sl->freshMs && now - sl->freshMs > g_tun.freshMs);
 }
 void Forget(void* mesh) {
     Slot* sl = slotFor(mesh);
@@ -534,6 +632,8 @@ void OnFinalizeBones(void* mesh, uint64_t nowMs) {
                 g_logf(m); }
         }
     }
+    // Blend between the last two finished sweeps rather than stepping onto each one (see Slot::interpN).
+    const bool interp = haveFresh && stepInterp(sl, nowMs, num);
     if (haveFresh) {
         // Count mismatch = the two ends MERGED different meshes for this player (garments carry rig
         // bones, and an item not installed here changes the merged mesh). The base skeleton is the
@@ -548,19 +648,94 @@ void OnFinalizeBones(void* mesh, uint64_t nowMs) {
         EnsureBoneMap(sl, mesh);
         if (g_tun.skeletonSync && g_tun.nameKeyedBones && sl->mapReady && sl->mapBuiltFor == mesh &&
             g_st.mappedBones > 0) {
+            int untransported = 0;
+            // The head as the GRAPH left it this frame, before we overwrite it. Three values make the
+            // buffers unambiguous: if `published` matches THIS, the read buffer is the graph's output
+            // and the probe was measuring nothing; if it matches what we STAMP, ours is what renders.
+            float headPre[4] = { 0, 0, 0, 0 };
+            if (debug::Get().headProbe && sl->headIdx >= 0 && sl->headIdx < num)
+                memcpy(headPre, cs + (size_t)sl->headIdx * off::kTransformStride + off::kTransformRotOff, 16);
             __try {
                 const int nLocal = num < kPoseMaxBones ? num : kPoseMaxBones;
                 for (int b = 0; b < nLocal; b++) {
                     const int r = sl->map[b];
                     // A bone the sender does not have keeps whatever the local graph put there --
                     // a garment bone of ours they cannot speak for, which is exactly right.
-                    if (r < 0 || r >= (int)sl->n) continue;
+                    // A bone the sender HAS a name for but did NOT transport (their pose was
+                    // trimmed shorter than their fingerprint) is left to the proxy's own graph. That
+                    // is invisible and it is not always harmless: during a moving pose the graph has
+                    // no fresh drivers, so such a bone drifts on stale input while the rest of the
+                    // skeleton is exact. Counted so "some bones are not ours" can never be silent.
+                    if (r >= (int)sl->n) {
+                        // NAME them, once per slot. "37 bones are not ours" is only actionable if it
+                        // says WHICH: inert leaf terminators and the board rig are trimmed on purpose
+                        // and skipping them is correct, but a real bone here is a hole in the pose that
+                        // the proxy's own graph fills -- and during a moving pose that graph has no
+                        // fresh drivers. Field 2026-09-20: a peer's head twisting during emotes only.
+                        if (!sl->saidNotSent && g_logf && untransported < 24) {
+                            char bn[64] = "?";
+                            game::SkeletonBoneName(mesh, b, bn, sizeof(bn));
+                            char m[160];
+                            snprintf(m, sizeof(m), "[pose] not sent by them: local bone %d '%s' -> their %d (they sent %d)",
+                                     b, bn, r, (int)sl->n);
+                            g_logf(m);
+                        }
+                        untransported++; continue;
+                    }
+                    if (r < 0) continue;
                     uint8_t* t = cs + (size_t)b * off::kTransformStride;
-                    memcpy(t + off::kTransformRotOff, sl->rot[r], 16);
-                    memcpy(t + off::kTransformPosOff, sl->pos[r], 12);
+                    float q[4], pv[3];
+                    poseFor(sl, r, interp, q, pv);
+                    memcpy(t + off::kTransformRotOff, q, 16);
+                    memcpy(t + off::kTransformPosOff, pv, 12);
                 }
                 g_st.applied++; g_st.mappedStamps++;
+                if (untransported > g_st.untransported) g_st.untransported = (uint8_t)(untransported > 255 ? 255 : untransported);
+                if (untransported) sl->saidNotSent = true;
             } __except (EXCEPTION_EXECUTE_HANDLER) { g_st.faults++; }
+            // ---- WHAT HAPPENS TO THE HEAD AFTER WE WRITE IT (debug::poseTwitch).
+            // We stamp the EDITABLE buffer and the engine publishes it; the READ buffer therefore holds
+            // what was actually RENDERED last frame. If they disagree on the head, something is writing
+            // it after us -- and the ANGLE BETWEEN THEM is how much. Field 2026-09-20: a watched head
+            // pitches down much further than the sender's, i.e. the same turn applied about twice.
+            if (debug::Get().headProbe) {
+                if (sl->headIdx == -2) {
+                    sl->headIdx = -1;
+                    for (int b2 = 0; b2 < num && b2 < kPoseMaxBones; b2++) {
+                        char bn[64] = "";
+                        if (!game::SkeletonBoneName(mesh, b2, bn, sizeof(bn))) continue;
+                        size_t L = strlen(bn);
+                        if (L >= 4 && _stricmp(bn + L - 4, "head") == 0) { sl->headIdx = (int16_t)b2; break; }
+                    }
+                    if (g_logf) { char m[120];
+                        snprintf(m, sizeof(m), "[posedbg] head bone = local %d (of %d)", (int)sl->headIdx, num);
+                        g_logf(m); }
+                }
+                static uint64_t saidMs = 0;
+                if (sl->headIdx >= 0 && g_logf && nowMs > saidMs + 1000) {
+                    saidMs = nowMs;
+                    int rn = 0; const uint8_t* rd = compSpace(mesh, /*editable*/ false, &rn);
+                    if (rd && sl->headIdx < rn) {
+                        const float* mine2 = (const float*)(cs + (size_t)sl->headIdx * off::kTransformStride + off::kTransformRotOff);
+                        const float* pub   = (const float*)(rd + (size_t)sl->headIdx * off::kTransformStride + off::kTransformRotOff);
+                        float d = mine2[0]*pub[0] + mine2[1]*pub[1] + mine2[2]*pub[2] + mine2[3]*pub[3];
+                        if (d < 0.0f) d = -d; if (d > 1.0f) d = 1.0f;
+                        const float deg = 2.0f * acosf(d) * 57.2957795f;
+                        char m[200];
+                        float dg = headPre[0]*pub[0] + headPre[1]*pub[1] + headPre[2]*pub[2] + headPre[3]*pub[3];
+                        if (dg < 0.0f) dg = -dg; if (dg > 1.0f) dg = 1.0f;
+                        const float degGraph = 2.0f * acosf(dg) * 57.2957795f;
+                        snprintf(m, sizeof(m), "[posedbg] head: graph(%.3f %.3f %.3f %.3f) ours(%.3f %.3f %.3f %.3f) "
+                                 "published(%.3f %.3f %.3f %.3f) | published vs ours %.1f, vs graph %.1f -- %s",
+                                 headPre[0], headPre[1], headPre[2], headPre[3],
+                                 mine2[0], mine2[1], mine2[2], mine2[3], pub[0], pub[1], pub[2], pub[3],
+                                 deg, degGraph,
+                                 degGraph < 5.0f ? "the READ buffer IS the graph: probe was measuring nothing"
+                                                 : (deg > 5.0f ? "SOMETHING MOVES IT AFTER US" : "ours is what renders"));
+                        g_logf(m);
+                    }
+                }
+            }
             keepStamped(sl, cs, num);       // ...so the release has something to fade out of
             sl->outArm = false; sl->outStartMs = 0;
             { char f[40]; snprintf(f, sizeof(f), "pose=1 stamped=1"); dbgLine(g_dbgPeer[(int)(sl - g_slots)], "rx ", mesh, cs, num, true, f, nowMs); }
@@ -576,8 +751,10 @@ void OnFinalizeBones(void* mesh, uint64_t nowMs) {
         __try {
             for (int b = 0; b < nStamp; b++) {
                 uint8_t* t = cs + (size_t)b * off::kTransformStride;
-                memcpy(t + off::kTransformRotOff, sl->rot[b], 16);
-                memcpy(t + off::kTransformPosOff, sl->pos[b], 12);
+                float q[4], pv[3];
+                poseFor(sl, b, interp, q, pv);
+                memcpy(t + off::kTransformRotOff, q, 16);
+                memcpy(t + off::kTransformPosOff, pv, 12);
             }
             g_st.applied++;
         } __except (EXCEPTION_EXECUTE_HANDLER) { g_st.faults++; }

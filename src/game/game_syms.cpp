@@ -334,6 +334,23 @@ static const SigEntry kSigs[] = {
     // scene component per loop start, every one moved with the proxy every frame. Optional: without
     // it the leak is back, nothing else changes.
     { "CompDestroy",           "40 57 48 83 EC 40 0F B6 81 8B 00 00 00 48 8B F9 A8 02 0F 85 ?? ?? ?? ?? 0C 02 48 89 6C 24 60 4C 89 6C 24 30", false },
+    // ---- UMG, for showing a game-native panel of our own (ui/nacon_panel.cpp). All five verified
+    // UNIQUE in BOTH the Epic and Steam builds with tools/sigmake.py.
+    { "WidgetCreate",          "48 89 5C 24 08 48 89 6C 24 18 48 89 74 24 20 57 48 83 EC 20 49 8B E8 48 8B DA 48 8B F1 48 85 D2", false },
+    { "WidgetAddToViewport",   "48 8B 01 44 8B C2 33 D2 48 FF A0 ?? ?? ?? ?? CC 45 33 C0 41 8B D0 38 91 79 05 00 00 48 0F 45 D1", false },
+    { "WidgetTreeFind",        "48 83 EC 48 48 8B 49 28 48 8D 44 24 50 48 C7 44 24 50 00 00 00 00 48 89 54 24 30 48 89 44 24 38", false },
+    { "TextBlockSetText",      "48 89 5C 24 10 48 89 6C 24 18 56 57 41 56 48 83 EC 50 48 8B F1 48 8B EA 48 81 C1 28 01 00 00 E8 ?? ?? ?? ??", false },
+    { "WidgetRemoveFromParent","40 57 48 83 EC 30 8B 41 08 48 8B F9 C1 E8 0F A8 01 0F 85 ?? ?? ?? ?? 48 83 B9 38 02 00 00 00 48 89 5C 24 40", false },
+    { "WidgetSetPosInVp",      "40 57 48 83 EC 20 48 89 54 24 30 48 8B F9 45 84 C0 ?? ?? E8 ?? ?? ?? ?? F3 0F 10 0D ?? ?? ?? ??", false },
+    { "WidgetSetSizeInVp",     "48 83 EC 28 48 89 54 24 30 0F 57 DB F3 0F 10 54 24 30 0F 2E 91 28 02 00 00 F3 0F 10 4C 24 34 ?? ??", false },
+    { "WidgetSetAlignInVp",    "48 83 EC 28 66 48 0F 6E CA 0F 2E 89 30 02 00 00 F2 0F 11 4C 24 30 ?? ?? F3 0F 10 44 24 34 0F 2E 81 34 02 00 00", false },
+    { "WidgetSetVisibility",   "40 53 48 83 EC 50 0F B6 DA 48 8D 54 24 20 88 99 C3 00 00 00 E8 ?? ?? ?? ?? 4C 8B 44 24 20 4D 85 C0", false },
+    { "SlotSetSize",           "48 83 EC 58 48 8B 41 68 48 89 54 24 60 F3 0F 10 44 24 60 F3 0F 10 4C 24 64 F3 0F 11 41 40 F3 0F 11 49 44", false },
+    { "SlotSetAnchors",        "48 83 EC 58 0F 10 02 0F 11 41 48 48 8B 49 68 48 85 C9 0F 84 ?? ?? ?? ?? 33 C0 48 89 5C 24 50 48 8D 51 48", false },
+    { "TextSetAutoWrap",       "48 83 EC 48 0F B6 81 0D 01 00 00 24 FE 0A C2 88 81 0D 01 00 00 48 8B 89 98 02 00 00 48 85 C9 ?? ??", false },
+    { "TextSyncProperties",    "48 8B C4 55 53 57 41 55 48 8D A8 58 FE FF FF 48 81 EC 88 02 00 00 48 89 70 18 48 8B D9 4C 89 60 D8", false },
+    { "ScaleBoxSetStretch",    "88 91 20 01 00 00 48 8B 89 30 01 00 00 48 85 C9 0F 85 ?? ?? ?? ?? C3 CC", false },
+    { "SlotSetPosition",       "48 83 EC 58 48 8B 41 68 48 89 54 24 60 F3 0F 10 44 24 60 F3 0F 10 4C 24 64 F3 0F 11 41 38 F3 0F 11 49 3C", false },
     // UWidget::SetIsEnabled                                              Epic 0x27b7a20 / Steam 0x2779db0
     // Greys a menu row and refuses its input -- how "Teleport to them" says no when there is nowhere
     // to go. Optional: without it the row still declines in its status text.
@@ -354,6 +371,43 @@ static const SigEntry kSigs[] = {
     { "SetSolverPosIters",     "40 57 48 83 EC 20 48 8B 01 8B FA 48 85 C0 ?? ?? 33 C9 48 89 5C 24 38 66 83 78 08 06 8B D9 48 0F 44 D8 48 85 DB ?? ?? 48 8B 03 4C 8D 44 24 30 89 4C 24 40 48 8D 54 24 40 89 4C 24 30 48 8B CB FF 90 ?? ?? ?? ?? 48 8B 03 8B D7 44 8B 44 24 30 48 8B CB", false },
     // FPhysicsInterface_PhysX::SetSolverVelocityIterationCount_AssumesLocked  Epic 0x2ea5070 / Steam 0x2e67b50
     { "SetSolverVelIters",     "40 57 48 83 EC 20 48 8B 01 8B FA 48 85 C0 ?? ?? 33 C9 48 89 5C 24 38 66 83 78 08 06 8B D9 48 0F 44 D8 48 85 DB ?? ?? 48 8B 03 4C 8D 44 24 40 89 4C 24 30 48 8D 54 24 30 89 4C 24 40 48 8B CB FF 90 ?? ?? ?? ?? 48 8B 03 44 8B C7 8B 54 24 30 48 8B CB", false },
+    // --- CALL SITE, not a function (the MenuTextSite pattern): 56 bytes of
+    // FImgMediaFactoryModule::CanPlayUrl ending exactly on its `call FText::FromString(const FString&)`.
+    // WHY A CALL SITE: FromString's body is byte-identical to FText::AsCultureInvariant (both 0x175
+    // bytes, 2 hits at any length), so a body signature is a coin flip between them -- harmless here,
+    // as it happens, since they do the same thing, but the decode costs nothing and is not a bet.
+    // WHY THIS OVERLOAD: FromString comes in const-ref and rvalue-ref twins, and picking the rvalue
+    // one by accident means the engine STEALS the buffer we pass and we double-free it. This one was
+    // read from disk: it allocates and memcpys the characters (Epic 0x126d560), so it COPIES, and the
+    // caller keeps ownership of its FString and frees it afterwards.
+    // Site: Epic 0xe86740 / Steam 0xe45e50, verified unique in both.
+    { "TextFromStringSite",    "85 C0 0F 94 C0 84 C0 0F 85 ?? ?? ?? ?? 48 83 C3 10 48 3B DF ?? ?? 4D 85 E4 0F 84 ?? ?? ?? ?? 4C 89 AC 24 50 01 00 00 48 8D 54 24 40 48 8D 4D F0 4C 89 BC 24 40 01 00 00 E8 ?? ?? ?? ??", false },
+    // UImage::SetColorAndOpacity(const FLinearColor&)  Epic 0x27b4c20 / Steam 0x2776fb0 (sigmake).
+    // A TINT the image is multiplied by -- how the release-notes panel darkens its own background
+    // without touching the blueprint's artwork. Writing ColorAndOpacity (+0x1a0) directly would not
+    // reach the live SImage, the same way WrapTextAt does not reach a live text block.
+    { "ImageSetColor",         "48 83 EC 38 0F 10 02 0F 11 81 A0 01 00 00", false },
+    // USizeBox::SetHeightOverride / ::SetMaxDesiredHeight  Epic 0x27b6c50, 0x27b8c10 (sigmake; unique
+    // in both). The two are the same eleven bytes apart from the OVERRIDE BIT they set -- 0x02 for the
+    // height, 0x20 for the max -- which is why a sig this short still tells them apart. The news
+    // article's description sits in a SizeBox that caps its height to one article's worth; both are
+    // raised so a long changelog uses the whole panel.
+    { "SizeBoxSetHeight",      "48 83 EC 48 80 89 50 01 00 00 02", false },
+    { "SizeBoxSetMaxHeight",   "48 83 EC 48 80 89 50 01 00 00 20", false },
+    // float UPlayerInput::GetKeyValue(FKey) const   Epic 0x308b010 / Steam 0x304db80, unique in both.
+    // HOW FAR A KEY IS HELD, asked of the ENGINE rather than of XInput. This game is played on a pad,
+    // and a DualSense reports NOTHING to XInput without a translation layer -- which is why the release
+    // notes could not be scrolled with a stick or a d-pad while our own reader kept reporting zero
+    // (field 2026-09-20). The engine's key-state map holds every key's value whatever backend read the
+    // pad, and SessionTweaks already reads the right trigger this way for the same reason.
+    // The FKey is 24 bytes by pointer (FName + a TSharedPtr of details); the map looks up by NAME
+    // alone, so one with null details is a whole key and the callee has nothing to release.
+    { "PlayerInputKeyValue",   "40 53 48 83 EC 30 0F 29 74 24 20 48 8B DA 4C 8B C2 48 89 7C 24 48 48 8D B9 60 02 00 00 48 8B CF 48 8D 54 24 40 E8 ?? ?? ?? ??", false },
+    // void UWidget::SetKeyboardFocus()  Epic 0x27b8490 / Steam 0x277a820 (sigmake; unique in both).
+    // WHO GETS THE BUTTONS. A scroll box only answers the stick while it HAS focus, and whatever holds
+    // focus swallows the menu's X -- so focus is HANDED BETWEEN them: to the notes while the stick is
+    // moving, back to the intro screen the moment it stops.
+    { "WidgetSetKeyboardFocus", "40 53 48 83 EC 40 48 8D 54 24 20 48 8B D9", false },
 };
 static const int kSigN = (int)(sizeof(kSigs) / sizeof(kSigs[0]));
 
@@ -1122,6 +1176,21 @@ const Syms& Resolve(void (*logf)(const char*)) {
     g_syms.BcastPaEnable      =                     take("BcastPaEnable");        // hooked, never called
     g_syms.TransitOpenMap     =                     take("TransitOpenMap");       // hooked, never called
     g_syms.CompDestroy        = (CompDestroyFn)     take("CompDestroy");
+    g_syms.WidgetCreate       = (WidgetCreateFn)    take("WidgetCreate");
+    g_syms.WidgetAddToViewport= (WidgetAddViewFn)   take("WidgetAddToViewport");
+    g_syms.WidgetTreeFind     = (WidgetTreeFindFn)  take("WidgetTreeFind");
+    g_syms.TextBlockSetText   = (TextSetTextFn)     take("TextBlockSetText");
+    g_syms.WidgetRemoveParent = (WidgetRemoveFn)    take("WidgetRemoveFromParent");
+    g_syms.WidgetSetPosInVp   = (WidgetVec2Fn)     take("WidgetSetPosInVp");
+    g_syms.WidgetSetSizeInVp  = (WidgetVec2NoFlagFn)take("WidgetSetSizeInVp");
+    g_syms.WidgetSetAlignInVp = (WidgetVec2NoFlagFn)take("WidgetSetAlignInVp");
+    g_syms.WidgetSetVisible   = (WidgetSetVisFn)   take("WidgetSetVisibility");
+    g_syms.SlotSetSize        = (WidgetVec2NoFlagFn)take("SlotSetSize");
+    g_syms.SlotSetAnchors     = (SlotAnchorsFn)    take("SlotSetAnchors");
+    g_syms.TextSetAutoWrap    = (WidgetSetVisFn)   take("TextSetAutoWrap");
+    g_syms.TextSyncProps      = (WidgetRemoveFn)   take("TextSyncProperties");
+    g_syms.ScaleBoxSetStretch = (WidgetSetVisFn)   take("ScaleBoxSetStretch");
+    g_syms.SlotSetPosition    = (WidgetVec2NoFlagFn)take("SlotSetPosition");
     g_syms.WidgetSetEnabled   = (WidgetSetEnabledFn) take("WidgetSetEnabled");
     g_syms.BodySetSimulate    = (BodySetSimulateFn)  take("BodySetSimulate");
     g_syms.BodySetResponse    = (BodySetResponseFn)  take("BodySetResponse");
@@ -1129,6 +1198,30 @@ const Syms& Resolve(void (*logf)(const char*)) {
     g_syms.PhysExecuteWrite   = (PhysExecuteWriteFn) take("PhysExecuteWrite");
     g_syms.SetSolverPosIters  = (SetSolverItersFn)   take("SetSolverPosIters");
     g_syms.SetSolverVelIters  = (SetSolverItersFn)   take("SetSolverVelIters");
+    // A CALL SITE, like MenuTextSite above: the symbol is the target of the `E8 rel32` in its last
+    // five bytes, and the opcode must actually BE an E8 or nothing is taken at all.
+    {
+        const int siteIdx = i;
+        const uint8_t* site = (const uint8_t*)take("TextFromStringSite");
+        Pat sp;
+        if (site && parsePat(kSigs[siteIdx].sig, sp) && sp.n >= 5) {
+            const uint8_t* call = site + sp.n - 5;
+            if (*call == 0xE8) {
+                int32_t rel = 0; memcpy(&rel, call + 1, 4);
+                g_syms.TextFromString = (TextFromStringFn)(call + 5 + rel);
+            }
+        }
+        char m[160];
+        snprintf(m, sizeof(m), "[sym] %-22s %s exe+%p (decoded from TextFromStringSite)", "FText::FromString",
+                 g_syms.TextFromString ? "->" : "!! NOT DECODED",
+                 g_syms.TextFromString ? (void*)((uint8_t*)g_syms.TextFromString - base) : nullptr);
+        say(m);
+    }
+    g_syms.ImageSetColor      = (ImageSetColorFn)    take("ImageSetColor");
+    g_syms.SizeBoxSetHeight   = (SizeBoxSetFloatFn) take("SizeBoxSetHeight");
+    g_syms.SizeBoxSetMaxHeight= (SizeBoxSetFloatFn) take("SizeBoxSetMaxHeight");
+    g_syms.PlayerInputKeyValue= (KeyValueFn)       take("PlayerInputKeyValue");
+    g_syms.WidgetSetFocus     = (WidgetVoidFn)     take("WidgetSetKeyboardFocus");
 
     // LOCKSTEP CHECK. The block above is POSITIONAL, and a table entry added without its assignment --
     // or vice versa -- shifts every later symbol onto the wrong address SILENTLY: sigs still resolve

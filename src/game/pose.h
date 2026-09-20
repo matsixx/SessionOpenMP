@@ -74,6 +74,21 @@ struct Tuning {
     // How long the last stamped pose is faded out over when a pose is released, instead of being
     // dropped in one frame. 0 restores the old hard cut. See Slot::outN for the measurement.
     uint32_t releaseFadeMs = 250;
+    // Blend between the last two WHOLE sweeps instead of stepping onto each one. The snapshot stream's
+    // own pose interpolation cannot do this for a sliced skeleton (its guard needs both snapshots to
+    // carry the same slice, and consecutive ones do not), so it happens here, after reassembly. Costs
+    // one sweep interval of extra lag on a watched pose -- and that pose already rides a jitter buffer.
+    // DEFAULT OFF. Even with the handover corrected this is only ~33% more even at the real cadence,
+    // and it holds the skeleton a fraction behind to do it. The honest fix for a watched pose is the
+    // full refresh rate (the driver interleave that was taking a fifth of it is off again) plus
+    // time-based interpolation against the playback clock, which this is not. Left in, switchable.
+    bool poseInterp = false;
+    // ...but only when sweeps are further apart than this. Below it the sender's skeleton is arriving
+    // whole every frame and the snapshot stream is already blending it; see stepInterp.
+    // 25 sat right ON the measured gap (field: span 25 ms), so the blend flickered in and out of use
+    // frame to frame -- worse than either state. Now the handover is continuous it costs nothing to
+    // leave it on, so this only switches off when a pose is genuinely arriving every frame.
+    float interpMinGapMs = 12.0f;
     // RETIRED (default false): re-stamp the last held pose over a proxy's skeleton during a local
     // replay. It served the live-view-while-scrubbing era, where fresh pose-lane packets always won
     // the race above and the hold only covered gaps. Today it has no beneficiary and one victim:
@@ -128,6 +143,12 @@ struct Stats {
     uint32_t sweeps = 0;         // slice sets that COMPLETED: without these a pose is never usable
     uint32_t wiped = 0;          // a pose-less frame cleared a pose that had completed
     uint32_t fadeFrames = 0;     // frames the last pose was blended out over instead of dropped
+    uint32_t interpSweeps = 0;   // whole sweeps captured as a blend endpoint
+    uint8_t  untransported = 0;  // local bones the sender NAMED but did not SEND: left to the proxy's
+                                 // own graph, which during a moving pose has no fresh drivers
+    float    interpSpanMs = 0.0f;// ...and the measured gap between them. 0 = the blend never engaged:
+                                 // either poseInterp is off, or sweeps land closer than interpMinGapMs
+                                 // (the sender's skeleton fits one packet and the stream already blends).
     uint32_t noSlice = 0;        // pose frames that carried no slice for us at all
     uint32_t noSlot = 0;         // a pose / fingerprint / hold REFUSED because every slot was taken: must stay 0
     uint8_t  liveN = 0;          // the newest slot's usable bone count (0 = nothing to stamp)
@@ -153,6 +174,10 @@ void SetLocalHold(bool on);
 // True when this capture happened ONLY because of the hold (not a bail, not a scrub) -- the cases
 // the session may thin.
 bool CapturedForHoldOnly(const repl::State& s);
+// Is a TRANSPORTED pose driving this proxy's skeleton right now? Takes the ACTOR. Asked by the head-look
+// export: a pose already carries the sender's head, so turning it again doubles the turn (see
+// session.cpp ProxyHeadLook). True while a fresh pose is in hand for that actor's mesh.
+bool PoseDrivingActorHead(void* actor);
 // Ungated capture off the pawn, for the packet the session unicasts to a SCRUBBING peer alone. Their
 // replay editor cannot evaluate our drivers, so they get results -- while everyone else keeps the
 // driver lane and never pays for somebody else's replay session.

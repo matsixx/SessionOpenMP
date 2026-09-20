@@ -176,6 +176,99 @@ int main() {
         ok(fabsf(dot4(q, q) - 1.0f) < 1e-4f, "a degenerate blend still leaves a unit quaternion");
     }
 
+    // ---- 6. SWEEP-TO-SWEEP INTERPOLATION. A sliced skeleton defeats the snapshot stream's own pose
+    // blend (its guard needs both snapshots to carry the same slice, and consecutive ones do not), so
+    // the pose lane steps between whole sweeps instead. The replacement blends between the last two
+    // FINISHED sweeps. What must hold: a sweep is crossed in steps, and a sweep landing MID-BLEND takes
+    // over from the rendered pose rather than from where the last one started -- otherwise every arrival
+    // is a jump, which is the stepping this is meant to remove.
+    printf("[sweep interpolation]\n");
+    {
+        float a4[4], b4[4];
+        quatZ(0.0f, a4); quatZ(24.0f, b4);              // a 24-degree sweep, 33 ms apart
+        float worst = 0.0f, prev = 0.0f;
+        for (int f = 1; f <= 2; f++) {                   // 16 ms render frames across it
+            float t = (float)f * 16.0f / 33.0f; if (t > 1.0f) t = 1.0f;
+            float q[4] = { a4[0], a4[1], a4[2], a4[3] };
+            blendQuat(q, b4, t);
+            const float ang = zDeg(q), step = ang - prev;
+            prev = ang;
+            if (step > worst) worst = step;
+        }
+        printf("  worst step across a 24-degree sweep at 60 fps: %.1f deg\n", worst);
+        ok(worst < 24.0f, "a sweep is crossed in steps, not in one jump");
+        ok(worst > 0.5f,  "...and it does move");
+    }
+    {
+        // THE HANDOVER, as pose.cpp actually performs it -- this models the capture, not just the
+        // arithmetic. The first version of this check blended two quaternions by hand and passed while
+        // the real code did the opposite (it set prev = cur, throwing away the unfinished part of the
+        // blend and jumping the skeleton forward once per pose). A gate that does not run the shape of
+        // the real code can pass a bug straight through, which is what happened on 2026-09-20.
+        struct Slot { float prev[4], cur[4], blendT; };
+        // `continuous` false reproduces the ORIGINAL bug (prev := cur) so the two can be compared in
+        // one run: an absolute threshold here would be a magic number, where "smoother than the thing
+        // it replaced" is the actual claim.
+        static bool continuous = true;
+        auto capture = [](Slot& s, const float* fresh) {       // <- mirrors Note()'s capture block
+            if (continuous) blendQuat(s.prev, s.cur, s.blendT);            // prev := what is ON SCREEN
+            else            for (int k = 0; k < 4; k++) s.prev[k] = s.cur[k];   // the bug: prev := cur
+            for (int k = 0; k < 4; k++) s.cur[k] = fresh[k];
+            s.blendT = 0.0f;
+        };
+        auto render = [](const Slot& s, float* out) {
+            for (int k = 0; k < 4; k++) out[k] = s.prev[k];
+            blendQuat(out, s.cur, s.blendT);
+        };
+        // Poses every 25 ms, frames every 16.7 -- the real cadence, so the blend never finishes.
+        auto run = [&](bool cont) {
+            continuous = cont;
+            float p0[4]; quatZ(0.0f, p0);
+            Slot s; for (int k = 0; k < 4; k++) { s.prev[k] = p0[k]; s.cur[k] = p0[k]; } s.blendT = 1.0f;
+            float shown[4]; render(s, shown);
+            float last = zDeg(shown), worst = 0.0f, least = 1e9f;
+            float tMs = 0.0f, nextPose = 25.0f, ang = 0.0f;
+            for (int f = 1; f <= 40; f++) {
+                tMs += 16.7f;
+                while (tMs >= nextPose) {                       // a pose lands mid-blend
+                    ang += 10.0f;                               // the sender turns 10 deg per pose
+                    float fresh[4]; quatZ(ang, fresh);
+                    capture(s, fresh);
+                    nextPose += 25.0f;
+                }
+                s.blendT += 16.7f / 25.0f; if (s.blendT > 1.0f) s.blendT = 1.0f;
+                render(s, shown);
+                const float a = zDeg(shown);
+                float step = a - last;                          // zDeg wraps at +/-180; the motion does not
+                while (step >  180.0f) step -= 360.0f;
+                while (step < -180.0f) step += 360.0f;
+                step = fabsf(step);
+                last = a;
+                if (f > 2) { if (step > worst) worst = step; if (step < least) least = step; }
+            }
+            return worst - least;      // SPREAD: even motion is what "not choppy" means, not a small peak
+        };
+        // The sender moves 10 deg per 25 ms = 6.7 deg per 16.7 ms frame. A CONTINUOUS handover tracks
+        // that; the old one adds the unfinished part of the blend on top, once per pose.
+        const float sCont = run(true), sJump = run(false);
+        continuous = true;
+        printf("  frame-to-frame SPREAD, poses 25 ms apart at 60 fps: %.2f deg continuous vs %.2f jumping\n",
+               sCont, sJump);
+        ok(sCont < sJump, "the continuous handover moves more evenly than prev := cur (the bug it replaced)");
+        // ~33% at this cadence. NOT a cure: the blend restarts on every arrival, so how far it gets
+        // per frame still beats against the 16.7 ms frame / 25 ms pose rhythm. Ending that needs
+        // time-based interpolation against the playback clock -- render at (now - delay) and blend the
+        // two poses bracketing it -- which is what the snapshot stream already does for transforms.
+        ok(sCont < sJump * 0.8f, "...and by a clear margin -- unevenness IS what chop is");
+    }
+    {
+        float a4[4], b4[4]; quatZ(10.0f, a4); quatZ(40.0f, b4);
+        float q1[4]={a4[0],a4[1],a4[2],a4[3]}, q2[4]={a4[0],a4[1],a4[2],a4[3]};
+        blendQuat(q1, b4, 1.0f); blendQuat(q2, b4, 1.0f);
+        nearly(zDeg(q1), zDeg(q2), 1e-4f, "an arrived blend is stable frame to frame (no drift while quiet)");
+        nearly(zDeg(q1), 40.0f, 0.1f, "...and it arrives exactly on the new sweep");
+    }
+
     printf("\nomp_posetest: %d checks passed, %d failed\n", g_checks - g_fail, g_fail);
     if (g_fail) { printf("POSE TEST FAIL\n"); return 1; }
     printf("POSE TEST PASS\n");

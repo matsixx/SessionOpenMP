@@ -69,6 +69,10 @@ bool PauseMenu_IsShown();
 // The world changed: whatever page was last built belongs to a menu that no longer exists, and its
 // memory may already hold something else. Forget it rather than read it.
 void PauseMenu_ForgetPage();
+// How many times the IN-GAME pause page has been built. The start menu and the pause menu are the
+// same kind of thing to the rest of the mod; the page key is what tells them apart, and this counter
+// is the only place that distinction is available outside this file. Watch it for CHANGE, not value.
+unsigned PauseMenu_PausePageBuilds();
 int  PauseMenu_TakeAction();                // game thread; returns OvAction and clears it
 int  PauseMenu_TakeJoinIndex();             // the browse index that OVA_JOIN_INDEX refers to
 // Who OVA_KICK / OVA_BAN refer to. An IDENTITY, never a row position: the roster rebuilds live, so an
