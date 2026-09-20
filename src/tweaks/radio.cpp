@@ -133,6 +133,8 @@ int   g_on = 1;
 float g_volume = 0.40f;                       // RadioVolumePct: x1 was "very loud" (the field). The start for every radio; the wheel moves each
 float g_volumeOthers = 0.10f;                 // RadioVolumeOthersPct: ...and what SOMEONE ELSE'S starts at
 float g_rangeMax = 12000.0f;                  // RadioRangeCm: how far a radio at FULL volume carries (120 m)
+// RadioCloseCm: "standing AT a speaker", which is what makes a click of the stick mean that speaker.
+float g_closeCm = 150.0f;
 float g_rangeMin = 800.0f;                    // RadioRangeMinCm: ...and how far one turned right down does (8 m)
 float g_falloffStart = 0.45f;                 // RadioFalloffStartPct: full volume out to this much of the range
 char  g_attenPath[160] = "";                  // RadioAttenuation: the falloff asset, or "none"
@@ -637,7 +639,9 @@ void BuildWheel(void* sk) {
     g_nActs = 0; g_muteTarget = nullptr;
     auto add = [](int act, const char* label) { if (g_nActs < 8) { g_acts[g_nActs] = act; snprintf(g_label[g_nActs], sizeof(g_label[0]), "%s", label); g_nActs++; } };
     const bool mine = g_mine.state != R_NONE && Alive(g_mine);
-    if (!mine) add(A_TAKE, "Radio");
+    // "Take out radio", not "Radio": the page above already says which prop this is, so the entry has
+    // to say what it DOES. It read as a bare label repeating the title.
+    if (!mine) add(A_TAKE, "Take out radio");
     else {
         const bool near_ = g_mine.state == R_HELD || (sk && DistanceTo(g_mine, sk) < 300.0f);
         if (g_mine.state == R_HELD) add(A_PUTDOWN, "Put radio down");
@@ -690,6 +694,7 @@ void BuildWheel(void* sk) {
 void Radio_ReadConfig(const char* buf) {
     g_on = TwkIniIntQuiet(buf, "RadioEnabled", 1) ? 1 : 0;
     g_rangeMax = (float)TwkIniIntQuiet(buf, "RadioRangeCm", 12000);
+    g_closeCm  = (float)TwkIniIntQuiet(buf, "RadioCloseCm", 150);
     g_rangeMin = (float)TwkIniIntQuiet(buf, "RadioRangeMinCm", 800);
     TwkIniStr(buf, "RadioAttenuation", g_attenPath, sizeof(g_attenPath), kAttenPath);
     g_rangeDebug = TwkIniIntQuiet(buf, "RadioRangeDebug", 0) != 0;
@@ -712,8 +717,22 @@ void Radio_ReadConfig(const char* buf) {
 }
 void Radio_SaveConfig(char* buf, size_t cap) { TwkIniSetInt(buf, cap, "RadioVolumePct", (int)(g_volume * 100.0f + 0.5f)); }
 bool Radio_Holding() { return g_mine.state == R_HELD; }
+// STANDING AT ONE -- near enough that a click of the stick plainly means "this speaker" rather than
+// "open the wheel". Deliberately tighter than the 3 m the wheel's own mute entry uses: that only has
+// to decide WHICH radio you meant once the wheel is already open, where being wrong costs a glance.
+// This CHANGES WHAT THE BUTTON DOES, so it wants you unmistakably at the thing.
+// A radio under your arm does not count -- the root wheel is what you want then, not the speaker page.
+bool Radio_AtSpeaker() {
+    if (!g_on || g_mine.state == R_HELD) return false;
+    void* sk = CatchTweaks_Skater();
+    return sk && NearestRadio(sk, g_closeCm) != nullptr;
+}
 void Radio_RequestPutDown() { InterlockedExchange(&g_reqPutDown, 1); }
 const char* Radio_WhyNot() { return g_whyNot; }
+// THE PROPS THEMSELVES, one entry each -- the page above the options. One for now; when there is a
+// second prop it gets a line here and a page of its own for free.
+int Radio_PropCount() { return g_on ? 1 : 0; }
+const char* Radio_PropLabel(int i) { return i == 0 ? "Radio" : ""; }
 int Radio_WheelCount() { BuildWheel(CatchTweaks_Skater()); return g_nActs; }
 const char* Radio_WheelLabel(int i) { return (i >= 0 && i < g_nActs) ? g_label[i] : ""; }
 // false = refused (Radio_WhyNot says why). `keepOpen` comes back true for the ones you may want again at once

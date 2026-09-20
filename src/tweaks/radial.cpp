@@ -348,21 +348,31 @@ static ShopConfirmFn    g_shopHidePrompt = nullptr;
 static ShopConfirmFn    g_gearCamera     = nullptr;
 
 // ------------------------------------------------------------------ the wheels
-enum Act { ACT_NONE, ACT_EMOTES, ACT_BOARD, ACT_CLOSET, ACT_PROPS, ACT_EMOTE, ACT_PROP };
+enum Act { ACT_NONE, ACT_EMOTES, ACT_BOARD, ACT_CLOSET, ACT_PROPS, ACT_EMOTE, ACT_PROP, ACT_PROP_OPEN };
 struct Entry { const char* label; Act act; };
 // Clockwise from the top.
 static const Entry kRoot[]   = { { "Emotes", ACT_EMOTES }, { "Board", ACT_BOARD },
                                  { "Props", ACT_PROPS },   { "Closet", ACT_CLOSET } };
 // The second wheel is whatever emote.cpp performs, in its order: an entry's place IS the emote's number.
 static Entry g_emotes[12];
-// ...and the third is whatever the props can do THIS MOMENT (radio.cpp builds it fresh: take it out / put it down /
-// pick it up / next song ...), so it is asked for again every frame the wheel is up.
+// ...and the third lists the PROPS THEMSELVES -- one entry each -- while the fourth is what the prop
+// you picked can do this moment (radio.cpp builds that fresh: take it out / put it down / next song /
+// volume ...), so it is asked for again every frame the wheel is up.
+// A PAGE PER PROP, rather than every prop's options in one list: there is one prop today and there
+// will be more, and a flat list would become a jumble the moment there are two.
+static Entry g_propList[8];
 static Entry g_props[8];
+static int   g_propPick = 0;       // which prop's page level 3 is showing -- its place in the list above
 static const Entry* Wheel(int level, int* n, const char** title) {
-    if (level == 2) {
+    if (level == 3) {
         int k = Radio_WheelCount(); if (k > 8) k = 8;
         for (int i = 0; i < k; i++) { g_props[i].label = Radio_WheelLabel(i); g_props[i].act = ACT_PROP; }
-        *n = k; *title = "Props"; return g_props;
+        *n = k; *title = Radio_PropLabel(g_propPick); return g_props;
+    }
+    if (level == 2) {
+        int k = Radio_PropCount(); if (k > 8) k = 8;
+        for (int i = 0; i < k; i++) { g_propList[i].label = Radio_PropLabel(i); g_propList[i].act = ACT_PROP_OPEN; }
+        *n = k; *title = "Props"; return g_propList;
     }
     if (level == 1) {
         int k = Emote_Count(); if (k > 12) k = 12;
@@ -393,7 +403,7 @@ static bool     g_shopBoard  = false;               // ...and it is the board's 
 static float    g_shopFeet[3] = { 0, 0, 0 }, g_shopYaw = 0.0f;      // where our shop was laid out, and facing what
 static float    g_camAt[3] = { 0, 0, 0 }; static bool g_camSet = false; static int64_t g_camQpc = 0;
 static float    g_camRest[3] = { 0, 0, 0 }; static int g_camLogged = 0;
-static uint64_t g_fnR3 = 0, g_fnA = 0, g_fnB = 0, g_fnRX = 0, g_fnRY = 0, g_fnRT = 0, g_fnRTb = 0;
+static uint64_t g_fnR3 = 0, g_fnA = 0, g_fnB = 0, g_fnRX = 0, g_fnRY = 0, g_fnRT = 0, g_fnRTb = 0, g_fnRB = 0;
 static int      g_rtAxisSeen = 0, g_swallowRT = 0;  // the trigger's axis has reported at least once; the button-press of it that we took
 static uint64_t g_fnNot[32]; static int g_fnNotN = 0;
 
@@ -424,8 +434,9 @@ static void Close(const char* why) {
 }
 
 // ------------------------------------------------------------------ keys
-// 1 click, 2 A, 3 B, 4 right X, 5 right Y, 6 the right trigger's AXIS, 7 the right trigger as a button, 0 not
-// ours. A name is resolved once per FName: this runs for every input event, the sticks' axes included.
+// 1 click, 2 A, 3 B, 4 right X, 5 right Y, 6 the right trigger's AXIS, 7 the right trigger as a button,
+// 8 RB (the board tap), 0 not ours. A name is resolved once per FName: this runs for every input event,
+// the sticks' axes included.
 static int KeyKind(const void* key) {
     const uint64_t nm = *(const uint64_t*)key;
     if (!nm) return 0;
@@ -436,6 +447,7 @@ static int KeyKind(const void* key) {
     if (nm == g_fnRY) return 5;
     if (nm == g_fnRT) return 6;
     if (nm == g_fnRTb) return 7;
+    if (nm == g_fnRB)  return 8;
     for (int i = 0; i < g_fnNotN; i++) if (nm == g_fnNot[i]) return 0;
     char nb[96];
     if (!GrindPop_FNameToString(key, nb, sizeof(nb))) return 0;
@@ -446,6 +458,7 @@ static int KeyKind(const void* key) {
     if (!strcmp(nb, "Gamepad_RightY"))            { g_fnRY = nm; return 5; }
     if (!strcmp(nb, "Gamepad_RightTriggerAxis"))  { g_fnRT = nm; return 6; }
     if (!strcmp(nb, "Gamepad_RightTrigger"))      { g_fnRTb = nm; return 7; }
+    if (!strcmp(nb, "Gamepad_RightShoulder"))     { g_fnRB = nm; return 8; }
     if (g_fnNotN < (int)(sizeof(g_fnNot) / sizeof(g_fnNot[0]))) g_fnNot[g_fnNotN++] = nm;
     return 0;
 }
@@ -480,6 +493,14 @@ int Radial_OnInputKey(const void* key, int ev, float* amount) {
         if (!Emote_WantsTrigger()) return 0;
         if (amount) *amount = 0.0f;                         // ...and while it is aiming the game does not get it
         return 2;
+    }
+    if (kind == 8) {                                        // RB: the board tap's pose, and its stick while held
+        if (ev != 0 && ev != 1) return 0;
+        const bool down = (ev == 0);
+        if (!g_open) Emote_TapButton(down);
+        // SWALLOWED ONLY WHILE IT IS OURS. RB is the game's own button otherwise, and taking it when
+        // no board is up would break whatever it normally does.
+        return (!g_open && Emote_TapHeld()) ? 1 : 0;
     }
     if (kind == 7) {                                        // ...and the same trigger as a BUTTON (the pad says "pressed" past 0.12)
         if (ev == 1) { if (!g_rtAxisSeen) Emote_Trigger(0.0f); if (!g_swallowRT) return 0; g_swallowRT = 0; return 1; }
@@ -521,7 +542,7 @@ void Radial_TickSticks(float* s) {
     if (!s) return;
     __try {
         g_rx = s[2]; g_ry = s[3];
-        const bool emote = !g_open && Emote_WantsStick();
+        const bool emote = !g_open && Emote_WantsStick();   // the tap only while RB is HELD; a Rage never
         Emote_Stick(emote ? g_rx : 0.0f, emote ? g_ry : 0.0f);
         if (g_open || emote) { s[2] = 0.0f; s[3] = 0.0f; }
     } __except (EXCEPTION_EXECUTE_HANDLER) { }
@@ -931,6 +952,9 @@ static void Take(const Entry& e, void* sk) {
     case ACT_BOARD:  if (Sit_PoseHeld()) Say("Stand up first"); else OpenWardrobe(sk, "SkateShopBuySkateboardGear", "board", true); break;
     case ACT_CLOSET: if (Sit_PoseHeld()) Say("Stand up first"); else OpenWardrobe(sk, "SkateShopBuySkaterGear", "closet", false);   break;
     case ACT_PROPS:  if (Sit_PoseHeld()) Say("Stand up first"); else { g_level = 2; g_sel = -1; g_msg[0] = 0; } break;
+    // A prop itself: open its own page of options. Which prop is its place in the list, the same way
+    // ACT_PROP reads its place below.
+    case ACT_PROP_OPEN: g_propPick = (int)(&e - g_propList); g_level = 3; g_sel = -1; g_msg[0] = 0; break;
     // A prop's own entry. Most close the wheel (you took it out, you put it down); the ones you may want again at
     // once -- next song, next station -- leave it up.
     case ACT_PROP: {
@@ -963,7 +987,15 @@ void Radial_PumpFrame() {
     if (g_reqToggle) {
         g_reqToggle = 0;
         if (g_open) Close("click");
-        else if (Allowed()) { g_open = 1; g_level = 0; g_sel = -1; g_msg[0] = 0; TwkLog("[radial] opened"); }
+        else if (Allowed()) {
+            // STRAIGHT TO THE SPEAKER when you are standing at one. Clicking the stick beside a radio
+            // can only mean that radio, and making it the Props page saves the root wheel every time.
+            // Back still steps out to the root, so nothing is lost.
+            const bool atSpeaker = Radio_AtSpeaker() && !Sit_PoseHeld();
+            if (atSpeaker) g_propPick = 0;                 // the radio's page: the speaker you are at
+            g_open = 1; g_level = atSpeaker ? 3 : 0; g_sel = -1; g_msg[0] = 0;
+            TwkLog("[radial] opened%s", atSpeaker ? " at the speaker" : "");
+        }
     }
     if (g_open && !Allowed()) Close("no longer off the board");
     int n = 0; const char* title = "";
@@ -978,7 +1010,13 @@ void Radial_PumpFrame() {
             const float step = 6.2831853f / (float)n;
             g_sel = (int)((a + step * 0.5f) / step) % n;
         }
-        if (g_reqBack) { g_reqBack = 0; if (g_level > 0) { g_level = 0; g_sel = -1; g_msg[0] = 0; wheel = Wheel(0, &n, &title); } else Close("back"); }
+        if (g_reqBack) {
+            g_reqBack = 0;
+            // ONE PAGE AT A TIME: a prop's options step back to the props list, everything else to the
+            // root. Jumping straight home from three levels in would lose your place.
+            if (g_level > 0) { g_level = (g_level == 3) ? 2 : 0; g_sel = -1; g_msg[0] = 0; wheel = Wheel(g_level, &n, &title); }
+            else Close("back");
+        }
         if (g_reqConfirm) {
             g_reqConfirm = 0;
             if (g_open && g_sel >= 0 && g_sel < n) { Take(wheel[g_sel], sk); wheel = Wheel(g_level, &n, &title); }

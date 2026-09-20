@@ -78,7 +78,8 @@
 #include "emote.h"
 #include "sit.h"              // Sit_PoseHeld, Sit_EditorOpen
 #include "sit_ui.h"           // SitObjRef / SitUI_Track / SitUI_Alive
-#include "catch_tweaks.h"     // CatchTweaks_Skater
+#include "catch_tweaks.h"     // CatchTweaks_Skater, and the trigger axes
+#include "radial.h"           // the wheel must not be up when the left trigger arms a throw
 #include "foot_place.h"       // FootPlace_AnimInstance
 #include "grind_pop.h"        // GrindPop_FNameToString
 #include "camera_height.h"    // CameraHeight_ViewForward: where the camera looks, for Point
@@ -189,14 +190,29 @@ const float TAU = 6.2831853f;
 enum { EM_NONE = -1, EM_WAVE = 0, EM_THUMBS, EM_POINT, EM_FACEPALM, EM_CLAP, EM_TAP, EM_RAGE, EM_DANCE, EM_CARRY, EM_COUNT, EM_WHEEL = EM_CARRY };
 // EVERY EMOTE IS HELD UNTIL IT IS PUT AWAY (B, or picked again): `loop` is true for all of them now, and `dur`
 // is only what a one-shot used to last. board: needs it in your hand.
-struct Def { const char* name; float dur; bool loop; bool lower; bool board; };
+// `wheel`: does it appear on the emote wheel? Some are reached by a button instead -- a throw is armed
+// by holding the left trigger -- and those are hidden rather than renumbered, because an emote's index
+// IS its identity everywhere else in this file.
+struct Def { const char* name; float dur; bool loop; bool lower; bool board; bool wheel; };
 const Def kDefs[EM_COUNT] = {
-    { "Wave",      0.0f, true, false, false }, { "Thumbs up", 0.0f, true, false, false }, { "Point", 0.0f, true, false, false },
-    { "Facepalm",  0.0f, true, false, false }, { "Clap",      0.0f, true, false, false },
-    { "Board tap", 0.0f, true, false, true  },      // no lower body: you stand as you stand
-    { "Throw board", 0.0f, true, false, true }, { "Dance",    0.0f, true, true,  false },      // EM_RAGE: "Throw board" on the wheel
-    { "Carry",     0.0f, true, false, false },      // EM_CARRY: internal (a held prop)
+    { "Wave",      0.0f, true, false, false, true }, { "Thumbs up", 0.0f, true, false, false, true }, { "Point", 0.0f, true, false, false, true },
+    { "Facepalm",  0.0f, true, false, false, true }, { "Clap",      0.0f, true, false, false, true },
+    // EM_TAP is NOT on the wheel either: RB holds the board in the tap pose, and HOLDING RB takes the
+    // right stick to work it. No lower body -- you stand as you stand.
+    { "Board tap", 0.0f, true, false, true,  false },
+    // EM_RAGE is NOT on the wheel: holding the left trigger off the board arms it, the right throws.
+    { "Throw board", 0.0f, true, false, true, false }, { "Dance",  0.0f, true, true,  false, true },
+    { "Carry",     0.0f, true, false, false, false },      // EM_CARRY: internal (a held prop)
 };
+// The wheel's entries are the ones flagged above, in order -- so its Nth entry is not necessarily
+// emote N, and everything that takes a wheel index maps through here.
+static int g_wheelIdx[EM_COUNT];
+static int g_wheelN = -1;
+static void BuildWheelIndex() {
+    if (g_wheelN >= 0) return;
+    g_wheelN = 0;
+    for (int i = 0; i < EM_WHEEL; i++) if (kDefs[i].wheel) g_wheelIdx[g_wheelN++] = i;
+}
 // A RAGE: wound up by kRageWind, then HELD AND AIMED for as long as you like; the RIGHT TRIGGER throws it. The swing
 // starts the moment the trigger is felt, the board leaves the hand kRageLetGo later, and HOW HARD is the most
 // the trigger was pulled in between -- a pull takes about that long, so nothing waits on it.
@@ -1500,8 +1516,44 @@ void PumpTap(void* sk, float dt) {
 // ------------------------------------------------------------------ the module's face
 // The right stick is the tap's while a tap is up -- and ONLY while something is driving it: a pump that has
 // stopped must never leave the camera's stick held (the radial menu's lesson, twice over).
+// ---- BOARD TAP, ON RB -------------------------------------------------------------------------------
+// A PRESS holds the board in the tap pose and leaves the camera alone -- you can look around while you
+// stand there holding it. HOLDING RB then takes the right stick to work the tap, which necessarily
+// locks the camera, because there is only one stick and it cannot be both.
+// Pressing RB again while in the pose puts the board back down. A press that BEGAN the pose does not
+// also end it, so the natural "hold it straight away" gesture is not read as an immediate cancel.
+const LONGLONG kTapHoldMs = 220;                  // longer than a press, shorter than a deliberate hold
+static bool     g_tapBtn = false, g_tapBeganHere = false;
+static LONGLONG g_tapDownMs = 0;
+// Is RB being HELD right now -- the stick is the tap's, and the camera is pinned?
+static bool TapWorking() {
+    return g_tapBtn && g_id == EM_TAP && !g_ending &&
+           (LONGLONG)GetTickCount64() - g_tapDownMs >= kTapHoldMs;
+}
+void Emote_TapButton(bool down) {
+    if (down == g_tapBtn) return;
+    const LONGLONG now = (LONGLONG)GetTickCount64();
+    g_tapBtn = down;
+    if (down) {
+        g_tapDownMs = now;
+        g_tapBeganHere = false;
+        if (g_id == EM_TAP && !g_ending) return;             // already in it: this press may end it on release
+        void* sk = CatchTweaks_Skater();
+        if (g_id != EM_NONE || g_req != EM_NONE) return;
+        if (!g_on || !sk || Twk_IsProxy(sk) || !OnFoot(sk) || Sit_EditorOpen() || Sit_PoseHeld()) return;
+        if (Emote_Carrying() || Radial_Open() || Radial_Busy() || !Sit_BoardInHand(sk)) return;
+        g_req = EM_TAP;
+        g_tapBeganHere = true;
+        TwkLog("[emote] board tap (RB)");
+    } else if (!g_tapBeganHere && now - g_tapDownMs < kTapHoldMs && g_id == EM_TAP && !g_ending) {
+        Emote_Stop();                                        // a second short press puts it away
+    }
+}
+bool Emote_TapHeld() { return TapWorking(); }
 bool Emote_WantsStick() {
-    return g_id == EM_TAP && !g_ending && g_w > 0.0f && (LONGLONG)GetTickCount64() - g_pumpMs < 300;
+    // ONLY WHILE RB IS HELD. The pose itself leaves the camera to you; taking the stick the whole time
+    // the board is up would mean you could never look around while holding it.
+    return TapWorking() && g_w > 0.0f && (LONGLONG)GetTickCount64() - g_pumpMs < 300;
 }
 void Emote_Stick(float rx, float ry) { g_stickX = rx; g_stickY = ry; }
 // The right trigger, as the pad last reported it (it reports changes, not a stream) -- always kept, so a Rage
@@ -1527,6 +1579,9 @@ int Emote_Prompts(SitPromptEntry* out, int cap) {
     int n = 0;
     const bool aiming = g_id == EM_RAGE && !g_thrown && g_rageSwingAt < 0.0f;
     if (aiming) out[n++] = { "Throw", 'T', 0.0f };
+    // The tap says what RB does now, because RB is what put the board up and it is not obvious that
+    // holding it does something else again.
+    if (g_id == EM_TAP && n < cap) out[n++] = { TapWorking() ? "Tapping" : "Hold to tap", 'S', 0.0f };
     if (n < cap) out[n++] = { aiming ? "Cancel" : "Stop emote", 'B', 0.0f };
     return n;
 }
@@ -1544,8 +1599,10 @@ void Emote_ReadConfig(const char* buf) {
     g_clapVolume = clampf((float)TwkIniIntQuiet(buf, "EmoteClapVolumePct", 150), 0.0f, 400.0f) / 100.0f;
     g_clapDoubleMs = (int)clampf((float)TwkIniIntQuiet(buf, "EmoteClapDoubleMs", 45), 0.0f, 400.0f);
 }
-int  Emote_Count() { return EM_WHEEL; }           // the wheel's: the internal ones (a carry) are asked for by whoever needs them
-const char* Emote_Name(int i) { return (i >= 0 && i < EM_WHEEL) ? kDefs[i].name : ""; }
+int  Emote_Count() { BuildWheelIndex(); return g_wheelN; }   // only the ones ON the wheel
+const char* Emote_Name(int i) { BuildWheelIndex(); return (i >= 0 && i < g_wheelN) ? kDefs[g_wheelIdx[i]].name : ""; }
+// A WHEEL index, not an emote index -- see BuildWheelIndex.
+int Emote_FromWheel(int i) { BuildWheelIndex(); return (i >= 0 && i < g_wheelN) ? g_wheelIdx[i] : EM_NONE; }
 // THE CHEST BONE'S NAME, off ANY character's mesh -- another player's, whose radio is hung from it. Worked out from
 // that mesh's own bone table with NOTHING of this module's state touched (the rig here is the local skater's, and
 // an emote may be mid-pose on it): pelvis, then the chain of "spine" children, the last of them -- as ResolveNames
@@ -1612,8 +1669,11 @@ bool Emote_Active()   { return g_id != EM_NONE; }
 bool Emote_PoseHeld() { return g_id != EM_NONE && g_w > 0.0f; }
 void Emote_Stop() { if (g_id != EM_NONE && !g_ending) { g_ending = true; g_outTime = kBlendOut; g_next = EM_NONE; } }
 const char* Emote_WhyNot() { return g_whyNot; }
-bool Emote_Play(int index) {
+// `wheelIndex` is a place ON THE WHEEL, which is not the same as an emote's number now that some are
+// hidden from it (see BuildWheelIndex).
+bool Emote_Play(int wheelIndex) {
     g_whyNot = "Not right now";
+    const int index = Emote_FromWheel(wheelIndex);
     if (!g_on || index < 0 || index >= EM_WHEEL) return false;
     if (Emote_Carrying()) { g_whyNot = "Put the radio down first"; return false; }
     void* sk = CatchTweaks_Skater();
@@ -1626,6 +1686,37 @@ bool Emote_Play(int index) {
     g_req = index;                   // taken up by the pump, which is the only place the state changes
     return true;
 }
+// ---- THE THROW, ON THE LEFT TRIGGER ------------------------------------------------------------------
+// Not a wheel entry any more: off the board, with a board in hand, HOLDING the left trigger arms the
+// throw -- the arm comes up and stays up for as long as it is held -- and the right trigger throws,
+// as hard as it is pulled (RageTrigger, unchanged). Letting go of the left without throwing puts the
+// arm down again.
+// WHY A HOLD rather than a press: the pose is a wind-up you aim from, so the natural gesture is to
+// hold it while you line the throw up. It also means there is no state to get stuck in -- release the
+// trigger and it is over -- which a press-to-arm would need a second button to undo.
+// Once the board has LEFT the hand the emote runs itself out (it is the one that ends itself), so the
+// left trigger is not consulted again until the next throw.
+const float kArmOn = 0.35f, kArmOff = 0.20f;    // hysteresis: a trigger resting near the edge must not flutter
+static bool g_armed = false;
+static void PollArmTrigger(void* sk) {
+    float lt = 0.0f;
+    if (!CatchTweaks_LeftTrigger(&lt)) return;               // no analogue value to be had: leave it alone
+    const bool wants = g_armed ? (lt > kArmOff) : (lt > kArmOn);
+    if (wants == g_armed) return;
+    g_armed = wants;
+    if (g_armed) {
+        // The same gates the wheel applied, minus the wheel: on foot, board in hand, nothing else going on.
+        if (g_id != EM_NONE || g_req != EM_NONE) { g_armed = false; return; }
+        if (!g_on || !sk || Twk_IsProxy(sk) || !OnFoot(sk) || Sit_EditorOpen() || Sit_PoseHeld()) { g_armed = false; return; }
+        if (Emote_Carrying() || Radial_Open() || Radial_Busy()) { g_armed = false; return; }
+        if (!Sit_BoardInHand(sk)) { g_armed = false; return; }
+        g_req = EM_RAGE;
+        TwkLog("[emote] throw armed (left trigger)");
+    } else if (g_id == EM_RAGE && !g_ending && !g_thrown) {
+        Emote_Stop();                                        // let go without throwing: the arm comes down
+    }
+}
+
 void Emote_Watchdog() {
     if (g_id == EM_NONE) return;
     const LONGLONG last = g_pumpMs;
@@ -1642,6 +1733,7 @@ void Emote_PumpFrame() {
     if (dt > 0.1f) dt = 0.1f;
 
     void* sk = CatchTweaks_Skater();
+    PollArmTrigger(sk);                  // holding the left trigger arms a throw; letting go lowers the arm
     // ---- a thrown board: the throw's second frame, and everything that brings it back
     if (Sit_BoardOut()) {
         g_outS += dt;

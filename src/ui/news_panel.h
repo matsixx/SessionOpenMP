@@ -29,9 +29,9 @@ bool NewsPanel_Available();
 bool NewsPanel_Show(const char* title, const char* body, const char* date,
                     void (*logf)(const char*) = nullptr);
 
-// GAME THREAD, every frame while it is up: moves the description under the stick, the d-pad or the
-// arrow/page keys. The panel is deliberately UNFOCUSABLE -- taking focus stopped the menu's own X
-// working -- so the scrolling cannot come from Slate and is driven from here instead.
+// GAME THREAD, every frame while it is up. Slate does the scrolling itself, but only while the panel
+// HAS focus -- and while it has focus the menu's own X does nothing. So focus is handed to the scroll
+// box while the stick or d-pad is moving and handed back a moment after it stops. See news_panel.cpp.
 void NewsPanel_Tick();
 
 bool NewsPanel_Showing();

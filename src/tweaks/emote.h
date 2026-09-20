@@ -8,7 +8,11 @@ void Emote_Watchdog();                   // from a tick that survives the editor
 
 int         Emote_Count();
 const char* Emote_Name(int index);
-bool        Emote_Play(int index);       // by wheel order. false = refused, and the log says why
+bool        Emote_Play(int wheelIndex);  // a place ON THE WHEEL. false = refused, and the log says why
+// RB: a press holds the board in the tap pose (the camera stays yours), and HOLDING it takes the right
+// stick to work the tap. A second short press puts the board down. Fed by the radial's key hook.
+void        Emote_TapButton(bool down);
+bool        Emote_TapHeld();             // RB held: the stick is the tap's and the camera is pinned
 const char* Emote_WhyNot();              // ...and so does this, in words for the wheel
 void        Emote_Stop();
 bool        Emote_Active();

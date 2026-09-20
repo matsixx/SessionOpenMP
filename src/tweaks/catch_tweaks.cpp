@@ -2562,6 +2562,28 @@ bool CatchTweaks_RightTrigger(float* out) {
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) { g_piKeyValue = nullptr; return false; }
 }
+// The LEFT trigger, the same way and for the same reason -- a throw is armed by holding it (emote.cpp).
+// Its own cached FName: these are FOUND, never added, so a build where the name does not exist simply
+// reports nothing rather than interning one.
+static uint64_t g_fnLTAxis = 0;
+bool CatchTweaks_LeftTrigger(float* out) {
+    if (out) *out = 0.0f;
+    PiLook();
+    if (!g_piKeyValue || !g_fnameCtor || !g_playerInput || !SitUI_Alive(&g_playerInputRef)) return false;
+    __try {
+        if (!g_fnLTAxis) {
+            uint64_t nm = 0;
+            g_fnameCtor(&nm, "Gamepad_LeftTriggerAxis", 0 /* FNAME_Find */);
+            if (!nm) return false;
+            g_fnLTAxis = nm;
+        }
+        uint64_t fkey[3] = { g_fnLTAxis, 0, 0 };
+        const float v = g_piKeyValue(g_playerInput, fkey);
+        if (!(v >= -0.01f && v <= 1.5f)) return false;
+        if (out) *out = v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v;
+        return true;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { g_piKeyValue = nullptr; return false; }
+}
 static bool hkInputKey(void* self, void* key, int ev, float amt, bool pad) {
     if (self != g_playerInput && self != g_piRefused) {       // a new one (a level change): watched, or -- once -- refused
         g_playerInput = self; SitUI_Track(&g_playerInputRef, self);

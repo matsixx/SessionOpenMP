@@ -396,6 +396,7 @@ static const char* KeyNameFor(char button) {
         case 'L': return "Gamepad_DPad_Left";
         case 'R': return "Gamepad_DPad_Right";
         case 'T': return "Gamepad_RightTrigger";          // a Rage's throw (emote.cpp)
+        case 'S': return "Gamepad_RightShoulder";         // the board tap's RB (emote.cpp)
         default:  return nullptr;
     }
 }

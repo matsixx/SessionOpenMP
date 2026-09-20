@@ -48,6 +48,8 @@ void* CatchSound_SpawnAttached(void*, void*, float, float) { g_soundsPlayed++; r
 uint8_t* TwkScanExe(const char*) { return nullptr; }
 static float g_stubRT = -1.0f;        // what the engine says the right trigger is at; < 0 = it cannot be asked
 bool  CatchTweaks_RightTrigger(float* out) { if (out) *out = g_stubRT < 0.0f ? 0.0f : g_stubRT; return g_stubRT >= 0.0f; }
+static float g_stubLT = -1.0f;        // ...and the left, which is what arms a throw
+bool  CatchTweaks_LeftTrigger(float* out) { if (out) *out = g_stubLT < 0.0f ? 0.0f : g_stubLT; return g_stubLT >= 0.0f; }
 static int g_stubSound = 0;          // what CatchSound_FindSound hands back (a loaded cue), or 0 for none
 void* CatchSound_FindSound(const char*) { return g_stubSound ? (void*)&g_stubSound : nullptr; }
 void  TwkIniStr(const char*, const char*, char* out, size_t cap, const char* def) { snprintf(out, cap, "%s", def ? def : ""); }
@@ -934,7 +936,16 @@ int main(int argc, char** argv) {
     //      SHAPE: longest side forward, thinnest across against the ribs, under the arm that has no board in it, the
     //      hand beneath it -- and where its ACTOR belongs is handed over in the WORLD's terms, body turned or not.
     {
-        Check(Emote_Count() == EM_WHEEL && EM_CARRY >= EM_WHEEL && !Emote_Name(EM_CARRY)[0], "carry: it is not on the wheel");
+        // The wheel is a SUBSET now -- a tap is RB's and a throw is the triggers' -- so the count is
+        // whatever is flagged for it, not every emote up to the internal ones. What must hold is that no
+        // place on the wheel is a carry, and that nothing off the wheel can be reached through it.
+        {
+            int n = Emote_Count(); bool ok = n > 0 && n < EM_WHEEL;
+            for (int i = 0; i < n; i++) { const int e = Emote_FromWheel(i); if (e < 0 || e >= EM_WHEEL || !kDefs[e].wheel) ok = false; }
+            for (int i = n; i < EM_COUNT + 2; i++) if (Emote_FromWheel(i) != EM_NONE || Emote_Name(i)[0]) ok = false;
+            Check(ok && !kDefs[EM_CARRY].wheel && !kDefs[EM_TAP].wheel && !kDefs[EM_RAGE].wheel,
+                  "carry, tap and throw are not on the wheel, and the wheel maps only to ones that are");
+        }
         const float shapes[3][6] = { { 30, 3, 2,  30, 14, 7 },      // long in X, thin in Z, its origin at a corner-ish
                                      {  0, 0, 0,   7, 14, 30 },     // long in Z (a tower), thin in X
                                      {  4, 20, 0,  14, 30, 7 } };   // long in Y
