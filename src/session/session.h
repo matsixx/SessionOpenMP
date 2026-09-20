@@ -101,6 +101,7 @@ void  RadioStreamStop();
 int   RadioStreamState(char* why, int cap);                               // 0 off, 1 starting, 2 live, -1 failed
 void  RadioSetListener(int peerIdx, bool wanted);                        // OWNER: this player's radio is playing ours
 void* RadioPeerWave(int peerIdx, bool rewind);                           // LISTENER: the wave their stream plays into
+void* RadioOwnWave(bool rewind);                                          // OWNER: ...and the wave OUR OWN stream plays into
 int   RadioPeerStreaming(int peerIdx);                                    // their frames arrived in the last second
 bool VoiceLoopback();
 const Config& GetConfig();

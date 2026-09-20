@@ -13,6 +13,7 @@
 namespace omp::game {
 
 bool trimPeerLegs      = true;
+bool trimPeerLegsOffBoard = true;   // ...and while they are on foot, where the game has no body physics at all
 bool trimPeerWorldHits = true;
 int  trimPeerIterDiv   = 2;
 

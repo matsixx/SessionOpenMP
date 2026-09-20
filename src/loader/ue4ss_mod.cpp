@@ -1812,6 +1812,7 @@ extern "C" {
     OMP_MOD_API int   OmpRadio_StreamState(char* why, int cap) { return omp::session::RadioStreamState(why, cap); }
     OMP_MOD_API void  OmpRadio_SetListener(int player, int wanted) { omp::session::RadioSetListener(player, wanted != 0); }
     OMP_MOD_API void* OmpRadio_PeerWave(int player, int rewind) { return omp::session::RadioPeerWave(player, rewind != 0); }
+    OMP_MOD_API void* OmpRadio_OwnWave(int rewind) { return omp::session::RadioOwnWave(rewind != 0); }
     OMP_MOD_API int   OmpRadio_PeerStreaming(int player) { return omp::session::RadioPeerStreaming(player); }
 
     // THE MOD CHANNEL -- the PUBLIC API for other mods (sdk/omp_mod_api.h, docs/modding-api.md).

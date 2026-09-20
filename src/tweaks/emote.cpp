@@ -230,7 +230,20 @@ float     g_trigger = 0.0f, g_rageSwingAt = -1.0f, g_ragePeak = 0.0f; bool g_tri
 bool      g_pulling = false, g_trigPolled = false; float g_pullHigh = 0.0f, g_pullRiseT = 0.0f; int g_trigSaid = 0;
 // the clap: where in its cycle the pump last saw it, and the sound it makes (looked up by name, watched like any
 // object -- a cue can be unloaded under us)
-float     g_clapPhase = 0.0f; int g_clapCount = 0;
+float     g_clapPhase = 0.0f; int g_clapCount = 0, g_clapMuted = 0;
+float     g_clapEchoAt = -1.0f;   int g_clapDoubleMs = 45;   // the clap's second strike (see ClapSound)
+// THE POSE SEAM'S OWN RECEIPT: which emote was last actually WRITTEN to the skeleton, and when.
+int             g_posedId = -1;          // EM_NONE is 0-ish, so -1 = "nothing has been posed yet"
+unsigned long long g_posedMs = 0;
+// Was THIS emote's pose actually written to the skeleton in the last few frames? The pump runs on the
+// skater's tick, but the pose is only written at sit's Flip seam, and the two can come apart (no seam
+// while an editor owns the skeleton, a stopped seam, a body swapped underneath). A sound is the one
+// part of an emote that is audible whether or not any of that happened -- so anything that makes a
+// NOISE asks this first, and a clap you cannot see is never heard. Field 2026-09-19: "I'm hearing the
+// clapping emote on my own character when I'm not clapping".
+static bool PoseIsLive(int id) {
+    return g_posedId == id && g_posedMs && (LONGLONG)GetTickCount64() - (LONGLONG)g_posedMs <= 120;
+}
 void*     g_clapCue = nullptr; SitObjRef g_clapCueRef = {}; bool g_clapCueTried = false;
 char      g_clapSound[64] = ""; float g_clapPitch = 1.6f, g_clapVolume = 1.5f;
 // the tap: THE POP OF AN OLLIE (asked for: "that seems like it'd fit a lot better" than the knock of a loose board).
@@ -1303,7 +1316,7 @@ bool Begin(int id, void* sk) {
     g_skater = sk; g_mesh = mesh; g_id = id; g_next = EM_NONE;
     g_t = 0.0f; g_w = 0.0f; g_ending = false; g_outTime = kBlendOut; g_lowerW = 0.0f; g_moveS = 0.0f; g_carry = -2; g_ptSet = false;
     g_throwDirSet = false; g_thrown = false; g_tapSay = (id == EM_TAP);
-    g_clapPhase = 0.0f; g_clapCount = 0; if (!g_clapCue) g_clapCueTried = false;
+    g_clapPhase = 0.0f; g_clapCount = 0; g_clapMuted = 0; g_clapEchoAt = -1.0f; if (!g_clapCue) g_clapCueTried = false;
     if (!g_tapCue) g_tapCueTried = false;
     g_tapLift = 14.0f; g_tapVel = 0.0f; g_tapSwing = 0.0f; g_tapHit = 0.0f; g_tapWalk = 0.0f; g_tapStickLift = false; g_tapDown = false; g_tapTipSet = false; g_tapCount = 0; g_tapGroundSet = false; g_tapGroundUSet = false; g_tapSurface = 0;
     g_boardInHand = Sit_BoardInHand(sk);
@@ -1376,7 +1389,22 @@ void ClapSound(void* sk) {
     if (!g_clapCue || !root) return;
     const float vol = g_clapVolume * (0.85f + 0.30f * Rand01()), pitch = g_clapPitch * (0.95f + 0.10f * Rand01());
     void* ac = CatchSound_SpawnAttached(g_clapCue, root, vol, pitch);
-    if (g_clapCount++ < 3) TwkLog("[emote] clap #%d: volume %.2f pitch %.2f, %s", g_clapCount, vol, pitch, ac ? "played" : "NOT PLAYED");
+    // THE SECOND STRIKE, a moment later and pitched apart. The game has no clap asset, so a clap is
+    // built out of SCU_HandLand -- which is the game's OWN hand-landing foley, played on your character
+    // every time a hand touches down. One knock of it IS a hand landing, and the field report was
+    // exactly that confusion: "I'm hearing the clapping emote on my own character when I'm not
+    // clapping". Two quick strikes are a clap and nothing else is, so the emote stops borrowing another
+    // sound's identity. EmoteClapDoubleMs = 0 returns it to the single knock.
+    if (g_clapDoubleMs > 0) g_clapEchoAt = g_t + (float)g_clapDoubleMs / 1000.0f;
+    // EVERY clap is logged, not the first three: the cap is what made "I hear clapping and nobody is
+    // clapping" impossible to check against a log. Throttled so a long clap cannot flood one.
+    g_clapCount++;
+    static unsigned long long lastSaid = 0;
+    const unsigned long long now = GetTickCount64();
+    if (g_clapCount <= 3 || now - lastSaid > 2000) {
+        lastSaid = now;
+        TwkLog("[emote] clap #%d: volume %.2f pitch %.2f, %s", g_clapCount, vol, pitch, ac ? "played" : "NOT PLAYED");
+    }
 }
 // The knock of the board on whatever is under its tail, as the game would make it (see the header).
 void TapSound(void* sk, float hardness) {
@@ -1514,6 +1542,7 @@ void Emote_ReadConfig(const char* buf) {
     TwkIniStr(buf, "EmoteClapSound", g_clapSound, sizeof(g_clapSound), "");
     g_clapPitch  = clampf((float)TwkIniIntQuiet(buf, "EmoteClapPitchPct", 160), 40.0f, 300.0f) / 100.0f;
     g_clapVolume = clampf((float)TwkIniIntQuiet(buf, "EmoteClapVolumePct", 150), 0.0f, 400.0f) / 100.0f;
+    g_clapDoubleMs = (int)clampf((float)TwkIniIntQuiet(buf, "EmoteClapDoubleMs", 45), 0.0f, 400.0f);
 }
 int  Emote_Count() { return EM_WHEEL; }           // the wheel's: the internal ones (a carry) are asked for by whoever needs them
 const char* Emote_Name(int i) { return (i >= 0 && i < EM_WHEEL) ? kDefs[i].name : ""; }
@@ -1670,8 +1699,25 @@ void Emote_PumpFrame() {
     }
     if (g_id == EM_CLAP && !g_ending) {             // the hands meet: that is when it is heard
         const float ph = ClapPhase(g_t);
-        if (g_w > 0.6f && g_t >= kClapStart && g_clapPhase < kClapContact && ph >= kClapContact) ClapSound(sk);
+        // ...and ONLY if the clap is actually on the skeleton. See PoseIsLive: the pump and the pose
+        // seam can come apart, and a clap nobody can see must not be a clap everybody can hear.
+        if (g_w > 0.6f && g_t >= kClapStart && g_clapPhase < kClapContact && ph >= kClapContact) {
+            if (PoseIsLive(EM_CLAP)) ClapSound(sk);
+            else if (g_clapMuted++ < 4)
+                TwkLog("[emote] clap: NOT played -- the clap is not on the skeleton just now "
+                       "(posed=%d, %lld ms ago, w=%.2f). This is the guard, not a fault.",
+                       g_posedId, (long long)((LONGLONG)GetTickCount64() - (LONGLONG)g_posedMs), g_w);
+        }
         g_clapPhase = ph;
+        // the second strike of the same clap -- armed by the first, and held to the same "is it really
+        // on the skeleton" rule, so stopping mid-clap cannot leave one behind
+        if (g_clapEchoAt >= 0.0f && g_t >= g_clapEchoAt) {
+            g_clapEchoAt = -1.0f;
+            void* root = sk ? twkP(sk, ACT_ROOT) : nullptr;
+            if (g_clapCue && root && PoseIsLive(EM_CLAP))
+                CatchSound_SpawnAttached(g_clapCue, root, g_clapVolume * (0.55f + 0.20f * Rand01()),
+                                         g_clapPitch * (1.04f + 0.08f * Rand01()));
+        }
     }
     if (g_id == EM_RAGE && !g_ending && !g_thrown) { PollTrigger(); RageTrigger(g_t); }
     // the moment of a Rage: the real board leaves the hand, the way the pose said it was going, as hard as it was pulled
@@ -1698,7 +1744,7 @@ void Emote_OnFlip(void* mesh) {
     if (g_id == EM_NONE || mesh != g_mesh || g_w <= 0.0f || !g_rigOk) return;
     if ((LONGLONG)GetTickCount64() - g_pumpMs > 300) return;      // nobody is driving the clock: the skeleton is not ours to write
     if (Sit_EditorOpen()) return;
-    __try { Apply(mesh); }
+    __try { Apply(mesh); g_posedId = g_id; g_posedMs = GetTickCount64(); }
     __except (EXCEPTION_EXECUTE_HANDLER) {
         g_faults++;
         TwkLog("[emote] fault while posing -- stopped");

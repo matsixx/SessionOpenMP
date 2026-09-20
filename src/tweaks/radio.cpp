@@ -131,10 +131,26 @@ char             g_lookWhy[96] = "Radio: not ready";
 // ---- settings
 int   g_on = 1;
 float g_volume = 0.40f;                       // RadioVolumePct: x1 was "very loud" (the field). The start for every radio; the wheel moves each
+float g_rangeMax = 12000.0f;                  // RadioRangeCm: how far a radio at FULL volume carries (120 m)
+float g_rangeMin = 800.0f;                    // RadioRangeMinCm: ...and how far one turned right down does (8 m)
+float g_falloffStart = 0.45f;                 // RadioFalloffStartPct: full volume out to this much of the range
+char  g_attenPath[160] = "";                  // RadioAttenuation: the falloff asset, or "none"
+bool  g_rangeDebug = false;                   // RadioRangeDebug: 1/s line of distance vs our own gain
 const char* const kMeshPath = "/Game/Art/Env/NYC/Skateshop/Props/Basemesh/Revamp/STM_NYC_SkateshopSpeaker.STM_NYC_SkateshopSpeaker";
 char  g_meshPath[200] = "";
 char  g_soundClass[64] = "SNDCLASS_Sfx";      // RadioSoundClass: the volume slider it answers to ("" = the song's own: Music)
-const char* const kAttenPath = "/Game/Audio/SAT_Sfx_Apt_Radio.SAT_Sfx_Apt_Radio";
+// THE FALLOFF CURVE. Not a sound -- a SoundAttenuation asset, the shape of how the radio fades with
+// distance. The obvious pick, SAT_Sfx_Apt_Radio, is the game's APARTMENT radio: MEASURED out of the pak,
+// full volume within 3 m and SILENT PAST 23 m. Right for a radio in a room, hopeless for a speaker in a
+// car park -- a peer's radio was inaudible across one at full volume, and no volume setting could reach
+// past it, because this is the asset's curve and not ours. The siren's curve has the same 3 m near field
+// and falls off over 190 m instead of 20, which is what a speaker outdoors actually does. Its name is
+// irrelevant: no siren is involved, only the distance curve.
+// Others measured, if this wants changing (RadioAttenuation): SAT_Sfx_Emitter_Pedestrians and
+// SAT_Sfx_Emitter_Wolf are identical to the siren; SAT_Sfx_Skate_RE 120 m; SAT_Sfx_Boathorn_Paris 224 m
+// (76 m of it at FULL volume); SAT_Sfx_Emitter_Bell 308 m (157 m flat out -- far too much).
+const char* const kAttenPath = "/Game/Audio/SAT_Sfx_Emitter_Siren.SAT_Sfx_Emitter_Siren";
+const char* const kAttenApt  = "/Game/Audio/SAT_Sfx_Apt_Radio.SAT_Sfx_Apt_Radio";   // the old one, if it is ever wanted back
 const struct { const char* name; const char* asset; const char* path; } kStations[3] = {
     { "RedRobin Radio",   "MSD_Station_RedRobin",          "/Game/Audio/Music/RedRobinRadio/MSD_Station_RedRobin.MSD_Station_RedRobin" },
     { "Chillhop Lofi",    "MSD_Station_ChillHop_Lofi",     "/Game/Audio/Music/Chillhop_Lofi/MSD_Station_ChillHop_Lofi.MSD_Station_ChillHop_Lofi" },
@@ -158,6 +174,7 @@ struct Radio {
     int       source;                            // radiowire::SRC_*: the game's stations, or a stream from the owner's PC
     char      srcName[48]; uint32_t srcPid;      // mine, streaming: which app
     bool      wantSent; float wantBeat;          // theirs, streaming: we have asked for it (and when we last did)
+    bool      farOut;                            // we were outside its range: the engine will have STOPPED the sound
 };
 Radio     g_mine, g_remote[MAX_REMOTE];
 float     g_boundsO[3] = { 0, 0, 0 }, g_boundsE[3] = { 30, 14, 7 }; bool g_boundsRead = false;
@@ -178,6 +195,7 @@ struct OmpRadioApi {
     int   (*StreamState)(char* why, int cap);
     void  (*SetListener)(int player, int wanted);
     void* (*PeerWave)(int player, int rewind);
+    void* (*OwnWave)(int rewind);                 // ...and ours, so our own radio is audible to us too
     int   (*PeerStreaming)(int player);
 };
 OmpRadioApi g_orad = {};
@@ -197,6 +215,7 @@ bool BindRadioApi() {
         a.StreamState   = (int (*)(char*, int))GetProcAddress(mods[i], "OmpRadio_StreamState");
         a.SetListener   = (void (*)(int, int))GetProcAddress(mods[i], "OmpRadio_SetListener");
         a.PeerWave      = (void* (*)(int, int))GetProcAddress(mods[i], "OmpRadio_PeerWave");
+        a.OwnWave       = (void* (*)(int))GetProcAddress(mods[i], "OmpRadio_OwnWave");
         a.PeerStreaming = (int (*)(int))GetProcAddress(mods[i], "OmpRadio_PeerStreaming");
         if (!a.Sources || !a.StreamStart || !a.StreamStop || !a.StreamState || !a.SetListener || !a.PeerWave || !a.PeerStreaming) return false;
         g_orad = a;
@@ -277,8 +296,12 @@ void* SongWave(void* station, int i) {
 }
 float VolumeOf(const Radio& r) { return r.volumeSet ? r.volume : g_volume; }
 void StopSound(Radio& r) {
+    // The component is spawned with autoDestroy FALSE (see SpawnOn), so stopping is ours to do. It is
+    // attached to the radio's own component and dies with the prop, so a stopped one left behind costs a
+    // component per song change -- a handful in a long session, against a restart every 2 s. There is no
+    // DestroyComponent bound here and this is not the round to add one.
     if (r.sound && SitUI_Alive(&r.sref) && g_audioStop) { __try { g_audioStop(r.sound); } __except (EXCEPTION_EXECUTE_HANDLER) { } }
-    r.sound = nullptr;
+    r.sound = nullptr; r.sref.obj = nullptr; r.farOut = false;
 }
 void* SpawnOn(Radio& r, void* wave, float start);
 // Start THIS game's sound of what a radio is playing, from where in the song the radio is -- or, for a radio that
@@ -289,8 +312,12 @@ void StartSound(Radio& r) {
     r.nextTryMs = GetTickCount64() + 2000;
     if (r.source == radiowire::SRC_STREAM) {
         r.songLen = 0.0f;
-        if (r.player < 0 || !g_orad.PeerWave) return;
-        void* wave = g_orad.PeerWave(r.player, 1);                     // rewound: what is heard starts from now
+        // OURS or a peer's -- either way it is a radio standing in the world and it is heard from where it
+        // stands. Ours was silent while the assumption held that the app itself is audible to us; once that
+        // app is sent to an output nobody listens to (the only way to not hear the music twice), silence was
+        // all the streamer got. Turn your own radio off locally if you would rather hear the app direct.
+        void* wave = (r.player < 0) ? (g_orad.OwnWave ? g_orad.OwnWave(1) : nullptr)
+                                    : (g_orad.PeerWave ? g_orad.PeerWave(r.player, 1) : nullptr);
         if (!wave) return;
         void* ac = SpawnOn(r, wave, 0.0f);
         char who[64];
@@ -312,8 +339,19 @@ void StartSound(Radio& r) {
 }
 // A sound on a radio: its falloff, its channel (see the header), its level, from `start` seconds in.
 void* SpawnOn(Radio& r, void* wave, float start) {
-    void* atten = LoadByPath(kAttenPath);                               // asked for each time: nothing of ours keeps it in memory between songs
-    if (!atten && !g_attenMissingSaid) { g_attenMissingSaid = true; TwkLog("[radio] %s could not be loaded -- the volume is set by distance here instead", kAttenPath); }
+    // THE FALLOFF SHAPE IS THIS ASSET'S, not ours -- ours only ends the tail (see the pump). The default
+    // is the game's own radio attenuation, and note what it is FOR: SAT_Sfx_Apt_RADIO, the APARTMENT one,
+    // authored for a sound source in a room. Outdoors across a skatepark it runs out of road long before
+    // you would expect a speaker to ("it just gets silent closer than it should" -- field, with a peer's
+    // radio inaudible across a car park at full volume). RadioAttenuation names a different one to try;
+    // "none" drops it entirely and leaves the distance wholly to us -- louder and further, but the engine
+    // then has nothing to place it with, so it stops being properly 3D. Try another asset first.
+    void* atten = nullptr;
+    if (_stricmp(g_attenPath, "none") != 0) {
+        atten = LoadByPath(g_attenPath);                                // asked for each time: nothing of ours keeps it in memory between songs
+        if (!atten && strcmp(g_attenPath, kAttenPath) != 0) atten = LoadByPath(kAttenPath);
+        if (!atten && !g_attenMissingSaid) { g_attenMissingSaid = true; TwkLog("[radio] %s could not be loaded -- the volume is set by distance here instead", g_attenPath); }
+    } else if (!g_attenMissingSaid) { g_attenMissingSaid = true; TwkLog("[radio] RadioAttenuation=none -- distance is set by hand, and the sound is not placed in 3D by the engine"); }
     // THE CHANNEL: not the song's own class (Music) but the one the ini names, so the Music slider is not the radio's
     void* cls = nullptr;
     if (g_soundClass[0] && g_audioPlay) {
@@ -324,7 +362,13 @@ void* SpawnOn(Radio& r, void* wave, float start) {
     const float zero[3] = { 0.0f, 0.0f, 0.0f };
     void* ac = nullptr;
     __try {
-        ac = g_spawnSound(wave, r.comp, 0, zero, zero, 0 /* keep relative */, true, cls ? 0.001f : VolumeOf(r), 1.0f, start, atten, nullptr, true);
+        // autoDestroy FALSE -- WE own this component's life, not the engine. With it true the engine
+        // destroyed the component the instant the sound stopped for any reason, including being culled
+        // for distance, and the 2 s retry below then spawned a NEW one: field-logged as StartSound
+        // firing every two seconds for minutes ("from 162 s", "164 s", "166 s" ...), heard as music
+        // that restarts instead of playing, and as a radio that never gets going when you join or walk
+        // back into range. StopSound stops it explicitly, so nothing was gained by letting it go.
+        ac = g_spawnSound(wave, r.comp, 0, zero, zero, 0 /* keep relative */, true, cls ? 0.001f : VolumeOf(r), 1.0f, start, atten, nullptr, false);
         if (ac && cls) {                                                // the class is read when a sound STARTS: so it is started again
             *(void**)((uint8_t*)ac + AC_CLASS_OVR) = cls;
             *(float*)((uint8_t*)ac + AC_VOLUME) = VolumeOf(r);
@@ -568,7 +612,12 @@ void PumpRemote(Radio& r, float dt) {
     // their song, on OUR clock between their words
     r.songPos += dt;
     if (r.songLen > 0.0f && r.songPos >= r.songLen - 0.25f) { StopSound(r); return; }   // over: their next word starts the next
-    if (!r.muted && (!r.sound || !SitUI_Alive(&r.sref)) && GetTickCount64() >= r.nextTryMs) StartSound(r);
+    // A restart here should now be RARE -- the component outlives going out of earshot. If this ever
+    // churns again the log says so at once, instead of it being heard as music that will not settle.
+    if (!r.muted && (!r.sound || !SitUI_Alive(&r.sref)) && GetTickCount64() >= r.nextTryMs) {
+        if (r.sound) { char who[64]; TwkLog("[radio] %s: their sound went away on its own -- starting it again from %.0f s", Whose(r, who, sizeof(who)), r.songPos); }
+        StartSound(r);
+    }
 }
 
 // ------------------------------------------------------------------ the wheel
@@ -614,9 +663,14 @@ void BuildWheel(void* sk) {
     g_muteTarget = sk ? NearestRadio(sk, 300.0f) : nullptr;
     if (g_muteTarget) {
         char vl[64];
-        const int pct = (int)(VolumeOf(*g_muteTarget) * 100.0f + 0.5f);
-        snprintf(vl, sizeof(vl), "Volume up (%d%%)", pct);   add(A_VOLUP, vl);
-        snprintf(vl, sizeof(vl), "Volume down (%d%%)", pct); add(A_VOLDOWN, vl);
+        const float vnow = VolumeOf(*g_muteTarget);
+        const int pct = (int)(vnow * 100.0f + 0.5f);
+        // ...and how far it now carries, because that is what the volume changes (see the pump). Metres,
+        // so the number means something to stand next to.
+        float vc = vnow; if (vc < 0.0f) vc = 0.0f; if (vc > 1.0f) vc = 1.0f;
+        const int reach = (int)((g_rangeMin + (g_rangeMax - g_rangeMin) * vc) / 100.0f + 0.5f);
+        snprintf(vl, sizeof(vl), "Volume up (%d%%, %d m)", pct, reach);   add(A_VOLUP, vl);
+        snprintf(vl, sizeof(vl), "Volume down (%d%%, %d m)", pct, reach); add(A_VOLDOWN, vl);
         char who[64], lb[64];
         if (g_muteTarget->player < 0) snprintf(lb, sizeof(lb), "Turn radio %s (for me)", g_muteTarget->muted ? "on" : "off");
         else snprintf(lb, sizeof(lb), "Turn %.30s radio %s (for me)", Whose(*g_muteTarget, who, sizeof(who)), g_muteTarget->muted ? "on" : "off");
@@ -630,6 +684,17 @@ void BuildWheel(void* sk) {
 // ------------------------------------------------------------------ the module's face
 void Radio_ReadConfig(const char* buf) {
     g_on = TwkIniIntQuiet(buf, "RadioEnabled", 1) ? 1 : 0;
+    g_rangeMax = (float)TwkIniIntQuiet(buf, "RadioRangeCm", 12000);
+    g_rangeMin = (float)TwkIniIntQuiet(buf, "RadioRangeMinCm", 800);
+    TwkIniStr(buf, "RadioAttenuation", g_attenPath, sizeof(g_attenPath), kAttenPath);
+    g_rangeDebug = TwkIniIntQuiet(buf, "RadioRangeDebug", 0) != 0;
+    if (!g_attenPath[0]) snprintf(g_attenPath, sizeof(g_attenPath), "%s", kAttenPath);
+    g_falloffStart = (float)TwkIniIntQuiet(buf, "RadioFalloffStartPct", 45) / 100.0f;
+    if (g_falloffStart < 0.0f) g_falloffStart = 0.0f;
+    if (g_falloffStart > 0.9f) g_falloffStart = 0.9f;
+    if (g_rangeMax < 100.0f) g_rangeMax = 100.0f;
+    if (g_rangeMin < 50.0f)  g_rangeMin = 50.0f;
+    if (g_rangeMin > g_rangeMax) g_rangeMin = g_rangeMax;
     const int v = TwkIniIntQuiet(buf, "RadioVolumePct", 40);
     g_volume = (float)(v < 0 ? 0 : v > 400 ? 400 : v) / 100.0f;
     TwkIniStr(buf, "RadioMesh", g_meshPath, sizeof(g_meshPath), kMeshPath);
@@ -678,11 +743,12 @@ bool Radio_WheelTake(int i, bool* keepOpen) {
         if (!g_srcN) { snprintf(g_whyNot, sizeof(g_whyNot), "Play something on your PC first"); return false; }
         const int k = g_streamNext < g_srcN ? g_streamNext : 0;
         if (r.source == radiowire::SRC_STREAM && !_stricmp(g_srcName[k], r.srcName)) { if (keepOpen) *keepOpen = true; return true; }
-        StopSound(r);                                                    // you hear the app itself, from your PC
+        StopSound(r);
         g_orad.StreamStart(g_srcPid[k], g_srcName[k]);
         r.source = radiowire::SRC_STREAM; r.srcPid = g_srcPid[k];
         snprintf(r.srcName, sizeof(r.srcName), "%s", g_srcName[k]);
         g_streamErr[0] = 0; g_dirty = true;
+        r.nextTryMs = 0;                 // ...and our own radio plays it back: StartSound, once there is audio to play
         TwkLog("[radio] streaming %s from this PC (pid %u)", r.srcName, r.srcPid);
         // The app goes on playing out of YOUR speakers as well as out of the radio, so the streamer
         // hears their music twice. Muting the app does NOT help -- process loopback taps it AFTER the
@@ -721,7 +787,15 @@ bool Radio_WheelTake(int i, bool* keepOpen) {
         int pct = now + (g_acts[i] == A_VOLUP ? step : -step);
         pct = pct < 0 ? 0 : pct > 200 ? 200 : pct;
         t->volume = (float)pct / 100.0f; t->volumeSet = true;
-        if (t->player < 0) { g_volume = t->volume; TwkMarkDirty(); }        // your own radio's level is the one that is kept
+        // Your own radio's level is the one KEPT for next time -- but only as the level a radio STARTS at.
+        // It used to be the live default that every radio you had not individually touched read through
+        // (VolumeOf), so turning yours up turned up everyone else's with it. Radios already out keep what
+        // they were playing at; the new default reaches only radios that appear later.
+        if (t->player < 0) {
+            if (!g_mine.volumeSet) { g_mine.volume = g_volume; g_mine.volumeSet = true; }
+            for (Radio& o : g_remote) if (o.used && !o.volumeSet) { o.volume = g_volume; o.volumeSet = true; }
+            g_volume = t->volume; TwkMarkDirty();
+        }
         bool applied = false;
         if (g_audioVolume && t->sound && SitUI_Alive(&t->sref) && !g_attenMissingSaid) {
             __try { g_audioVolume(t->sound, t->volume); applied = true; } __except (EXCEPTION_EXECUTE_HANDLER) { }
@@ -771,8 +845,12 @@ void Radio_PumpFrame() {
                     }
                 }
             }
-            // STREAMING: nothing to play here, only whether it is still going
+            // STREAMING: our own radio plays our own stream, so it needs starting like any other -- but
+            // only once the capture has produced something, or the wave starts on an empty ring and the
+            // engine drops it. StartSound sets nextTryMs, so a refusal is retried rather than given up on.
             if (r.source == radiowire::SRC_STREAM) {
+                if (!r.sound && !r.muted && Alive(r) && GetTickCount64() >= r.nextTryMs &&
+                    g_orad.OwnWave && g_orad.StreamState && g_orad.StreamState(nullptr, 0) == 2) StartSound(r);
                 char why[160] = "";
                 if (g_orad.StreamState && g_orad.StreamState(why, sizeof(why)) == -1) {
                     snprintf(g_streamErr, sizeof(g_streamErr), "%s", why[0] ? why : "it stopped");
@@ -791,12 +869,62 @@ void Radio_PumpFrame() {
     }
     // ---- everyone else's
     for (Radio& o : g_remote) if (o.used) PumpRemote(o, dt);
-    // ---- no attenuation asset: the distance does it by hand, for every radio heard
-    if (sk && g_attenMissingSaid && g_audioVolume) {
+    // ---- HOW FAR IT CARRIES FOLLOWS HOW LOUD IT IS SET.
+    // Turning a radio down used to make it quieter everywhere and no smaller: the attenuation asset's
+    // radius is fixed, so a radio at 10% was still "present" across the whole park, just faintly. A real
+    // one turned down is simply a thing you have to be near. So the range is scaled by the volume --
+    // RadioRangeCm at full, RadioRangeMinCm at nothing -- and the gain rolls off to silence there,
+    // SQUARED so the near field holds up and the tail goes quietly rather than stopping.
+    // This multiplies the attenuation asset rather than replacing it (the asset still does the
+    // spatialisation and its own falloff), so the audible distance is whichever of the two is shorter --
+    // which is the point. It also covers the case the old code was written for: no asset at all.
+    if (sk && g_audioVolume) {
         auto byDistance = [&](Radio& x) {
             if (!x.sound || !SitUI_Alive(&x.sref)) return;
-            const float d = DistanceTo(x, sk), k = d < 250.0f ? 1.0f : d > 3500.0f ? 0.0f : 1.0f - (d - 250.0f) / 3250.0f;
-            __try { g_audioVolume(x.sound, VolumeOf(x) * k * k); } __except (EXCEPTION_EXECUTE_HANDLER) { }
+            const float vol = VolumeOf(x);
+            float v = vol; if (v < 0.0f) v = 0.0f; if (v > 1.0f) v = 1.0f;
+            const float range = g_rangeMin + (g_rangeMax - g_rangeMin) * v;
+            const float full  = range * g_falloffStart;            // ...holds full volume this far out
+            const float d = DistanceTo(x, sk);
+            const float k = d <= full ? 1.0f : d >= range ? 0.0f : 1.0f - (d - full) / (range - full);
+            // LINEAR, and only across the outer part of the range. This MULTIPLIES the attenuation asset,
+            // which is already doing a natural near-field falloff of its own -- so squaring it here on top
+            // of that, from 15% of the range out, compounded into "really loud when close but it gets quiet
+            // quicker than I feel like it should" (field). Our job is only to end the tail where the volume
+            // says it should end; the asset shapes the rest.
+            __try { g_audioVolume(x.sound, vol * k); } __except (EXCEPTION_EXECUTE_HANDLER) { }
+            // WHO IS SILENCING IT. Two things can: this gain, and the attenuation ASSET's own curve,
+            // which we cannot read. So print ours next to the distance -- if it reads ~1.00 where the
+            // radio has already gone quiet, ours is not the limiter and the asset is (see SpawnOn).
+            if (g_rangeDebug) {
+                static ULONGLONG saidMs = 0;
+                const ULONGLONG nowMs = GetTickCount64();
+                if (nowMs > saidMs + 1000) {
+                    saidMs = nowMs;
+                    char who[64];
+                    TwkLog("[radio] %s: %.0f m away, volume %.0f%%, our gain %.2f (range %.0f m, flat to %.0f m) -- "
+                           "if you cannot hear it and this gain is near 1.00, the attenuation asset is what stops it",
+                           Whose(x, who, sizeof(who)), d / 100.0f, vol * 100.0f, k, range / 100.0f, full / 100.0f);
+                }
+            }
+            // COMING BACK INTO RANGE HAS TO START IT AGAIN. The engine stops a sound it has culled for
+            // distance, and since the component is spawned with autoDestroy FALSE it survives that --
+            // STOPPED. So "is the component still there" answers yes forever and nothing would ever
+            // restart it: the radio went silent for good once you walked away, until it was turned off
+            // and on again. Field 2026-09-19, and the direct cost of the autoDestroy fix that stopped it
+            // restarting every 2 s -- this is the other half of owning the sound's life ourselves.
+            // Hysteresis: out at the range, back in at 92% of it, so standing on the line cannot
+            // retrigger this every frame.
+            if (d >= range) x.farOut = true;
+            else if (x.farOut && d < range * 0.92f) {
+                x.farOut = false;
+                if (x.source == radiowire::SRC_STREAM) StartSound(x);      // rewound: a live stream resumes at NOW
+                else if (g_audioPlay) {                                    // the same component, from where the song is
+                    __try { g_audioPlay(x.sound, x.songPos); } __except (EXCEPTION_EXECUTE_HANDLER) { }
+                    char who[64];
+                    TwkLog("[radio] %s: back in range -- playing again from %.0f s", Whose(x, who, sizeof(who)), x.songPos);
+                } else StartSound(x);
+            }
         };
         byDistance(r);
         for (Radio& o : g_remote) if (o.used) byDistance(o);

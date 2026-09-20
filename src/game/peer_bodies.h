@@ -32,6 +32,10 @@ namespace omp::game {
 extern bool trimPeerLegs;        // legs and pelvis kinematic instead of simulated
 extern bool trimPeerWorldHits;   // the remaining bodies ignore the level
 extern int  trimPeerIterDiv;     // solver iterations divided by this (1 = leave them alone)
+// Hold the cuts OFF THE BOARD as well, not only while the game's physical animation is on. A proxy is
+// posed from the wire in both states, so simulated legs off-board only ever reacted to being walked
+// into. False restores the old behaviour (legs simulating whenever the peer is on foot).
+extern bool trimPeerLegsOffBoard;
 
 using TrimLogFn = void (*)(const char*);
 

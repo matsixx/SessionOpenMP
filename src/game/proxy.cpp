@@ -1288,9 +1288,19 @@ void Proxy::Apply(const repl::State& s, uint64_t nowMs, uint64_t nowUs, void (*l
             const int paFlags = safeByte(actor_, off::kSkaterPhysAnimOn);
             const bool paLive = paFlags >= 0 && (((paFlags >> 4) & 1) != 0) && !s.bailing;
             void* trimMesh = safePtr(actor_, off::kSkaterMesh);
+            // ...AND OFF THE BOARD TOO. The game only ever has body physics on while riding, so off the
+            // board this used to RESTORE the legs to simulating -- on a skater whose every pose comes off
+            // the wire. Simulated legs on a wire-driven proxy have nothing to contribute and one thing to
+            // do: react. Walk into someone on foot and your capsule shoved their leg bodies while the next
+            // pose yanked them back, once per frame. Field 2026-09-19: "when I walk into another skater,
+            // their legs collide with me and their legs start freaking out ... sometimes when they're
+            // standing still too". Kinematic legs still BLOCK you -- they just stop being pushed.
+            // A proxy needs its bodies for real in exactly one case, and it is the one excluded here:
+            // a bail, which the game ragdolls on these same bodies (see peer_bodies.h).
+            const bool wantTrim = !s.bailing && (paLive || (trimPeerLegsOffBoard && !s.onBoard));
             if (trimMesh) {
-                if (paLive) PeerBodiesTrim(trimMesh, nowMs, logf);
-                else        PeerBodiesRestore(trimMesh, logf);
+                if (wantTrim) PeerBodiesTrim(trimMesh, nowMs, logf);
+                else          PeerBodiesRestore(trimMesh, logf);
             }
         }
 

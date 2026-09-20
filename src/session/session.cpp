@@ -1960,6 +1960,29 @@ static void radioSend(uint16_t seq, const uint8_t* const* fp, const int* fl, int
         g_radioTx += (uint32_t)n;
     }
 }
+// YOUR OWN STREAM, PLAYED BACK THROUGH YOUR OWN RADIO.
+// It used to be deliberately silent -- "you hear the app itself" -- which was true only while the app
+// was also coming out of your speakers. The cure for hearing your music twice is to send that app to an
+// output you do not listen to, and then the streamer heard NOTHING: their own radio played nothing and
+// there was no second machine in earshot. (It worked on the shared-memory loopback for exactly that
+// reason: the other local client was a peer and played it back.) So the frames on their way out are
+// ALSO decoded here, and the owner's radio plays them like any other -- positional, distance-faded,
+// mutable, at the radio's own volume. Field 2026-09-19: "the stream music option wasn't working ...
+// just hearing nothing ... it was working locally on shm perfectly".
+static RadioRx g_ownRx;
+static void radioOwnFrame(const uint8_t* f, int len) {
+    if (!f || len <= 0) return;
+    if (!g_ownRx.dec) {
+        int err = 0;
+        g_ownRx.dec = opus_decoder_create(48000, 1, &err);
+        if (err != OPUS_OK || !g_ownRx.dec) { g_ownRx.dec = nullptr; return; }
+    }
+    g_ownRx.voice.primeSamples = 2400;      // 50 ms: no network between here and here
+    g_ownRx.voice.trimAbove   = 14400;      // ...and never more than 300 ms behind what is going out
+    int16_t pcm[960];
+    const int got = opus_decode((OpusDecoder*)g_ownRx.dec, f, len, pcm, 960, 0);
+    if (got > 0) g_ownRx.voice.ring.Write(pcm, got);
+}
 static void radioFrame(uint64_t nowUs, int nPeers) {
     // out: whatever the capture encoded since last frame, three frames to a packet. The queue is ALWAYS
     // drained -- nobody listening just means nothing is sent -- so what goes out is never stale.
@@ -1972,6 +1995,7 @@ static void radioFrame(uint64_t nowUs, int nPeers) {
         if (len <= 0) break;
         if (n > 0 && sq != (uint16_t)(seq0 + n)) { uint8_t keep[256]; memcpy(keep, fb[n], (size_t)len); flush(); memcpy(fb[0], keep, (size_t)len); }
         if (n == 0) seq0 = sq;
+        radioOwnFrame(fb[n], len);                   // ...and to our own radio, which is in the world too
         fp[n] = fb[n]; fl[n] = len; n++;
         if (n == 3) flush();
     }
@@ -2025,8 +2049,17 @@ int RadioSources(uint32_t* pids, char* names, int nameCap, int cap) {
     }
     return n;
 }
-int  RadioStreamStart(uint32_t pid, const char* name) { if (!pid) return 0; radiocap::Start(pid, name); return 1; }
-void RadioStreamStop() { radiocap::Stop(); }
+static void radioOwnReset() {                    // a new stream must never start on the last one's tail
+    if (g_ownRx.dec) { opus_decoder_destroy((OpusDecoder*)g_ownRx.dec); g_ownRx.dec = nullptr; }
+    g_ownRx.voice.ring.Clear();
+}
+int  RadioStreamStart(uint32_t pid, const char* name) { if (!pid) return 0; radioOwnReset(); radiocap::Start(pid, name); return 1; }
+void RadioStreamStop() { radiocap::Stop(); radioOwnReset(); }
+void* RadioOwnWave(bool rewind) {
+    void* w = game::voice::EnsureWave(g_ownRx.voice, g_logf);
+    if (w && rewind) game::voice::Rewind(g_ownRx.voice);
+    return w;
+}
 int  RadioStreamState(char* why, int cap) { return radiocap::State(why, cap); }
 void RadioSetListener(int peerIdx, bool wanted) {
     Slot* s = slotByPeer(peerIdx);
@@ -2053,6 +2086,7 @@ static void radioOnPacket(int, const uint8_t*, int, uint64_t) {}
 static void radioFrame(uint64_t, int) {}
 int   RadioSources(uint32_t*, char*, int, int) { return 0; }
 int   RadioStreamStart(uint32_t, const char*) { return 0; }
+void* RadioOwnWave(bool) { return nullptr; }
 void  RadioStreamStop() {}
 int   RadioStreamState(char* why, int cap) { if (why && cap) why[0] = 0; return 0; }
 void  RadioSetListener(int, bool) {}
