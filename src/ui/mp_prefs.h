@@ -64,8 +64,32 @@ int  MpPrefs_NameDistM();                // how far away a name is still drawn
 void MpPrefs_SetNameDistM(int metres);
 int  MpPrefs_BubbleDistM();              // ...and a chat bubble, which is deliberately much shorter
 void MpPrefs_SetBubbleDistM(int metres);
+// How big the text in a speech bubble is, at the distance a nameplate is drawn at its natural size.
+// It still shrinks and grows with distance from there; this is what it grows and shrinks AROUND.
+int  MpPrefs_BubbleTextSize();
+void MpPrefs_SetBubbleTextSize(int size);
 // The slider limits, so the menu row and the setter's clamp cannot drift apart.
 enum { MPNAME_DIST_MIN = 10, MPNAME_DIST_MAX = 250, MPBUBBLE_DIST_MIN = 5, MPBUBBLE_DIST_MAX = 100 };
+enum { MPBUBBLE_TEXT_MIN = 8, MPBUBBLE_TEXT_MAX = 22, MPBUBBLE_TEXT_DEFAULT = 11 };
+
+// ---- THE CHAT BOX's look. Stored here for the same reason the nameplate settings are: they are the
+// player's, they have to survive a restart, and the game-thread publish copies them into the live
+// tuning every frame so there is exactly one source of truth and no apply step.
+enum { MPCHAT_TEXT_MIN = 10, MPCHAT_TEXT_MAX = 26, MPCHAT_TEXT_DEFAULT = 15 };
+// The header and the key hints. Their own setting rather than a fraction of the talk: somebody who
+// wants big text does not necessarily want a big header, and the two were tied together.
+enum { MPCHAT_SMALL_MIN = 8, MPCHAT_SMALL_MAX = 22, MPCHAT_SMALL_DEFAULT = 12 };
+enum { MPCHAT_WIDTH_MIN = 360, MPCHAT_WIDTH_MAX = 1200, MPCHAT_WIDTH_DEFAULT = 620 };
+enum { MPCHAT_LINES_MIN = 4, MPCHAT_LINES_MAX = 16, MPCHAT_LINES_DEFAULT = 12 };
+enum { MPCHAT_HOLD_MIN = 3, MPCHAT_HOLD_MAX = 30, MPCHAT_HOLD_DEFAULT = 9 };
+enum { MPCHAT_PANEL_DEFAULT = 48, MPCHAT_BLUR_DEFAULT = 70 };    // both 0..100
+int  MpPrefs_ChatTextSize();   void MpPrefs_SetChatTextSize(int v);
+int  MpPrefs_ChatSmallSize();  void MpPrefs_SetChatSmallSize(int v);
+int  MpPrefs_ChatWidth();      void MpPrefs_SetChatWidth(int v);
+int  MpPrefs_ChatLines();      void MpPrefs_SetChatLines(int v);
+int  MpPrefs_ChatHoldSec();    void MpPrefs_SetChatHoldSec(int v);
+int  MpPrefs_ChatPanelPct();   void MpPrefs_SetChatPanelPct(int v);
+int  MpPrefs_ChatBlurPct();    void MpPrefs_SetChatBlurPct(int v);
 
 // ---- DROPPED OBJECTS (the object dropper). What happens to the props everyone already had SAVED on
 // the map when a session starts; live placements replicate above Off either way. See session.h.

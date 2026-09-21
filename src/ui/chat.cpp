@@ -542,8 +542,12 @@ int Chat_Lines(ChatLineView* out, int cap) {
         const float age = (float)((double)(t - l.atUs) * 1e-6);
         if (!open && age > keep) continue;
         ChatLineView v{};
-        if (l.system || !l.name[0]) snprintf(v.text, sizeof(v.text), "%s", l.text);
-        else                        snprintf(v.text, sizeof(v.text), "%s  %s", l.name, l.text);
+        if (l.system || !l.name[0]) { snprintf(v.text, sizeof(v.text), "%s", l.text); v.nameLen = 0; }
+        else {
+            snprintf(v.text, sizeof(v.text), "%s  %s", l.name, l.text);
+            const size_t nl = strlen(l.name);
+            v.nameLen = (uint8_t)(nl > 255 ? 255 : nl);
+        }
         // OPEN MEANS NO FADE. Reported as age zero rather than with a second flag, so the caller has
         // one rule for alpha and the two states cannot get out of step.
         v.ageMs = open ? 0u : (uint32_t)(age * 1000.0f);

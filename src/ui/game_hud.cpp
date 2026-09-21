@@ -12,7 +12,8 @@
 // SessionOpenMP -- our text on screen, drawn by the game. Contract and thread rule: game_hud.h.
 #include "game_hud.h"
 #include "nameplates.h"
-#include "chat.h"                        // the chat is this surface's other user
+#include "chat.h"
+#include "mp_prefs.h"                        // the chat is this surface's other user
 #include "version_tag.h"                  // the game instance, for creating a widget
 #include "../omp_peers.h"                 // OMP_MAX_PEERS -- how many plates there can ever be
 #include "../game/game_syms.h"
@@ -63,7 +64,9 @@ enum {
 // here stay in the space they were chosen in and `toLinear` converts them at the point of the write.
 float kNameR = 0.55f, kNameG = 0.80f, kNameB = 1.00f;    // somebody else's name -- pale blue
 float kMsgR  = 0.88f, kMsgG  = 0.88f, kMsgB  = 0.88f;    // what they said -- near-white
-float kSayR  = 0.98f, kSayG  = 0.78f, kSayB  = 0.22f;    // you -- the game's own highlight amber
+// YOU. The game's highlight amber, opened up: the theme's 0.98/0.78/0.22 read as a deep mustard
+// against a dark panel, where the overlay's version of the same colour had looked brighter.
+float kSayR  = 1.00f, kSayG  = 0.87f, kSayB  = 0.42f;
 float kSysR  = 0.55f, kSysG  = 0.60f, kSysB  = 0.65f;    // joins, leaves, notices
 float kDimR  = 0.62f, kDimG  = 0.62f, kDimB  = 0.62f;    // the header and the key hints
 float kWarnR = 1.00f, kWarnG = 0.55f, kWarnB = 0.35f;    // ...and a counter with no room left
@@ -78,10 +81,17 @@ float kChatSize = 15.0f;
 const char* kChatPrompt = "> ";
 // HOW WIDE A CHAT LINE IS ALLOWED TO GET, in characters. See `wrapInto` for why this is counted in
 // characters rather than measured in units.
-int kChatCols = 66;
+// HOW MANY CHARACTERS FIT ON A LINE is not a constant -- it falls out of how wide the box is and how
+// big the text is, and BOTH are the player's to set now. It was 66, which is what the default width
+// and the default size happen to give; widen the box or enlarge the text and the wrap went on
+// breaking at 66 anyway, so long lines ran straight out of the panel (field 2026-09-21). Derived
+// per frame by `chatCols` instead, from the same kCharWEm the panels are sized with, so the box and
+// the wrapping cannot disagree about how wide a character is.
 // The BUFFER is fixed and the knob is clamped into it, because a live static cannot size an array
 // and the whole point of the knob is that it can be corrected without a rebuild.
-enum { kChatRows = 64, kChatColsMax = 160 };
+// The widest box at the smallest text asks for ~190 columns, so the ceiling has to clear that or
+// the widest setting would wrap narrower than the box it was given.
+enum { kChatRows = 128, kChatColsMax = 200 };
 // The dark rim that keeps a name readable over a bright wall. On the other surface this is four
 // offset copies of the text; here it is the font's own outline, which is cheaper and rounder.
 // IT IS SIZED WITH THE TEXT. A flat 2 is a fifth of the way across a 14 px glyph -- the rims of
@@ -114,7 +124,10 @@ float kBubbleGap   = 1.05f;
 // distance boost and all -- which at the 1.3x close-range clamp made it the biggest text anywhere in
 // the mod, bigger than the chat box it is quoting. This brings it to about the chat's own size at the
 // reference distance, and it still scales with distance like the plate it hangs over.
-float kBubbleSizeMul = 0.85f;
+// The PLAYER sets this (Player names -> Chat bubble text size); the multiplier is gone. It is the
+// size at the reference distance and still scales with distance from there, like the plate it hangs
+// over.
+float kBubbleSizeMul = 0.85f;   // unused; kept so an old ini that mentions it does not look wrong
 int   kBubbleCols  = 26;
 enum { kBubbleMaxLines = 4 };  // past this a sentence is cut: a paragraph over a head is not readable       // characters per line before it wraps -- wrapped HERE, see `wrapInto`
 // Room inside the panel, in slate units. TOP AND BOTTOM ARE NOT THE SAME, because the text is placed
@@ -189,12 +202,22 @@ int   kMakePerFrame = 2;
 enum { kChatLines = 48 };
 enum { kLaneName = 0, kLaneBubble = 1, kLaneChat = 100, kLaneChatIn = 90,
        kLaneChatHdr = 91, kLaneChatOnline = 92, kLaneChatHints = 93, kLaneChatCount = 94,
-       kLaneChatEmpty = 95 };
+       kLaneChatEmpty = 95, kLaneChatName = 200 };
 // The pool is two zones, because the two halves are added to the viewport at different depths and a
 // slot cannot change its mind afterwards. Names first, then the chat's rows and its furniture.
 // A name and up to a few wrapped bubble lines per peer. Slots cost nothing until something claims
 // one -- a widget is built on demand -- so this is a ceiling, not an allocation.
-enum { kSlotsName = OMP_MAX_PEERS * 4, kSlotsChat = 32, kSlots = kSlotsName + kSlotsChat };
+// THREE ZONES, because a widget's depth is fixed when it is added to the viewport and a slot cannot
+// change its mind afterwards. Floating names under the menus; the chat above them; and the chat's
+// NAME OVERLAYS above the chat -- an overlay that shares a depth with the line it has to cover is
+// ordered by which of the two happened to be built first, which is not something to rely on. (It was
+// relied on, and the field found it: a name would come out white, because the plain line had been
+// created after the overlay and drew over it.)
+enum { kSlotsName     = OMP_MAX_PEERS * 4,
+       kSlotsChat     = 32,
+       kSlotsChatName = 16,
+       kSlots         = kSlotsName + kSlotsChat + kSlotsChatName };
+enum { kZoneName = 0, kZoneChat = 1, kZoneChatName = 2 };
 
 struct Slot {
     void*    w    = nullptr;      // the UUserWidget
@@ -551,9 +574,16 @@ static int wrapInto(const char* text, int from, char* out, int cap, int wantCols
 // and their text is never rebuilt for nothing), then an idle one, then a fresh one, then any free one
 // at all. The last step matters: with the pool full and every widget still showing from last frame,
 // the first three all come up empty, and a peer who had just been given a new key would get nothing.
-static Slot* claim(uint64_t key, bool chat, void* cls, void* gi, int* madeThisFrame) {
-    const int lo = chat ? kSlotsName : 0, hi = chat ? kSlots : kSlotsName;
-    const int z  = chat ? kZOrderChat : kZOrder;
+static Slot* claim(uint64_t key, int zone, void* cls, void* gi, int* madeThisFrame) {
+    const int lo = (zone == kZoneName) ? 0
+                 : (zone == kZoneChat) ? kSlotsName
+                                       : kSlotsName + kSlotsChat;
+    const int hi = (zone == kZoneName) ? kSlotsName
+                 : (zone == kZoneChat) ? kSlotsName + kSlotsChat
+                                       : kSlots;
+    const int z  = (zone == kZoneName) ? kZOrder
+                 : (zone == kZoneChat) ? kZOrderChat
+                                       : kZOrderChat + 1;   // the overlay, over the line it tints
     for (int i = lo; i < hi; i++) { Slot& s = g_slot[i];
         if (s.w && s.key == key && !s.claimed) { s.claimed = true; return &s; } }
     for (int i = lo; i < hi; i++) { Slot& s = g_slot[i];
@@ -561,7 +591,7 @@ static Slot* claim(uint64_t key, bool chat, void* cls, void* gi, int* madeThisFr
     for (int i = lo; i < hi; i++) { Slot& s = g_slot[i];
         if (s.w || *madeThisFrame >= kMakePerFrame) continue;
         (*madeThisFrame)++;
-        if (!build(s, cls, gi, z, chat && kChatPlayerLayer)) return nullptr;
+        if (!build(s, cls, gi, z, zone != kZoneName && kChatPlayerLayer)) return nullptr;
         s.claimed = true; s.key = key;
         return &s; }
     for (int i = lo; i < hi; i++) { Slot& s = g_slot[i];
@@ -1050,7 +1080,7 @@ void GameHud_Names(const NameplateItem* items, int n, bool show) {
             float bubLineH = 0.0f, wS = 0.0f, hS = 0.0f;
             const bool haveBubble = msgA > 0.01f;
             if (haveBubble) {
-                bsize = (int)((float)size * kBubbleSizeMul + 0.5f);
+                bsize = (int)((float)MpPrefs_BubbleTextSize() * scale + 0.5f);
                 if (bsize < 6) bsize = 6;
                 for (int at = 0; at >= 0 && nLines < kBubbleMaxLines; ) {
                     at = wrapInto(it.msg, at, bl[nLines], kChatColsMax + 1, kBubbleCols);
@@ -1071,7 +1101,7 @@ void GameHud_Names(const NameplateItem* items, int n, bool show) {
             // ---- the name. Over the head normally; at the BUBBLE'S TOP-LEFT when there is one, so
             // the two read as one object rather than as a label parked under a panel.
             if (nameA > 0.01f) {
-                Slot* s = claim(hashOf(it.name, kLaneName), false, cls, gi, &made);
+                Slot* s = claim(hashOf(it.name, kLaneName), kZoneName, cls, gi, &made);
                 if (s) {
                     style(*s, size, rgba(kNameR, kNameG, kNameB, nameA), 0.0f);
                     if (haveBubble) {
@@ -1113,7 +1143,7 @@ void GameHud_Names(const NameplateItem* items, int n, bool show) {
                 }
                 for (int k = 0; k < nLines; k++) {
                     // Bottom line first, so k counts UP the screen exactly as the chat's rows do.
-                    Slot* s = claim(hashOf(it.name, kLaneBubble + k), false, cls, gi, &made);
+                    Slot* s = claim(hashOf(it.name, kLaneBubble + k), kZoneName, cls, gi, &made);
                     if (!s) break;
                     style(*s, bsize, rgba(kMsgR, kMsgG, kMsgB, msgA), 0.0f);
                     align(*s, 0.5f, 1.0f);
@@ -1187,10 +1217,25 @@ void GameHud_Chat(bool menuUp) {
     const float yBase  = (float)g_vh - px(C.marginY) - (menuUp ? px(kPauseLiftY) : 0.0f);
 
     // ---- everything that was said, as visual lines, oldest first
-    struct Row { const char* text; float r, g, b, a; };
-    char  rowText[kChatRows][kChatColsMax + 1];
-    Row   rows[kChatRows];
-    int   nr = 0;
+    // `nameLen` is how much of the row is the speaker's name, and only on the row the name is ON --
+    // a wrapped continuation carries none of it. The row is drawn in the plain text colour and the
+    // name re-drawn over the top in the speaker's, which is how one colour per widget becomes two.
+    struct Row { const char* text; float a; int nameLen; bool mine, system; };
+    // The wrap width, from the box the player asked for and the text they asked for.
+    int cols = (int)((float)C.width / ((float)size * kCharWEm));
+    if (cols < 8) cols = 8;
+    if (cols > kChatColsMax) cols = kChatColsMax;
+
+    // WHAT EACH MESSAGE COSTS IN ROWS, before any of them are built. The build below fills `rows`
+    // oldest-first and used to simply stop at kChatRows -- so when the talk wrapped into more rows
+    // than there was room for, the ones that fell off the end were the NEWEST. The box would open on
+    // a conversation that stopped part-way, with nothing below it to scroll down to, and it came
+    // right on its own once those long messages aged out of the window. It got easier to hit once
+    // the player could set the width and the text size, because both move `cols`.
+    // The count is taken by running the REAL wrapper, not a second copy of its rules: a count that
+    // disagrees with the build is the same bug wearing a different hat.
+    float rowAlpha[kChatLines];
+    int   rowCost[kChatLines];
     for (int i = 0; i < n; i++) {
         const ChatLineView& l = lines[i];
         // The same fade the other surface gives a line, so switching between them does not change how
@@ -1201,19 +1246,48 @@ void GameHud_Chat(bool menuUp) {
             const float over = C.fadeOverSec > 0.01f ? C.fadeOverSec : 1.0f;
             a = 1.0f - (age - C.fadeAfterSec) / over;
         }
+        rowAlpha[i] = a;
+        int cost = 0;
+        if (a > 0.01f) {
+            char scratch[kChatColsMax + 1];
+            for (int at = 0; at >= 0; ) { at = wrapInto(l.text, at, scratch, (int)sizeof(scratch), cols); cost++; }
+        }
+        rowCost[i] = cost;
+    }
+    // Spend the budget from the NEWEST backwards: the bottom of the box has to be the bottom of the
+    // conversation. The newest message goes in even if it alone overruns -- clipped beats absent.
+    int start = n;
+    for (int i = n - 1, budget = kChatRows; i >= 0; i--) {
+        if (rowCost[i] > budget && start < n) break;
+        budget -= rowCost[i];
+        start = i;
+        if (budget <= 0) break;
+    }
+
+    char  rowText[kChatRows][kChatColsMax + 1];
+    Row   rows[kChatRows];
+    int   nr = 0;
+    for (int i = start; i < n; i++) {
+        const ChatLineView& l = lines[i];
+        const float a = rowAlpha[i];
         if (a <= 0.01f) continue;
-        // WHO SAID IT IS THE COLOUR OF THE WHOLE LINE. The ImGui surface tints the name and leaves
-        // the words pale, which one text widget cannot do -- a second widget per line would double
-        // the pool and still have to guess where the name ended, and guessing the width of a
-        // proportional name would show as a ragged left edge on every message. Colouring the line
-        // reads at least as well and carries the thing that actually matters: whose words these are.
-        const float r = l.system ? kSysR : (l.mine ? kSayR : kNameR);
-        const float g = l.system ? kSysG : (l.mine ? kSayG : kNameG);
-        const float b = l.system ? kSysB : (l.mine ? kSayB : kNameB);
+        bool first = true;
         for (int at = 0; at >= 0 && nr < kChatRows; ) {
-            at = wrapInto(l.text, at, rowText[nr], kChatColsMax + 1, kChatCols);
+            const int from = at;
+            at = wrapInto(l.text, at, rowText[nr], kChatColsMax + 1, cols);
             rows[nr].text = rowText[nr];
-            rows[nr].r = r; rows[nr].g = g; rows[nr].b = b; rows[nr].a = a;
+            rows[nr].a = a; rows[nr].mine = l.mine; rows[nr].system = l.system;
+            // The name only belongs to the row it starts on, and only as far as that row goes -- a
+            // name long enough to wrap keeps its colour on the part that fits and no further.
+            int nl = 0;
+            if (first && l.nameLen > 0) {
+                nl = (int)l.nameLen - from;
+                const int have = (int)strlen(rowText[nr]);
+                if (nl > have) nl = have;
+                if (nl < 0) nl = 0;
+            }
+            rows[nr].nameLen = nl;
+            first = false;
             nr++;
         }
     }
@@ -1224,7 +1298,10 @@ void GameHud_Chat(bool menuUp) {
     if (histSlots <= 0) histSlots = 8;
     // ...and never more rows than the chat's half of the pool can hold, or the furniture at the
     // bottom of this function would find nothing left to claim.
-    if (histSlots > kSlotsChat - 8) histSlots = kSlotsChat - 8;
+    if (histSlots > kSlotsChat - 8)  histSlots = kSlotsChat - 8;
+    // ...and no more rows than there are overlays to tint their names with, or the rows past
+    // the end would come out white -- which is the bug this zone was added for.
+    if (histSlots > kSlotsChatName)  histSlots = kSlotsChatName;
     if (!open && histSlots > nr) histSlots = nr;      // closed, the panel is not there to be filled
     // SCROLLING BACK. The offset is in visual lines from the newest, and THIS is where it can be
     // clamped, because this is the only place that knows how many lines there are -- so the answer
@@ -1260,7 +1337,7 @@ void GameHud_Chat(bool menuUp) {
         // wrap -- an input that grew upward and shoved the history every time it gained a line would
         // be worse than a window -- so what is shown is the TAIL, which is where the caret is.
         const char* tail = typed;
-        if (tn > kChatCols) tail = typed + (tn - kChatCols);
+        if (tn > cols) tail = typed + (tn - cols);
         snprintf(compose, sizeof(compose), "%s%s", kChatPrompt, tail);
     }
 
@@ -1291,7 +1368,7 @@ void GameHud_Chat(bool menuUp) {
 
     // ---- the header: what this is, and who is here
     if (open) {
-        Slot* s = claim(hashOf("hdr", kLaneChatHdr), true, g_cls, g_gi, &g_made);
+        Slot* s = claim(hashOf("hdr", kLaneChatHdr), kZoneChat, g_cls, g_gi, &g_made);
         if (s) {
             style(*s, tiny, rgba(kDimR, kDimG, kDimB, 1.0f), 0.0f);
             align(*s, 0.0f, 1.0f);
@@ -1302,7 +1379,7 @@ void GameHud_Chat(bool menuUp) {
             showIt(*s, true);
             g_drawn++;
         }
-        Slot* o = claim(hashOf("online", kLaneChatOnline), true, g_cls, g_gi, &g_made);
+        Slot* o = claim(hashOf("online", kLaneChatOnline), kZoneChat, g_cls, g_gi, &g_made);
         if (o) {
             char who[40];
             // Everybody, not everybody else: "1 ONLINE" alone in a session is the true answer and
@@ -1324,20 +1401,42 @@ void GameHud_Chat(bool menuUp) {
         // Keyed by the row's place ON SCREEN, not by its index in the list: the list shifts every
         // time a line arrives or expires, and a key that shifted with it would move every row onto a
         // different widget for no reason.
-        Slot* s = claim(hashOf("line", kLaneChat + k), true, g_cls, g_gi, &g_made);
+        const float yRow = yHist0 - (float)k * lineH;
+        Slot* s = claim(hashOf("line", kLaneChat + k), kZoneChat, g_cls, g_gi, &g_made);
         if (s) {
-            style(*s, size, rgba(row.r, row.g, row.b, row.a), 0.0f);
+            // THE WORDS ARE PLAIN. A system line has no name and keeps its own grey.
+            const float r = row.system ? kSysR : kMsgR;
+            const float g = row.system ? kSysG : kMsgG;
+            const float b = row.system ? kSysB : kMsgB;
+            style(*s, size, rgba(r, g, b, row.a), 0.0f);
             align(*s, 0.0f, 1.0f);
             say(*s, row.text);
-            place(*s, x, yHist0 - (float)k * lineH);
+            place(*s, x, yRow);
             showIt(*s, true);
             g_drawn++;
+        }
+        // ...and THE NAME OVER THE TOP of it, in whose it is. Same font, same size, same left edge,
+        // so every glyph lands exactly on the one underneath and nothing has to be measured.
+        if (row.nameLen > 0) {
+            Slot* ns = claim(hashOf("name", kLaneChatName + k), kZoneChatName, g_cls, g_gi, &g_made);
+            if (ns) {
+                char nm[64];
+                int nl = row.nameLen; if (nl > (int)sizeof(nm) - 1) nl = (int)sizeof(nm) - 1;
+                memcpy(nm, row.text, (size_t)nl); nm[nl] = 0;
+                style(*ns, size, rgba(row.mine ? kSayR : kNameR, row.mine ? kSayG : kNameG,
+                                      row.mine ? kSayB : kNameB, row.a), 0.0f);
+                align(*ns, 0.0f, 1.0f);
+                say(*ns, nm);
+                place(*ns, x, yRow);
+                showIt(*ns, true);
+                g_drawn++;
+            }
         }
         if (yHist0 - (float)k * lineH < lineH) break;    // ran off the top of the screen
     }
     // An empty history says so, rather than leaving a panel that looks like it failed to load.
     if (open && histShown == 0) {
-        Slot* s = claim(hashOf("empty", kLaneChatEmpty), true, g_cls, g_gi, &g_made);
+        Slot* s = claim(hashOf("empty", kLaneChatEmpty), kZoneChat, g_cls, g_gi, &g_made);
         if (s) {
             style(*s, size, rgba(kDimR, kDimG, kDimB, 0.75f), 0.0f);
             align(*s, 0.0f, 1.0f);
@@ -1350,7 +1449,7 @@ void GameHud_Chat(bool menuUp) {
 
     // ---- the line being typed
     if (open) {
-        Slot* s = claim(hashOf("compose", kLaneChatIn), true, g_cls, g_gi, &g_made);
+        Slot* s = claim(hashOf("compose", kLaneChatIn), kZoneChat, g_cls, g_gi, &g_made);
         if (s) {
             style(*s, size, rgba(kSayR, kSayG, kSayB, 1.0f), 0.0f);
             align(*s, 0.0f, 1.0f);
@@ -1363,7 +1462,7 @@ void GameHud_Chat(bool menuUp) {
 
     // ---- the keys that work, and how much room is left
     if (open) {
-        Slot* s = claim(hashOf("hints", kLaneChatHints), true, g_cls, g_gi, &g_made);
+        Slot* s = claim(hashOf("hints", kLaneChatHints), kZoneChat, g_cls, g_gi, &g_made);
         if (s) {
             style(*s, tiny, rgba(kDimR, kDimG, kDimB, 1.0f), 0.0f);
             align(*s, 0.0f, 1.0f);
@@ -1376,7 +1475,7 @@ void GameHud_Chat(bool menuUp) {
         // a number that is always there stops being read.
         const int len = Chat_TypedLen(), maxLen = Chat_TypedMax();
         if (len >= maxLen - kCountWarnAt) {
-            Slot* c = claim(hashOf("count", kLaneChatCount), true, g_cls, g_gi, &g_made);
+            Slot* c = claim(hashOf("count", kLaneChatCount), kZoneChat, g_cls, g_gi, &g_made);
             if (c) {
                 char t[24]; snprintf(t, sizeof(t), "%d/%d", len, maxLen);
                 const bool full = len >= maxLen;
@@ -1447,6 +1546,20 @@ void GameHud_Clear(void* world) {
     // The world is still here, but OUR references to the font and the texture have just gone with the
     // widgets -- which is exactly the state that leaves a remembered pointer dangling.
     forgetCachedAssets();
+}
+
+void GameHud_SetChatLook(int textSize, int smallSize, int panelPct, int blurPct) {
+    // The header and the hints used to be a fixed fraction of the talk. They are their own setting
+    // now: wanting big text is not the same as wanting a big header, and tying them together meant
+    // neither could be chosen.
+    if (textSize  >= 8 && textSize  <= 40) kChatSize  = (float)textSize;
+    if (smallSize >= 6 && smallSize <= 40) kChatSmall = (float)smallSize;
+    if (panelPct >= 0 && panelPct <= 100) kBoxAlpha = (float)panelPct / 100.0f;
+    if (blurPct  >= 0 && blurPct  <= 100) {
+        kBoxBlurMax    = (float)blurPct * 0.50f;
+        kBoxBlurRadius = (int)((float)blurPct * 0.43f + 0.5f);
+        kBoxBlur       = blurPct > 0;
+    }
 }
 
 // Every way this can come to nothing looks identical on screen -- no names -- so each is said in

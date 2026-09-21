@@ -79,6 +79,11 @@ void GameHud_Forget();
 // they come off the viewport properly; otherwise this is GameHud_Forget.
 void GameHud_Clear(void* world);
 
+// THE CHAT BOX'S LOOK, pushed from the player's settings every frame -- the same rule the nameplate
+// tuning follows, so a change from either menu takes effect on the next frame with no apply step.
+// `panelPct` and `blurPct` are 0..100; the rest are in slate units.
+void GameHud_SetChatLook(int textSize, int smallSize, int panelPct, int blurPct);
+
 // Is the game-drawn path the one in use? When false the overlay still owns the names and
 // GameHud_Names does nothing -- the A/B, and the way back if the game's own widget ever misbehaves
 // on somebody's machine. Not persisted: this is a fallback, not a preference.

@@ -382,11 +382,11 @@ static uint64_t  g_namesOpenKey = 0;
 static uint8_t   g_nameModeRow[0x90];
 static FTextBlob g_nameModeOpts[3];
 static uint64_t  g_nameModeKey = 0;
-static uint8_t   g_nameDistRow[0x90], g_bubbleDistRow[0x90];
-static uint64_t  g_nameDistKey = 0, g_bubbleDistKey = 0;
+static uint8_t   g_nameDistRow[0x90], g_bubbleDistRow[0x90], g_bubbleTextRow[0x90];
+static uint64_t  g_nameDistKey = 0, g_bubbleDistKey = 0, g_bubbleTextKey = 0;
 // Widget indices within the LAST build, so the current values can be stamped once the whole rebuild
 // is finished (they cannot be stamped any earlier -- see stampValues). -1 = not on this page.
-static int       g_nameModeAt = -1, g_nameDistAt = -1, g_bubbleDistAt = -1;
+static int       g_nameModeAt = -1, g_nameDistAt = -1, g_bubbleDistAt = -1, g_bubbleTextAt = -1;
 static const int kMpNamesAfter = 0;      // directly under "Your name": both are about who you see
 // ---- DROPPED OBJECTS. A three-state MultiOption on the multiplayer page: off / live edits only /
 // share one set. It sits with "Player names" rather than with the connect buttons because it is about
@@ -923,6 +923,15 @@ static void buildRows() {
                            "on purpose -- a sentence needs far more room to read than a name.", _TRUNCATE);
         b.minValue = (float)MPBUBBLE_DIST_MIN; b.maxValue = (float)MPBUBBLE_DIST_MAX; b.step = 5.0f;
         if (!buildSliderRow(g_bubbleDistRow, b, &g_bubbleDistKey)) g_bubbleDistKey = 0;
+    }
+    {
+        GuestItem t{};
+        strncpy_s(t.key,   "OmpBubbleText", _TRUNCATE);
+        strncpy_s(t.label, "Chat bubble text size", _TRUNCATE);
+        strncpy_s(t.desc,  "How big the words in a speech bubble are. They still shrink with distance "
+                           "like the name under them; this is the size they shrink from.", _TRUNCATE);
+        t.minValue = (float)MPBUBBLE_TEXT_MIN; t.maxValue = (float)MPBUBBLE_TEXT_MAX; t.step = 1.0f;
+        if (!buildSliderRow(g_bubbleTextRow, t, &g_bubbleTextKey)) g_bubbleTextKey = 0;
     }
     // The replay-editor row. A failure here disables only this row: the page key not interning, or
     // the row not building, must never take the multiplayer menu down with it.
@@ -1599,13 +1608,14 @@ static const TArrayHdr* chooseArray(void* page, const TArrayHdr* items, TArrayHd
         // index goes on the definition here (so the row is right even if the stamp is skipped), and
         // stampValues writes both it and the slider positions onto the widgets after the whole
         // rebuild, which is the only point at which they survive (see the note there).
-        g_nameModeAt = g_nameDistAt = g_bubbleDistAt = -1;
+        g_nameModeAt = g_nameDistAt = g_bubbleDistAt = g_bubbleTextAt = -1;
         if (g_nameModeKey) {
             *(int32_t*)(g_nameModeRow + off::kItemMultiStart) = MpPrefs_NameMode();
             g_nameModeAt = n; add(g_nameModeRow, true);
         }
         if (g_nameDistKey)   { g_nameDistAt   = n; add(g_nameDistRow, true); }
         if (g_bubbleDistKey) { g_bubbleDistAt = n; add(g_bubbleDistRow, true); }
+        if (g_bubbleTextKey) { g_bubbleTextAt = n; add(g_bubbleTextRow, true); }
         add(g_mpRows + (size_t)(kMpRowCount - 1) * off::kItemSize, true);       // the shared Back row
     } else if (g_page == PG_PLAYERS) {
         // Everyone in YOUR session. Kick is only offered for a session you host, so say plainly when
@@ -1866,8 +1876,10 @@ static void stampValues(void* page) {
                 S.MenuProgressSetPct(w, pct(MpPrefs_NameDistM(), MPNAME_DIST_MIN, MPNAME_DIST_MAX));
             if (void* w = widgetAt(g_bubbleDistAt))
                 S.MenuProgressSetPct(w, pct(MpPrefs_BubbleDistM(), MPBUBBLE_DIST_MIN, MPBUBBLE_DIST_MAX));
+            if (void* w = widgetAt(g_bubbleTextAt))
+                S.MenuProgressSetPct(w, pct(MpPrefs_BubbleTextSize(), MPBUBBLE_TEXT_MIN, MPBUBBLE_TEXT_MAX));
         }
-        g_nameModeAt = g_nameDistAt = g_bubbleDistAt = -1;   // one shot per build
+        g_nameModeAt = g_nameDistAt = g_bubbleDistAt = g_bubbleTextAt = -1;   // one shot per build
     }
     // The voice page and the player page's mute switch, same argument.
     if (g_muteAt >= 0 && S.MenuMultiSetIndex) {
@@ -2650,7 +2662,7 @@ static bool handleValueChange(void* params, bool isSlider) {
             }
             return true;
         }
-        if (isSlider && (k == g_nameDistKey || k == g_bubbleDistKey)) {
+        if (isSlider && (k == g_nameDistKey || k == g_bubbleDistKey || k == g_bubbleTextKey)) {
             // NewPercent is the normalised bar position; the displayed number -- and the value the
             // player thinks they chose -- is min + pct*(max-min) rounded, which is exactly what the
             // game prints.
@@ -2658,9 +2670,12 @@ static bool handleValueChange(void* params, bool isSlider) {
             if (k == g_nameDistKey && g_nameDistKey) {
                 const float v = MPNAME_DIST_MIN + pct * (float)(MPNAME_DIST_MAX - MPNAME_DIST_MIN);
                 MpPrefs_SetNameDistM((int)(v + 0.5f));
-            } else if (g_bubbleDistKey) {
+            } else if (k == g_bubbleDistKey && g_bubbleDistKey) {
                 const float v = MPBUBBLE_DIST_MIN + pct * (float)(MPBUBBLE_DIST_MAX - MPBUBBLE_DIST_MIN);
                 MpPrefs_SetBubbleDistM((int)(v + 0.5f));
+            } else if (g_bubbleTextKey) {
+                const float v = MPBUBBLE_TEXT_MIN + pct * (float)(MPBUBBLE_TEXT_MAX - MPBUBBLE_TEXT_MIN);
+                MpPrefs_SetBubbleTextSize((int)(v + 0.5f));
             }
             return true;
         }

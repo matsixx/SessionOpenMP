@@ -547,6 +547,12 @@ static void buildUI() {
             ImGui::SliderInt("Chat bubble distance", &bubD, MPBUBBLE_DIST_MIN, MPBUBBLE_DIST_MAX, "%d m");
             bubActive = ImGui::IsItemActive();
             if (ImGui::IsItemDeactivatedAfterEdit()) MpPrefs_SetBubbleDistM(bubD);
+            static int bubT = 0; static bool bubTActive = false;
+            if (!bubTActive) bubT = MpPrefs_BubbleTextSize();
+            ImGui::SetNextItemWidth(220.0f);
+            ImGui::SliderInt("Chat bubble text size", &bubT, MPBUBBLE_TEXT_MIN, MPBUBBLE_TEXT_MAX);
+            bubTActive = ImGui::IsItemActive();
+            if (ImGui::IsItemDeactivatedAfterEdit()) MpPrefs_SetBubbleTextSize(bubT);
             ImGui::TextDisabled("Bubbles are shown whether you are on your board or not.");
 
             // WHICH SURFACE DRAWS THEM. The game's own text widget is the one that should be on;
@@ -564,6 +570,67 @@ static void buildUI() {
 
         ImGui::EndTabItem();
         }   // You
+
+        // ---- CHAT: the box itself. Everything here is the PLAYER'S and is kept in the preferences
+        // file, not a live static -- the game-thread publish copies the lot into the chat's tuning
+        // every frame, so a slider moved here shows on the next one and survives a restart.
+        //
+        // Sliders are written on RELEASE, not while dragged: each setter saves the preferences file,
+        // and a slider dragged across its range would otherwise write it once per frame.
+        if (ImGui::BeginTabItem("Chat")) {
+        ImGui::Spacing();
+        {
+            struct Knob {
+                const char* label; const char* hint; int lo, hi; const char* fmt;
+                int  (*get)(); void (*set)(int);
+            };
+            static const Knob knobs[] = {
+                { "Text size",      "How big the talk is. The header and the key hints follow it.",
+                  MPCHAT_TEXT_MIN,  MPCHAT_TEXT_MAX,  "%d",
+                  &MpPrefs_ChatTextSize, &MpPrefs_SetChatTextSize },
+                { "Header size",    "The SESSION CHAT line and the key hints under the box. Its own "
+                                    "setting, so big talk need not mean a big header.",
+                  MPCHAT_SMALL_MIN, MPCHAT_SMALL_MAX, "%d",
+                  &MpPrefs_ChatSmallSize, &MpPrefs_SetChatSmallSize },
+                { "Box width",      "How wide the box is, and where a long line wraps.",
+                  MPCHAT_WIDTH_MIN, MPCHAT_WIDTH_MAX, "%d",
+                  &MpPrefs_ChatWidth,    &MpPrefs_SetChatWidth },
+                { "Lines shown",    "How much history the open box holds. It is the same size every "
+                                    "time it opens, so this sets that size.",
+                  MPCHAT_LINES_MIN, MPCHAT_LINES_MAX, "%d",
+                  &MpPrefs_ChatLines,    &MpPrefs_SetChatLines },
+                { "Lines linger",   "With the box CLOSED, how long a message stays on screen before "
+                                    "it fades.",
+                  MPCHAT_HOLD_MIN,  MPCHAT_HOLD_MAX,  "%d s",
+                  &MpPrefs_ChatHoldSec,  &MpPrefs_SetChatHoldSec },
+                { "Panel darkness", "How dark the panel behind the open box is. 0 leaves the words "
+                                    "on the world.",
+                  0, 100, "%d%%",
+                  &MpPrefs_ChatPanelPct, &MpPrefs_SetChatPanelPct },
+                { "Panel blur",     "How much the world behind the box is blurred. 0 turns it off.",
+                  0, 100, "%d%%",
+                  &MpPrefs_ChatBlurPct,  &MpPrefs_SetChatBlurPct },
+            };
+            static int  vals[sizeof(knobs) / sizeof(knobs[0])] = {};
+            static bool held[sizeof(knobs) / sizeof(knobs[0])] = {};
+            for (int i = 0; i < (int)(sizeof(knobs) / sizeof(knobs[0])); i++) {
+                const Knob& k = knobs[i];
+                if (!held[i]) vals[i] = k.get();        // the store is authoritative while nobody drags
+                ImGui::SetNextItemWidth(220.0f);
+                ImGui::SliderInt(k.label, &vals[i], k.lo, k.hi, k.fmt);
+                held[i] = ImGui::IsItemActive();
+                if (ImGui::IsItemDeactivatedAfterEdit()) k.set(vals[i]);
+                ImGui::TextDisabled("%s", k.hint);
+                ImGui::Spacing();
+            }
+            ImGui::Separator();
+            ImGui::TextDisabled("ENTER opens the box, ESC closes it, UP recalls your last line,");
+            ImGui::TextDisabled("and the wheel scrolls back through what was said.");
+            if (!omp::ui::GameHud_Enabled())
+                ImGui::TextDisabled("The overlay is drawing the chat, so these do not apply to it.");
+        }
+        ImGui::EndTabItem();
+        }   // Chat
 
         // ---- SESSION: the ways in and out of one.
         if (ImGui::BeginTabItem("Session")) {

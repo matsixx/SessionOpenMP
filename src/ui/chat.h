@@ -122,6 +122,11 @@ void Chat_NoteKey(int vk, bool ctrl, bool repeat);
 // ---- what the GAME-DRAWN surface reads (ui/game_hud.h). Any thread; the mutex is inside. --------
 struct ChatLineView {
     char     text[208];     // "name  what they said", already joined -- one widget draws one line
+    // HOW MUCH OF THAT IS THE NAME. The surface draws the whole line in the plain text colour and
+    // then draws just the name over the top in the speaker's colour -- same font, same start, so the
+    // glyphs land exactly on themselves. That gets a two-tone line out of a widget that can only
+    // hold one colour, and without having to guess how wide a proportional name came out.
+    uint8_t  nameLen;       // 0 for a system line or anything with no name
     uint32_t ageMs;         // ...and 0 whenever the box is open, which is what holds the fade off
     bool     mine, system;
 };

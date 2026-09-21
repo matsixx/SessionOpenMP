@@ -42,8 +42,11 @@ struct Release { const char* version; const char* notes; };
 // short enough that trimming never has to happen: budget ~300 characters a release, three releases.
 static const Release kReleases[] = {
     { "1.2.6",
-      "- Fixes 1.2.5: the pause menu's confirm dialogs work again.\n"
-      "- Hold-to-apply on a graphics change could not be used." },
+      "- Set up the chat box yourself: size, width, lines, blur (F1 -> Chat).\n"
+      "- Chat text is white; only names carry colour. Bubble size is in Player names.\n"
+      "- The newest messages always sit at the bottom of the box now.\n"
+      "- Your chat settings survive a restart.\n"
+      "- Fixes 1.2.5: the pause menu's confirm dialogs work again." },
     { "1.2.5",
       "- Fixes a crash when changing maps with other players around.\n"
       "- Speech bubbles have a panel and a tail; the name sits on them.\n"

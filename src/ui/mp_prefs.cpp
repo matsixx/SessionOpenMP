@@ -35,6 +35,14 @@ static char     g_peerId[33] = {0};      // 32 hex chars + terminator; empty unt
 static int      g_nameMode    = MPNAME_OFFBOARD;
 static int      g_nameDistM   = 120;
 static int      g_bubbleDistM = 35;
+static int      g_bubbleTextSize = MPBUBBLE_TEXT_DEFAULT;
+static int      g_chatTextSize = MPCHAT_TEXT_DEFAULT;
+static int      g_chatSmallSize = MPCHAT_SMALL_DEFAULT;
+static int      g_chatWidth    = MPCHAT_WIDTH_DEFAULT;
+static int      g_chatLines    = MPCHAT_LINES_DEFAULT;
+static int      g_chatHoldSec  = MPCHAT_HOLD_DEFAULT;
+static int      g_chatPanelPct = MPCHAT_PANEL_DEFAULT;
+static int      g_chatBlurPct  = MPCHAT_BLUR_DEFAULT;
 // Dropped objects: SHARED by default. One canonical set is the only arrangement in which everyone is
 // looking at the same spot, and it takes nothing away permanently -- your own props are hidden for
 // the session and come straight back.
@@ -77,6 +85,18 @@ static void saveAll() {
     fprintf(f, "SyncSeconds=%d\n", g_syncSeconds);
     fprintf(f, "NameDistM=%d\n", g_nameDistM);
     fprintf(f, "BubbleDistM=%d\n", g_bubbleDistM);
+    fprintf(f, "# How big the words in a speech bubble are, at the distance a name is drawn at its\n");
+    fprintf(f, "# natural size. They still shrink with distance from there.\n");
+    fprintf(f, "BubbleTextSize=%d\n", g_bubbleTextSize);
+    fprintf(f, "# The chat box: text and header size, how wide it is, how many lines the open box\n");
+    fprintf(f, "# holds, how long a line lingers with the box closed, and the panel behind it.\n");
+    fprintf(f, "ChatTextSize=%d\n", g_chatTextSize);
+    fprintf(f, "ChatSmallSize=%d\n", g_chatSmallSize);
+    fprintf(f, "ChatWidth=%d\n", g_chatWidth);
+    fprintf(f, "ChatLines=%d\n", g_chatLines);
+    fprintf(f, "ChatHoldSec=%d\n", g_chatHoldSec);
+    fprintf(f, "ChatPanelPct=%d\n", g_chatPanelPct);
+    fprintf(f, "ChatBlurPct=%d\n", g_chatBlurPct);
     fprintf(f, "# Dropped objects: 0 off, 1 only what is placed during the session, 2 share one set.\n");
     fprintf(f, "DropMode=%d\n", g_dropMode);
     fprintf(f, "# Other players' body physics on your screen: 0 off, 1 light, 2 full. VERY heavy --\n");
@@ -226,6 +246,14 @@ void MpPrefs_SetSyncSeconds(int seconds) {
 
 int  MpPrefs_NameDistM()   { return g_nameDistM; }
 int  MpPrefs_BubbleDistM() { return g_bubbleDistM; }
+int  MpPrefs_BubbleTextSize() { return g_bubbleTextSize; }
+int  MpPrefs_ChatTextSize() { return g_chatTextSize; }
+int  MpPrefs_ChatSmallSize() { return g_chatSmallSize; }
+int  MpPrefs_ChatWidth()    { return g_chatWidth; }
+int  MpPrefs_ChatLines()    { return g_chatLines; }
+int  MpPrefs_ChatHoldSec()  { return g_chatHoldSec; }
+int  MpPrefs_ChatPanelPct() { return g_chatPanelPct; }
+int  MpPrefs_ChatBlurPct()  { return g_chatBlurPct; }
 
 void MpPrefs_SetNameMode(int mode) {
     mode = clampI(mode, MPNAME_OFF, MPNAME_ALWAYS);
@@ -251,6 +279,26 @@ void MpPrefs_SetBubbleDistM(int metres) {
     saveAll();
     char m[96]; snprintf(m, sizeof(m), "[prefs] bubble distance: %d m", metres); say(m);
 }
+
+void MpPrefs_SetBubbleTextSize(int size) {
+    size = clampI(size, MPBUBBLE_TEXT_MIN, MPBUBBLE_TEXT_MAX);
+    if (size == g_bubbleTextSize) return;           // a no-op write must not churn the file
+    g_bubbleTextSize = size;
+    saveAll();
+    char m[96]; snprintf(m, sizeof(m), "[prefs] chat bubble text size: %d", size); say(m);
+}
+
+// One shape for all six: clamp, ignore a no-op (a write that changes nothing must not churn the
+// file), store, save.
+#define OMP_CHAT_SETTER(fn, var, lo, hi)                           void fn(int v) {                                                   v = clampI(v, lo, hi);                                         if (v == var) return;                                          var = v; saveAll();                                        }
+OMP_CHAT_SETTER(MpPrefs_SetChatTextSize, g_chatTextSize, MPCHAT_TEXT_MIN,  MPCHAT_TEXT_MAX)
+OMP_CHAT_SETTER(MpPrefs_SetChatSmallSize, g_chatSmallSize, MPCHAT_SMALL_MIN, MPCHAT_SMALL_MAX)
+OMP_CHAT_SETTER(MpPrefs_SetChatWidth,    g_chatWidth,    MPCHAT_WIDTH_MIN, MPCHAT_WIDTH_MAX)
+OMP_CHAT_SETTER(MpPrefs_SetChatLines,    g_chatLines,    MPCHAT_LINES_MIN, MPCHAT_LINES_MAX)
+OMP_CHAT_SETTER(MpPrefs_SetChatHoldSec,  g_chatHoldSec,  MPCHAT_HOLD_MIN,  MPCHAT_HOLD_MAX)
+OMP_CHAT_SETTER(MpPrefs_SetChatPanelPct, g_chatPanelPct, 0, 100)
+OMP_CHAT_SETTER(MpPrefs_SetChatBlurPct,  g_chatBlurPct,  0, 100)
+#undef OMP_CHAT_SETTER
 
 void MpPrefs_Init(const char* dir, void (*logf)(const char*)) {
     g_log = logf;
@@ -278,6 +326,14 @@ void MpPrefs_Init(const char* dir, void (*logf)(const char*)) {
             else if (!_stricmp(key, "SyncSeconds")) g_syncSeconds = clampI(atoi(val), MPSYNC_SEC_MIN, MPSYNC_SEC_MAX);
             else if (!_stricmp(key, "NameDistM"))   g_nameDistM   = clampI(atoi(val), MPNAME_DIST_MIN, MPNAME_DIST_MAX);
             else if (!_stricmp(key, "BubbleDistM")) g_bubbleDistM = clampI(atoi(val), MPBUBBLE_DIST_MIN, MPBUBBLE_DIST_MAX);
+            else if (!_stricmp(key, "BubbleTextSize")) g_bubbleTextSize = clampI(atoi(val), MPBUBBLE_TEXT_MIN, MPBUBBLE_TEXT_MAX);
+            else if (!_stricmp(key, "ChatTextSize")) g_chatTextSize = clampI(atoi(val), MPCHAT_TEXT_MIN, MPCHAT_TEXT_MAX);
+            else if (!_stricmp(key, "ChatSmallSize")) g_chatSmallSize = clampI(atoi(val), MPCHAT_SMALL_MIN, MPCHAT_SMALL_MAX);
+            else if (!_stricmp(key, "ChatWidth"))    g_chatWidth    = clampI(atoi(val), MPCHAT_WIDTH_MIN, MPCHAT_WIDTH_MAX);
+            else if (!_stricmp(key, "ChatLines"))    g_chatLines    = clampI(atoi(val), MPCHAT_LINES_MIN, MPCHAT_LINES_MAX);
+            else if (!_stricmp(key, "ChatHoldSec"))  g_chatHoldSec  = clampI(atoi(val), MPCHAT_HOLD_MIN, MPCHAT_HOLD_MAX);
+            else if (!_stricmp(key, "ChatPanelPct")) g_chatPanelPct = clampI(atoi(val), 0, 100);
+            else if (!_stricmp(key, "ChatBlurPct"))  g_chatBlurPct  = clampI(atoi(val), 0, 100);
             else if (!_stricmp(key, "DropMode"))    g_dropMode    = clampI(atoi(val), MPDROP_OFF, MPDROP_SHARED);
             else if (!_stricmp(key, "PeerBodyPhysics")) g_peerBody = clampI(atoi(val), MPBODY_OFF, MPBODY_FULL);
             else if (!_stricmp(key, "PeerBodyDefaultedOff")) g_peerBodyOffDone = atoi(val) != 0;

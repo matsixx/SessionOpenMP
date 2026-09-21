@@ -943,6 +943,16 @@ static void publishNameplates() {
     // The chat rides the same decision and the same frame -- Begin/End bracket BOTH surfaces, because
     // End is what hides whatever nobody claimed and it cannot tell one caller's widgets from
     // another's. Told every frame, not on the edge: it is also what stops the ImGui box drawing.
+    // The chat box's look is the player's, pushed every frame like the nameplate tuning above --
+    // one source of truth, no apply step, and either menu can write it.
+    {
+        ChatTuning& C = Chat_Tuning();
+        C.width        = (float)MpPrefs_ChatWidth();
+        C.maxShownOpen = MpPrefs_ChatLines();
+        C.fadeAfterSec = (float)MpPrefs_ChatHoldSec();
+        omp::ui::GameHud_SetChatLook(MpPrefs_ChatTextSize(), MpPrefs_ChatSmallSize(),
+                                     MpPrefs_ChatPanelPct(), MpPrefs_ChatBlurPct());
+    }
     Chat_SetGameDrawn(gameDrawn);
     omp::ui::GameHud_SetLog(&logLine);
     if (omp::ui::GameHud_Begin(liveWorld())) {
