@@ -110,6 +110,7 @@ static void saveSettings() {
     CameraHeight_SaveConfig(buf, sizeof(buf));
     Sit_SaveConfig(buf, sizeof(buf));
     Radial_SaveConfig(buf, sizeof(buf));
+    Emote_SaveConfig(buf, sizeof(buf));
     Radio_SaveConfig(buf, sizeof(buf));
     Upscale_SaveConfig(buf, sizeof(buf));
     MaxDetail_SaveConfig(buf, sizeof(buf));
@@ -232,6 +233,9 @@ static void drawSection(const OmpMenuApi* api, void*) {
     static DrawFn const kCloth[]  = { ClothMerge_DrawMenu, ClothSim_DrawMenu };
     static DrawFn const kSit[]    = { Sit_DrawMenu, Radial_DrawMenu };
     static DrawFn const kGfx[]    = { MaxDetail_DrawMenu };
+    // The board tap's hand, joint by joint. It started as a dev page for correcting a pose that kept
+    // coming out wrong, and stayed because posing your own hand on the board is a thing people want.
+    static DrawFn const kTapHand[] = { Emote_DrawTapHandMenu };
     #define TWK_GROUP(title, arr) group(title, arr, (int)(sizeof(arr) / sizeof(arr[0])))
     TWK_GROUP("Pop control",    kPop);
     TWK_GROUP("Board & tricks", kBoard);
@@ -242,6 +246,7 @@ static void drawSection(const OmpMenuApi* api, void*) {
     TWK_GROUP("Clothing",       kCloth);
     TWK_GROUP("Sitting",        kSit);
     TWK_GROUP("Graphics",       kGfx);
+    TWK_GROUP("Board tap hand", kTapHand);
     #undef TWK_GROUP
 
     // The same reset the pause menu offers, so neither surface is the only way to get back.
@@ -334,6 +339,7 @@ static const char* const kTwkSitReach    = "TwkSitReach";
 static const char* const kTwkSitLean     = "TwkSitLean";
 static const char* const kTwkHeadLook    = "TwkHeadLook";
 static const char* const kTwkRadial      = "TwkRadial";
+static const char* const kTwkRadialLeft  = "TwkRadialLeft";
 // "Style settings"
 static const char* const kTwkArmLoose   = "TwkBodyArmLoosePct";
 static const char* const kTwkArmHold    = "TwkBodyArmHoldPct";
@@ -440,6 +446,7 @@ static void pageValue(const char* key, int iv, float fv, void*) {
     else if (!strcmp(key, kTwkSitLean))     Sit_SetLeanDeg(fv);
     else if (!strcmp(key, kTwkHeadLook))    Sit_SetHeadLook(iv != 0);
     else if (!strcmp(key, kTwkRadial))      Radial_SetEnabled(iv != 0);
+    else if (!strcmp(key, kTwkRadialLeft))  Radial_SetLeftStick(iv != 0);
     else if (!strcmp(key, kTwkArmLoose))   BodyFeel_SetArmLoosePct(fv);
     else if (!strcmp(key, kTwkArmHold))    BodyFeel_SetArmHoldPct(fv);
     else if (!strcmp(key, kTwkArmDamp))    BodyFeel_SetArmDampPct(fv);
@@ -536,6 +543,7 @@ static int pageGet(const char* key, int* oi, float* of, void*) {
     else if (!strcmp(key, kTwkSitLean))     { *of = Sit_LeanDeg();                      return 1; }
     else if (!strcmp(key, kTwkHeadLook))    { *oi = Sit_HeadLook() ? 1 : 0;             return 1; }
     else if (!strcmp(key, kTwkRadial))      { *oi = Radial_Enabled() ? 1 : 0;           return 1; }
+    else if (!strcmp(key, kTwkRadialLeft))  { *oi = Radial_LeftStick() ? 1 : 0;          return 1; }
     else if (!strcmp(key, kTwkArmLoose))   { *of = BodyFeel_ArmLoosePct();    return 1; }
     else if (!strcmp(key, kTwkArmHold))    { *of = BodyFeel_ArmHoldPct();     return 1; }
     else if (!strcmp(key, kTwkArmDamp))    { *of = BodyFeel_ArmDampPct();     return 1; }
@@ -822,7 +830,10 @@ static const OmpPageItem2 kTwkSitItems[] = {
     { OMP_ITEM_TOGGLE, kTwkHeadLook,    "Head follows the camera",
       "Off the board, the head turns to look where the camera looks -- as far as a neck goes, then it holds, then it comes back" },
     { OMP_ITEM_TOGGLE, kTwkRadial,      "Radial menu",
-      "Off the board, click the right stick for a wheel of things to do: point with the right stick, A to pick, B to go back. You can keep walking" },
+      "Off the board, click a stick for a wheel of things to do: point with the right stick, A to pick, B to go back. You can keep walking" },
+    { OMP_ITEM_TOGGLE, kTwkRadialLeft,  "Radial on the left stick",
+      "Open the wheel by clicking the LEFT stick instead of the right. The right stick still points at the entries",
+      "Right stick", "Left stick" },
 };
 static const OmpPageItem2 kTwkPopItems[] = {
     { OMP_ITEM_TOGGLE, kTwkPop,       "Pop control scheme",

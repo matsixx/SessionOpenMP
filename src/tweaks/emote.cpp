@@ -83,6 +83,7 @@
 #include "foot_place.h"       // FootPlace_AnimInstance
 #include "grind_pop.h"        // GrindPop_FNameToString
 #include "camera_height.h"    // CameraHeight_ViewForward: where the camera looks, for Point
+#include "ui/menu_ext.h"      // the F1 "Board tap hand" page
 #include "catch_sound.h"      // CatchSound_SpawnAttached: the replay-aware one-shot, for the knock of the tap
 
 namespace {
@@ -288,6 +289,36 @@ bool      g_tapDown = false, g_boardPosed = false, g_tapStickLift = false;
 // ini: EmoteTapVolumePct (how loud the knock is, percent of the game's own), EmoteTapRollDeg (the board turned
 // about its length, should a rig ever show the wrong face forward).
 float     g_tapVolume = 2.5f, g_tapRollDeg = 0.0f;
+// THE GRIP ON THE NOSE, live so it can be tried against the screen rather than rebuilt at. `reach` is wrist
+// to knuckles and `palmGap` how far the deck's face stands off the palm -- together they say where on the
+// hand the end of the wood sits. `curl` is the four fingers coming round the tip; they must stay past 0.5,
+// which is where Fingers() has a closed finger for the thumb to fold onto -- under it the thumb springs
+// open beside the board again. How the hand is TURNED is not a knob: see the table in DoTap.
+float     g_tapReach = 9.0f, g_tapPalmGap = 2.0f;
+// THE HAND THAT HOLDS THE BOARD, every joint of it -- the F1 "Board tap hand" page and the matching
+// EmoteTap* ini keys. Turning: roll about the palm, twist about the fingers, pitch about the thumb's side
+// (DoTap says what each one looks like). Placing: a nudge in the BODY's terms, cm. The defaults are the
+// pose the field settled on, which is kTapShipped; all zero is the frame DoTap builds on its own.
+float     g_tapHandRoll = 15.0f, g_tapHandTwist = 12.0f, g_tapHandPitch = -45.0f;
+float     g_tapGripFwd = 3.0f, g_tapGripRight = 0.0f, g_tapGripUp = 0.0f;
+// HOW SHUT EACH FINGER IS (0 open, 1 a fist), index to little, and the thumb ON ITS OWN -- 0 open, 1
+// folded across them. One number for all four was tried and is not enough: a hand holding a board wants
+// its thumb somewhere the other four are not, and moving them together can only ever trade one for the
+// other. The thumb is a BLEND rather than a curl because of what ThumbBlend says. Open the four too far
+// and their tips stop crossing the deck, which is where the gate draws the line.
+float     g_tapCurl[4]  = { 0.07f, 0.09f, 0.08f, 0.12f };
+float     g_tapThumb = 0.50f;
+// ...and each finger's tip nudged off where its curl put it, the same three axes the thumb has:
+// [finger][0] along the fingers, [1] out through the palm, [2] across toward the thumb. In cm.
+float     g_tapFingerOff[4][3] = { { 0, 0, 0 }, { 0, 0, 0 }, { 0, 0, 0 }, { 0, 0, 0 } };
+// ...and WHERE the thumb sits once the blend has placed it, nudged in the hand's own terms (cm): along
+// the fingers, out through the palm, across toward them. The blend alone runs alone one line between two
+// poses, which cannot reach round a board -- these are the other two axes, and they are what "full
+// control of the thumb" means in practice.
+float     g_tapThumbAlong = 2.9f, g_tapThumbOut = 4.2f, g_tapThumbAcross = 3.0f;
+// ...and how the reach an arm falls short by is found: the shoulder let down, then the grip slid up the
+// board. In cm. The slide is LAST RESORT now -- it is what used to lift the hand clear of the board.
+float     g_tapDropMax = 7.0f, g_tapSlideMax = 2.0f;
 float     g_tapTipW[3] = { 0, 0, 0 }; bool g_tapTipSet = false;
 // ...and what is under it: found by the pump's trace (world), turned into a height in the body's terms by the
 // hook. Believed only near where the feet say the floor is -- a tail poked out over a drop is not an
@@ -803,6 +834,56 @@ void Fingers(int sd, int thumb, float c1, float c2, float c3, float c4, float sp
     AimBone(t0, sub(g_Ct[t1].p, g_Ct[t0].p), e0);
     if (t2 >= 0) AimBone(t1, sub(g_Ct[t2].p, g_Ct[t1].p), e1);
 }
+// A THUMB ANYWHERE BETWEEN OPEN AND FOLDED, for a hand that is holding something rather than making a
+// fist or lying flat -- the two the modes above give. `t` 0 is the open thumb's pose, 1 is TH_IN's fold
+// onto `on`'s middle bone, and in between the TARGET is what moves, never the aim: pointing a thumb by
+// direction is the dead end written about over Fingers(), and it is no less dead halfway.
+// Call after Fingers(..., TH_KEEP, ...), which leaves the thumb alone.
+void ThumbBlend(int sd, int on, float t) {
+    const int t0 = g_fing[sd][0][0], t1 = g_fing[sd][0][1], t2 = g_fing[sd][0][2];
+    if (t0 < 0 || t1 < 0 || t2 < 0) return;
+    if (on < 1 || on > 4 || g_fing[sd][on][1] < 0 || g_fing[sd][on][2] < 0) return;
+    V3 F, N, A;
+    if (!HandAxes(sd, &F, &N, &A)) return;
+    t = clampf(t, 0.0f, 1.0f);
+    const V3 H = g_Ct[t0].p;
+    const float a = len(sub(g_Ct[t1].p, H)), b = len(sub(g_Ct[t2].p, g_Ct[t1].p));
+    const V3 mid = mul(add(g_Ct[g_fing[sd][on][1]].p, g_Ct[g_fing[sd][on][2]].p), 0.5f);
+    const V3 folded = add(mid, mix3(N, 1.3f * SC, A, -0.4f * SC, F, 0.0f));      // just proud of the finger
+    const V3 open   = add(H, mul(norm(mix3(A, -0.74f, F, 0.62f, N, 0.15f)), (a + b) * 0.95f));
+    const V3 want   = add(add(mul(open, 1.0f - t), mul(folded, t)),
+                          mix3(F, g_tapThumbAlong * SC, N, g_tapThumbOut * SC, A, g_tapThumbAcross * SC));
+    const V3 M = MidJoint(H, want, a, b, mix3(A, -0.85f, F, 0.40f, N, 0.20f));
+    AimBone(t0, sub(g_Ct[t1].p, H), sub(M, H));
+    AimBone(t1, sub(g_Ct[t2].p, g_Ct[t1].p), sub(want, g_Ct[t1].p));
+    // the tip has no child to measure: folded it turns on toward the next finger, open it runs straight on
+    const int next = (on < 4 && g_fing[sd][on + 1][1] >= 0 && g_fing[sd][on + 1][2] >= 0) ? on + 1 : on;
+    const V3 nextMid = mul(add(g_Ct[g_fing[sd][next][1]].p, g_Ct[g_fing[sd][next][2]].p), 0.5f);
+    const V3 toFold = add(nextMid, mix3(N, 0.5f * SC, A, next == on ? 2.0f * SC : 0.0f, F, 0.0f));
+    const V3 run    = norm(sub(g_Ct[t2].p, g_Ct[t1].p));
+    const V3 toOpen = add(g_Ct[t2].p, mul(run, 3.0f * SC));
+    const V3 to = add(mul(toOpen, 1.0f - t), mul(toFold, t));
+    AimBone(t2, sub(g_Ct[t2].p, g_Ct[t1].p), sub(to, g_Ct[t2].p));
+}
+// A FINGER'S TIP MOVED OFF WHERE ITS CURL PUT IT, in the hand's own terms (cm along the fingers, out
+// through the palm, across toward the thumb). The same two-bone reach the thumb gets, and for the same
+// reason: a fingertip is a PLACE, and the joint angles that put it there are arithmetic, not a guess.
+// The curl still decides the shape -- the bend's existing plane is handed in as the pole, so the finger
+// keeps the look the curl gave it and only reaches further or nearer. Call after Fingers().
+void FingerNudge(int sd, int f, float along, float out, float across) {
+    if (fabsf(along) < 0.01f && fabsf(out) < 0.01f && fabsf(across) < 0.01f) return;
+    const int j0 = g_fing[sd][f][0], j1 = g_fing[sd][f][1], j2 = g_fing[sd][f][2];
+    if (j0 < 0 || j1 < 0 || j2 < 0) return;
+    V3 F, N, A;
+    if (!HandAxes(sd, &F, &N, &A)) return;
+    const V3 H = g_Ct[j0].p;
+    const float a = len(sub(g_Ct[j1].p, H)), b = len(sub(g_Ct[j2].p, g_Ct[j1].p));
+    const V3 want = add(g_Ct[j2].p, mix3(F, along * SC, N, out * SC, A, across * SC));
+    const V3 pole = sub(g_Ct[j1].p, H);                 // where the curl already has it bending
+    const V3 M = MidJoint(H, want, a, b, pole);
+    AimBone(j0, sub(g_Ct[j1].p, H), sub(M, H));
+    AimBone(j1, sub(g_Ct[j2].p, g_Ct[j1].p), sub(want, g_Ct[j1].p));
+}
 void OpenHand(int sd, float spread) { Fingers(sd, TH_OPEN, 0.0f, 0.0f, 0.0f, 0.0f, spread, 0.0f); }
 void Fist(int sd, int thumb)        { Fingers(sd, thumb, 1.0f, 1.0f, 1.0f, 1.0f, 0.4f, 0.0f); }
 int  FreeHand() { return g_carry == 1 ? 0 : 1; }          // the right, unless that is the one with the board
@@ -972,28 +1053,90 @@ void DoTap(float) {
     const V3 S0 = g_Ct[g_uarm[c]].p;
     V3 Nc = add(S0, mix3(BF, 0.22f * g_arm[c], BR, 0.27f * g_arm[c] * sg, U, 0.0f));
     Nc = add(Nc, mul(U, TapGround() - L * dot(ax, U) - dot(e, U) - dot(Nc, U)));
-    // THE HAND LIES OVER THE NOSE'S END, from the skater's side: the wrist above it and back toward the body,
-    // the knuckles over the end, the fingers gone over and curled down the graphic, the thumb on the grip
-    // tape. `f` is the way the fingers run, `p` the way the palm faces; `reach` is wrist to knuckles.
+    // THE HAND CLOSES ON THE NOSE'S END: the wrist above the tip, the fingers running straight DOWN the board
+    // and curling ROUND the end onto the graphic, so the wood passes through the fist. `f` is the way the
+    // fingers run, `p` the way the palm faces; `reach` is wrist to knuckles.
+    //
+    // WHICH WAY THE HAND IS TURNED took four measured tries, because two of the three things it has to be are
+    // in tension and none of them is obvious from reading. It must be ALL of: fingers pointing down (or the
+    // wrist is not above the tip and a hanging arm cannot reach it), the palm turned AT the deck (fingers curl
+    // toward the palm, so a palm facing away swings them OFF the board -- which is why more curl used to make
+    // it worse), and the palm not turned UP (a palm facing the sky is a tray; in the field it read as "the
+    // hand is upside down"). On the test body, with the deck's own axes as the measure:
+    //
+    //   frame         palm.up  palm.fwd   fingers     what it was
+    //   0 f0,p0         -0.68     -0.73    down-fwd   ORIGINAL: fingers never crossed the deck
+    //   1 f0,-p0        +0.68     +0.73    down-fwd   grips, but the palm is turned up: "upside down"
+    //   2 -p0,f0        -0.73     +0.67    up-fwd     grips, but the wrist lands BELOW the tip -- 10.8 cm
+    //                                                 out of a hanging arm's reach
+    //   3 p0,-f0        +0.73     -0.67    wrong side of everything
+    //   4               -0.23     +0.97    straight   holds, but the palm is turned OUT IN FRONT: the field
+    //                                      down      called it flipped the wrong way
+    //   5 (below)       +0.23     -0.97    straight   SHIPPED
+    //                                      down
+    //
+    // 4 and 5 are mirrors -- the hand gripping from one side of the deck or the other -- and they hold the
+    // board equally well, so nothing in the geometry chooses between them. What chooses is how an arm HANGS:
+    // at rest the palm faces BACK, which is 5. Both are frames 0/1's pair with the 28 degree tilt laid the
+    // other way, so the fingers come off the wrist straight down the deck instead of angling out over the
+    // end -- that is what lets the palm turn to the board without rolling the hand over to do it.
+    // ...and HOW THE HAND IS TURNED ON TOP OF THAT is three ini keys, one per axis, because which of them is
+    // wrong is a thing you can see and not a thing the geometry can be asked. They are applied in this order
+    // and each is about the frame the one before it left:
+    //   Roll  (EmoteTapHandRollDeg)  about the PALM's normal -- the fingers swing within the palm's own
+    //                                plane, straight down the deck at 0 and across it at a quarter turn.
+    //   Twist (EmoteTapHandTwistDeg) about the FINGERS -- the palm turns around them like a doorknob:
+    //                                back at 0, then toward the body, then forward.
+    //   Pitch (EmoteTapHandPitchDeg) about the THUMB's side -- the wrist cocks, tipping the fingers from
+    //                                pointing down toward pointing out in front (or behind, negative).
     const float th = 28.0f * 0.01745329f;
-    const V3 f = norm(mix3(ax, cosf(th), top, -sinf(th), U, 0.0f)), p = norm(mix3(ax, sinf(th), top, cosf(th), U, 0.0f));
-    float reach = 9.0f * SC;
-    auto wristFor = [&](V3 nose, float rc) { return sub(add(nose, e), mix3(f, rc, p, 2.0f * SC, U, 0.0f)); };
+    V3 p = norm(mix3(ax, -sinf(th), top, cosf(th), U, 0.0f));
+    V3 f = norm(mix3(ax, cosf(th), top, sinf(th), U, 0.0f));
+    if (fabsf(g_tapHandRoll)  > 0.5f) f = norm(qrot(qaxis(p, g_tapHandRoll), f));
+    if (fabsf(g_tapHandTwist) > 0.5f) p = norm(qrot(qaxis(f, g_tapHandTwist), p));
+    if (fabsf(g_tapHandPitch) > 0.5f) {
+        const Q4 q = qaxis(norm(cross(f, p)), g_tapHandPitch);
+        f = norm(qrot(q, f)); p = norm(qrot(q, p));
+    }
+    float reach = g_tapReach * SC;
+    // WHERE ON THE BOARD THE HAND SITS, as a nudge in the body's own terms (cm, from the F1 page).
+    // It has to come off BOTH sides of the solve -- the wrist the arm is sent to, and the place the board
+    // is then hung from -- or it moves the hand and the board together and nothing changes between them.
+    const V3 gripNudge = mix3(BF, g_tapGripFwd * SC, BR, g_tapGripRight * SC, U, g_tapGripUp * SC);
+    auto wristFor = [&](V3 nose, float rc) { return sub(add(nose, e), add(mix3(f, rc, p, g_tapPalmGap * SC, U, 0.0f), gripNudge)); };
     // What a straight arm cannot reach is found where a person finds it, IN THIS ORDER, and never in the
-    // knees: the shoulder let down, the hand slid back so the fingers hook it, a few degrees of lean. All of
-    // it sized from the CONTACT, so none of it moves while the board does.
+    // knees: the shoulder let down, the grip slid up the board, a few degrees of lean. All of it sized from
+    // the CONTACT, so none of it moves while the board does.
     auto shortBy = [&](float rc) { return len(sub(wristFor(Nc, rc), g_Ct[g_uarm[c]].p)) - 0.985f * g_arm[c]; };
     float sh = shortBy(reach), dropped = 0.0f, slid = 0.0f, leaned = 0.0f;
-    if (sh > 0.0f) { dropped = clampf(sh * 1.1f, 0.0f, 3.0f * SC); DropShoulder(c, dropped); sh = shortBy(reach); }
-    if (sh > 0.0f) { slid = clampf(sh * 1.8f, 0.0f, 4.5f * SC); reach += slid; sh = shortBy(reach); }      // it slides along the hand, not up the arm: x1.8
+    // THE SHOULDER GOES FIRST AND GOES FURTHER THAN IT USED TO (3 cm), because the SLIDE is what costs the
+    // grip: it overstates the wrist-to-knuckle distance, so the hand is placed that much further up the board
+    // and ends up closing on the air above the tip -- measured, a 4.5 cm slide left the knuckles 3.3 cm past
+    // the nose. A dropped shoulder buys the same reach and nothing in the pose pays for it.
+    // ...and it is STEPPED, because one pass of 1.1x the shortfall undershoots: the collarbone aims down from
+    // wherever it is now, so letting it down twice more costs nothing and gets the reach out of the shoulder
+    // instead of out of the grip.
+    for (int i = 0; i < 3 && sh > 0.0f && dropped < g_tapDropMax * SC; i++) {
+        const float add = clampf(sh * 1.1f, 0.0f, g_tapDropMax * SC - dropped);
+        DropShoulder(c, add); dropped += add; sh = shortBy(reach);
+    }
+    if (sh > 0.0f) { slid = clampf(sh * 1.8f, 0.0f, g_tapSlideMax * SC); reach += slid; sh = shortBy(reach); }   // along the hand, not up the arm: x1.8
     if (sh > 0.0f) { leaned = clampf(sh * 1.3f, 0.0f, 5.0f); SpineLean(0.0f, leaned * sg, 0.0f); TorsoFrame(); sh = shortBy(reach); }
     if (g_tapSay) {                  // once: what the solve found on THIS body with THIS board
         g_tapSay = false;
         const V3 guess = DeckTopByAnchors(axis0);
         TwkLog("[emote] tap: board %.0f cm, shoulder %.0f cm up, arm %.0f cm; the wrist wants to be %.0f cm up; "
                "shoulder let down %.1f cm, hand slid back %.1f cm, lean %.1f deg, still short %.1f cm | floor by %s",
-               L / SC, (dot(S0, U) - TapGround()) / SC, g_arm[c] / SC, (dot(wristFor(Nc, 9.0f * SC), U) - TapGround()) / SC,
+               L / SC, (dot(S0, U) - TapGround()) / SC, g_arm[c] / SC, (dot(wristFor(Nc, g_tapReach * SC), U) - TapGround()) / SC,
                dropped / SC, slid / SC, leaned, sh > 0.0f ? sh / SC : 0.0f, g_tapGroundUSet ? "the trace under the tail" : "the feet");
+        // ...and how the hand ended up turned, so EmoteTapHandRollDeg can be dialled against what is on screen
+        // rather than described. `down` is how much the fingers run down the deck, `across` how much they run
+        // over its width: 0 roll is all down, a quarter turn is all across.
+        TwkLog("[emote] tap: hand roll %.0f / twist %.0f / pitch %.0f -- fingers %.0f%% down the deck, %.0f%% across, "
+               "%.0f%% out through its face; palm %.0f%% onto the face, %.0f%% down, %.0f%% sideways",
+               g_tapHandRoll, g_tapHandTwist, g_tapHandPitch,
+               100.0f * fabsf(dot(f, ax)), 100.0f * fabsf(dot(f, norm(cross(ax, top)))), 100.0f * fabsf(dot(f, top)),
+               100.0f * fabsf(dot(p, top)), 100.0f * fabsf(dot(p, ax)), 100.0f * fabsf(dot(p, norm(cross(ax, top)))));
         TwkLog("[emote] tap: deck top by %s (the anchors' guess is %.0f deg from it), deck %.1f cm over the truck line, turned %.0f deg to face front (+%.0f asked)",
                g_deckTopSrc == 2 ? "the drawn board" : g_deckTopSrc == 1 ? "the reference pose" : "THE ANCHORS (nothing better)", acosf(clampf(dot(guess, top0), -1.0f, 1.0f)) * 57.2957795f,
                g_deckRise, roll - g_tapRollDeg, g_tapRollDeg);
@@ -1001,10 +1144,16 @@ void DoTap(float) {
     HeadTurn(5.0f * sg, 4.0f + 5.0f * hit, 0.0f);                   // head up; a glance down as it lands
     ArmTo(c, wristFor(add(Nc, mul(U, g_tapLift)), reach), mix3(tf, -0.9f, Out(c), 0.35f, tu, -0.1f), 0.15f);      // a hanging arm's elbow points back
     HandPose(c, f, p);
-    Fingers(c, TH_KEEP, 0.36f, 0.36f, 0.40f, 0.45f, 0.4f, 0.0f);    // over the end and down the graphic; the thumb keeps the grip it had
+    // ...and the thumb CLOSES (TH_IN) rather than being left wherever the carry clip put it (TH_KEEP), which
+    // in the field was out in the air. It cannot be planted on the tape by aiming: measured, it comes up 3 cm
+    // short of the deck wherever it is pointed, because the board lies past its reach. Folding it onto the
+    // fingers -- which are now round the far side of the nose -- shuts the hand ON the board instead.
+    Fingers(c, TH_KEEP, g_tapCurl[0], g_tapCurl[1], g_tapCurl[2], g_tapCurl[3], 0.4f, 0.0f);
+    for (int fi = 0; fi < 4; fi++) FingerNudge(c, fi + 1, g_tapFingerOff[fi][0], g_tapFingerOff[fi][1], g_tapFingerOff[fi][2]);
+    ThumbBlend(c, 1, g_tapThumb);        // ...and the thumb separately, across the INDEX whatever the four do
     // THE BOARD GOES WHERE THE HAND ENDED UP, not where it was asked to: a reach the arm fell short of must
     // not pull the board out of the fingers.
-    const V3 nose = sub(add(g_Ct[h].p, mix3(f, reach, p, 2.0f * SC, U, 0.0f)), e);
+    const V3 nose = sub(add(g_Ct[h].p, add(mix3(f, reach, p, g_tapPalmGap * SC, U, 0.0f), gripNudge)), e);
     for (int i = 0; i < g_nBoardRoot; i++) {
         const int b = g_boardRoot[i];
         SetComp(b, qmul(Rb, g_C[b].q), sub(add(nose, qrot(Rb, sub(g_C[b].p, nose0))), g_visOff));      // less what the drawn one sits off by
@@ -1585,10 +1734,157 @@ int Emote_Prompts(SitPromptEntry* out, int cap) {
     if (n < cap) out[n++] = { aiming ? "Cancel" : "Stop emote", 'B', 0.0f };
     return n;
 }
+// ---- the F1 "Board tap hand" page ------------------------------------------------------------------
+// EVERY JOINT OF THE HAND THAT HOLDS THE BOARD, live. It began as a dev page: which axis of a hand is
+// wrong is exactly what cannot be told from the code, and every round before it was an argument about
+// axes settled by rebuilding the DLL. It stayed, and is named for what it does rather than for dev,
+// because posing your own hand on the board turns out to be something people want.
+// "Log this pose" prints the lot as ini keys, so a pose somebody likes can be kept or passed on.
+// RENDER THREAD (the menu_ext contract). The knobs are plain floats the game thread reads next frame.
+// THE FIELD'S OWN VALUES, which are also this page's Reset. Kept here rather than as literals in three
+// places (the defaults above, the ini fallbacks, this button) so the three can never drift apart.
+struct TapPose { float twist, pitch, roll, thumb, thAlong, thOut, thAcross; float curl[4]; float fwd, right, up; };
+static const TapPose kTapShipped = { 12.0f, -45.0f, 15.0f, 0.50f, 2.9f, 4.2f, 3.0f,
+                                     { 0.07f, 0.09f, 0.08f, 0.12f }, 3.0f, 0.0f, 0.0f };
+
+void Emote_DrawTapHandMenu(const OmpMenuApi* api) {
+    if (!api) return;
+    api->Text("The hand that holds the board for a board tap");
+    api->TextDisabled("Hold RB while off the board to see it. Every row is live, and saves itself.");
+    // A CHANGE IS A SAVE, the same as every other setting here: `changed` collects what the rows report
+    // and marks the file dirty once, so dragging a slider does not write the ini on every frame of the
+    // drag (TwkMarkDirty settles for two seconds first).
+    bool changed = false;
+    api->Separator();
+    api->Text("How the hand is turned");
+    changed |= api->SliderFloat("Twist (palm turns around the fingers)", &g_tapHandTwist, -180.0f, 180.0f, "%.0f deg");
+    changed |= api->SliderFloat("Pitch (the wrist cocks)",               &g_tapHandPitch, -180.0f, 180.0f, "%.0f deg");
+    changed |= api->SliderFloat("Roll (fingers swing on the palm)",      &g_tapHandRoll,  -180.0f, 180.0f, "%.0f deg");
+    api->Separator();
+    api->Text("Where it holds the nose");
+    changed |= api->SliderFloat("Forward", &g_tapGripFwd,   -30.0f, 30.0f, "%.1f cm");
+    api->SameLine(); api->TextDisabled("(the arm still has to reach: see the log)");
+    changed |= api->SliderFloat("Right",   &g_tapGripRight, -30.0f, 30.0f, "%.1f cm");
+    changed |= api->SliderFloat("Up",      &g_tapGripUp,    -30.0f, 30.0f, "%.1f cm");
+    api->Separator();
+    api->Text("The thumb");
+    changed |= api->SliderFloat("Thumb (0 open, 1 across the fingers)", &g_tapThumb,       0.0f,  1.0f, "%.2f");
+    changed |= api->SliderFloat("Thumb along the fingers",              &g_tapThumbAlong, -10.0f, 10.0f, "%.1f cm");
+    changed |= api->SliderFloat("Thumb out through the palm",           &g_tapThumbOut,   -10.0f, 10.0f, "%.1f cm");
+    changed |= api->SliderFloat("Thumb across toward them",             &g_tapThumbAcross,-10.0f, 10.0f, "%.1f cm");
+    // ...and the four the same way. The labels carry the finger's name so a row read on its own still
+    // says what it moves, which matters in a list this long.
+    static const char* const kFinger[4] = { "Index", "Middle", "Ring", "Little" };
+    static const char* const kCurlRow[4] = { "Index (0 open, 1 a fist)", "Middle (0 open, 1 a fist)",
+                                             "Ring (0 open, 1 a fist)",  "Little (0 open, 1 a fist)" };
+    static const char* const kAlongRow[4] = { "Index along the fingers", "Middle along the fingers",
+                                              "Ring along the fingers",  "Little along the fingers" };
+    static const char* const kOutRow[4]   = { "Index out through the palm", "Middle out through the palm",
+                                              "Ring out through the palm",  "Little out through the palm" };
+    static const char* const kAcrossRow[4]= { "Index across toward the thumb", "Middle across toward the thumb",
+                                              "Ring across toward the thumb",  "Little across toward the thumb" };
+    for (int i = 0; i < 4; i++) {
+        api->Separator();
+        api->Text(kFinger[i]);
+        changed |= api->SliderFloat(kCurlRow[i],   &g_tapCurl[i],          0.0f,  1.0f, "%.2f");
+        changed |= api->SliderFloat(kAlongRow[i],  &g_tapFingerOff[i][0], -10.0f, 10.0f, "%.1f cm");
+        changed |= api->SliderFloat(kOutRow[i],    &g_tapFingerOff[i][1], -10.0f, 10.0f, "%.1f cm");
+        changed |= api->SliderFloat(kAcrossRow[i], &g_tapFingerOff[i][2], -10.0f, 10.0f, "%.1f cm");
+    }
+    api->Separator();
+    if (api->version >= 2 && api->Button && api->Button("Log this pose")) {
+        TwkLog("[emote] BOARD TAP HAND -- these are the ini keys, and this is their order in the file:");
+        TwkLog("    EmoteTapHandTwistDeg=%.0f",   g_tapHandTwist);
+        TwkLog("    EmoteTapHandPitchDeg=%.0f",   g_tapHandPitch);
+        TwkLog("    EmoteTapHandRollDeg=%.0f",    g_tapHandRoll);
+        TwkLog("    EmoteTapGripFwdCm=%.1f",      g_tapGripFwd);
+        TwkLog("    EmoteTapGripRightCm=%.1f",    g_tapGripRight);
+        TwkLog("    EmoteTapGripUpCm=%.1f",       g_tapGripUp);
+        TwkLog("    EmoteTapThumbPct=%.0f",       g_tapThumb * 100.0f);
+        TwkLog("    EmoteTapThumbAlongCm=%.1f",   g_tapThumbAlong);
+        TwkLog("    EmoteTapThumbOutCm=%.1f",     g_tapThumbOut);
+        TwkLog("    EmoteTapThumbAcrossCm=%.1f",  g_tapThumbAcross);
+        static const char* const kKey[4] = { "Index", "Middle", "Ring", "Little" };
+        for (int i = 0; i < 4; i++) {
+            TwkLog("    EmoteTap%sPct=%.0f",      kKey[i], g_tapCurl[i] * 100.0f);
+            TwkLog("    EmoteTap%sAlongCm=%.1f",  kKey[i], g_tapFingerOff[i][0]);
+            TwkLog("    EmoteTap%sOutCm=%.1f",    kKey[i], g_tapFingerOff[i][1]);
+            TwkLog("    EmoteTap%sAcrossCm=%.1f", kKey[i], g_tapFingerOff[i][2]);
+        }
+        g_tapSay = true;                 // ...and the solve's own line next time the pose is built
+    }
+    api->SameLine();
+    if (api->version >= 2 && api->Button && api->Button("Back to the shipped pose")) {
+        const TapPose& d = kTapShipped;
+        g_tapHandTwist = d.twist; g_tapHandPitch = d.pitch; g_tapHandRoll = d.roll;
+        g_tapGripFwd = d.fwd; g_tapGripRight = d.right; g_tapGripUp = d.up;
+        g_tapThumb = d.thumb; g_tapThumbAlong = d.thAlong; g_tapThumbOut = d.thOut; g_tapThumbAcross = d.thAcross;
+        for (int i = 0; i < 4; i++) {
+            g_tapCurl[i] = d.curl[i];
+            g_tapFingerOff[i][0] = g_tapFingerOff[i][1] = g_tapFingerOff[i][2] = 0.0f;
+        }
+        changed = true;
+    }
+    if (changed) TwkMarkDirty();
+}
+
+// Everything the F1 page can change, written back so a pose someone built survives the game closing.
+// TwkIniSetInt APPENDS a key it cannot find, so a file written by an older build simply grows these.
+void Emote_SaveConfig(char* buf, size_t cap) {
+    TwkIniSetInt(buf, cap, "EmoteTapHandTwistDeg",  (int)g_tapHandTwist);
+    TwkIniSetInt(buf, cap, "EmoteTapHandPitchDeg",  (int)g_tapHandPitch);
+    TwkIniSetInt(buf, cap, "EmoteTapHandRollDeg",   (int)g_tapHandRoll);
+    TwkIniSetInt(buf, cap, "EmoteTapGripFwdCm",     (int)g_tapGripFwd);
+    TwkIniSetInt(buf, cap, "EmoteTapGripRightCm",   (int)g_tapGripRight);
+    TwkIniSetInt(buf, cap, "EmoteTapGripUpCm",      (int)g_tapGripUp);
+    TwkIniSetInt(buf, cap, "EmoteTapThumbPct",      (int)(g_tapThumb * 100.0f + 0.5f));
+    TwkIniSetInt(buf, cap, "EmoteTapThumbAlongCm",  (int)g_tapThumbAlong);
+    TwkIniSetInt(buf, cap, "EmoteTapThumbOutCm",    (int)g_tapThumbOut);
+    TwkIniSetInt(buf, cap, "EmoteTapThumbAcrossCm", (int)g_tapThumbAcross);
+    static const char* const kK[4] = { "Index", "Middle", "Ring", "Little" };
+    static const char* const kAx[3] = { "AlongCm", "OutCm", "AcrossCm" };
+    char key[64];
+    for (int i = 0; i < 4; i++) {
+        snprintf(key, sizeof(key), "EmoteTap%sPct", kK[i]);
+        TwkIniSetInt(buf, cap, key, (int)(g_tapCurl[i] * 100.0f + 0.5f));
+        for (int x = 0; x < 3; x++) {
+            snprintf(key, sizeof(key), "EmoteTap%s%s", kK[i], kAx[x]);
+            TwkIniSetInt(buf, cap, key, (int)g_tapFingerOff[i][x]);
+        }
+    }
+}
+
 void Emote_ReadConfig(const char* buf) {
     g_on = TwkIniIntQuiet(buf, "EmotesEnabled", 1) ? 1 : 0;
     g_tapVolume = clampf((float)TwkIniIntQuiet(buf, "EmoteTapVolumePct", 250), 0.0f, 400.0f) / 100.0f;
     g_tapRollDeg = clampf((float)TwkIniIntQuiet(buf, "EmoteTapRollDeg", 0), -180.0f, 180.0f);
+    g_tapHandRoll  = clampf((float)TwkIniIntQuiet(buf, "EmoteTapHandRollDeg",  (int)kTapShipped.roll),  -180.0f, 180.0f);
+    g_tapHandTwist = clampf((float)TwkIniIntQuiet(buf, "EmoteTapHandTwistDeg", (int)kTapShipped.twist), -180.0f, 180.0f);
+    g_tapHandPitch = clampf((float)TwkIniIntQuiet(buf, "EmoteTapHandPitchDeg", (int)kTapShipped.pitch), -180.0f, 180.0f);
+    // THE BOARD TAP'S HAND. Every row of the F1 page has a key here, and the defaults ARE kTapShipped --
+    // the pose the field settled on -- so a fresh install stands where the tuning ended rather than at
+    // some neutral that was never looked at.
+    const TapPose& d = kTapShipped;
+    g_tapThumb       = clampf((float)TwkIniIntQuiet(buf, "EmoteTapThumbPct", (int)(d.thumb * 100.0f)), 0.0f, 100.0f) / 100.0f;
+    g_tapThumbAlong  = clampf((float)TwkIniIntQuiet(buf, "EmoteTapThumbAlongCm",  (int)d.thAlong),  -10.0f, 10.0f);
+    g_tapThumbOut    = clampf((float)TwkIniIntQuiet(buf, "EmoteTapThumbOutCm",    (int)d.thOut),    -10.0f, 10.0f);
+    g_tapThumbAcross = clampf((float)TwkIniIntQuiet(buf, "EmoteTapThumbAcrossCm", (int)d.thAcross), -10.0f, 10.0f);
+    {
+        static const char* const kK[4] = { "Index", "Middle", "Ring", "Little" };
+        char key[64];
+        for (int i = 0; i < 4; i++) {
+            snprintf(key, sizeof(key), "EmoteTap%sPct", kK[i]);
+            g_tapCurl[i] = clampf((float)TwkIniIntQuiet(buf, key, (int)(d.curl[i] * 100.0f)), 0.0f, 100.0f) / 100.0f;
+            static const char* const kAx[3] = { "AlongCm", "OutCm", "AcrossCm" };
+            for (int x = 0; x < 3; x++) {
+                snprintf(key, sizeof(key), "EmoteTap%s%s", kK[i], kAx[x]);
+                g_tapFingerOff[i][x] = clampf((float)TwkIniIntQuiet(buf, key, 0), -10.0f, 10.0f);
+            }
+        }
+    }
+    g_tapGripFwd   = clampf((float)TwkIniIntQuiet(buf, "EmoteTapGripFwdCm",   (int)kTapShipped.fwd),   -30.0f, 30.0f);
+    g_tapGripRight = clampf((float)TwkIniIntQuiet(buf, "EmoteTapGripRightCm", (int)kTapShipped.right), -30.0f, 30.0f);
+    g_tapGripUp    = clampf((float)TwkIniIntQuiet(buf, "EmoteTapGripUpCm",    (int)kTapShipped.up),    -30.0f, 30.0f);
     // the tap's sound: a cue's short name (the ollie's pop; empty = the board's own knock) and its level. The older
     // EmoteTapVolumePct is the KNOCK's, which needed lifting; the pop does not.
     TwkIniStr(buf, "EmoteTapSound", g_tapSoundName, sizeof(g_tapSoundName), "SCU_Pop_Hi_Jump");

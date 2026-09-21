@@ -26,7 +26,10 @@
 // ------------------------------------------------------------------ the world outside emote.cpp
 static float g_camFwd[3] = { 0.0f, 1.0f, 0.0f };
 static bool  g_stubInHand = false;
-void  TwkLog(const char*, ...) {}
+void  TwkLog(const char* f, ...) {   // silent, unless TAPFRAME is asking what the solve did
+    if (!getenv("TAPFRAME")) return;
+    va_list a; va_start(a, f); printf("   ["); vprintf(f, a); printf("]\n"); va_end(a);
+}
 int   TwkIniIntQuiet(const char*, const char*, int def) { return def; }
 int   Twk_IsProxy(void*) { return 0; }
 void  Twk_SetPoseHold(bool) {}
@@ -53,6 +56,8 @@ bool  CatchTweaks_LeftTrigger(float* out) { if (out) *out = g_stubLT < 0.0f ? 0.
 static int g_stubSound = 0;          // what CatchSound_FindSound hands back (a loaded cue), or 0 for none
 void* CatchSound_FindSound(const char*) { return g_stubSound ? (void*)&g_stubSound : nullptr; }
 void  TwkIniStr(const char*, const char*, char* out, size_t cap, const char* def) { snprintf(out, cap, "%s", def ? def : ""); }
+int   TwkIniSetInt(char*, size_t, const char*, int) { return 0; }      // the tap hand's page saves; nothing here reads it back
+void  TwkMarkDirty() {}
 void  SitUI_Track(SitObjRef* r, void* o) { if (r) { r->obj = o; r->index = 0; r->serial = 0; r->cls = nullptr; } }
 bool  SitUI_Alive(const SitObjRef* r) { return r && r->obj; }
 
@@ -511,6 +516,34 @@ int main(int argc, char** argv) {
             auto noseP = [&]() { return add(lineNose(), mul(topNow(), g_deckRise + 3.0f * SC)); };
             g_tapLift = 0.0f; g_tapSwing = 0.0f; g_tapHit = 0.0f;
             Play(EM_TAP, 1.0f, hand);
+            // TAPFRAME=1 DUMPS THE GRIP'S FRAME, in the world's terms and in the deck's. Kept rather than
+            // deleted: the hand on the nose came out wrong four times running, and every one of them was
+            // settled by these numbers rather than by reading the code -- which axis the palm faces, which
+            // side of the deck the knuckles are on, where the fingertips and thumb actually land. The
+            // checks below say whether the pose is right; this says WHAT IT IS when it is not.
+            if (getenv("TAPFRAME")) {
+                V3 Fh, Nh, Ah; HandAxes(hand, &Fh, &Nh, &Ah);
+                const V3 w = g_Ct[g_hand[hand]].p, np = noseP(), tn = topNow();
+                const V3 across = norm(cross(norm(sub(lineTail(), lineNose())), tn));
+                printf("[frame] %s\n", keep);
+                printf("   top(tape normal)  fwd %+.2f up %+.2f side %+.2f\n", dot(tn, kF), dot(tn, kU), dot(tn, mul(kR, hand ? 1.f : -1.f)));
+                printf("   fingers F         fwd %+.2f up %+.2f side %+.2f\n", dot(Fh, kF), dot(Fh, kU), dot(Fh, mul(kR, hand ? 1.f : -1.f)));
+                printf("   palm    N         fwd %+.2f up %+.2f side %+.2f  (N.top %+.2f, N.across %+.2f)\n",
+                       dot(Nh, kF), dot(Nh, kU), dot(Nh, mul(kR, hand ? 1.f : -1.f)), dot(Nh, tn), dot(Nh, across));
+                printf("   wrist off noseP   tape %+.1f cm, down-deck %+.1f cm, across %+.1f cm\n",
+                       dot(sub(w, np), tn), dot(sub(w, np), norm(sub(lineTail(), lineNose()))), dot(sub(w, np), across));
+                V3 kn = v3(0,0,0); int kc = 0;
+                for (int ff = 1; ff <= 4; ff++) if (g_fing[hand][ff][0] >= 0) { kn = add(kn, g_Ct[g_fing[hand][ff][0]].p); kc++; }
+                kn = mul(kn, 1.0f / (float)kc);
+                printf("   knuckles off noseP tape %+.1f cm, down-deck %+.1f cm, across %+.1f cm\n",
+                       dot(sub(kn, np), tn), dot(sub(kn, np), norm(sub(lineTail(), lineNose()))), dot(sub(kn, np), across));
+                const V3 tipM = g_Ct[g_fing[hand][2][2]].p;
+                printf("   mid fingertip      tape %+.1f cm, down-deck %+.1f cm, across %+.1f cm\n",
+                       dot(sub(tipM, np), tn), dot(sub(tipM, np), norm(sub(lineTail(), lineNose()))), dot(sub(tipM, np), across));
+                const V3 thT = g_Ct[g_fing[hand][0][2]].p;
+                printf("   thumb tip          tape %+.1f cm, down-deck %+.1f cm, across %+.1f cm\n",
+                       dot(sub(thT, np), tn), dot(sub(thT, np), norm(sub(lineTail(), lineNose()))), dot(sub(thT, np), across));
+            }
             Check(g_deckTopOk && g_deckTopSrc == 2 && fabsf(g_deckRise - 5.0f) < 0.05f, "tap: the DRAWN board was measured: the deck's top, and its rise over the trucks", Fmt("%s source %d rise %.2f", keep, g_deckTopSrc, g_deckRise));
             {   // the rig's own account of the carried board: the reference pose is RIGHT, the anchors a quarter turn out
                 V3 a0 = norm(sub(g_C[g_truckF].p, g_C[g_truckB].p));
@@ -538,20 +571,58 @@ int main(int argc, char** argv) {
             Check(dot(lineNose(), kF) < 16.0f, "tap: ...and the nose by the hip, not held out in front", keep);
             // the GRAPHIC to the front: the deck's TRUE top faces back at the skater
             Check(dot(topNow(), kF) < -0.93f, "tap: the graphic faces the FRONT (the deck's true top faces the skater)", Fmt("%s top.forward %.2f", keep, dot(topNow(), kF)));
-            // the hand LIES OVER THE NOSE'S END from the skater's side: wrist above the end and back toward the
-            // body, fingers gone forward over it and down, palm down onto it
+            // THE HAND CLOSES ON THE NOSE'S END: the wrist above the tip and near the deck's plane, the fingers
+            // running straight DOWN the board so the arm can hang, the palm turned at the board but NOT up.
+            // These three used to read "wrist over the end, on the skater's side, fingers forward over it and
+            // down" -- a hand that lay ALONGSIDE the nose rather than round it, and nothing here said so
+            // because each part was checked against the world's axes instead of the deck's.
             const V3 wrist = g_Ct[g_hand[hand]].p;
             const float above = dot(sub(wrist, noseP()), kU);
             Check(above > 4.0f && above < 14.0f, "tap: the wrist is over the nose's end", Fmt("%s %.1f cm above", keep, above));
-            Check(dot(sub(wrist, noseP()), kF) < -0.5f, "tap: ...on the skater's side of it", Fmt("%s %.1f cm", keep, dot(sub(wrist, noseP()), kF)));
+            Check(fabsf(dot(sub(wrist, noseP()), topNow())) < 8.0f, "tap: ...and close to the deck's own plane, not standing off it",
+                  Fmt("%s %.1f cm off it", keep, dot(sub(wrist, noseP()), topNow())));
             V3 F, N, A; HandAxes(hand, &F, &N, &A);
-            Check(dot(F, kU) < -0.45f && dot(F, kF) > 0.3f, "tap: the fingers go forward OVER the end and down", Fmt("%s up %.2f fwd %.2f", keep, dot(F, kU), dot(F, kF)));
-            Check(dot(N, kU) < -0.3f && dot(N, kF) < -0.3f, "tap: the palm is down on it, facing back", Fmt("%s up %.2f fwd %.2f", keep, dot(N, kU), dot(N, kF)));
+            Check(dot(F, kU) < -0.55f, "tap: the fingers run DOWN the board, so the arm can hang to it", Fmt("%s up %.2f fwd %.2f", keep, dot(F, kU), dot(F, kF)));
+            // A relaxed arm hangs with the palm turned BACK, so level-ish is right and only a palm turned up
+            // toward the sky is wrong -- that is the one the field called "the hand is upside down" (+0.68).
+            Check(dot(N, kU) < 0.45f, "tap: ...and is not turned UP -- a hand, not a tray", Fmt("%s palm.up %.2f", keep, dot(N, kU)));
+            // WHICH SIDE of the deck the hand is on is not something the geometry can settle. It is settled by
+            // how an arm HANGS: at rest the palm faces back, not out in front, and the arrangement that turned
+            // it forward was rejected in the field as "the palm is flipped the wrong way".
+            Check(dot(N, kF) < -0.3f, "tap: ...and faces back, the way a hanging arm rests", Fmt("%s palm.forward %.2f", keep, dot(N, kF)));
             {   // IN THE HAND: the end of the wood is under the knuckles -- a knuckle's depth off the palm's plane, no more
                 V3 kn = v3(0, 0, 0); int k = 0;
                 for (int f = 1; f <= 4; f++) if (g_fing[hand][f][0] >= 0) { kn = add(kn, g_Ct[g_fing[hand][f][0]].p); k++; }
                 kn = mul(kn, 1.0f / (float)k);
                 Check(len(sub(kn, noseP())) < 6.0f, "tap: the nose's end is IN the hand, under the knuckles", Fmt("%s %.1f cm from them", keep, len(sub(kn, noseP()))));
+            }
+            {   // ...AND THE HAND IS ON IT. THE NOSE SITS IN THE CROOK OF THE HAND, fingers draped over the
+                // tip and down the deck -- NOT a fist closed round the wood, which is what these checks
+                // demanded through several rounds and is not the pose the field approved. The board LEANS
+                // BACK (its tail is set out ahead, checked above), so its own weight presses the nose into
+                // the web of the hand and the fingers over the tip stop it sliding; a far-side grip would be
+                // a belt on top of those braces. Measured along the DECK's axes: `S` is off its near face,
+                // `D` is down it from the tip.
+                const V3 along = norm(sub(lineTail(), lineNose()));
+                const V3 tipM = g_Ct[g_fing[hand][2][2]].p;
+                V3 kn2 = v3(0, 0, 0); int k2 = 0;
+                for (int ff = 1; ff <= 4; ff++) if (g_fing[hand][ff][0] >= 0) { kn2 = add(kn2, g_Ct[g_fing[hand][ff][0]].p); k2++; }
+                kn2 = mul(kn2, 1.0f / (float)k2);
+                const float knS = dot(sub(kn2, noseP()), topNow()), knD = dot(sub(kn2, noseP()), along);
+                const float tipS = dot(sub(tipM, noseP()), topNow()), tipD = dot(sub(tipM, noseP()), along);
+                Check(fabsf(knS) < 5.0f && knD < 2.0f && knD > -6.0f, "tap: the knuckles are at the nose's tip",
+                      Fmt("%s %.1f cm off its face, %.1f cm down the deck", keep, knS, knD));
+                Check(tipD - knD > 3.0f, "tap: ...and the fingers drape OVER the tip and down past it",
+                      Fmt("%s knuckles %.1f cm down it, fingertips %.1f cm", keep, knD, tipD));
+                Check(fabsf(tipS) < 3.5f, "tap: ...lying against the deck, not out in the air beside it",
+                      Fmt("%s fingertips %.1f cm off its face", keep, tipS));
+                // The thumb CANNOT be planted on the far face -- measured, it comes up 3 cm short of the deck
+                // wherever it is aimed, because the board lies past its reach. What is asked of it is that it
+                // is at the nose at all, rather than out past the edge holding nothing (it was 6 cm out once).
+                const V3 thT = g_Ct[g_fing[hand][0][2]].p;
+                const float thD = dot(sub(thT, noseP()), along), thS = dot(sub(thT, noseP()), topNow());
+                Check(fabsf(thD) < 6.0f && fabsf(thS) < 6.0f, "tap: ...and the thumb is at the nose too",
+                      Fmt("%s %.1f cm down the deck, %.1f cm off its face", keep, thD, thS));
             }
             // the arm hangs: nearly straight, elbow behind the line from shoulder to wrist rather than out front
             const V3 Sh = g_Ct[g_uarm[hand]].p, El = g_Ct[g_larm[hand]].p;

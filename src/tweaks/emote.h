@@ -6,6 +6,12 @@ void Emote_PumpFrame();                  // GAME THREAD: the clock, the blend, a
 void Emote_OnFlip(void* mesh);           // from sit's FlipEditableSpaceBases detour, AFTER the seat's own pose
 void Emote_Watchdog();                   // from a tick that survives the editors: the pump does not (see sit.cpp)
 
+struct OmpMenuApi;
+// The F1 "Board tap hand" page: every joint of the hand that holds the board, live. RENDER THREAD (the
+// menu_ext contract). What it changes is saved by Emote_SaveConfig.
+void        Emote_DrawTapHandMenu(const OmpMenuApi* api);
+void        Emote_SaveConfig(char* iniText, size_t cap);
+
 int         Emote_Count();
 const char* Emote_Name(int index);
 bool        Emote_Play(int wheelIndex);  // a place ON THE WHEEL. false = refused, and the log says why

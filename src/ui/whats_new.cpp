@@ -44,7 +44,7 @@ static const Release kReleases[] = {
     { "1.2.2",
       "- Release notes on the start menu, pulled from the GitHub release.\n"
       "- Update from inside the game: Multiplayer options, hold X on Update.\n"
-      "- Standing at a speaker, clicking the stick opens that speaker.\n"
+      "- The hand actually holds the board, and you can pose it yourself.\n"
       "- Throw your board by holding LT and pulling RT; RB holds it for a tap." },
     { "1.2.1",
       "- Radios carry properly now, and volume sets how far one reaches.\n"

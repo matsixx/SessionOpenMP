@@ -160,6 +160,10 @@
 
 // ------------------------------------------------------------------ knobs
 static int   g_on = 1;                  // RadialEnabled
+// RadialLeftStick: which stick's CLICK opens the wheel. The right is the default because that is the
+// one the wheel is then steered with, so the whole gesture is one thumb -- but the right stick's click
+// is the game's own look-behind, and anyone who uses that wants the wheel somewhere else.
+static int   g_leftStick = 0;
 // Layout numbers are read from the ini but never written to it: they are being calibrated against
 // screenshots, and a guess saved to disk outlives the build that guessed it.
 static float g_radiusPct = 24.0f;       // RadialRadiusPct: of the viewport's shorter side
@@ -403,7 +407,7 @@ static bool     g_shopBoard  = false;               // ...and it is the board's 
 static float    g_shopFeet[3] = { 0, 0, 0 }, g_shopYaw = 0.0f;      // where our shop was laid out, and facing what
 static float    g_camAt[3] = { 0, 0, 0 }; static bool g_camSet = false; static int64_t g_camQpc = 0;
 static float    g_camRest[3] = { 0, 0, 0 }; static int g_camLogged = 0;
-static uint64_t g_fnR3 = 0, g_fnA = 0, g_fnB = 0, g_fnRX = 0, g_fnRY = 0, g_fnRT = 0, g_fnRTb = 0, g_fnRB = 0;
+static uint64_t g_fnR3 = 0, g_fnL3 = 0, g_fnA = 0, g_fnB = 0, g_fnRX = 0, g_fnRY = 0, g_fnRT = 0, g_fnRTb = 0, g_fnRB = 0;
 static int      g_rtAxisSeen = 0, g_swallowRT = 0;  // the trigger's axis has reported at least once; the button-press of it that we took
 static uint64_t g_fnNot[32]; static int g_fnNotN = 0;
 
@@ -440,7 +444,12 @@ static void Close(const char* why) {
 static int KeyKind(const void* key) {
     const uint64_t nm = *(const uint64_t*)key;
     if (!nm) return 0;
-    if (nm == g_fnR3) return 1;
+    // EITHER STICK'S CLICK CAN BE THE WHEEL'S, and BOTH names are resolved and remembered whichever one
+    // is chosen -- the choice is made HERE, on the way out, not by refusing to learn the other's FName.
+    // A stick that is not ours must return 0 so the game still gets it, and it has to be able to become
+    // ours the moment the setting changes, which it cannot if it was filed away in g_fnNot.
+    if (nm == g_fnR3) return g_leftStick ? 0 : 1;
+    if (nm == g_fnL3) return g_leftStick ? 1 : 0;
     if (nm == g_fnA)  return 2;
     if (nm == g_fnB)  return 3;
     if (nm == g_fnRX) return 4;
@@ -451,7 +460,8 @@ static int KeyKind(const void* key) {
     for (int i = 0; i < g_fnNotN; i++) if (nm == g_fnNot[i]) return 0;
     char nb[96];
     if (!GrindPop_FNameToString(key, nb, sizeof(nb))) return 0;
-    if (!strcmp(nb, "Gamepad_RightThumbstick"))   { g_fnR3 = nm; return 1; }
+    if (!strcmp(nb, "Gamepad_RightThumbstick"))   { g_fnR3 = nm; return g_leftStick ? 0 : 1; }
+    if (!strcmp(nb, "Gamepad_LeftThumbstick"))    { g_fnL3 = nm; return g_leftStick ? 1 : 0; }
     if (!strcmp(nb, "Gamepad_FaceButton_Bottom")) { g_fnA  = nm; return 2; }
     if (!strcmp(nb, "Gamepad_FaceButton_Right"))  { g_fnB  = nm; return 3; }
     if (!strcmp(nb, "Gamepad_RightX"))            { g_fnRX = nm; return 4; }
@@ -1072,10 +1082,15 @@ void Radial_SetMovable(void* comp) {
 bool Radial_Open()    { return g_open != 0; }
 bool Radial_Busy()    { return g_open != 0 || ShopMenuUp(); }
 bool Radial_Enabled() { return g_on != 0; }
+bool Radial_LeftStick() { return g_leftStick != 0; }
 void Radial_SetEnabled(bool on) { g_on = on ? 1 : 0; if (!on) Close("turned off"); TwkMarkDirty(); }
-void Radial_ResetDefaults() { g_on = 1; }
+// Closed on the way over: the click that opens it is the one being moved, so leaving the wheel up would
+// leave it open on a button that no longer shuts it.
+void Radial_SetLeftStick(bool on) { g_leftStick = on ? 1 : 0; if (g_open) Close("the opening stick changed"); TwkMarkDirty(); }
+void Radial_ResetDefaults() { g_on = 1; g_leftStick = 0; }
 void Radial_ReadConfig(const char* buf) {
     g_on        = TwkIniInt(buf, "RadialEnabled", 1) ? 1 : 0;
+    g_leftStick = TwkIniIntQuiet(buf, "RadialLeftStick", 0) ? 1 : 0;
     g_radiusPct = (float)TwkIniIntQuiet(buf, "RadialRadiusPct", 24);
     g_deadzone  = (float)TwkIniIntQuiet(buf, "RadialDeadzonePct", 45) * 0.01f;
     g_charW     = (float)TwkIniIntQuiet(buf, "RadialCharWx10", 160) * 0.1f;
@@ -1095,11 +1110,20 @@ void Radial_ReadConfig(const char* buf) {
     if (g_radiusPct < 8.0f || g_radiusPct > 45.0f) g_radiusPct = 24.0f;
     if (g_deadzone < 0.1f || g_deadzone > 0.95f)   g_deadzone = 0.45f;
 }
-void Radial_SaveConfig(char* buf, size_t cap) { TwkIniSetInt(buf, cap, "RadialEnabled", g_on); }
+void Radial_SaveConfig(char* buf, size_t cap) {
+    TwkIniSetInt(buf, cap, "RadialEnabled", g_on);
+    TwkIniSetInt(buf, cap, "RadialLeftStick", g_leftStick);
+}
 void Radial_DrawMenu(const OmpMenuApi* api) {
     bool on = g_on != 0;
-    if (api->Checkbox("Radial menu (click the right stick while off the board)", &on)) Radial_SetEnabled(on);
+    if (api->Checkbox(g_leftStick ? "Radial menu (click the LEFT stick while off the board)"
+                                  : "Radial menu (click the right stick while off the board)", &on)) Radial_SetEnabled(on);
     api->SameLine(); api->TextDisabled(g_shopConfirm ? "(A select, B back)" : "(closet and board unavailable this build)");
+    bool left = g_leftStick != 0;
+    if (api->Checkbox("Open it with the LEFT stick instead", &left)) Radial_SetLeftStick(left);
+    // The wheel is STEERED with the right stick either way -- only the click that opens it moves -- so
+    // this is worth saying rather than leaving somebody to find out.
+    api->SameLine(); api->TextDisabled("(the right stick still points at the entries)");
 }
 void Radial_Install() {
     g_shopConfirm = (ShopConfirmFn)TwkScanExe(SIG_SHOP_CONFIRM);
