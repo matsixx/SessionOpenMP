@@ -45,6 +45,7 @@
 #include "mp_prefs.h"
 #include "chat.h"
 #include "nameplates.h"
+#include "game_hud.h"
 #include "../transport/eos_sideload.h"      // GameSdkWasReplaced: an older install overwrote the game's EOS file
 #include "theme.h"
 
@@ -167,6 +168,27 @@ static LRESULT CALLBACK hkWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     const bool capturing = g_visible.load() || Overlay_PromptOpen() || Chat_IsOpen();
     if (capturing) {
         ImGui_ImplWin32_WndProcHandler(h, m, w, l);
+        // THE TYPING, WHEN THE GAME IS DRAWING THE BOX. The keys are already being swallowed here --
+        // they have to be, or a WASD typed mid-sentence rolls you down the street -- so this is the
+        // one place they exist at all. Chat decides whether it wants them (they are a no-op unless
+        // the game-drawn box is open), which keeps the surface choice out of the window hook.
+        // The auto-repeat bit is PASSED, not filtered: holding backspace should keep deleting, while
+        // the repeats of the Enter that opened the box must not send the empty line. See chat.h.
+        switch (m) {
+        case WM_CHAR:
+            Chat_NoteChar((unsigned int)w);
+            break;
+        case WM_KEYDOWN: case WM_SYSKEYDOWN:
+            Chat_NoteKey((int)w, (GetKeyState(VK_CONTROL) & 0x8000) != 0, (l & (1 << 30)) != 0);
+            break;
+        case WM_MOUSEWHEEL:
+            // The wheel walks the history back. It is swallowed here whether or not the chat wants
+            // it, so this is the only place it exists -- and there is no cursor on screen while the
+            // box is open, which is exactly why the wheel has to be the way through it.
+            Chat_Scroll(GET_WHEEL_DELTA_WPARAM(w) > 0 ? 3 : -3);
+            break;
+        default: break;
+        }
         switch (m) { // swallow input while the menu is up so clicks/keys don't leak into the game
         case WM_MOUSEMOVE: case WM_LBUTTONDOWN: case WM_LBUTTONUP: case WM_LBUTTONDBLCLK:
         case WM_RBUTTONDOWN: case WM_RBUTTONUP: case WM_MBUTTONDOWN: case WM_MBUTTONUP:
@@ -178,7 +200,13 @@ static LRESULT CALLBACK hkWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         // A fresh Enter that reached the game (bit 30 = it was already down: an auto-repeat) is the
         // chat's open key. Reported, not acted on: the game frame decides whether the box may open.
         // Here rather than polled there -- see chat.h.
-        if (m == WM_KEYDOWN && w == VK_RETURN && !(l & (1 << 30))) Chat_NoteEnterPressed();
+        if (m == WM_KEYDOWN && w == VK_RETURN && !(l & (1 << 30))) {
+            Chat_NoteEnterPressed();
+            // SWALLOWED when the game thread says the box will take it. The chat opens from the
+            // pause menu now, and an Enter that fell through would confirm whatever row was selected
+            // on its way past -- so the press that opens the box stops here.
+            if (Chat_EnterOurs()) return 0;
+        }
     }
     if (!capturing && (m == WM_KEYUP || m == WM_SYSKEYUP)) {
         // RELEASES ALWAYS REACH IMGUI, capturing or not. The capture gate opens and closes
@@ -514,6 +542,17 @@ static void buildUI() {
             bubActive = ImGui::IsItemActive();
             if (ImGui::IsItemDeactivatedAfterEdit()) MpPrefs_SetBubbleDistM(bubD);
             ImGui::TextDisabled("Bubbles are shown whether you are on your board or not.");
+
+            // WHICH SURFACE DRAWS THEM. The game's own text widget is the one that should be on;
+            // this is the way back if it ever misbehaves, and the A/B while it is new. Not saved:
+            // a fallback is not a preference, and a fresh launch should always try the good path.
+            // It covers the CHAT as well -- they share the widget pool, and a build where the names
+            // were native and the chat was not would be the worst of both.
+            bool gameDrawn = omp::ui::GameHud_Enabled();
+            if (ImGui::Checkbox("Draw names and chat with the game's own UI", &gameDrawn))
+                omp::ui::GameHud_SetEnabled(gameDrawn);
+            if (!omp::ui::GameHud_Available())
+                ImGui::TextDisabled("The game's text widget is not loaded here -- using the overlay.");
             ImGui::Unindent();
         }
 

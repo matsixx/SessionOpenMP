@@ -27,6 +27,7 @@
 #include "ue4ss_abi.h"
 
 #include "transport/transport.h"
+#include "omp_peers.h"                // OMP_MAX_PEERS -- the one place the lobby cap lives
 #include "session/session.h"
 #include "game/game_syms.h"
 #include "game/gather.h"
@@ -48,6 +49,7 @@
 #include "ui/chat.h"
 #include "replication/replaysync.h"   // the sync-progress bubble below
 #include "ui/nameplates.h"
+#include "ui/game_hud.h"
 #include "game/game_font.h"
 #include "session/banlist.h"
 #include "session/mutelist.h"
@@ -422,11 +424,25 @@ static void MpPump() {
     // text field a frame later is handled where it lands, by chat.cpp's send arming.
     // The press itself is an EVENT from the window hook (chat.h says why it is not polled here).
     if (Chat_TakeEnterPressed()) {
-        // game::PauseMenuOpen() is always false in this mod (world pausing is off, and it tests the
-        // paused-menu container) -- so PauseMenu_IsShown, read off the page widget itself, is what
-        // actually keeps a hotkey from firing underneath an open menu.
-        const bool menu = game::PauseMenuOpen() || PauseMenu_IsShown();
-        if (g_armed && !Chat_IsOpen() && !Overlay_Visible() && !menu) {
+        // WHICH "IS A MENU UP" SIGNAL. There are three, and this gate was using the two wrong ones:
+        //   game::PauseMenuOpen()  always false in this mod -- world pausing is off, and it tests the
+        //                          paused-menu container.
+        //   PauseMenu_IsShown()    reads g_lastPage, whose own comment says it is "only ever used by
+        //                          the bounded browse poll". It was never meant to answer this and it
+        //                          does not: the remembered page keeps its Visible flag and a live
+        //                          Slate refcount after the menu is dismissed, so it says YES for the
+        //                          rest of the session. Field log: 18 refusals out of 18, all "the
+        //                          pause menu is up", while skating. That IS the "Enter does not open
+        //                          the chat until I open and close the pause menu" report -- the round
+        //                          trip never fixed anything, it just rebuilt the page.
+        //   MenuDisplayed()        ASessionPlayerController::IsPauseMenuDisplayed: measured false on
+        //                          the start menu, true only once the in-game pause menu is really up.
+        //                          That is the question being asked, so it is the one that answers.
+        // THE PAUSE MENU NO LONGER REFUSES IT. Chatting from the menu was asked for, and it is the
+        // right way round: the menu is exactly where somebody is standing still long enough to type.
+        // The box moves to the other side of the screen while the menu is up (GameHud_Chat) and is
+        // drawn over it. MenuDisplayed() is still read -- for where to put the box, not whether to.
+        if (g_armed && !Chat_IsOpen() && !Overlay_Visible()) {
             Chat_SetOpen(true);
         } else {
             // Say which gate refused it. "Enter did nothing" has been reported and could not be
@@ -437,8 +453,7 @@ static void MpPump() {
                 lastSaidMs = ms;
                 char m[160];
                 snprintf(m, sizeof(m), "[chat] Enter ignored: %s", !g_armed ? "not in a session"
-                         : Chat_IsOpen() ? "the box is already open" : Overlay_Visible() ? "the F1 panel or a prompt is up"
-                         : "the pause menu is up");
+                         : Chat_IsOpen() ? "the box is already open" : "the F1 panel or a prompt is up");
                 logLine(m);
             }
         }
@@ -737,7 +752,10 @@ static void MpPump() {
 // numbers. Positions leave NORMALISED against the game's own viewport, because the viewport and the
 // window are different sizes whenever a resolution scale is set and only the render thread knows the
 // second one.
-static const int kMaxNameplates = 16;            // the lobby cap: one plate per peer is the maximum
+// One plate per peer is the maximum there can ever be, so this IS the lobby cap -- it was
+// left at 16 when the cap went to 32 (1.2.4), which silently gave the 17th player onwards
+// no name and no speech bubble.
+static const int kMaxNameplates = OMP_MAX_PEERS;
 // ---- SPEECH BUBBLES. What each peer last said, keyed by their TRANSPORT INDEX -- the name is a label
 // two people can share and an actor pointer is valid only for the instant it is read, so the peer
 // index is the one identity a store is allowed to hold on to.
@@ -772,6 +790,10 @@ static const char* liveChatBubble(int peerId, uint64_t ms, uint32_t* ageOut) {
 // identical on screen, so each is counted separately rather than left to be guessed at.
 static int  g_npPlated = 0, g_npNoName = 0, g_npOffScreen = 0, g_npVw = 0, g_npVh = 0;
 static bool g_npShow = false;
+// Defined with the other per-frame facts below; declared here because the nameplates are the
+// first thing that needs it.
+static void* liveWorld();
+
 static void publishNameplates() {
     NameplateItem items[kMaxNameplates];
     int  n = 0;
@@ -904,9 +926,27 @@ static void publishNameplates() {
         // progress readout does not drag a nameplate onto the shot with it.
         show = !inReplay && anyPeer && (mode == MPNAME_ALWAYS || (mode == MPNAME_OFFBOARD && !onBoard));
     }
+    // ONE SURFACE AT A TIME. The names are drawn either by the GAME (its own text widget, on this
+    // thread -- ui/game_hud.h) or by the OVERLAY (ImGui, on the render thread). The game-drawn path
+    // is preferred and falls back on its own when the widget class is not reachable, so there is no
+    // build where both draw and none where neither does.
+    //
     // Published every frame, empty list included -- that is what makes the plates go away when the
-    // session does, instead of hanging over a world that has moved on.
-    Nameplates_Publish(items, n, show);
+    // session does, instead of hanging over a world that has moved on. The surface that is NOT in
+    // use is published an empty list for exactly that reason: switching between them mid-session
+    // must not leave the other one's names hanging.
+    const bool gameDrawn = omp::ui::GameHud_Enabled() && omp::ui::GameHud_Available();
+    // The chat rides the same decision and the same frame -- Begin/End bracket BOTH surfaces, because
+    // End is what hides whatever nobody claimed and it cannot tell one caller's widgets from
+    // another's. Told every frame, not on the edge: it is also what stops the ImGui box drawing.
+    Chat_SetGameDrawn(gameDrawn);
+    omp::ui::GameHud_SetLog(&logLine);
+    if (omp::ui::GameHud_Begin(liveWorld())) {
+        if (gameDrawn) omp::ui::GameHud_Names(items, n, show);
+        omp::ui::GameHud_Chat(MenuDisplayed());
+    }
+    omp::ui::GameHud_End();
+    Nameplates_Publish(gameDrawn ? nullptr : items, gameDrawn ? 0 : n, gameDrawn ? false : show);
     g_npPlated = n; g_npShow = show; g_npVw = vw; g_npVh = vh;
 }
 
@@ -1085,15 +1125,24 @@ static void refreshOwnPawn(uint64_t ms) {
     static uint64_t lastTry = 0;
     if (ms - lastTry >= 250) { lastTry = ms; discoverOwnPawn(); }
 }
+// THE WORLD WE ARE IN RIGHT NOW, or null when that cannot be known -- no pawn, no symbol, or the
+// read faulted. Deliberately NOT g_lastWorld, which is the last one SEEN and therefore names a level
+// that may already be gone: anything that is about to reach into a widget or an actor has to ask
+// whether the level is still there, and "the last one I noticed" does not answer that question.
+static void* liveWorld() {
+    if (!g_ownPawn) return nullptr;
+    const game::Syms& S = game::Get();
+    if (!S.GetWorld) return nullptr;
+    __try { return S.GetWorld(g_ownPawn); } __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+}
 // world change -> every actor we spawned died with it; drop the pointers before anything reads them.
 static void noteWorldChange() {
     if (!g_ownPawn) return;
-    const game::Syms& S = game::Get();
-    void* w = nullptr;
-    if (S.GetWorld) { __try { w = S.GetWorld(g_ownPawn); } __except (EXCEPTION_EXECUTE_HANDLER) {} }
+    void* w = liveWorld();
     if (w && g_lastWorld && w != g_lastWorld) {
         session::ForgetProxies(); ghosts::ForgetAll();
         PauseMenu_ForgetPage();     // the old world's menu widget is gone; its address may be reused
+        omp::ui::GameHud_Forget();  // ...and so are every nameplate widget: dropped, never touched
     }
     if (w) g_lastWorld = w;
 }
@@ -1106,6 +1155,19 @@ static void GameThreadFrame() {
     const uint64_t ms = GetTickCount64();
 
     MpPump();                                    // input + transport/lobby state machine; sets g_armed
+    // LEAVING A SESSION TAKES THE NAMES WITH IT. Nothing past the early-out below runs once disarmed,
+    // so without this edge the last frame's plates would hang on the viewport until a map change.
+    // (The world guard inside is about a level going away, not about being called on the wrong frame.)
+    static bool wasArmed = false;
+    if (wasArmed && !g_armed) omp::ui::GameHud_Clear(liveWorld());
+    wasArmed = g_armed;
+    // WHOSE ENTER IS IT. The hook decides inside the window message whether to let the key through,
+    // and the answer is a game-thread fact, so it is published here and read there. It matters now
+    // that the box opens from the pause menu: an Enter that fell through would ALSO confirm whatever
+    // menu row was selected, so the press that opens the chat is swallowed.
+    // ABOVE the early-out on purpose -- published every frame, armed or not. Set only where the
+    // session runs, it would stay true after a session ended and swallow Enter for ever.
+    Chat_SetEnterOurs(g_armed && !Overlay_Visible());
     if (!g_armed) {
         // THE ONE THING THAT RUNS WITHOUT A SESSION: a saved replay's peers (replay_ghosts.h). It
         // needs the own pawn (to spawn from) and the world-change edge, nothing else of the frame.
@@ -1271,6 +1333,11 @@ static void GameThreadFrame() {
             // offScreen = behind the camera or past maxDistCm (both normal).
             snprintf(m, sizeof(m), "[names] show=%d plated=%d noName=%d offScreen=%d viewport=%dx%d",
                      g_npShow ? 1 : 0, g_npPlated, g_npNoName, g_npOffScreen, g_npVw, g_npVh);
+            logLine(m);
+            // ...and WHICH SURFACE drew them. `plated` above counts what the publish produced; this
+            // says whether the game's own widget or the overlay put it on screen, and -- when it is
+            // neither -- which of the two reasons applies.
+            omp::ui::GameHud_Status(m, sizeof(m));
             logLine(m);
             // The pose lane, both ends. `noted` climbing with `applied` flat means the seam is not
             // firing for that mesh; a `skipCnt` means the wire and the mesh disagree on bone count,

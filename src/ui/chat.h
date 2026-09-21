@@ -11,6 +11,27 @@
 // loads into. See LICENSE-EXCEPTION.txt.
 // SessionOpenMP -- the in-game chat box.
 //
+// TWO SURFACES, ONE MODEL. The lines, the compose buffer and the send queue all live here; what draws
+// them is chosen elsewhere:
+//   * the GAME's own text widgets (ui/game_hud.h) -- the default, and what "built into the game" means
+//   * the ImGui window below it -- the fallback and the A/B, switched with the names
+// Everything in this file is surface-agnostic except Chat_Draw, which is the ImGui one.
+//
+// WHY THE EDITING IS OURS AND NOT THE GAME'S EDITABLE TEXT BOX. The game does have one -- two, in
+// fact: PBP_ReplaySaveUI and PBP_EditSkaterName_Widget both carry a real UEditableTextBox with a
+// style, a hint and a font, which is why the old claim in this header that there was "no UI for
+// typing" was wrong. The problem is not the widget, it is FOCUS. A Slate editable text only receives
+// keys while it holds keyboard focus, and during play the viewport owns input (FInputModeGameOnly):
+// focus handed to a widget is taken back on the next tick. Making it stick means putting the player
+// controller into GameAndUI for as long as the box is open, which changes mouse capture and cursor
+// behaviour mid-session for a text field -- a poor trade.
+//
+// So the KEYS come from the window hook, which already swallows every keystroke while the box is open
+// (overlay.cpp's hkWndProc -- it has to, or a WASD typed mid-sentence rolls you down the street), and
+// the LINE is drawn by the game like every other line. The player sees the game's font, the game's
+// text; what they do not see is whose caret it is. The cost is that clipboard, selection and IME are
+// ours to implement rather than Slate's to provide -- paste is done, the rest is not.
+//
 // WHY IT IS NOT A PAUSE-MENU PAGE: a menu page is a list of rows the engine builds when a page
 // activates, and it cannot take free text at all -- the same reason the join-code prompt lives in
 // ImGui (see mp_name.h). Chat also has to be readable and typable WHILE SKATING, which a pause menu
@@ -44,6 +65,7 @@ struct ChatTuning {
     float collapseSec   = 0.22f;    // ...and a faded line gives its height back over this
     float shadowAlpha   = 0.75f;    // the dark rim under closed-box text: the nameplates' outlineAlpha
     int   maxShownIdle  = 6;        // lines drawn when closed
+    int   maxShownOpen  = 12;       // ...and when it is open, where there is no fade to thin them out
 };
 ChatTuning& Chat_Tuning();
 
@@ -67,6 +89,11 @@ bool Chat_HasVisible();
 // the background, and raced the render thread's Enter-to-send close into an immediate reopen.
 void Chat_NoteEnterPressed();           // window-message thread
 bool Chat_TakeEnterPressed();           // game thread; true once per press
+// ...and whether that press is OURS to take. Published by the game thread, read by the hook, which
+// swallows an Enter it knows will open the box: the chat opens from the pause menu now, and a press
+// that fell through to the game would confirm whatever menu row was selected on its way past.
+void Chat_SetEnterOurs(bool ours);
+bool Chat_EnterOurs();
 
 // ---- game thread -------------------------------------------------------------------------------
 // A line to display. `mine` picks the "you" colour; a null/empty name renders as a system line, which
@@ -79,6 +106,50 @@ void Chat_System(const char* text);
 bool Chat_Take(char* out, int cap);
 // How many other players are in the session -- shown in the open box's header. Display only.
 void Chat_SetPresence(int players);
+
+// ---- typing, when the editing is ours (see the header note) ------------------------------------
+// WINDOW-MESSAGE THREAD, from overlay.cpp's hook, and only while the box owns the keyboard. `ch` is
+// one typed character; `vk` is a virtual key for the ones that edit rather than insert (backspace,
+// delete, the arrows, home/end, escape, enter) plus Ctrl+V. Both are no-ops unless the game is
+// drawing the box AND it is open, so the hook does not have to decide anything.
+//
+// `repeat` IS THE KEY'S AUTO-REPEAT BIT, and it is passed rather than filtered because the two kinds
+// of key want opposite things: holding backspace should keep deleting, while the ENTER that opened
+// the box is still physically down and its repeats must not send the empty line and shut it again.
+void Chat_NoteChar(unsigned int ch);
+void Chat_NoteKey(int vk, bool ctrl, bool repeat);
+
+// ---- what the GAME-DRAWN surface reads (ui/game_hud.h). Any thread; the mutex is inside. --------
+struct ChatLineView {
+    char     text[208];     // "name  what they said", already joined -- one widget draws one line
+    uint32_t ageMs;         // ...and 0 whenever the box is open, which is what holds the fade off
+    bool     mine, system;
+};
+// The lines that should be on screen right now, OLDEST FIRST (so the last one drawn sits lowest).
+int  Chat_Lines(ChatLineView* out, int cap);
+// The line being typed, with a caret already in it at the right place; empty when the box is shut.
+// The caret BLINKS, so this changes on its own and the caller must expect a new string without a
+// keystroke behind it.
+int  Chat_Compose(char* out, int cap);
+
+// ---- SCROLLING BACK. There is no cursor while the box is open (the window hook swallows the mouse
+// so a click cannot reach the game), so the history is walked with the WHEEL and with PageUp/PageDown
+// -- both arrive through the same hook as the typing. The offset is in VISUAL LINES from the newest,
+// and it is the SURFACE that knows how many there are, so it clamps and writes the answer back.
+void Chat_Scroll(int lines);        // window-message thread: + is back into the history
+int  Chat_ScrollGet();
+void Chat_ScrollClamp(int maxBack); // the surface's answer: this is as far back as there is to go
+
+// How much has been typed, and how much room is left: the character counter in the open box. The
+// LIMIT is the model's, not the surface's, so both draw the same number.
+int  Chat_TypedLen();
+int  Chat_TypedMax();
+// How many OTHER players are here, for the box's header. What Chat_SetPresence was last told.
+int  Chat_Presence();
+
+// Is the game drawing it? While true Chat_Draw does nothing and Chat_HasVisible is false, so the two
+// surfaces can never both be up. Set once a frame by the caller that decides, exactly like the names.
+void Chat_SetGameDrawn(bool on);
 
 // The chat's own tunables live above; the LOOK (palette + font) is shared with every other surface
 // this mod draws -- see theme.h.

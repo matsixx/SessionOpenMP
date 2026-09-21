@@ -46,19 +46,28 @@ int        g_count = 0;
 std::atomic<bool> g_open{false};
 std::atomic<bool> g_typing{false};
 std::atomic<bool> g_enterPending{false};
+// "an Enter right now would open the box": a game-thread fact the window hook needs in the message.
+std::atomic<bool> g_enterOurs{false};
 std::atomic<int>  g_players{0};
 // The press that OPENS the box is still physically down when the box appears, and ImGui's text field
 // sees it on its very next frame -- which would send an empty line and close again instantly. A send
 // is therefore accepted only once Enter has been observed UP since opening. A fact, not a timer.
 std::atomic<bool> g_sendArmed{false};
 std::atomic<bool> g_justOpened{false};   // set on open (game thread), consumed by the draw
+// Which surface owns the box. Up here with the rest of the state because Chat_HasVisible, which
+// sits above the game-drawn section, is one of the things it gates.
+std::atomic<bool> g_gameDrawn{false};
+// How far back into the history the box is scrolled, in VISUAL lines. Zero -- the bottom -- is
+// restored whenever the box opens or anything is sent, so it is never a surprise on the way in.
+std::atomic<int>  g_scroll{0};
 
 // Typed lines waiting for the game thread. A tiny queue rather than one slot: a fast typist can send
 // twice inside one game tick, and dropping the second is a bug the player would never understand.
 const int kOutMax = 8;
 char       g_out[kOutMax][kTextLen];
 int        g_outN = 0;
-char       g_lastSent[kTextLen] = {};   // render thread only: Up recalls it
+char       g_lastSent[kTextLen] = {};   // whichever surface is up; Up recalls it. Only one of
+                                        // them ever runs, so there is nothing to race with.
 
 // Microseconds from the performance counter. Both threads stamp and age with THIS clock: the tick
 // count's 16 ms grain shows as steps in a 180 ms fade.
@@ -322,10 +331,13 @@ bool Chat_IsOpen()   { return g_open.load(); }
 bool Chat_IsTyping() { return g_open.load() && g_typing.load(); }   // closed box can never be typing
 
 void Chat_SetOpen(bool open) {
+    g_scroll = 0;                       // always at the newest on the way in or out
     if (open && !g_open.load()) { g_sendArmed = false; g_justOpened = true; }   // wait for the opening key to come up
     g_open = open;
 }
 void Chat_NoteEnterPressed() { g_enterPending = true; }
+void Chat_SetEnterOurs(bool ours) { g_enterOurs = ours; }
+bool Chat_EnterOurs() { return g_enterOurs.load() && !g_open.load(); }
 bool Chat_TakeEnterPressed() { return g_enterPending.exchange(false); }
 void Chat_SetPresence(int players) { g_players = players < 0 ? 0 : players; }
 
@@ -343,7 +355,7 @@ bool Chat_Take(char* out, int cap) {
 }
 
 bool Chat_HasVisible() {
-    if (!g_tune.enabled) return false;
+    if (!g_tune.enabled || g_gameDrawn.load()) return false;
     if (g_open.load()) return true;
     const uint64_t t = nowUs();
     const float keep = g_tune.fadeAfterSec + g_tune.fadeOverSec + g_tune.collapseSec;
@@ -353,8 +365,196 @@ bool Chat_HasVisible() {
     return (float)((double)(t - newest.atUs) * 1e-6) <= keep;
 }
 
+// =====================================================================================================
+// THE GAME-DRAWN SURFACE: the compose line, and what the HUD reads.
+//
+// The editing is ours -- see chat.h for why the game's own editable text box cannot hold the keyboard
+// during play. What lives here is a buffer, a caret, and the handful of keys that move them. It is
+// touched by the WINDOW-MESSAGE thread (the keys) and read by the GAME thread (the draw), so it has
+// its own small lock: deliberately NOT g_mx, which a send has to take, and nesting the two would be
+// a deadlock waiting for somebody to reorder a line.
+// =====================================================================================================
+namespace {
+
+std::mutex g_cmx;
+char       g_compose[kTextLen] = {};
+int        g_caret = 0;
+
+// Printable ASCII only. Every name and message in this mod travels the wire as plain bytes and is
+// drawn through an FText built from ASCII, so a character that cannot survive that round trip is
+// better refused at the keyboard than turned into a question mark on somebody else's screen.
+bool typable(unsigned int ch) { return ch >= 32 && ch < 127; }
+// How far a wheel notch or a page key moves the history.
+const int kScrollStep = 3;      // a page key; the wheel uses the same
+
+void insertChar(char c) {
+    const int len = (int)strlen(g_compose);
+    if (len >= kTextLen - 1) return;
+    if (g_caret < 0) g_caret = 0;
+    if (g_caret > len) g_caret = len;
+    memmove(g_compose + g_caret + 1, g_compose + g_caret, (size_t)(len - g_caret) + 1);
+    g_compose[g_caret++] = c;
+}
+void eraseAt(int at) {
+    const int len = (int)strlen(g_compose);
+    if (at < 0 || at >= len) return;
+    memmove(g_compose + at, g_compose + at + 1, (size_t)(len - at));
+}
+// Ctrl+V. On the window-message thread, which is the one allowed to open the clipboard.
+void pasteClipboard() {
+    if (!OpenClipboard(nullptr)) return;
+    if (HANDLE h = GetClipboardData(CF_UNICODETEXT)) {
+        if (const wchar_t* w = (const wchar_t*)GlobalLock(h)) {
+            // A pasted NEWLINE ends the paste rather than sending it: somebody pasting two lines
+            // meant to say the first one, and a chat box that fires on its own is a way to say
+            // something you did not mean to.
+            for (int i = 0; w[i] && w[i] != 13 && w[i] != 10; i++)
+                if (typable((unsigned int)w[i])) insertChar((char)w[i]);
+            GlobalUnlock(h);
+        }
+    }
+    CloseClipboard();
+}
+
+} // namespace
+
+void Chat_SetGameDrawn(bool on) { g_gameDrawn = on; }
+int  Chat_TypedMax() { return kTextLen - 1; }
+void Chat_Scroll(int lines) {
+    if (!g_gameDrawn.load() || !g_open.load() || !lines) return;
+    int v = g_scroll.load() + lines;
+    if (v < 0) v = 0;
+    g_scroll = v;                       // the surface clamps the far end; it is the one that counts
+}
+int  Chat_ScrollGet() { return g_open.load() ? g_scroll.load() : 0; }
+void Chat_ScrollClamp(int maxBack) {
+    if (maxBack < 0) maxBack = 0;
+    if (g_scroll.load() > maxBack) g_scroll = maxBack;
+}
+int  Chat_Presence() { return g_players.load(); }
+int  Chat_TypedLen() {
+    if (!g_open.load()) return 0;
+    std::lock_guard<std::mutex> lk(g_cmx);
+    return (int)strlen(g_compose);
+}
+
+void Chat_NoteChar(unsigned int ch) {
+    if (!g_gameDrawn.load() || !g_open.load() || !typable(ch)) return;
+    std::lock_guard<std::mutex> lk(g_cmx);
+    insertChar((char)ch);
+    g_typing = g_compose[0] != 0;
+}
+
+void Chat_NoteKey(int vk, bool ctrl, bool repeat) {
+    if (!g_gameDrawn.load() || !g_open.load()) return;
+    bool send = false;
+    char outLine[kTextLen] = {};
+    {
+        std::lock_guard<std::mutex> lk(g_cmx);
+        const int len = (int)strlen(g_compose);
+        if (g_caret > len) g_caret = len;
+        if (ctrl && (vk == 'V' || vk == 'v')) {
+            pasteClipboard();
+        } else switch (vk) {
+        case VK_BACK:   if (g_caret > 0) { eraseAt(g_caret - 1); g_caret--; } break;
+        case VK_DELETE: eraseAt(g_caret); break;
+        case VK_LEFT:   if (g_caret > 0) g_caret--; break;
+        case VK_RIGHT:  if (g_caret < len) g_caret++; break;
+        case VK_HOME:   g_caret = 0; break;
+        case VK_END:    g_caret = len; break;
+        case VK_PRIOR:  g_scroll = g_scroll.load() + kScrollStep; break;   // PageUp: back
+        case VK_NEXT: { int v = g_scroll.load() - kScrollStep; g_scroll = v < 0 ? 0 : v; } break;
+        case VK_UP:     // the last thing you said, for fixing a typo or saying it again
+            strncpy_s(g_compose, g_lastSent, _TRUNCATE);
+            g_caret = (int)strlen(g_compose);
+            break;
+        case VK_ESCAPE:
+            g_compose[0] = 0; g_caret = 0;
+            g_typing = false; g_open = false;
+            break;
+        case VK_RETURN:
+            // THE ENTER THAT OPENED THE BOX IS STILL DOWN. Its auto-repeats arrive here and must not
+            // send the empty line and shut the box again -- which is the whole reason `repeat` is
+            // passed in rather than filtered at the hook (backspace wants the opposite).
+            if (repeat) break;
+            {   // Trim: a line of spaces is not a message, and a trailing space is invisible noise
+                // on everyone else's screen.
+                char* p = g_compose; while (*p == ' ') p++;
+                int n = (int)strlen(p); while (n > 0 && p[n - 1] == ' ') p[--n] = 0;
+                if (n > 0) { strncpy_s(outLine, p, _TRUNCATE); send = true; }
+            }
+            g_compose[0] = 0; g_caret = 0; g_scroll = 0;
+            g_typing = false; g_open = false;       // Enter sends AND closes, like every game chat
+            break;
+        default: break;
+        }
+        if (vk != VK_RETURN && vk != VK_ESCAPE) g_typing = g_compose[0] != 0;
+    }
+    // The send queue is g_mx's, and it is taken HERE -- outside g_cmx, which is the whole point of
+    // there being two locks.
+    if (send) {
+        strncpy_s(g_lastSent, outLine, _TRUNCATE);
+        std::lock_guard<std::mutex> lk(g_mx);
+        if (g_outN < kOutMax) { strncpy_s(g_out[g_outN], outLine, _TRUNCATE); g_outN++; }
+    }
+}
+
+int Chat_Compose(char* out, int cap) {
+    if (!out || cap <= 0) return 0;
+    out[0] = 0;
+    if (!g_open.load()) return 0;
+    // The caret is a CHARACTER inserted at its own index, not a drawn bar: one text widget draws one
+    // string and nothing here knows how wide a glyph came out. It blinks on a ~1 s cycle, so an empty
+    // box still reads as "waiting for you" rather than as something that failed to open.
+    const bool on = ((nowUs() / 530000ull) & 1ull) == 0ull;
+    std::lock_guard<std::mutex> lk(g_cmx);
+    const int len = (int)strlen(g_compose);
+    const int at = g_caret < 0 ? 0 : (g_caret > len ? len : g_caret);
+    int k = 0;
+    for (int i = 0; i <= len && k < cap - 1; i++) {
+        if (i == at && on) out[k++] = '|';
+        if (i < len && k < cap - 1) out[k++] = g_compose[i];
+    }
+    out[k] = 0;
+    return k;
+}
+
+int Chat_Lines(ChatLineView* out, int cap) {
+    if (!out || cap <= 0) return 0;
+    const bool open = g_open.load();
+    const uint64_t t = nowUs();
+    // Closed, a line is kept until it has faded AND given its height back -- the same life the ImGui
+    // surface gives it, so switching between the two does not change how long anything stays up.
+    const float keep = g_tune.fadeAfterSec + g_tune.fadeOverSec + g_tune.collapseSec;
+
+    std::lock_guard<std::mutex> lk(g_mx);
+    const int first = (g_head - g_count + kMaxLines) % kMaxLines;
+    // START NEAR THE END. This walked from the OLDEST message and stopped once it had `cap` of them,
+    // so with more than `cap` in the ring the newest were never even looked at: open the box after a
+    // busy minute and it showed a conversation from earlier and nothing you had just said. The trim
+    // that used to follow could not save it -- by then the newest were not in the array to trim to.
+    // Everything alive is handed over now; the WINDOW is the surface's business, because the surface
+    // is what knows how many lines these wrap into and how far back it has been scrolled.
+    int k0 = g_count - cap; if (k0 < 0) k0 = 0;
+    int n = 0;
+    for (int k = k0; k < g_count && n < cap; k++) {
+        const Line& l = g_lines[(first + k) % kMaxLines];
+        const float age = (float)((double)(t - l.atUs) * 1e-6);
+        if (!open && age > keep) continue;
+        ChatLineView v{};
+        if (l.system || !l.name[0]) snprintf(v.text, sizeof(v.text), "%s", l.text);
+        else                        snprintf(v.text, sizeof(v.text), "%s  %s", l.name, l.text);
+        // OPEN MEANS NO FADE. Reported as age zero rather than with a second flag, so the caller has
+        // one rule for alpha and the two states cannot get out of step.
+        v.ageMs = open ? 0u : (uint32_t)(age * 1000.0f);
+        v.mine = l.mine; v.system = l.system;
+        out[n++] = v;
+    }
+    return n;
+}
+
 void Chat_Draw() {
-    if (!g_tune.enabled) return;
+    if (!g_tune.enabled || g_gameDrawn.load()) return;
     const bool open = g_open.load();
     const uint64_t t = nowUs();
 

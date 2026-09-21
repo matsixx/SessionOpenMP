@@ -11,6 +11,7 @@
 // loads into. See LICENSE-EXCEPTION.txt.
 // SessionOpenMP -- floating player names. Contract and thread rule: nameplates.h.
 #include "nameplates.h"
+#include "../omp_peers.h"
 #include "theme.h"
 #include "imgui.h"
 #include <windows.h>
@@ -22,7 +23,9 @@ namespace {
 
 NameplateTuning g_tune;
 
-const int kMaxPlates = 16;          // the lobby cap; a plate per peer is the most there can ever be
+// The lobby cap; a plate per peer is the most there can ever be. It has to be the SAME number
+// the publisher builds its list with, or the clamp below quietly drops the last peers.
+const int kMaxPlates = OMP_MAX_PEERS;
 
 std::mutex    g_mx;
 NameplateItem g_items[kMaxPlates];

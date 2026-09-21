@@ -304,6 +304,9 @@ if(EXISTS "${UE4SS_LIB}")
             src/ui/chat.cpp
             # Floating player names. ImGui like the chat, and drawn from the same Present hook.
             src/ui/nameplates.cpp
+            # ...and the same names drawn by the GAME instead, in its own text widget. No ImGui at
+            # all -- it is here only because it shares the nameplate tuning next door.
+            src/ui/game_hud.cpp
             src/game/game_font.cpp
             ${IMGUI_SRC}/imgui.cpp
             ${IMGUI_SRC}/imgui_draw.cpp

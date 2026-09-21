@@ -293,6 +293,14 @@ using WidgetSetVisFn    = void  (*)(void* widget, unsigned char slateVisibility)
 // than margins from the parent's edges.
 using SlotAnchorsFn     = void  (*)(void* canvasSlot, const float* anchorsMinXYMaxXY);
 using WidgetSetEnabledFn = void (*)(void* widget, bool enabled);
+using ViewportScaleFn   = float (*)(void* worldContext);   // UWidgetLayoutLibrary::GetViewportScale
+// UBackgroundBlur::SetBlurStrength / ::SetBlurRadius. These PUSH to the live Slate widget; a
+// direct write to the property does not, and there is no synchronise to call afterwards.
+// UUserWidget::AddToPlayerScreen(int32) -- the PLAYER layer, which SGameLayerManager slots above
+// everything AddToViewport put down. Returns false if the widget has no owning local player.
+using WidgetAddPlayerFn = bool  (*)(void* userWidget, int zOrder);
+using BlurStrengthFn    = void  (*)(void* backgroundBlur, float strength);
+using BlurRadiusFn      = void  (*)(void* backgroundBlur, int radius);
 // Peer body trim (peer_bodies.cpp): the body-level knobs behind a proxy's physical animation.
 // FBodyInstance::SetInstanceSimulatePhysics takes three bools in 4.26 and two in 4.25; passing three
 // is safe either way, since a Microsoft x64 caller that hands over an argument the callee does not
@@ -541,6 +549,11 @@ struct Syms {
     WidgetRemoveFn       TextSyncProps      = nullptr;   // UTextBlock::SynchronizeProperties
     WidgetSetVisFn       ScaleBoxSetStretch = nullptr;   // UScaleBox::SetStretch(EStretch)
     WidgetVec2NoFlagFn   SlotSetPosition    = nullptr;   // UCanvasPanelSlot::SetPosition
+    // The DPI scale. Pixels / this = SLATE units, the space widgets are placed and fonts sized in.
+    ViewportScaleFn      ViewportScale      = nullptr;   // UWidgetLayoutLibrary::GetViewportScale
+    WidgetAddPlayerFn    WidgetAddToPlayer  = nullptr;   // the chat, over the pause menu
+    BlurStrengthFn       BlurSetStrength    = nullptr;   // the chat panel's frost
+    BlurRadiusFn         BlurSetRadius      = nullptr;
     WidgetSetEnabledFn   WidgetSetEnabled = nullptr;    // grey a menu row out (UWidget::SetIsEnabled)
     // Peer body trim (peer_bodies.h): cutting a proxy's physical animation down to what can be seen.
     // All optional -- without them a peer simply keeps the whole simulated asset, as before.
@@ -1073,6 +1086,14 @@ namespace off {
                                                  // keep the blueprint's own alpha when tinting
     constexpr int kSScrollDesired     = 0x340;   // SScrollBox::DesiredScrollOffset (float)
     constexpr int kUserWidgetTree     = 0x1d8;   // UUserWidget::WidgetTree (PDB)
+    constexpr int kWidgetTreeRoot     = 0x28;    // UWidgetTree::RootWidget (PDB)
+    // Walking a tree: a panel's children hang off its slots, and a slot holds one widget.
+    constexpr int kPanelSlots         = 0x108;   // UPanelWidget::Slots (TArray; Num at +8)
+    constexpr int kSlotContent        = 0x30;    // UPanelSlot::Content (UWidget*)
+    constexpr int kBlurApplyAlpha     = 0x132;   // UBackgroundBlur::bApplyAlphaToBlur
+    constexpr int kBlurStrength       = 0x134;   // ::BlurStrength (float; the radius follows it)
+    constexpr int kBlurAutoRadius     = 0x138;   // ::bOverrideAutoRadiusCalculation
+    constexpr int kBlurRadius         = 0x13c;   // ::BlurRadius (int32, used when overridden)
     constexpr int kWidgetSlot         = 0x28;    // UWidget::Slot (PDB)
     constexpr int kSlotParent         = 0x28;    // UPanelSlot::Parent -- the widget that CONTAINS it
     // UTextLayoutWidget, the PARENT of UTextBlock -- which is why neither is on UTextBlock itself.
@@ -1081,6 +1102,23 @@ namespace off {
     // widget's own width. There is no compiled setter for it, so it is written directly.
     constexpr int kTextWrapAt         = 0x110;   // UTextLayoutWidget::WrapTextAt (float)
     constexpr int kTextAutoWrap       = 0x10d;   // UTextLayoutWidget::AutoWrapText (bool)
+    constexpr int kTextJustify        = 0x10b;   // ::Justification (ETextJustify: 0 Left, 1 Center, 2 Right)
+    // ...and UTextBlock's own look (PDB). All written directly and pushed into the live STextBlock
+    // with SynchronizeProperties -- the same rule as WrapTextAt above, for the same reason: the Slate
+    // widget was built when the UMG one was and keeps its own copy of every one of these.
+    constexpr int kTextColor          = 0x150;   // UTextBlock::ColorAndOpacity (FSlateColor)
+    constexpr int kSlateColorValue    = 0x00;    //   FSlateColor::SpecifiedColor (FLinearColor, RGBA)
+    constexpr int kSlateColorRule     = 0x10;    //   ::ColorUseRule (0 = UseColor_Specified)
+    constexpr int kTextFont           = 0x188;   // ::Font (FSlateFontInfo)
+    constexpr int kFontOutline        = 0x10;    //   FSlateFontInfo::OutlineSettings
+    constexpr int kFontOutlineSize    = 0x00;    //     FFontOutlineSettings::OutlineSize (int32)
+    constexpr int kFontOutlineColor   = 0x10;    //     ::OutlineColor (FLinearColor)
+    constexpr int kFontObject         = 0x00;    //   ::FontObject (UFont*) -- the typeface itself
+    constexpr int kFontTypeface       = 0x40;    //   ::TypefaceFontName (FName; the face inside it)
+    constexpr int kFontSize           = 0x48;    //   ::Size (int32)
+    constexpr int kFontLetterSpacing  = 0x4c;    //   ::LetterSpacing (int32, thousandths of an em)
+    constexpr int kTextShadowOffset   = 0x268;   // UTextBlock::ShadowOffset (FVector2D)
+    constexpr int kTextShadowColor    = 0x270;   // ::ShadowColorAndOpacity (FLinearColor)
     constexpr int kPauseInitLen       = 0x32a;
     // ---- COSMETICS. A skater's look is NOT on the skater: ASkaterCharacterBase::RefreshVisuals reads
     // it off the GAME INSTANCE, so there is one cosmetic identity per PROCESS and dressing a proxy

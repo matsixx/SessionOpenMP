@@ -11,10 +11,17 @@
 // loads into. See LICENSE-EXCEPTION.txt.
 // SessionOpenMP -- each player's multiplayer name, floating above their head.
 //
-// WHY IMGUI AND NOT A WORLD WIDGET: a UMG billboard needs a widget blueprint and a font asset we do
-// not have (the same wall the join-code prompt and the name box hit), and a UTextRenderComponent needs
-// a material. Drawing from the Present hook needs no engine cooperation at all -- and the mod already
-// owns that surface.
+// THIS IS THE FALLBACK SURFACE NOW. Names are drawn by the GAME's own text widget (ui/game_hud.h);
+// what is here is the ImGui path, kept as the A/B and as the way back if the widget is ever
+// unreachable. One of the two draws, never both -- the publisher hands the other an empty list.
+//
+// The old note here said a UMG billboard "needs a widget blueprint and a font asset we do not have".
+// That was wrong: PBP_TrickDisplayTextWidget is one text block in the menu font, authored, and the
+// game loads it for its own trick readout. It is worth knowing how long that claim went unchallenged.
+//
+// WHY THIS SURFACE IS STILL SCREEN-SPACE: a plate wants a constant readable size, always facing you
+// and always on top, which is what screen space gives for free and what a world billboard has to be
+// argued out of. The projection is computed on the game thread either way.
 //
 // ONLY PEERS EVER GET A PLATE. There is no "hide my own" filter to get wrong: the list is built from
 // the peer roster, and the local player is not in it.

@@ -42,9 +42,10 @@ struct Release { const char* version; const char* notes; };
 // short enough that trimming never has to happen: budget ~300 characters a release, three releases.
 static const Release kReleases[] = {
     { "1.2.4",
-      "- Lobbies of 32 players, up from 16.\n"
-      "- The Update row appears without restarting the game.\n"
-      "- One number sizes every per-player table, checked at build time." },
+      "- Names and chat are drawn with the game's own UI now.\n"
+      "- The chat box has a frosted panel, a header and a character counter.\n"
+      "- Scroll it back with the wheel; chat from the pause menu too.\n"
+      "- Lobbies of 32 players, up from 16." },
     { "1.2.3",
       "- The object dropper syncs 1024 objects, not 256.\n"
       "- ...and stops re-sending the whole list every 6 seconds.\n"

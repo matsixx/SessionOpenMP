@@ -351,6 +351,21 @@ static const SigEntry kSigs[] = {
     { "TextSyncProperties",    "48 8B C4 55 53 57 41 55 48 8D A8 58 FE FF FF 48 81 EC 88 02 00 00 48 89 70 18 48 8B D9 4C 89 60 D8", false },
     { "ScaleBoxSetStretch",    "88 91 20 01 00 00 48 8B 89 30 01 00 00 48 85 C9 0F 85 ?? ?? ?? ?? C3 CC", false },
     { "SlotSetPosition",       "48 83 EC 58 48 8B 41 68 48 89 54 24 60 F3 0F 10 44 24 60 F3 0F 10 4C 24 64 F3 0F 11 41 38 F3 0F 11 49 3C", false },
+    // float UWidgetLayoutLibrary::GetViewportScale(UObject*) -- the DPI scale, returned in xmm0.
+    // Pixels divided by it are SLATE units, which is the space a widget is positioned and a font
+    // is sized in. SessionTweaks' prompt bar has relied on this same signature since it shipped.
+    // UBackgroundBlur::SetBlurStrength(float) / ::SetBlurRadius(int32). WRITING THE PROPERTY IS
+    // NOT ENOUGH: both of these store the value and then push it into the live SBackgroundBlur
+    // through MyBackgroundBlur (+0x1c8), and there is no SynchronizeProperties to do it later
+    // the way a text block has. A blur realised at strength 0 stays at 0 for ever otherwise.
+    // bool UUserWidget::AddToPlayerScreen(int32 ZOrder). NOT the same layer as AddToViewport:
+    // SGameLayerManager slots the per-player canvas AFTER the viewport overlay, so a widget added
+    // this way draws ABOVE everything AddToViewport put down, whatever its z-order. That is what
+    // the chat needs to sit over the game's own pause menu.
+    { "WidgetAddToPlayer",     "48 89 5C 24 10 57 48 83 EC 70 48 8B 01 8B FA 48 8B D9 FF 90 ?? ?? ?? ??", false },
+    { "BlurSetStrength",       "48 83 EC 48 F3 0F 11 89 34 01 00 00 48 8B 89 C8 01 00 00 48 85 C9", false },
+    { "BlurSetRadius",         "48 83 EC 58 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 44 24 40 89 91 3C 01 00 00", false },
+    { "ViewportScale",         "40 53 48 83 EC 30 8B 15 ?? ?? ?? ?? 48 8B D9 65 48 8B 04 25 58 00 00 00 B9 08 01 00 00 48 8B 04 D0 8B 04 01 39 05 ?? ?? ?? ?? 0F 8F ?? ?? ?? ??", false },
     // UWidget::SetIsEnabled                                              Epic 0x27b7a20 / Steam 0x2779db0
     // Greys a menu row and refuses its input -- how "Teleport to them" says no when there is nowhere
     // to go. Optional: without it the row still declines in its status text.
@@ -1191,6 +1206,10 @@ const Syms& Resolve(void (*logf)(const char*)) {
     g_syms.TextSyncProps      = (WidgetRemoveFn)   take("TextSyncProperties");
     g_syms.ScaleBoxSetStretch = (WidgetSetVisFn)   take("ScaleBoxSetStretch");
     g_syms.SlotSetPosition    = (WidgetVec2NoFlagFn)take("SlotSetPosition");
+    g_syms.WidgetAddToPlayer  = (WidgetAddPlayerFn)take("WidgetAddToPlayer");
+    g_syms.BlurSetStrength    = (BlurStrengthFn)   take("BlurSetStrength");
+    g_syms.BlurSetRadius      = (BlurRadiusFn)     take("BlurSetRadius");
+    g_syms.ViewportScale      = (ViewportScaleFn)  take("ViewportScale");
     g_syms.WidgetSetEnabled   = (WidgetSetEnabledFn) take("WidgetSetEnabled");
     g_syms.BodySetSimulate    = (BodySetSimulateFn)  take("BodySetSimulate");
     g_syms.BodySetResponse    = (BodySetResponseFn)  take("BodySetResponse");
