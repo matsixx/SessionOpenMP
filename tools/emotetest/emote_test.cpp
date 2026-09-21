@@ -230,7 +230,7 @@ static const char* Fmt(const char* f, ...) { static char b[256]; va_list a; va_s
 // Play emote `id` at time t, fully blended in, on a fresh standing body carrying the board in `hand`
 // (-1: not carried) with `grip`. Which hand has it is left for the emote to work out, as in the game.
 static int g_grip = GRIP_HANG;
-static float g_testSwingAt = 1.30f, g_testPeak = 1.0f;      // when a played Rage's trigger was pulled (emote time; < 0 = not yet), how far
+static float g_testSwingAt = 1.30f, g_testRate = 20.0f;     // when a played Rage's trigger was pulled (emote time; < 0 = not yet), how fast
 // Point the camera: `yaw` to the body's RIGHT of straight ahead and `pitch` up, both radians, in the body's terms
 // -- handed over in the WORLD's, as the game's camera is (the mesh component may sit turned in it).
 static void Look(float yaw, float pitch) {
@@ -269,7 +269,7 @@ static void Play(int id, float t, int hand) {
     g_id = id; g_t = t; g_w = 1.0f; g_carry = -2; g_lowerW = 1.0f; g_seated = false; g_ptSet = false;
     g_boardInHand = g_stubInHand = hand >= 0; g_thrown = false; g_throwDirSet = false; g_boardPosed = false;
     g_rageAimSet = false; g_rageLastT = 0.0f;
-    g_rageSwingAt = g_testSwingAt; g_ragePeak = g_testPeak;
+    g_rageSwingAt = g_testSwingAt; g_rageRate = g_testRate;
     g_mesh = mesh;
     Apply(mesh);
 }
@@ -810,16 +810,15 @@ int main(int argc, char** argv) {
             Check(dot(sub(g_Ct[g_neck].p, g_Ct[g_pelvis].p), kF) < hunch - 1.5f, "throw board: ...and over it by the time it ends");
         }
         // THE TRIGGER. Held when the Rage begins (through the wheel), it is not listened to until let go; a pull
-        // before the wind-up is done throws as soon as it is; the STRENGTH is the most it reached before the board
-        // left the hand, and nothing after.
+        // before the wind-up is done throws as soon as it is; the STRENGTH is HOW FAST it was pulled, not how far.
         {
-            auto fresh = [](float trigNow) { g_trigger = trigNow; g_rageSwingAt = -1.0f; g_ragePeak = 0.0f; g_pulling = false; g_trigArmed = g_trigger < kTrigOff; };
+            auto fresh = [](float trigNow) { g_trigger = trigNow; g_rageSwingAt = -1.0f; g_rageRate = 0.0f; g_pulling = false; g_trigArmed = g_trigger < kTrigOff; };
             auto hold = [](float from, float to, float v) { for (float t = from; t < to; t += 0.008f) { g_trigger = v; RageTrigger(t); } };
             fresh(1.0f);
             hold(0.0f, 2.0f, 1.0f);
             Check(g_rageSwingAt < 0.0f, "trigger: one held while the wheel was up does not throw");
             hold(2.0f, 2.02f, 0.0f); hold(2.02f, 2.30f, 0.6f);
-            Check(g_rageSwingAt > 2.02f && g_rageSwingAt < 2.13f && fabsf(g_ragePeak - 0.6f) < 0.01f, "trigger: ...let go and pulled again, it does -- once the pull has stopped", Fmt("(at %.3f, %.2f)", g_rageSwingAt, g_ragePeak));
+            Check(g_rageSwingAt > 2.02f && g_rageSwingAt < 2.13f, "trigger: ...let go and pulled again, it does -- once the pull has stopped", Fmt("(at %.3f)", g_rageSwingAt));
             fresh(0.0f);
             hold(0.0f, 0.30f, 0.9f);
             Check(g_rageSwingAt < 0.0f, "trigger: pulled before the wind-up is done, it waits for it");
@@ -828,42 +827,48 @@ int main(int argc, char** argv) {
             // A QUICK FULL PULL goes at once, at full strength
             fresh(0.0f);
             { float t = 1.0f; for (int k = 0; k < 40 && g_rageSwingAt < 0.0f; k++, t += 0.008f) { g_trigger = k < 6 ? 0.18f * (float)k : 1.0f; RageTrigger(t); }
-              Check(g_rageSwingAt > 0.0f && g_rageSwingAt < 1.07f && g_ragePeak > 0.96f, "trigger: a quick full pull goes at once, and hard", Fmt("(%.3f s, %.2f)", g_rageSwingAt - 1.0f, g_ragePeak)); }
-            // A SQUEEZE TO PART WAY, AND HELD: known a moment after it stops, and that is how hard -- pulling on
-            // further after the board has gone changes nothing
+              Check(g_rageSwingAt > 0.0f && g_rageSwingAt < 1.07f && RageStrength(g_rageRate) > 0.99f, "trigger: a quick full pull goes at once, and hard", Fmt("(%.3f s, %.1f /s)", g_rageSwingAt - 1.0f, g_rageRate)); }
+            // THE POINT OF MEASURING THE SPEED: a FLICK TO HALFWAY is a hard throw and a SLOW SQUEEZE ALL THE WAY
+            // is a gentle one -- both the other way round from what measuring the depth gave.
+            fresh(0.0f);
+            { float t = 1.0f; for (int k = 0; k < 80 && g_rageSwingAt < 0.0f; k++, t += 0.008f) { g_trigger = k < 4 ? 0.13f * (float)k : 0.5f; RageTrigger(t); } }
+            const float flick = g_rageRate;
+            Check(RageStrength(flick) > 0.8f, "trigger: a FLICK to halfway is a hard throw", Fmt("(%.1f /s -> %.0f%%)", flick, 100.0f * RageStrength(flick)));
+            fresh(0.0f);
+            { float tt = 1.0f; for (; tt < 4.0f && g_rageSwingAt < 0.0f; tt += 0.008f) { g_trigger = clampf((tt - 1.0f) / 1.2f, 0.0f, 1.0f); RageTrigger(tt); } }
+            Check(RageStrength(g_rageRate) < 0.2f, "trigger: ...and a SLOW squeeze to the end is a gentle one", Fmt("(%.1f /s -> %.0f%%)", g_rageRate, 100.0f * RageStrength(g_rageRate)));
+            Check(flick > g_rageRate * 2.0f, "trigger: ...the flick is the harder of the two, by a long way", Fmt("(%.1f /s vs %.1f /s)", flick, g_rageRate));
+            // A SQUEEZE PART WAY AND HELD: known a moment after it stops, and a pull that carries on after the
+            // board has gone can only ever make it HARDER, never softer
             fresh(0.0f);
             float t = 1.0f;
             for (int k = 0; k <= 11; k++, t += 0.008f) { g_trigger = 0.05f * (float)k; RageTrigger(t); }       // ...stops at 0.55
             Check(g_rageSwingAt < 0.0f, "trigger: it does not go while the pull is still going further");
             for (; g_rageSwingAt < 0.0f && t < 2.0f; t += 0.008f) RageTrigger(t);
-            const float at = g_rageSwingAt;
+            const float at = g_rageSwingAt, wasRate = g_rageRate;
             Check(at > 1.0f && at < 1.0f + 12 * 0.008f + kTrigSettle + 0.02f, "trigger: ...and goes a moment after it stops", Fmt("(%.3f)", at));
             for (; t < at + kRageLetGo; t += 0.008f) RageTrigger(t);
-            g_trigger = 1.0f; RageTrigger(at + kRageLetGo + 0.01f);                                              // ...pulled harder AFTER it has gone
-            Check(fabsf(g_ragePeak - 0.55f) < 0.01f, "trigger: how hard is how far it was pulled", Fmt("(%.2f)", g_ragePeak));
-            // A SLOW SQUEEZE ALL THE WAY is a full throw: not whatever it had reached early on
-            fresh(0.0f);
-            { float tt = 1.0f; for (; tt < 3.0f && g_rageSwingAt < 0.0f; tt += 0.008f) { g_trigger = clampf((tt - 1.0f) / 0.6f, 0.0f, 1.0f); RageTrigger(tt); }
-              Check(g_ragePeak > 0.96f && g_rageSwingAt > 1.5f, "trigger: a slow squeeze all the way is a FULL throw", Fmt("(%.2f, at %.2f)", g_ragePeak, g_rageSwingAt)); }
-            // a blip -- touched and let go before it settled -- goes with what it reached
+            g_trigger = 1.0f; RageTrigger(at + kRageLetGo + 0.01f);                                              // ...pulled on AFTER it has gone
+            Check(g_rageRate >= wasRate - 0.01f, "trigger: a pull after the board has gone cannot soften the throw", Fmt("(%.1f -> %.1f /s)", wasRate, g_rageRate));
+            // a blip -- touched and let go before it settled -- goes with how fast it got there
             fresh(0.0f);
             hold(1.0f, 1.03f, 0.30f); hold(1.03f, 1.10f, 0.0f);
-            Check(g_rageSwingAt > 1.0f && fabsf(g_ragePeak - 0.30f) < 0.01f, "trigger: a blip goes with what it reached");
+            Check(g_rageSwingAt > 1.0f && g_rageRate > 0.0f, "trigger: a blip goes with how fast it got there", Fmt("(%.1f /s)", g_rageRate));
             // THE ENGINE'S VALUE IS THE ONE THAT COUNTS: with it to be had, the press (a "full pull") is not listened to
             g_stubRT = 0.35f; PollTrigger(); Emote_Trigger(1.0f);
             Check(g_trigPolled && fabsf(g_trigger - 0.35f) < 1e-4f, "trigger: the analogue value is what counts, not the press");
             g_stubRT = -1.0f; PollTrigger(); Emote_Trigger(1.0f);
             Check(!g_trigPolled && g_trigger > 0.99f, "trigger: ...and with none to be had, the press is a full pull");
-            Check(RageSpeed(kTrigOn) > 350.0f && RageSpeed(kTrigOn) < 500.0f && RageSpeed(1.0f) > 1400.0f && RageSpeed(1.0f) < 1700.0f, "trigger: a touch is a toss, a full pull a hurl", Fmt("(%.0f .. %.0f cm/s)", RageSpeed(kTrigOn), RageSpeed(1.0f)));
+            Check(RageSpeed(kRateSoft) > 350.0f && RageSpeed(kRateSoft) < 500.0f && RageSpeed(kRateHard) > 1400.0f && RageSpeed(kRateHard) < 1700.0f, "trigger: a slow pull is a toss, a snap a hurl", Fmt("(%.0f .. %.0f cm/s)", RageSpeed(kRateSoft), RageSpeed(kRateHard)));
             float prev = 0.0f; bool rising = true;
-            for (float v = kTrigOn; v <= 1.0f; v += 0.04f) { if (RageSpeed(v) <= prev) rising = false; prev = RageSpeed(v); }
-            Check(rising, "trigger: ...and every bit further is a bit harder");
+            for (float v = kRateSoft; v <= kRateHard; v += 0.3f) { if (RageSpeed(v) <= prev) rising = false; prev = RageSpeed(v); }
+            Check(rising, "trigger: ...and every bit faster is a bit harder");
             g_trigger = 0.0f;
             // a harder throw is a bigger one in the body, too
-            g_testPeak = 1.0f;  Play(EM_RAGE, kRageSwing + 0.16f, 1); const float leanHard = dot(sub(g_Ct[g_neck].p, g_Ct[g_pelvis].p), kF);
-            g_testPeak = 0.15f; Play(EM_RAGE, kRageSwing + 0.16f, 1); const float leanSoft = dot(sub(g_Ct[g_neck].p, g_Ct[g_pelvis].p), kF);
+            g_testRate = 20.0f; Play(EM_RAGE, kRageSwing + 0.16f, 1); const float leanHard = dot(sub(g_Ct[g_neck].p, g_Ct[g_pelvis].p), kF);
+            g_testRate = 1.0f;  Play(EM_RAGE, kRageSwing + 0.16f, 1); const float leanSoft = dot(sub(g_Ct[g_neck].p, g_Ct[g_pelvis].p), kF);
             Check(leanHard > leanSoft + 1.0f, "trigger: the body goes into a hard throw more than a soft one", Fmt("(%.1f vs %.1f cm)", leanHard, leanSoft));
-            g_testPeak = 1.0f;
+            g_testRate = 20.0f;
         }
         for (int hand = 0; hand <= 1; hand++) {
             Look(0.0f, 0.0f);
@@ -873,7 +878,9 @@ int main(int argc, char** argv) {
             Check(BoardSlip(hand) < 0.05f, "rage: the board goes up with the hand");
             Play(EM_RAGE, tThrough, hand);
             Check(dot(sub(g_Ct[g_hand[hand]].p, g_Ct[g_uarm[hand]].p), kF) > 25.0f, "rage: thrown THROUGH, out in front");
-            Check(g_throwDirSet && throwW().y > 0.8f && throwW().z > 0.1f, "rage: looking ahead, the world is told it goes ahead and up", Fmt("(%.2f %.2f %.2f)", throwW().x, throwW().y, throwW().z));
+            // LOOKING LEVEL THROWS LEVEL. It used to be told to go ahead AND UP, because the aim carried a
+            // fixed +0.42 lob: level was unreachable, and so was everything below it.
+            Check(g_throwDirSet && throwW().y > 0.95f && fabsf(throwW().z) < 0.12f, "rage: looking level, the world is told it goes level", Fmt("(%.2f %.2f %.2f)", throwW().x, throwW().y, throwW().z));
             // LOOK SOMEWHERE ELSE and that is where it goes: to either side, and behind
             Play(EM_RAGE, tHeld, hand);
             const V3 acrossAhead = norm(sub(g_Ct[g_uarm[1]].p, g_Ct[g_uarm[0]].p));          // the shoulders, wound up and aimed straight ahead
@@ -897,10 +904,16 @@ int main(int argc, char** argv) {
                     Check(turned * (yw > 0.0f ? 1.0f : -1.0f) > 0.15f, "rage: the shoulders turn toward the look", Fmt("(hand %d, look %.1f, turned %.2f)", hand, yw, turned));
                 }
             }
-            // the LOOK's height is the throw's: up lobs it, down throws it flat, never into the ground
+            // THE LOOK IS THE THROW, the whole way up and the whole way down -- the reason the aim became a
+            // true elevation angle. Down USED to be floored just above level ("never at your feet"), which
+            // took the entire lower half of the sphere away to buy a lob nobody asked for.
             Look(0.3f, 0.5f);  Play(EM_RAGE, tThrough, hand); const float hi = throwW().z;
             Look(0.3f, -0.5f); Play(EM_RAGE, tThrough, hand); const float lo = throwW().z;
-            Check(hi > lo + 0.3f && lo > 0.05f && hi < 0.75f, "rage: looking up lobs it, looking down throws it flat -- never at your feet", Fmt("(up %.2f, down %.2f)", hi, lo));
+            Check(hi > 0.3f && lo < -0.3f, "rage: looking up throws it up, looking DOWN throws it down", Fmt("(up %.2f, down %.2f)", hi, lo));
+            // ...and the extremes are reachable at all, which is the whole complaint
+            Look(0.0f, 1.5f);  Play(EM_RAGE, tThrough, hand); const float top = throwW().z;
+            Look(0.0f, -1.5f); Play(EM_RAGE, tThrough, hand); const float bot = throwW().z;
+            Check(top > 0.9f && bot < -0.9f, "rage: ...and straight up and straight down are both reachable", Fmt("(%.2f, %.2f)", top, bot));
             // the body may sit turned in the world: the camera's say is in the WORLD's terms, and so is the answer
             g_meshYaw = 90.0f; Look(1.0f, 0.0f);
             Play(EM_RAGE, tThrough, hand);

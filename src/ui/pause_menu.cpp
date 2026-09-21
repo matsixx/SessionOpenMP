@@ -1017,13 +1017,16 @@ static void buildRows() {
 // Its FTexts do NOT go through cachedText: the roster string changes as people join and leave, and
 // that cache is a fixed table which would fill up and stop updating. This owns one blob and rebuilds
 // it only when the text actually changes (the old one is left alone -- see the ownership note above).
-static char      g_rosterStr[512] = {0};
+// 2 KB, not 512. A full lobby is sixteen players and the roster names every one of them with where
+// they are: at 512 the build loop simply stopped partway down the list, which looks exactly like the
+// panel running out of room and was in fact the string running out of bytes. Both limits were real.
+static char      g_rosterStr[2048] = {0};
 static FTextBlob g_rosterText{};
 static bool      g_rosterHave = false;
 
 static void buildRosterText() {
     const MpUiState& s = g_state;
-    char buf[512];
+    char buf[2048];                                 // sized with g_rosterStr: see the note there
     int n = 0;
     // A private game's whole point is the code, so it leads -- spaced out, because it gets read
     // aloud and typed by hand.
@@ -1043,9 +1046,12 @@ static void buildRosterText() {
     // rather than inferred from who pressed Host -- and it is an IDENTITY, because two players can
     // pick the same name.
     const char* ownerId = omp::LobbyOwnerId();
-    n += snprintf(buf + n, sizeof(buf) - n, "%s  (you)%s\n", MpName_Get(),
-                  omp::LobbyIsHost() ? "  (host)" : "");
-    if (myLabel[0]) n += snprintf(buf + n, sizeof(buf) - n, "   %s\n", myLabel);
+    // ONE LINE PER PLAYER: "name  (host) - where they are". The map used to sit on its own indented
+    // line underneath, which read nicely at four players and ran off the bottom of the panel at
+    // twelve -- a full lobby is sixteen, and every player was costing two lines.
+    n += snprintf(buf + n, sizeof(buf) - n, "%s  (you)%s%s%s\n", MpName_Get(),
+                  omp::LobbyIsHost() ? "  (host)" : "",
+                  myLabel[0] ? " - " : "", myLabel[0] ? myLabel : "");
     int shown = 0;
     for (int i = 0; i < omp::session::PeerSlots() && n < (int)sizeof(buf) - 64; i++) {
         char who[48] = {0};
@@ -1056,18 +1062,20 @@ static void buildRosterText() {
         const bool peerIsHost = ownerId[0] && peerId[0] && _stricmp(ownerId, peerId) == 0;
         // A peer whose cosmetics have not landed yet has no name to show -- say so rather than
         // printing a blank line, so "connected but silent" is visibly different from "not there".
-        n += snprintf(buf + n, sizeof(buf) - n, "%s%s%s\n",
-                      who[0] ? who : "(connecting...)", peerIsHost ? "  (host)" : "",
-                      actor ? "" : "   [no skater yet]");
-        // Their map, on its own indented line. A DIFFERENT map from yours is the single most useful
-        // thing this panel can tell you: the session is fine, you simply cannot see each other.
+        // Their map goes on the SAME line. A DIFFERENT map from yours is the single most useful thing
+        // this panel can tell you -- the session is fine, you simply cannot see each other -- so that
+        // tag is still said in full rather than shortened to fit.
         char theirMap[64] = {0}, theirLabel[64] = {0};
+        char whereBuf[96] = {0};
         if (omp::session::PeerMap(i, theirMap, sizeof(theirMap)) && theirMap[0]) {
             PrettyMapName(theirMap, theirLabel, sizeof(theirLabel));
             const bool elsewhere = (myMap[0] && _stricmp(theirMap, myMap) != 0);
-            n += snprintf(buf + n, sizeof(buf) - n, "   %s%s\n",
-                          theirLabel[0] ? theirLabel : theirMap, elsewhere ? "   (different map)" : "");
+            snprintf(whereBuf, sizeof(whereBuf), " - %s%s",
+                     theirLabel[0] ? theirLabel : theirMap, elsewhere ? "   (different map)" : "");
         }
+        n += snprintf(buf + n, sizeof(buf) - n, "%s%s%s%s\n",
+                      who[0] ? who : "(connecting...)", peerIsHost ? "  (host)" : "",
+                      whereBuf, actor ? "" : "   [no skater yet]");
         shown++;
     }
     if (!shown) {

@@ -448,8 +448,15 @@ static void dropSetTarget(Slot::DropObj& d, const dropsync::Rec& r, bool withCla
 // packets stop arriving keeps its objects (they are still THERE in their world) until it is released.
 static void dropMarkAllDead(Slot& s) { for (auto& d : s.drop) if (d.used) d.dead = true; }
 
+// Peers whose copy of OUR set does not match the heartbeat's hash, and who have therefore asked for
+// it. Acted on by the next publish tick, which sends the set to THESE peers only -- the 6 s beat
+// itself carries nothing but the hash now.
+static bool g_dropWant[kMaxPeers] = { false };
+static bool g_dropWantAny = false;
+
 static void applyDropUpdate(Slot& s, const dropsync::Update& up, int peerIdx, uint64_t nowUs) {
     if (up.haveAuth) { s.dropAuthKey = up.authKey; s.haveDropAuth = true; }
+    if (up.setWanted && peerIdx >= 0 && peerIdx < kMaxPeers) { g_dropWant[peerIdx] = true; g_dropWantAny = true; }
     if (up.genReset) {
         // Their ids stopped meaning what they meant (their world changed, or they reset). Everything
         // we hold for them is stale by definition -- including the ACTORS, which are still standing
@@ -1110,15 +1117,21 @@ static uint64_t dropOwnAuthKey() {
     return h ? h : 1;                                  // never collide with the "unknown" sentinel
 }
 
+// `only` (optional) restricts the send to the peers flagged in it -- what a kSet does now that the
+// heartbeat no longer carries one: the set goes to whoever asked, not to everybody every 6 seconds.
 static void dropSendToAll(int kind, int nPeers, uint8_t gen,
-                          const dropsync::Rec* recs, int n, const uint16_t* ids) {
+                          const dropsync::Rec* recs, int n, const uint16_t* ids,
+                          const bool* only = nullptr) {
     PeerStats ps;
     for (int i = 0; i < nPeers; i++) {
+        if (only && !(i < kMaxPeers && only[i])) continue;
         if (!GetStats(i, &ps) || ps.state == 5) continue;
         if (kind == 0) {
             // A set is ALL OR NOTHING (a half-received one applies as "everything else was
             // deleted"), so SendSet refuses rather than truncating -- and a refusal must not be
             // silent, or a big park simply never appears for anyone with no line to explain it.
+            // 0 parts with records to send is a real refusal now (a record that cannot fit at all);
+            // a set too big for one tick is NOT -- it returns what it sent and stays in progress.
             if (dropsync::SendSet(i, gen, dropOwnAuthKey(), recs, n, SendBudget()) == 0 && n > 0) {
                 static bool said = false;
                 if (!said) { said = true; if (g_logf) { char m[200]; snprintf(m, sizeof(m),
@@ -1135,11 +1148,13 @@ static void dropSendToAll(int kind, int nPeers, uint8_t gen,
 // Enumerate our own visible set, diff it against the baseline, and publish what changed. This is the
 // whole sender: place, duplicate, drag, stick-to-ground, revert and call-back are all just an added,
 // removed or moved entry, so none of them needs its own hook.
-static void dropPublishOwn(uint64_t nowUs, int nPeers, bool forceResync, bool includeBaseline) {
+static void dropPublishOwn(uint64_t nowUs, int nPeers, bool forceResync, bool includeBaseline,
+                           bool heartbeatOnly = false) {
     using namespace game;
-    // STATIC, not stack: 256 objects across five buffers is ~100 KB, which is a lot to put on the
-    // game thread's frame several times a second. Safe because everything here runs on that one
-    // thread, like the rest of the session.
+    // STATIC, not stack: 1024 objects across five buffers is ~400 KB, which is not something to put
+    // on the game thread's frame several times a second -- it was ~100 KB at the old cap of 256 and
+    // was already static then. Safe because everything here runs on that one thread, like the rest
+    // of the session.
     static dropper::ObjRec recs[dropper::kMaxObjects];
     static void*           actors[dropper::kMaxObjects];
     int n = dropper::EnumerateOwn(recs, actors, dropper::kMaxObjects);
@@ -1228,7 +1243,28 @@ static void dropPublishOwn(uint64_t nowUs, int nPeers, bool forceResync, bool in
                      (unsigned)g_dropGen, g_ownDropN, nPeers, g_ownDropN ? " -- " : "", names);
             g_logf(m);
         }
+        // THE BEAT SENDS THE HASH, NOT THE SET. `heartbeatOnly` is the 6 s tick: every peer is told
+        // what our set IS (gen, hash, count) in 12 bytes, and the ones whose copy disagrees ask --
+        // which is what fills g_dropWant for the next tick. A real change (forceResync without
+        // heartbeatOnly) still goes to everybody at once, so an edit is no slower to arrive.
+        if (heartbeatOnly) {
+            const uint32_t h = dropsync::SetHash(full, g_ownDropN);
+            PeerStats ps;
+            for (int i = 0; i < nPeers; i++) {
+                if (!GetStats(i, &ps) || ps.state == 5) continue;
+                dropsync::SendSetPing(i, g_dropGen, h, (uint16_t)g_ownDropN);
+            }
+            // ...and answer anyone who asked on the PREVIOUS beat, them only.
+            if (g_dropWantAny) {
+                dropSendToAll(0, nPeers, g_dropGen, full, g_ownDropN, nullptr, g_dropWant);
+                for (int i = 0; i < kMaxPeers; i++) g_dropWant[i] = false;
+                g_dropWantAny = false;
+            }
+            return;
+        }
         dropSendToAll(0, nPeers, g_dropGen, full, g_ownDropN, nullptr);
+        for (int i = 0; i < kMaxPeers; i++) g_dropWant[i] = false;      // they just got it
+        g_dropWantAny = false;
         return;
     }
     if (nPlace) dropSendToAll(1, nPeers, g_dropGen, place, nPlace, nullptr);
@@ -1619,15 +1655,26 @@ static void dropFrame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, int nPeers,
     // objects move); a slow poll otherwise, because a set that nobody is editing cannot change.
     const bool active = dropper::LocalActive();
     const uint64_t enumPeriod = active ? 33000ull : 250000ull;
-    const bool resyncDue = g_dropResend || !lastResyncUs || sinceUs(nowUs, lastResyncUs) > 6000000ull;
-    if (!lastEnumUs || sinceUs(nowUs, lastEnumUs) >= enumPeriod || resyncDue) {
+    // THE 6 s BEAT IS A HASH now, not the set (see dropPublishOwn). `g_dropResend` -- an actual change,
+    // a new peer, an authority flip -- is still a real resync and still goes to everyone at once; only
+    // the periodic one became a ping. A peer that asked on the last beat is answered on this one, so a
+    // set nobody has is at most 6 s away exactly as before.
+    const bool changed   = g_dropResend || !lastResyncUs;
+    const bool beatDue   = changed || sinceUs(nowUs, lastResyncUs) > 6000000ull;
+    // ...and a set too big for one tick keeps the pump running until its last part has gone.
+    bool sending = false;
+    for (int i = 0; i < nPeers && !sending; i++) sending = dropsync::SetSendInProgress(i);
+    const bool wantsPending = g_dropWantAny || sending;
+    if (!lastEnumUs || sinceUs(nowUs, lastEnumUs) >= enumPeriod || beatDue || wantsPending) {
         lastEnumUs = nowUs;
-        dropPublishOwn(nowUs, nPeers, resyncDue, includeBaseline);
-        if (resyncDue) { lastResyncUs = nowUs; g_dropResend = false; }
+        dropPublishOwn(nowUs, nPeers, beatDue || wantsPending, includeBaseline, !changed);
+        if (beatDue) { lastResyncUs = nowUs; g_dropResend = false; }
     }
 
-    // ---- THE LEVEL'S OWN PROPS. Its own lane, and the host's to define.
-    worldFrame(ownPawn, nowUs, nowMs, nPeers, anyPresent, resyncDue, dt,
+    // ---- THE LEVEL'S OWN PROPS. Its own lane, and the host's to define. Still on the plain beat: its
+    // layout is capped at 128 records and it is the same pattern, so it is the obvious next one to
+    // hash-gate -- but one lane at a time, and this one was not what was costing the traffic.
+    worldFrame(ownPawn, nowUs, nowMs, nPeers, anyPresent, beatDue, dt,
                iAmCanonical, canonicalPeer, authoritySettled);
 
     // ---- APPLY. Every game call for peers' objects happens here, on the engine-tick anchor the

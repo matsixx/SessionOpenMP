@@ -41,7 +41,7 @@
 
 namespace omp { namespace dropsync {
 
-static const int kMaxSetRecords = 256;   // must match game::dropper::kMaxObjects
+static const int kMaxSetRecords = 1024;  // must match game::dropper::kMaxObjects
 static const int kRecsPerPacket = 30;    // 30 x 32 B + header + name table stays under the 1 KB cap
 static const int kMoveBatch     = 24;
 static const int kMaxNameLen    = 63;
@@ -65,16 +65,34 @@ void SetSendFn(SendFn fn);
 bool IsPacket(const uint8_t* d, int len);
 
 // ---- sender ------------------------------------------------------------------------------------
-// Each returns the number of packets sent. `SendSet` is capped at `budget` packets per call
-// (transport SendBudget()) and returns 0 having sent nothing if it cannot send the WHOLE set: a
-// half-set would apply as "everything else was deleted". Sets are small enough that this is always a
-// single burst in practice -- the cap is a guard, not a pacing scheme.
+// Each returns the number of packets sent. `SendSet` sends at most `budget` parts per call (transport
+// SendBudget()) and PICKS UP WHERE IT LEFT OFF on the next one -- a 1024-object set measures 103 parts
+// against budgets of 32 and 64, so refusing what does not fit in one tick, which is what this used to
+// do, meant a large park never went at all. Keep calling while SetSendInProgress(peer). A set is still
+// invisible until it is whole: the receiver assembles and applies only on the last part, so a half-
+// arrived one is never mistaken for "everything else was deleted". 0 with records to send is a real
+// refusal (a record too big to fit a packet at all), not a pause.
 // `authKey` is the sender's stable identity, hashed. It rides the set because the SHARED policy has
 // to pick one canonical saved set and every machine must pick the SAME one, with no host concept to
 // lean on: the transport cannot help (PeerIdStr is EOS-only -- it is "" on shared memory and UDP,
 // which is exactly the same-PC test rig), and a peer INDEX is local to whoever is counting. Lowest
 // key wins, so the choice is symmetric, needs no agreement protocol, and survives the host leaving.
 int SendSet(int peerIdx, uint8_t gen, uint64_t authKey, const Rec* recs, int n, int budget);
+// ---- THE HEARTBEAT, WHICH DOES NOT CARRY THE SET --------------------------------------------------
+// A set used to be re-sent WHOLE to every peer every 6 seconds, whether or not anything had changed.
+// That is O(objects x peers) of reliable traffic forever: measured, a 256-object park costs 10.5 KB a
+// beat, so 16 peers is 28 KB/s of upload for a list nobody is editing -- and both numbers are meant to
+// grow. The heartbeat is now a 12-byte PING carrying what the set IS (generation, hash, count); a peer
+// whose own copy does not match asks for it, and only then does anything large move.
+// The healing the blind re-send provided is kept exactly: a peer whose assembly was abandoned mid-way
+// holds no matching set, so it asks again on the very next beat.
+uint32_t SetHash(const Rec* recs, int n);                 // the same bytes on both ends: id, localId, pose
+int SendSetPing(int peerIdx, uint8_t gen, uint32_t hash, uint16_t count);
+// A set larger than one tick's packet budget goes out ACROSS ticks -- 1024 objects measures 103 parts
+// against a budget of 32 -- so SendSet returns the parts sent THIS call and the caller keeps calling
+// while this is true. Parts stay in order on the reliable channel and the receiver applies only on the
+// last one, so a set in flight is invisible until it is whole, exactly as before.
+bool SetSendInProgress(int peerIdx);
 int SendPlace(int peerIdx, uint8_t gen, const Rec& r);
 int SendMove(int peerIdx, uint8_t gen, const Rec* recs, int n);
 int SendRemove(int peerIdx, uint8_t gen, const uint16_t* ids, int n);
@@ -114,6 +132,7 @@ struct Update {
     uint8_t  gen       = 0;
     bool     genReset  = false;   // this peer's ids changed meaning: drop every object you hold for it
     bool     setReady  = false;   // a COMPLETE set is available from SetRecords(peerIdx)
+    bool     setWanted = false;   // this peer's copy of OUR set does not match: send it to them
     bool     haveAuth  = false;   // authKey below is from this packet (kSet only)
     uint64_t authKey   = 0;
     int     nPlace     = 0;   const Rec*      place  = nullptr;
@@ -149,6 +168,9 @@ struct Stats {
     int setsSent = 0, setRecordsSent = 0;      // what we published
     int setsRecv = 0, setRecordsRecv = 0;      // ...and what completed on the way in
     int unsendable = 0;                        // records dropped for an untransportable name
+    int setsWhole = 0, setsSpread = 0;         // sets finished, and calls that sent only part of one
+    int pingsSent = 0, pingsRecv = 0;          // the heartbeat that replaced re-sending the whole set
+    int wantsSent = 0, wantsRecv = 0;          // ...and the asks it turned into
 };
 const Stats& St();
 

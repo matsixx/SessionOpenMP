@@ -37,7 +37,7 @@ namespace omp { namespace game { namespace dropper {
 // Hard cap on objects tracked in either direction. Session's dropper is inventory-limited (you buy
 // the props), so a real set is dozens; the cap exists so a hostile or broken peer cannot make us
 // spawn without bound, and so the wire's part count is knowable in advance.
-static const int kMaxObjects = 256;
+static const int kMaxObjects = 1024;
 
 struct Tuning {
     bool  enabled      = true;    // dev kill switch for the whole feature
@@ -183,6 +183,7 @@ bool  InPersistentLoad();
 
 struct Stats {
     int own = 0, remote = 0;
+    int overCap = 0;            // objects the array held past kMaxObjects: counted, never published
     int spawned = 0, spawnFails = 0, unknownIds = 0, destroyed = 0;
     int purgedFromAll = 0;      // remote actors pulled back out of `_allObjects` -- see EnumerateOwn
     int faults = 0;

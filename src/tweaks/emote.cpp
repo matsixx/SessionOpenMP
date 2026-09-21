@@ -215,8 +215,8 @@ static void BuildWheelIndex() {
     for (int i = 0; i < EM_WHEEL; i++) if (kDefs[i].wheel) g_wheelIdx[g_wheelN++] = i;
 }
 // A RAGE: wound up by kRageWind, then HELD AND AIMED for as long as you like; the RIGHT TRIGGER throws it. The swing
-// starts the moment the trigger is felt, the board leaves the hand kRageLetGo later, and HOW HARD is the most
-// the trigger was pulled in between -- a pull takes about that long, so nothing waits on it.
+// starts the moment the trigger is felt, the board leaves the hand kRageLetGo later, and HOW HARD is HOW FAST the
+// trigger was pulled in between -- a pull takes about that long, so nothing waits on it.
 const float kRageWind = 0.50f, kRageLetGo = 0.14f, kRageSwingLen = 0.30f;
 // THE ONE EMOTE THAT ENDS ITSELF: held for as long as you aim, but once the board has gone he is angry about it for
 // a bit and that is that -- the old one-shot's own length (it swung at 0.5 of 3.2 s), measured from the swing.
@@ -235,16 +235,26 @@ int       g_carry = -2;                   // -2 not looked yet, -1 both hands fr
 bool      g_boardInHand = false;          // the board's own movement mode says it is being carried (the pump reads it)
 const char* g_whyNot = "";
 // Rage: which way it goes (chosen as it starts), what it leaves with, and what is left of the throw to do
-float     g_rageYaw = 0.0f, g_rageSpeed = 800.0f, g_rageUp = 0.3f, g_rageSpin[3] = { 0, 0, 0 };
-// the aim: g_rageYaw (radians off straight ahead, unwrapped) and g_rageUp FOLLOW THE CAMERA until the board goes;
+float     g_rageYaw = 0.0f, g_rageSpeed = 800.0f, g_ragePitch = 0.0f, g_rageSpin[3] = { 0, 0, 0 };
+// the aim: g_rageYaw (radians off straight ahead, unwrapped) and g_ragePitch (radians, -90..+90) FOLLOW THE
+// CAMERA until the board goes;
 // how much of it the spine has taken up (degrees); the clock the hook eases them by
 float     g_rageTwist = 0.0f, g_rageLastT = 0.0f; bool g_rageAimSet = false;
 // the trigger: as last fed (0..1), whether it has been let go since the Rage began (one held through the wheel
-// must not fire it), when the swing started (emote time; < 0 = still aiming) and the most it was pulled since
-float     g_trigger = 0.0f, g_rageSwingAt = -1.0f, g_ragePeak = 0.0f; bool g_trigArmed = false;
+// must not fire it), when the swing started (emote time; < 0 = still aiming) and the FASTEST the trigger has been
+// pulled since -- in trigger-units per second, which is what strength is made of
+float     g_trigger = 0.0f, g_rageSwingAt = -1.0f, g_rageRate = 0.0f; bool g_trigArmed = false;
 // ...a pull in progress: the most it has reached and when it last went further (a pull that has STOPPED is one
-// whose strength is known); and whether the engine is handing over the real analogue value (else: the press)
+// whose strength is known), and where and when it STARTED, which is the other end of the rate; and whether the
+// engine is handing over the real analogue value (else: the press)
 bool      g_pulling = false, g_trigPolled = false; float g_pullHigh = 0.0f, g_pullRiseT = 0.0f; int g_trigSaid = 0;
+float     g_pullLowV = 0.0f, g_pullLowT = 0.0f;
+// HOW FAST COUNTS AS HARD, in trigger-units per second: a deliberate squeeze from nothing to the end over half a
+// second is about 2, a brisk pull about 7, a snap 20 or more. Below kRateSoft is the gentlest throw there is,
+// kRateHard and above is everything. `kRateMinDt` is a floor on the measured interval so a pull that happens
+// inside ONE frame reads as very fast rather than as a divide by zero.
+float     kRateSoft = 1.5f, kRateHard = 10.0f;
+const float kRateMinDt = 0.008f;
 // the clap: where in its cycle the pump last saw it, and the sound it makes (looked up by name, watched like any
 // object -- a cue can be unloaded under us)
 float     g_clapPhase = 0.0f; int g_clapCount = 0, g_clapMuted = 0;
@@ -1168,20 +1178,26 @@ void DoTap(float) {
 // third-person camera's line would go into the ground at your feet: it looks a little down on you).
 // Only the UPPER body turns (a Rage has no legs of its own, so you can walk through one): the spine takes what a
 // spine can, the head looks the rest of the way, and the arm throws where it is told even if that is behind you.
+float RageStrength(float rate);      // below, with the trigger: how fast a pull was, 0..1
 void AimRage(const void* mesh, float t) {
     float f[3];
-    float yaw = 0.0f, up = 0.30f;
+    float yaw = 0.0f, pitch = 0.0f;
     if (mesh && CameraHeight_ViewForward(f)) {
         const float* m = (const float*)((const uint8_t*)mesh + SC_C2W);
         const V3 d = norm(qinv(q4(m[0], m[1], m[2], m[3]), v3(f[0], f[1], f[2])));
         const V3 flat = sub(d, mul(U, dot(d, U)));
         if (len(flat) > 0.05f) yaw = atan2f(dot(flat, BR), dot(flat, BF));
         else yaw = g_rageYaw;                                            // looking straight up or down: keep the heading
-        up = clampf(0.42f + 1.10f * dot(d, U), 0.10f, 0.95f);
+        // WHERE YOU LOOK IS WHERE IT GOES, the whole way down and the whole way up. This was a rise-per-
+        // unit-forward biased by 0.42 and clamped to 0.10..0.95, which is +6 to +44 degrees: level was a
+        // lob and straight down was unreachable. The bias was there because a third-person camera looks a
+        // little DOWN on the skater, so 1:1 threw at their feet -- but paying for that with the whole
+        // lower half of the sphere is the wrong trade. It is a true elevation ANGLE now, and 1:1.
+        pitch = asinf(clampf(dot(d, U), -1.0f, 1.0f));
     }
     const float dtH = clampf(t - g_rageLastT, 0.0f, 0.05f);
     g_rageLastT = t;
-    if (!g_rageAimSet) { g_rageYaw = yaw; g_rageUp = up; g_rageTwist = clampf(yaw * 57.2957795f * 0.6f, -65.0f, 65.0f); g_rageAimSet = true; return; }
+    if (!g_rageAimSet) { g_rageYaw = yaw; g_ragePitch = pitch; g_rageTwist = clampf(yaw * 57.2957795f * 0.6f, -65.0f, 65.0f); g_rageAimSet = true; return; }
     if (g_thrown || (g_rageSwingAt >= 0.0f && t >= g_rageSwingAt + kRageLetGo)) return;      // it has gone: the follow-through finishes the way it went
     // the short way round -- and kept UNWRAPPED, so a look passing directly behind does not whip the body
     // from one side to the other until it is plainly on the other side
@@ -1192,7 +1208,7 @@ void AimRage(const void* mesh, float t) {
     g_rageYaw += dy * a;
     if (g_rageYaw > 3.9f) g_rageYaw -= 6.2831853f;
     if (g_rageYaw < -3.9f) g_rageYaw += 6.2831853f;
-    g_rageUp += (up - g_rageUp) * a;
+    g_ragePitch += (pitch - g_ragePitch) * a;
     const float want = clampf(g_rageYaw * 57.2957795f * 0.6f, -65.0f, 65.0f);
     g_rageTwist += (want - g_rageTwist) * (1.0f - expf(-dtH * 8.0f));
 }
@@ -1202,7 +1218,7 @@ void DoRage(const void* mesh, float t) {
     const V3 dirH = norm(add(mul(BF, cosf(g_rageYaw)), mul(BR, sinf(g_rageYaw))));
     const bool  going = g_rageSwingAt >= 0.0f;                            // the trigger has been pulled: until then it is held, and aimed
     const float T0 = going ? g_rageSwingAt : 1e9f;
-    const float hard = going ? clampf(0.55f + 0.45f * g_ragePeak, 0.55f, 1.0f) : 1.0f;      // a harder pull is a bigger throw
+    const float hard = going ? clampf(0.55f + 0.45f * RageStrength(g_rageRate), 0.55f, 1.0f) : 1.0f;   // a faster pull is a bigger throw
     const float wind = smooth(t / kRageWind), swing = smooth((t - T0) / kRageSwingLen), after = smooth((t - T0 - 0.35f) / 0.45f);
     const float seethe = going ? window(t, T0 + 0.50f, T0 + 2.50f, 0.4f) : 0.0f;      // angry about it for a bit -- then the pump ends it (kRageAfter)
     const float held = wind * (1.0f - swing);                             // cocked, and being aimed
@@ -1213,12 +1229,12 @@ void DoRage(const void* mesh, float t) {
               g_rageTwist * wind * (1.0f - after) + Sg(c) * (9.0f * held - 12.0f * swing * (1.0f - after)));      // toward the throwing side, then through
     TorsoFrame();
     HeadTurn(clampf(aimDeg - g_rageTwist, -70.0f, 70.0f) * wind * (1.0f - after) + 9.0f * sinf(TAU * 1.6f * t) * seethe,
-             -8.0f * held - 14.0f * (g_rageUp - 0.3f) * held + 20.0f * seethe, 0.0f);
+             -8.0f * held - 12.0f * g_ragePitch * held + 20.0f * seethe, 0.0f);
     // the throwing arm: up and back -- AWAY from where it is going, and shaking with it while it is held --
     // then through along the way it goes (and up it, for a lob), then let fall
     const float L = g_arm[c];
     const V3 S = g_Ct[g_uarm[c]].p;
-    const float loft = atanf(g_rageUp) * 0.7f;
+    const float loft = g_ragePitch * 0.7f;      // the arm follows the aim, a little short of it
     const float shake = 0.012f * L * sinf(TAU * 7.0f * t) * held * smooth((t - 0.5f) / 0.2f);
     const V3 back = add(S, mix3(tu, 0.80f * L + shake, dirH, -0.30f * L, Out(c), 0.18f * L));
     const V3 fwd  = add(S, mix3(dirH, 0.86f * L * cosf(loft), tu, 0.86f * L * sinf(loft) - 0.22f * L, Out(c), 0.05f * L));
@@ -1238,7 +1254,7 @@ void DoRage(const void* mesh, float t) {
     RaiseShoulder(o, 0.30f * seethe); RaiseShoulder(c, 0.30f * seethe);
     // which way the WORLD sees the throw go: the pump does the throwing, this only tells it where
     g_throwDirSet = true;
-    const V3 dc = norm(add(dirH, mul(U, g_rageUp)));
+    const V3 dc = add(mul(dirH, cosf(g_ragePitch)), mul(U, sinf(g_ragePitch)));    // already unit: dirH is
     g_throwDirW[0] = dc.x; g_throwDirW[1] = dc.y; g_throwDirW[2] = dc.z;       // component space; turned to the world in Apply
 }
 void DoDance(float t) {
@@ -1492,7 +1508,7 @@ bool Begin(int id, void* sk) {
     if (id == EM_RAGE) {
             g_rng ^= (unsigned)GetTickCount64();
         g_rageAimSet = false; g_rageLastT = 0.0f; g_rageTwist = 0.0f;   // WHERE it goes is the camera's to say (AimRage), all through the wind-up
-        g_rageSwingAt = -1.0f; g_ragePeak = 0.0f; g_pulling = false;    // WHEN, and HOW HARD, the right trigger's
+        g_rageSwingAt = -1.0f; g_rageRate = 0.0f; g_pulling = false;    // WHEN, and HOW FAST, the right trigger's
         PollTrigger();
         g_trigArmed = g_trigger < kTrigOff;                             // ...once it has been let go: one held through the wheel does not fire it
         for (int i = 0; i < 3; i++) g_rageSpin[i] = (Rand01() * 2.0f - 1.0f) * 11.0f;      // rad/s
@@ -1511,27 +1527,45 @@ void PollTrigger() {
     g_trigPolled = CatchTweaks_RightTrigger(&v);
     if (g_trigPolled) g_trigger = v;
 }
-// HOW HARD IS HOW FAR IT IS PULLED -- so the throw waits for the pull to say: it goes when the trigger has reached
-// the end (kTrigFull), or has stopped going further for kTrigSettle, or has been let go again; a quick full pull
-// is at the end within a frame or two, a squeeze to a third and held is known a moment after it stops, and a slow
-// squeeze all the way is a FULL throw, not whatever it had reached early on. (The first cut took the most reached
+// HOW HARD IS HOW FAST IT IS PULLED -- the rate from where the pull started to where it got to, not how far it
+// got. A flick to halfway is a hard throw and a slow squeeze to the end is a gentle one, which is how throwing
+// something actually works: what you put in is the speed of the hand, not how far it travelled.
+// WHEN it goes is unchanged, and still waits for the pull to say it is done: the trigger reaches the end
+// (kTrigFull), or stops going further for kTrigSettle, or is let go again. (An older cut took the most it reached
 // in the 0.14 s after the first touch -- and, the field found, never saw the analogue value at all: see
-// CatchTweaks_RightTrigger.) What it reaches while the arm is already coming through still counts.
+// CatchTweaks_RightTrigger.) A pull still going while the arm comes through is still measured.
 const float kTrigFull = 0.97f, kTrigSettle = 0.07f;
+// The rate of the pull as it stands: from where it was first felt to the furthest it has got, over the time
+// between. Measured across the WHOLE pull rather than frame to frame, because a per-frame difference is one
+// sample of a noisy axis and this is an average of the lot.
+static float PullRate() {
+    const float dv = g_pullHigh - g_pullLowV;
+    if (dv <= 0.0f) return 0.0f;
+    const float dt = g_pullRiseT - g_pullLowT;
+    return dv / (dt > kRateMinDt ? dt : kRateMinDt);
+}
 void RageTrigger(float t) {
     if (g_rageSwingAt < 0.0f) {
         if (!g_trigArmed) { if (g_trigger < kTrigOff) g_trigArmed = true; return; }
         if (t < kRageWind * 0.9f) return;
         if (g_trigger >= kTrigOn) {
-            if (!g_pulling) { g_pulling = true; g_pullHigh = g_trigger; g_pullRiseT = t; }
+            // WHERE THE PULL STARTED is one frame BEFORE it was first felt, not at kTrigOn: by the time the
+            // trigger reads 0.12 a fast pull is already moving, and starting the clock there throws away the
+            // part of the travel that says how fast it was.
+            if (!g_pulling) { g_pulling = true; g_pullHigh = g_trigger; g_pullRiseT = t; g_pullLowV = 0.0f; g_pullLowT = t - kRateMinDt; }
             else if (g_trigger > g_pullHigh + 0.015f) { g_pullHigh = g_trigger; g_pullRiseT = t; }
-            if (g_pullHigh >= kTrigFull || t - g_pullRiseT >= kTrigSettle) { g_rageSwingAt = t; g_ragePeak = g_pullHigh; }
-        } else if (g_pulling) { g_rageSwingAt = t; g_ragePeak = g_pullHigh; }      // a blip: it goes with what it reached
-    } else if (t < g_rageSwingAt + kRageLetGo && g_trigger > g_ragePeak) g_ragePeak = g_trigger;
+            if (g_pullHigh >= kTrigFull || t - g_pullRiseT >= kTrigSettle) { g_rageSwingAt = t; g_rageRate = PullRate(); }
+        } else if (g_pulling) { g_rageSwingAt = t; g_rageRate = PullRate(); }      // a blip: it goes with how fast it got there
+    } else if (t < g_rageSwingAt + kRageLetGo) {
+        // still being pulled while the arm comes through: it counts, but only if it is FASTER
+        if (g_trigger > g_pullHigh + 0.015f) { g_pullHigh = g_trigger; g_pullRiseT = t; }
+        const float r = PullRate();
+        if (r > g_rageRate) g_rageRate = r;
+    }
 }
 bool  RageDone(float t) { return g_rageSwingAt >= 0.0f && t >= g_rageSwingAt + kRageAfter; }      // thrown, and angry long enough
-float RageStrength(float peak) { return clampf((peak - kTrigOn) / (1.0f - kTrigOn), 0.0f, 1.0f); }
-float RageSpeed(float peak) { return 420.0f + 1130.0f * powf(RageStrength(peak), 1.15f); }      // cm/s: a toss .. a hurl
+float RageStrength(float rate) { return clampf((rate - kRateSoft) / (kRateHard - kRateSoft), 0.0f, 1.0f); }
+float RageSpeed(float rate) { return 420.0f + 1130.0f * powf(RageStrength(rate), 1.15f); }      // cm/s: a toss .. a hurl
 // A clap's sound. The game ships no clap; the nearest things it has are a PALM landing on the ground
 // (SCU_HandLand) and the slaps a board makes on feet and hands -- played pitched up, the first of them that is
 // loaded. Found by NAME (only a loaded cue is found), watched like any object since a cue can be unloaded, and
@@ -1857,6 +1891,11 @@ void Emote_SaveConfig(char* buf, size_t cap) {
 void Emote_ReadConfig(const char* buf) {
     g_on = TwkIniIntQuiet(buf, "EmotesEnabled", 1) ? 1 : 0;
     g_tapVolume = clampf((float)TwkIniIntQuiet(buf, "EmoteTapVolumePct", 250), 0.0f, 400.0f) / 100.0f;
+    // HOW FAST A PULL COUNTS AS HARD, in tenths of a trigger-unit per second (15 = 1.5/s, a deliberate
+    // squeeze; 100 = 10/s, a brisk snap). Tenths because the ini holds integers.
+    kRateSoft = clampf((float)TwkIniIntQuiet(buf, "EmoteThrowSoftRateX10",  15), 1.0f, 300.0f) * 0.1f;
+    kRateHard = clampf((float)TwkIniIntQuiet(buf, "EmoteThrowHardRateX10", 100), 2.0f, 600.0f) * 0.1f;
+    if (kRateHard < kRateSoft + 0.2f) kRateHard = kRateSoft + 0.2f;      // never a divide by nothing in RageStrength
     g_tapRollDeg = clampf((float)TwkIniIntQuiet(buf, "EmoteTapRollDeg", 0), -180.0f, 180.0f);
     g_tapHandRoll  = clampf((float)TwkIniIntQuiet(buf, "EmoteTapHandRollDeg",  (int)kTapShipped.roll),  -180.0f, 180.0f);
     g_tapHandTwist = clampf((float)TwkIniIntQuiet(buf, "EmoteTapHandTwistDeg", (int)kTapShipped.twist), -180.0f, 180.0f);
@@ -2110,10 +2149,12 @@ void Emote_PumpFrame() {
     if (g_id == EM_RAGE && !g_ending && !g_thrown) { PollTrigger(); RageTrigger(g_t); }
     // the moment of a Rage: the real board leaves the hand, the way the pose said it was going, as hard as it was pulled
     if (g_id == EM_RAGE && !g_thrown && g_rageSwingAt >= 0.0f && g_t >= g_rageSwingAt + kRageLetGo && g_throwDirSet && g_w > 0.5f) {
-        const float strength = RageStrength(g_ragePeak);
-        g_rageSpeed = RageSpeed(g_ragePeak) * (0.97f + 0.06f * Rand01());
+        const float strength = RageStrength(g_rageRate);
+        g_rageSpeed = RageSpeed(g_rageRate) * (0.97f + 0.06f * Rand01());
         for (int i = 0; i < 3; i++) { g_kickVel[i] = g_throwDirW[i] * g_rageSpeed; g_rageSpin[i] *= 0.35f + 0.65f * strength; }
-        TwkLog("[emote] Throw board: the trigger reached %.2f (%s) -> %.0f cm/s", g_ragePeak, g_trigPolled ? "analogue" : "ONLY ITS PRESS: no analogue value to be had", g_rageSpeed);
+        TwkLog("[emote] Throw board: pulled at %.1f /s (%.0f%% of the way to hard, %s), aimed %.0f deg -> %.0f cm/s",
+               g_rageRate, 100.0f * strength, g_trigPolled ? "analogue" : "ONLY ITS PRESS: no analogue value to be had",
+               g_ragePitch * 57.2957795f, g_rageSpeed);
         if (Sit_BoardThrow(sk, g_kickVel, g_rageSpin)) { g_thrown = true; g_kickLeft = 1; g_outS = 0.0f; g_outSaid = 0; }
         else { g_thrown = true; TwkLog("[emote] Throw board: the board could not be let go of -- it stays in hand"); }
     }

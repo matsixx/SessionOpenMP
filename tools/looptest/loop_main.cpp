@@ -1276,6 +1276,128 @@ static bool dropSyncCheck() {
         }
     }
 
+    // ---- A SET BIGGER THAN ONE TICK'S BUDGET. 1024 objects is 103 parts and every backend's budget is
+    // 32 or 64, so "send it all or send nothing" would mean a big park never syncs at all. It goes out
+    // across ticks instead. What must hold: the parts still arrive in order, the receiver still applies
+    // ONLY when the last one lands, and a set that changes mid-flight starts again rather than splicing
+    // its tail onto the new one.
+    {
+        ResetAll();
+        const int budget = 32;
+        g_dropPkts.clear();
+        int calls = 0, sentTotal = 0;
+        do {
+            const int sent = SendSet(3, 9, 77ull, set, kMaxSetRecords, budget);
+            if (sent <= 0) { printf("  drop: a chunked set stalled after %d parts\n", sentTotal); return false; }
+            if (sent > budget) { printf("  drop: a chunked set ignored the budget (%d > %d)\n", sent, budget); return false; }
+            sentTotal += sent;
+            if (++calls > 40) { printf("  drop: a chunked set never finished\n"); return false; }
+        } while (SetSendInProgress(3));
+        if (calls < 2) { printf("  drop: a 1024-object set fitted one tick -- this check proves nothing\n"); return false; }
+
+        // ONE completion, on the LAST packet: a set half-arrived must never look ready.
+        Update u4; int ready = 0, readyAt = -1;
+        for (size_t i = 0; i < g_dropPkts.size(); i++) {
+            if (!OnPacket(3, g_dropPkts[i].data(), (int)g_dropPkts[i].size(), u4)) {
+                printf("  drop: part %d of a chunked set did not parse\n", (int)i); return false;
+            }
+            if (u4.setReady) { ready++; readyAt = (int)i; }
+        }
+        if (ready != 1 || readyAt != (int)g_dropPkts.size() - 1) {
+            printf("  drop: a chunked set completed %d time(s), at part %d of %d\n", ready, readyAt, (int)g_dropPkts.size()); return false;
+        }
+        int cn = 0; const Rec* cs = SetRecords(3, &cn);
+        if (!cs || cn != kMaxSetRecords || SetHash(cs, cn) != SetHash(set, kMaxSetRecords)) {
+            printf("  drop: a chunked set did not arrive intact (%d records)\n", cn); return false;
+        }
+
+        // CHANGED MID-FLIGHT: the tail of the old set must not be sent as if it belonged to the new one.
+        ResetAll();
+        g_dropPkts.clear();
+        SendSet(3, 9, 77ull, set, kMaxSetRecords, budget);              // ...only the first chunk
+        if (!SetSendInProgress(3)) { printf("  drop: setup for the mid-flight change did not leave one in flight\n"); return false; }
+        Rec other[64];
+        for (int i = 0; i < 64; i++) { other[i] = set[i]; other[i].localId = (uint16_t)(9000 + i); }
+        g_dropPkts.clear();
+        SendSet(3, 9, 77ull, other, 64, budget);                        // a DIFFERENT set, same peer
+        if (SetSendInProgress(3)) { printf("  drop: the new set did not replace the one in flight\n"); return false; }
+        Update u5; int ready2 = 0;
+        for (auto& pk : g_dropPkts) if (OnPacket(3, pk.data(), (int)pk.size(), u5) && u5.setReady) ready2++;
+        int n2 = 0; const Rec* s2 = SetRecords(3, &n2);
+        if (ready2 != 1 || !s2 || n2 != 64 || SetHash(s2, n2) != SetHash(other, 64)) {
+            printf("  drop: the set after a mid-flight change is wrong (%d records)\n", n2); return false;
+        }
+        ResetAll();
+    }
+
+    // ---- THE HEARTBEAT. The 6 s beat carries a HASH, not the set, so what has to hold is: a peer
+    // holding the same set says nothing, a peer holding a different one (or none, or one from another
+    // generation) asks, and the ask is what the sender turns into a set. That last part is the healing
+    // the blind re-send used to give for free, and losing it quietly is how this change could go wrong
+    // -- so it is checked from the far side, on a peer whose set was forgotten.
+    {
+        ResetAll();
+        g_dropPkts.clear();
+        SendSet(2, 5, 1234ull, set, 40, 0);
+        Update u2;
+        for (auto& pk : g_dropPkts) OnPacket(2, pk.data(), (int)pk.size(), u2);
+        int haveN = 0;
+        if (!SetRecords(2, &haveN) || haveN != 40) { printf("  drop: ping setup set did not assemble\n"); return false; }
+
+        // the hash is of what TRAVELLED: both ends compute the same number from the same records
+        const uint32_t h = SetHash(set, 40);
+        int gotN = 0; const Rec* got = SetRecords(2, &gotN);
+        if (SetHash(got, gotN) != h) { printf("  drop: the received set hashes differently from the sent one\n"); return false; }
+        if (SetHash(set, 40) == SetHash(set, 39)) { printf("  drop: the hash ignores the record count\n"); return false; }
+
+        // MATCHING: nothing goes back.
+        g_dropPkts.clear();
+        if (SendSetPing(2, 5, h, 40) != 1) { printf("  drop: a ping did not send\n"); return false; }
+        std::vector<std::vector<uint8_t>> beat = g_dropPkts;
+        if (beat.size() != 1 || beat[0].size() > 16) { printf("  drop: a ping is not small\n"); return false; }
+        g_dropPkts.clear();
+        if (!OnPacket(2, beat[0].data(), (int)beat[0].size(), u2)) { printf("  drop: a ping did not parse\n"); return false; }
+        if (!g_dropPkts.empty()) { printf("  drop: a peer holding the SAME set still asked for it\n"); return false; }
+
+        // A DIFFERENT SET OF THE SAME SIZE: the hash is the only thing that can tell, and it must.
+        g_dropPkts.clear();
+        SendSetPing(2, 5, h ^ 0x5A5A5A5Au, 40);
+        std::vector<std::vector<uint8_t>> odd = g_dropPkts;
+        g_dropPkts.clear();
+        OnPacket(2, odd[0].data(), (int)odd[0].size(), u2);
+        if (g_dropPkts.size() != 1) { printf("  drop: a peer holding a DIFFERENT set did not ask\n"); return false; }
+
+        // ...and the ask reaches the other end as exactly that, and nothing more.
+        Update u3;
+        if (!OnPacket(2, g_dropPkts[0].data(), (int)g_dropPkts[0].size(), u3) || !u3.setWanted) {
+            printf("  drop: the ask did not arrive as setWanted\n"); return false;
+        }
+        if (u3.setReady || u3.nPlace || u3.nRemove) { printf("  drop: an ask carried more than an ask\n"); return false; }
+
+        // THE HEALING CASE: a peer that never completed a set asks, even when the answer is EMPTY --
+        // an empty set is a real answer ("I have nothing") and a joiner has to receive it.
+        ForgetPeer(2);
+        g_dropPkts.clear();
+        SendSetPing(2, 5, SetHash(nullptr, 0), 0);
+        std::vector<std::vector<uint8_t>> empt = g_dropPkts;
+        g_dropPkts.clear();
+        OnPacket(2, empt[0].data(), (int)empt[0].size(), u2);
+        if (g_dropPkts.size() != 1) { printf("  drop: a peer with NO set did not ask for one\n"); return false; }
+
+        // A GENERATION CHANGE is a different set by definition: their ids stopped meaning what they meant.
+        ResetAll();
+        g_dropPkts.clear();
+        SendSet(2, 5, 1234ull, set, 40, 0);
+        for (auto& pk : g_dropPkts) OnPacket(2, pk.data(), (int)pk.size(), u2);
+        g_dropPkts.clear();
+        SendSetPing(2, 6, h, 40);                                    // same hash, NEW generation
+        std::vector<std::vector<uint8_t>> gen2 = g_dropPkts;
+        g_dropPkts.clear();
+        OnPacket(2, gen2[0].data(), (int)gen2[0].size(), u2);
+        if (g_dropPkts.size() != 1) { printf("  drop: a new generation did not ask for the set\n"); return false; }
+        ResetAll();
+    }
+
     // ---- TRUNCATION. No strict prefix of a valid packet may ever parse, and no packet with trailing
     // bytes may either -- the bounds cursor's whole promise against hostile input.
     g_dropPkts.clear();

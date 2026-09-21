@@ -27,7 +27,8 @@ static const uint32_t kMagic = 0x4F504D4Fu;   // "OMPO" -- OMPL/OMPM/OMPN retire
 // kWorldSet/kWorldMove are LATER ADDITIONS and need no magic bump: an older build's `default:`
 // ignores an unknown subtype, so a mixed pair simply does not share the level's props -- the
 // extension path replaysync's kAck established.
-enum : uint8_t { kSet = 1, kPlace = 2, kMove = 3, kRemove = 4, kWorldSet = 5, kWorldMove = 6 };
+enum : uint8_t { kSet = 1, kPlace = 2, kMove = 3, kRemove = 4, kWorldSet = 5, kWorldMove = 6,
+                 kSetPing = 7, kSetWant = 8 };      // appended, same reason: an older build ignores them
 
 // Under the transport's ~1 KB message convention with room to spare for the name table.
 static const int kMaxPacket = 1000;
@@ -150,8 +151,59 @@ static int buildSetPart(uint8_t* out, int cap, uint8_t gen, uint64_t authKey,
     return take;
 }
 
+// THE SET, AS ONE NUMBER. Hashed over exactly what travels -- the class name, the local id and the
+// pose -- so a sender and a receiver holding the same set compute the same value. The floats are
+// hashed as their BYTES, which is sound here because they are sent verbatim as f32 and arrive
+// bit-identical; nothing rounds or re-derives them on the way.
+uint32_t SetHash(const Rec* recs, int n) {
+    uint32_t h = 2166136261u;
+    auto feed = [&h](const void* p, size_t len) {
+        const uint8_t* b = (const uint8_t*)p;
+        for (size_t i = 0; i < len; i++) { h ^= b[i]; h *= 16777619u; }
+    };
+    const uint32_t cnt = (uint32_t)(n < 0 ? 0 : n);
+    feed(&cnt, sizeof(cnt));                       // so 3 records can never hash like 4
+    for (int i = 0; i < (n > 0 ? n : 0); i++) {
+        const Rec& r = recs[i];
+        size_t idLen = 0; while (idLen < sizeof(r.id) && r.id[idLen]) idLen++;
+        feed(r.id, idLen);
+        feed(&r.localId, sizeof(r.localId));
+        feed(r.loc, sizeof(r.loc));
+        feed(r.quat, sizeof(r.quat));
+    }
+    return h ? h : 1u;                             // 0 is free to mean "no answer"
+}
+
+int SendSetPing(int peerIdx, uint8_t gen, uint32_t hash, uint16_t count) {
+    if (!g_send) return 0;
+    uint8_t pkt[16];
+    Wr w{ pkt, (int)sizeof(pkt), 0, true };
+    w.u32(kMagic); w.u8(kSetPing); w.u8(gen); w.u32(hash); w.u16(count);
+    if (!w.ok) return 0;
+    g_send(peerIdx, pkt, w.n, true);
+    g_st.sent++; g_st.pingsSent++;
+    return 1;
+}
+
+static int SendSetWant(int peerIdx, uint8_t gen) {
+    if (!g_send) return 0;
+    uint8_t pkt[8];
+    Wr w{ pkt, (int)sizeof(pkt), 0, true };
+    w.u32(kMagic); w.u8(kSetWant); w.u8(gen);
+    if (!w.ok) return 0;
+    g_send(peerIdx, pkt, w.n, true);
+    g_st.sent++; g_st.wantsSent++;
+    return 1;
+}
+
+// Where a set that did not fit in one tick's budget has got to, per peer. `hash` is which set it is:
+// if the park changes mid-send the new one starts from part 0 rather than finishing the old one's tail.
+struct Out { bool active = false; uint32_t hash = 0; int nextPart = 0, parts = 0; };
+static Out    g_out[kPeers];
+
 int SendSet(int peerIdx, uint8_t gen, uint64_t authKey, const Rec* recs, int n, int budget) {
     if (!g_send || n < 0 || n > kMaxSetRecords) return 0;
+    if (peerIdx < 0 || peerIdx >= kPeers) return 0;
     // MEASURED FIRST, SENT SECOND -- the cosmetics packer's discipline (decide what fits BEFORE
     // writing a count), extended to a multi-packet message: a set that arrives half-complete would be
     // applied as "everything else was deleted". So a dry run decides the part boundaries and the part
@@ -176,8 +228,19 @@ int SendSet(int peerIdx, uint8_t gen, uint64_t authKey, const Rec* recs, int n, 
             if (took == 0) break;                        // the empty set: one part, zero records
         } while (at < n);
     }
-    if (budget > 0 && parts > budget) return 0;
-    for (int i = 0; i < parts; i++) {
+    // A BIG SET IS SENT ACROSS TICKS, not refused. This used to be `parts > budget -> return 0`, which
+    // was fine while a set was 256 objects (9 parts against a budget of 32) and fatal past it: a
+    // 1024-object park measures 103 parts, so on every backend the whole set would simply never go.
+    // The receiver has always assembled across packets and only applies on the LAST part, so spreading
+    // them over several ticks changes nothing it sees -- what matters is that they stay IN ORDER, which
+    // the reliable channel gives us, and that a set which CHANGES mid-send starts again rather than
+    // interleaving two of them. The hash is what notices that.
+    const uint32_t h = SetHash(recs, n);
+    Out& o = g_out[peerIdx];
+    if (!o.active || o.hash != h || o.parts != parts) { o.active = true; o.hash = h; o.parts = parts; o.nextPart = 0; }
+    int first = o.nextPart, last = parts;
+    if (budget > 0 && last - first > budget) last = first + budget;
+    for (int i = first; i < last; i++) {
         uint8_t pkt[kMaxPacket]; int len = 0;
         int wrote = 0;
         buildSetPart(pkt, kMaxPacket, gen, authKey, (uint8_t)i, (uint8_t)parts, recs, start[i], n, &len, &wrote);
@@ -185,7 +248,15 @@ int SendSet(int peerIdx, uint8_t gen, uint64_t authKey, const Rec* recs, int n, 
         g_send(peerIdx, pkt, len, true);
         g_st.sent++; g_st.setsSent++; g_st.setRecordsSent += wrote;
     }
-    return parts;
+    o.nextPart = last;
+    if (o.nextPart >= parts) { o.active = false; g_st.setsWhole++; }
+    else g_st.setsSpread++;
+    return last - first;
+}
+
+// Is a set still going out to this peer in pieces? The session keeps calling until it is not.
+bool SetSendInProgress(int peerIdx) {
+    return peerIdx >= 0 && peerIdx < kPeers && g_out[peerIdx].active;
 }
 
 // One world-set part. Records are self-contained (name inline), so unlike kSet there is no name
@@ -348,8 +419,9 @@ static PeerIn g_in[kPeers];
 void ForgetPeer(int peerIdx) {
     if (peerIdx < 0 || peerIdx >= kPeers) return;
     g_in[peerIdx] = PeerIn();
+    g_out[peerIdx] = Out();          // ...and any set still going out to them in pieces
 }
-void ResetAll() { for (int i = 0; i < kPeers; i++) g_in[i] = PeerIn(); }
+void ResetAll() { for (int i = 0; i < kPeers; i++) { g_in[i] = PeerIn(); g_out[i] = Out(); } }
 
 const Rec* SetRecords(int peerIdx, int* nOut) {
     if (peerIdx < 0 || peerIdx >= kPeers || !g_in[peerIdx].have) { if (nOut) *nOut = 0; return nullptr; }
@@ -403,6 +475,25 @@ bool OnPacket(int peerIdx, const uint8_t* d, int len, Update& out) {
     }
 
     switch (sub) {
+    // THE HEARTBEAT. "My set is gen G, hash H, N records." Answered only when our copy disagrees --
+    // which covers the three ways to disagree: a different set, a set we never completed, and a
+    // generation whose ids mean something else now. An ask is 6 bytes and the answer is the set.
+    case kSetPing: {
+        const uint32_t hash  = r.u32();
+        const uint16_t count = r.u16();
+        if (!r.ok) { g_st.rejected++; return false; }
+        g_st.pingsRecv++;
+        const bool mine = in.have && in.setN == (int)count && SetHash(in.set, in.setN) == hash;
+        if (!mine) SendSetWant(peerIdx, gen);
+        return true;
+    }
+    // ...and the ask itself, from a peer whose copy of OUR set is stale or missing. The session owns
+    // what to do about it: this lane does not know what our set is, only that somebody wants it.
+    case kSetWant: {
+        g_st.wantsRecv++;
+        out.setWanted = true;
+        return true;
+    }
     case kSet: {
         uint64_t authKey = 0;
         if (!r.b(&authKey, 8)) { g_st.rejected++; return false; }

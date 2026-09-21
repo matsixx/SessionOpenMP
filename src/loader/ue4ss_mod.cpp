@@ -1235,17 +1235,18 @@ static void GameThreadFrame() {
                 // account for every object in between, so a gap can be attributed instead of guessed
                 // at -- own < array with all skips at 0 means the array shrank under us mid-walk.
                 snprintf(m, sizeof(m),
-                         "[drop] array=%d own=%d (skip: world=%d remote=%d hidden=%d noClass=%d"
+                         "[drop] array=%d own=%d overCap=%d (skip: world=%d remote=%d hidden=%d noClass=%d"
                          " noRoot=%d) remote=%d | spawned=%d failed=%d notInstalled=%d destroyed=%d"
                          " drift=%d movable=%d byName=%d purged=%d faults=%d mapDefaults=%d/%d"
-                         " | world: session=%d missing=%d guard=%s",
-                         d.arrayNum, st.dropOwn, d.skipWorld, d.skipRemote, d.skipHidden,
+                         " | world: session=%d missing=%d guard=%s | beat: pings=%d/%d asks=%d/%d",
+                         d.arrayNum, st.dropOwn, d.overCap, d.skipWorld, d.skipRemote, d.skipHidden,
                          d.skipNoClass, d.skipNoRoot,
                          st.dropRemote, d.spawned, d.spawnFails, d.unknownIds, d.destroyed,
                          d.driftFixes, d.madeMovable, d.resolvedByName, d.purgedFromAll, d.faults,
                          d.mapDefaults, d.mapDefaultMissed,
                          st.dropWorld, d.worldMissing,
-                         game::dropper::SaveGuardArmed() ? "on" : "OFF(look-only)");
+                         game::dropper::SaveGuardArmed() ? "on" : "OFF(look-only)",
+                         ds.pingsSent, ds.pingsRecv, ds.wantsSent, ds.wantsRecv);
                 logLine(m);
                 // The wire, both directions on one line: sets out vs sets in is the single comparison
                 // that says which end of the lane lost a set.

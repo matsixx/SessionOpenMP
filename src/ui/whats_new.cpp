@@ -41,6 +41,11 @@ struct Release { const char* version; const char* notes; };
 // instead of anything else (field 2026-09-20, at 1600). `show` measures and trims, but keep the source
 // short enough that trimming never has to happen: budget ~300 characters a release, three releases.
 static const Release kReleases[] = {
+    { "1.2.3",
+      "- The object dropper syncs 1024 objects, not 256.\n"
+      "- ...and stops re-sending the whole list every 6 seconds.\n"
+      "- Throw the board exactly where you look, down included.\n"
+      "- How hard you throw is how fast you pull the trigger." },
     { "1.2.2",
       "- Release notes on the start menu, pulled from the GitHub release.\n"
       "- Update from inside the game: Multiplayer options, hold X on Update.\n"

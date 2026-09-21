@@ -216,7 +216,7 @@ static void purgeFromAllObjects(void* actor) {
 // ---- our own set ------------------------------------------------------------------------------
 int EnumerateOwn(ObjRec* out, void** actorsOut, int cap) {
 #ifdef _WIN32
-    g_st.own = 0; g_st.remote = g_remoteN;
+    g_st.own = 0; g_st.remote = g_remoteN; g_st.overCap = 0;
     g_st.arrayNum = 0; g_st.skipWorld = 0;
     g_st.skipRemote = g_st.skipHidden = g_st.skipNoClass = g_st.skipNoRoot = 0;
     void* m = Manager();
@@ -236,7 +236,12 @@ int EnumerateOwn(ObjRec* out, void** actorsOut, int cap) {
         }
         i++;
         if (isHidden(actor)) { g_st.skipHidden++; continue; }   // adopted away: not in the shared world
-        if (n >= cap) continue;                      // count what we have, publish what fits
+        // OVER THE CAP: counted, not published, and SAID SO. This used to be a bare `continue` whose
+        // comment claimed it counted what it had -- it did not, `g_st.own` is the clamped number -- so
+        // a host past the cap published a subset while every line in the log read as healthy. The
+        // objects lost are the ones placed LAST, because that is the end of the array, which is why it
+        // presents as "the new stuff does not show up for anyone".
+        if (n >= cap) { g_st.overCap++; continue; }
         // THE LEVEL'S OWN PROPS ARE LEFT ALONE. Only an object that can be stored back into an
         // inventory -- one the player actually owns -- is ours to publish. A bench belongs to the map:
         // every player already has it, syncing it was tried and withdrawn, and touching it here is
