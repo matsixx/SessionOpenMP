@@ -10,6 +10,7 @@
 // work combined with the Epic Online Services SDK and the proprietary game runtime it
 // loads into. See LICENSE-EXCEPTION.txt.
 // SessionOpenMP -- session orchestration.
+#include "omp_peers.h"
 #include "session.h"
 #include "modapi.h"
 #include "replay_ghosts.h"
@@ -75,7 +76,8 @@ struct RadioRx {
 
 namespace omp { namespace session {
 
-static const int kMaxPeers = 16;
+static const int kMaxPeers = 32;
+static_assert(kMaxPeers == OMP_MAX_PEERS, "per-peer table out of step with omp_peers.h");
 
 struct Slot {
     bool        used = false;

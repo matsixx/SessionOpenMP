@@ -10,6 +10,7 @@
 // work combined with the Epic Online Services SDK and the proprietary game runtime it
 // loads into. See LICENSE-EXCEPTION.txt.
 // SessionOpenMP -- proxy lifecycle + apply.
+#include "omp_peers.h"
 #include "proxy.h"
 #include "../debug.h"
 #include "../session/session.h"
@@ -284,7 +285,8 @@ static void clearReplayTags(void* actor, const char* what, void (*logf)(const ch
 // stored blob as the LAST writer before pose evaluation. Freshness-gated: a quiet stream stops feeding
 // the slot, the write stops, and the proxy's own graph takes over (OnQuiet semantics).
 // =====================================================================================================
-static const int kAnimSlots = 16;
+static const int kAnimSlots = 32;
+static_assert(kAnimSlots == OMP_MAX_PEERS, "per-peer table out of step with omp_peers.h");
 struct AnimSlot {
     Proxy*   owner = nullptr;
     void*    ai = nullptr;

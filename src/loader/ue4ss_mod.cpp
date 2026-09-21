@@ -692,7 +692,7 @@ static void MpPump() {
     // is exactly "you decide who plays in YOUR game". A kick is async and the member takes a moment
     // to leave, so each target is re-kicked at most once every few seconds rather than every frame.
     if (omp::LobbyIsHost()) {
-        static uint64_t lastKickMs[16] = {0};
+        static uint64_t lastKickMs[32] = {0};
         const uint64_t nowMs = GetTickCount64();
         const int n = omp::PeerCount();
         for (int i = 0; i < n && i < 16; i++) {

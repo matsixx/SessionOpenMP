@@ -19,6 +19,12 @@ namespace omp { namespace ui {
 // once; the answer arrives later, or never.
 void UpdateCheck_Start();
 
+// ASK AGAIN. For the multiplayer menu: a release that goes live while somebody is playing should
+// reach them without a restart. Cheap to call on every menu open -- it does nothing once an update
+// HAS been found, while a check is in flight, or within five minutes of the last one (GitHub allows
+// 60 unauthenticated calls an hour and this is wired to a button somebody can press all evening).
+void UpdateCheck_Recheck();
+
 // Has an answer arrived AND is it "you are behind"? Any thread. False while asking, false when
 // current, and false when the question could not be answered at all -- a check that cannot reach
 // GitHub must look exactly like a check that found nothing.

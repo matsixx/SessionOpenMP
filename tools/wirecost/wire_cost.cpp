@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include "omp_peers.h"
 #include "replication/replication.h"
 #include "replication/anim_fields.h"
 
@@ -74,8 +75,8 @@ int main() {
     // moving (sitting still) ships its skeleton once a second and drivers in between.
     printf("\nPER PLAYER, UPLOAD AND DOWNLOAD (every other player sends to you what you send to them)\n");
     printf("  %-8s %-44s %11s %11s   %s\n", "lobby", "what everyone is doing", "upload", "download", "(+ headers, est.)");
-    const int lobbies[3] = { 4, 10, 16 };
-    for (int li = 0; li < 3; li++) {
+    const int lobbies[4] = { 4, 10, 16, OMP_MAX_PEERS };
+    for (int li = 0; li < (int)(sizeof(lobbies) / sizeof(lobbies[0])); li++) {
         const int N = lobbies[li], peers = N - 1;
         const double hz = Hz(peers);
         struct Mix { const char* what; double skating, sitting, moving; } mixes[4] = {

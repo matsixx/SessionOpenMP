@@ -19,6 +19,7 @@
 //   * the send-after-close cooldown below is kept regardless of SDK version: it is correct behaviour,
 //     not a workaround for one release.
 #include <time.h>
+#include "omp_peers.h"
 #include "transport.h"
 #include "eos_creds.h"
 #include "eos_sideload.h"      // our SDK, loaded beside the game's (the mod target only: OMP_EOS_SIDELOAD)
@@ -79,7 +80,7 @@ struct Peer {
     // carries "not any more". Clearing it would let a departed peer re-enter as a fresh stranger.
     bool              rosterSeen = false;
 };
-static Peer g_peers[16];   // sized for the 16-member lobby (15 remotes + headroom)
+static Peer g_peers[OMP_MAX_PEERS];   // the lobby cap, one table: see omp_peers.h
 static int  g_nPeers = 0;
 // A peer leaves the session. The entry is KEPT (see rosterSeen) but becomes reclaimable, oldest first.
 static void markDeparted(Peer& p) {
@@ -420,7 +421,8 @@ bool LobbyHost() {
     EOS_Lobby_CreateLobbyOptions o{};
     o.ApiVersion = EOS_LOBBY_CREATELOBBY_API_LATEST;
     o.LocalUserId = g_me;
-    o.MaxLobbyMembers = 16;   // matches g_peers[16] + the session's 16 slots. The practical ceiling is
+    o.MaxLobbyMembers = OMP_MAX_PEERS;   // matches g_peers[32] + the session's 32 slots. EOS allows 64
+                              // (EOS_LOBBY_MAX_LOBBY_MEMBERS); the practical ceiling is
                               // proxy CPU (each remote = a full anim graph), not this number.
     o.PermissionLevel = EOS_ELobbyPermissionLevel::EOS_LPL_PUBLICADVERTISED;
     o.bPresenceEnabled = EOS_FALSE;

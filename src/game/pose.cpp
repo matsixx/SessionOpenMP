@@ -10,6 +10,7 @@
 // work combined with the Epic Online Services SDK and the proprietary game runtime it
 // loads into. See LICENSE-EXCEPTION.txt.
 #include <cmath>
+#include "omp_peers.h"
 #include "pose.h"
 #include "pose_blend.h"
 #include "game_syms.h"
@@ -33,13 +34,14 @@ Stats   GetStats() { return g_st; }
 
 // The transported pose, keyed by the MESH that has to wear it -- the same shape as the anim post-pass
 // registry, and for the same reason: the hook sees a component, not a proxy.
-// ONE PER PEER THE SESSION CAN HOLD (session.cpp kMaxPeers = 16; the anim post-pass registry beside this one,
-// proxy.cpp kAnimSlots, is 16 too). IT WAS 8, and a slot is never given back while its proxy lives -- so in a
+// ONE PER PEER THE SESSION CAN HOLD (session.cpp kMaxPeers = 32; the anim post-pass registry beside this one,
+// proxy.cpp kAnimSlots, is 32 too). IT WAS 8, and a slot is never given back while its proxy lives -- so in a
 // lobby of ten, the ninth proxy on every machine had NO transported pose at all: not their sit, not their bail's
 // rag-doll, not an emote. Worse for a pose that MOVES (an emote, a carried prop): its packets carry the skeleton
 // INSTEAD of the drivers, so that viewer got neither -- a frozen, broken-looking skater (field, 2026-09-19:
 // peers=9). Every refusal is COUNTED now (Stats::noSlot): it was silent.
-static const int kSlots = 16;
+static const int kSlots = 32;
+static_assert(kSlots == OMP_MAX_PEERS, "per-peer table out of step with omp_peers.h");
 struct Slot {
     void*    mesh = nullptr;
     uint8_t  n = 0;                       // TRANSPORTED pose (0 = none in hand)

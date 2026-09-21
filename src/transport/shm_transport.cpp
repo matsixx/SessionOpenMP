@@ -30,6 +30,7 @@
 //   * THE MAPPING NAME CARRIES A VERSION: a mapping's SIZE is fixed by whoever creates it FIRST, so a
 //     stale mapping from an older layout, held open by a surviving process, would silently cap this
 //     one. Bump the name on any layout change.
+#include "omp_peers.h"
 #include "transport.h"
 #include <cstdio>
 #include <cstring>
@@ -37,7 +38,8 @@
 
 namespace omp { namespace shmb {
 
-static const int      kSlots   = 16;
+static const int      kSlots   = 32;
+static_assert(kSlots == OMP_MAX_PEERS, "per-peer table out of step with omp_peers.h");
 static const int      kMaxMsg  = 1024;               // > our packet (State ~= 470 B) with room to grow
 static const int      kRelRing = 64;                 // reliable messages in flight per sender. Sized
                                                      // for the replay-sync bulk transfer: its chunk

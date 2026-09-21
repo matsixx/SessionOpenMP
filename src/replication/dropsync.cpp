@@ -10,6 +10,7 @@
 // work combined with the Epic Online Services SDK and the proprietary game runtime it
 // loads into. See LICENSE-EXCEPTION.txt.
 // SessionOpenMP -- the dropped-object lane (see the header for the design).
+#include "omp_peers.h"
 #include "dropsync.h"
 #include <cstring>
 #include <cmath>
@@ -32,7 +33,8 @@ enum : uint8_t { kSet = 1, kPlace = 2, kMove = 3, kRemove = 4, kWorldSet = 5, kW
 
 // Under the transport's ~1 KB message convention with room to spare for the name table.
 static const int kMaxPacket = 1000;
-static const int kPeers     = 16;             // the lobby cap
+static const int kPeers     = 32;             // the lobby cap
+static_assert(kPeers == OMP_MAX_PEERS, "per-peer table out of step with omp_peers.h");
 
 static SendFn g_send = nullptr;
 void SetSendFn(SendFn fn) { g_send = fn; }

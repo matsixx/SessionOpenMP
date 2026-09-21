@@ -38,6 +38,7 @@
 //   * A DEPARTED PEER IS NOTICED. Silence is the only signal a datagram transport gets, so silence has
 //     to count: past `kPeerTimeoutMs` the peer goes to state 5, which is what stops a proxy being
 //     driven by a corpse.
+#include "omp_peers.h"
 #include "transport.h"
 
 #define _CRT_RAND_S
@@ -92,7 +93,8 @@ static const int kHdr = (int)sizeof(Hdr);       // 12
 static const int kIdLen = 32;
 
 // ---- tuning ------------------------------------------------------------------------------------------
-static const int kPeers          = 16;          // matches the EOS backend and the session's slot table
+static const int kPeers          = 32;          // matches the EOS backend and the session's slot table
+static_assert(kPeers == OMP_MAX_PEERS, "per-peer table out of step with omp_peers.h");
 static const int kRelWindow      = 32;          // reliable messages in flight per peer
 static const int kRelResendMs    = 200;
 static const int kRelGiveUpMs    = 4000;        // past this a message is dropped and SAID

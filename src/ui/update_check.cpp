@@ -67,6 +67,13 @@ bool UpdateCheck_NoteAt(int i, char* verOut, int verCap, char* bodyOut, int body
     return true;
 }
 static volatile LONG g_started = 0;
+// A re-check in flight (the worker clears it), and when the last one went out. Five minutes is far
+// inside GitHub's hourly allowance while still being often enough that a release lands within one
+// menu visit of going live.
+static volatile LONG g_busy = 0;
+static volatile LONG g_skipNotes = 0;      // a re-check wants the tag only -- see the second request
+static ULONGLONG     g_lastAskMs = 0;
+static const ULONGLONG kMinGapMs = 5 * 60 * 1000;
 
 // ---- version comparison ------------------------------------------------------------------------
 // Written against the tags this project ACTUALLY publishes, which is not what a first guess assumes:
@@ -283,11 +290,17 @@ static DWORD WINAPI worker(LPVOID) {
     req = nullptr;
 
     // ---- SECOND REQUEST: the release LIST, for the notes the What's New panel shows.
+    // SKIPPED ON A RE-CHECK. parseReleases writes the notes table in place and publishes the count
+    // last, which is safe on the FIRST pass (the count is 0 while the entries are written) and is a
+    // torn read on a second one -- a reader holding the old count while the entries underneath it
+    // change. A re-check only ever needs to know whether the tag moved, so it does not ask for this
+    // at all: the notes it would fetch are the same ones already parsed, and the panel that reads
+    // them only appears on the start menu, before any re-check can have run.
     // A separate request rather than reading the notes out of the one above, because the two want
     // different things: "am I out of date" must use /releases/latest, which EXCLUDES drafts and
     // pre-releases, and swapping it for the list would start announcing a pre-release as an update.
     // Bodies are prose and there are several of them, so the buffer is heap rather than stack.
-    if (con) {
+    if (con && !InterlockedCompareExchange(&g_skipNotes, 0, 0)) {
         char* list = (char*)malloc(kListBytes);
         DWORD n = 0;
         if (list) {
@@ -323,18 +336,47 @@ static DWORD WINAPI worker(LPVOID) {
             // otherwise be able to see "newer version" with nothing to name.
             strncpy(g_latest, tag, sizeof(g_latest) - 1);
             InterlockedExchange(&g_state, 2);
+            InterlockedExchange(&g_busy, 0);
             return 0;
         }
     }
     InterlockedExchange(&g_state, 1);        // current, or unknowable -- both mean say nothing
+    InterlockedExchange(&g_busy, 0);
     return 0;
 }
 
-void UpdateCheck_Start() {
-    if (InterlockedExchange(&g_started, 1)) return;          // once per process, ever
+static void spawnWorker() {
     HANDLE h = CreateThread(nullptr, 0, &worker, nullptr, 0, nullptr);
     if (h) CloseHandle(h);                                   // detached: nothing waits on it
-    else InterlockedExchange(&g_state, 1);
+    else { InterlockedExchange(&g_state, 1); InterlockedExchange(&g_busy, 0); }
+}
+
+void UpdateCheck_Start() {
+    if (InterlockedExchange(&g_started, 1)) return;          // the FIRST one is once per process
+    InterlockedExchange(&g_busy, 1);
+    g_lastAskMs = GetTickCount64();
+    spawnWorker();
+}
+
+// ASK AGAIN, so a release that goes live while the game is running is noticed without a restart.
+// Three guards, and each one is load-bearing:
+//   * ALREADY FOUND -- state 2 is terminal. There is nothing a later answer could add, and the row
+//     is already on screen.
+//   * STILL ASKING -- the worker owns g_latest and the notes table while it runs; a second one
+//     would write them underneath the first. `g_busy` is cleared by the worker itself, at the end.
+//   * TOO SOON -- GitHub allows 60 unauthenticated calls an hour per address, and this is wired to
+//     opening a menu, which somebody can do all evening. One ask per kMinGapMs at the very most.
+void UpdateCheck_Recheck() {
+    if (!InterlockedCompareExchange(&g_started, 0, 0)) { UpdateCheck_Start(); return; }
+    if (InterlockedCompareExchange(&g_state, 2, 2) == 2) return;
+    if (InterlockedCompareExchange(&g_busy, 1, 1)) return;
+    const ULONGLONG now = GetTickCount64();
+    if (g_lastAskMs && now - g_lastAskMs < kMinGapMs) return;
+    if (InterlockedExchange(&g_busy, 1)) return;             // lost the race to another caller
+    g_lastAskMs = now;
+    InterlockedExchange(&g_state, 0);                        // asking again: not "answered, current"
+    InterlockedExchange(&g_skipNotes, 1);                    // ...and leave the notes table alone
+    spawnWorker();
 }
 
 bool UpdateCheck_NewerAvailable(char* latestOut, int cap) {

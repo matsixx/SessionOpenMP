@@ -1160,9 +1160,15 @@ static uint32_t sessionSig() {
     // field that is rendered but not signed is a field that silently goes stale.
     for (const char* c = omp::LobbyOwnerId(); c && *c; c++) txt = txt * 31u + (uint32_t)*c;
     for (const char* c = MpName_Get(); c && *c; c++) txt = txt * 31u + (uint32_t)*c;
+    // WHETHER THERE IS AN UPDATE is on this page too -- it is a whole row appearing or not -- so it
+    // belongs in the signature for the same reason the join code does: a field that is rendered but
+    // not signed is one that silently goes stale. This is what turns the re-check into a row that
+    // arrives by itself instead of one you have to leave the page and come back for. The text hash
+    // gives up a bit to make room, which costs it nothing it was using.
+    const uint32_t upd = omp::ui::UpdateCheck_NewerAvailable(nullptr, 0) ? 1u : 0u;
     return (uint32_t)(s.armed ? 1 : 0) | ((uint32_t)(s.tpState & 3) << 1)
          | ((uint32_t)(s.lobby & 7) << 3) | ((uint32_t)(s.peers & 31) << 6)
-         | ((uint32_t)(s.proxies & 31) << 11) | ((txt & 0xffffu) << 16);
+         | ((uint32_t)(s.proxies & 31) << 11) | (upd << 16) | ((txt & 0x7fffu) << 17);
 }
 
 // The live session line. Mirrors what the F1 menu says, so the two surfaces never disagree.
@@ -1418,6 +1424,12 @@ static const TArrayHdr* chooseArray(void* page, const TArrayHdr* items, TArrayHd
         // ABOVE EVERYTHING, and only when there is actually something to install. It goes first
         // because playing on an old version is the thing that wastes people's evening: the lobby
         // connects and the other player is invisible.
+        // ASK AGAIN WHILE WE ARE HERE. A release going live mid-session used to need a restart before
+        // this row could appear -- the check was one shot at startup. It is rate-limited to one ask
+        // per five minutes, so opening this page repeatedly costs nothing, and the answer lands a
+        // second or two later: sessionSig() carries the result, so the page re-renders itself and the
+        // row drops in while it is still on screen.
+        omp::ui::UpdateCheck_Recheck();
         if (g_updateKey && omp::ui::UpdateCheck_NewerAvailable(nullptr, 0)) {
             setRowRoster(g_updateRow);
             add(g_updateRow, true);

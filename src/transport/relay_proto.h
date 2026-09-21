@@ -39,7 +39,11 @@ static const uint8_t  kVer   = 1;
 static const int kRoomCodeLen = 8;      // "ABC123" and room for growth; NUL-padded, not terminated
 static const int kNameLen     = 32;     // a display name, and a peer identity string
 static const int kMapLen      = 32;
-static const int kMaxSlots    = 16;     // per room; matches kPeers in every other backend
+static const int kMaxSlots    = 32;     // per room. MUST MATCH OMP_MAX_PEERS in src/omp_peers.h --
+                                        // checked by hand, because this header is deliberately
+                                        // standalone (the relay builds with no game and no SDK).
+                                        // A 32-slot RT_ROSTER is 1061 B against kMaxPayload 1100 --
+                                        // it fits, but that is the number to check before going higher.
 static const int kMaxPayload  = 1100;   // an OMPU-framed game datagram, with room for its own header
 static const int kListRooms   = 8;      // rooms per LIST reply
 
