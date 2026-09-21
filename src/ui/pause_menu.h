@@ -85,12 +85,24 @@ void PauseMenu_ForgetPage();
 // likely trigger is nearby in the same class: `_gameWasPausedBeforeAltTab`. Coming back from alt-tab
 // the game restores the pause it thinks it had, and our patch makes that fail.
 //
-// THE REPAIR: while the menu is really displayed, put focus back on the LIVE container (read off the
-// controller, never the cached page). Re-asserting focus that is already there costs nothing, so this
-// runs on a slow beat rather than trying to detect the fault -- there is no way to ask Slate who has
-// focus without another signature, and a repair that only needs to be right within a quarter second
-// does not need one. `PauseMenuFocusFix` in the ini turns it off.
+// THE REPAIR, AND WHY IT IS NOT A BEAT. The first version put focus back on a 250 ms beat, on the
+// grounds that re-asserting focus already held costs nothing. That is true of the MENU and false of
+// everything else: a confirm dialog opened from inside the menu -- "hold X to apply" on a graphics
+// change -- takes focus legitimately, and the beat took it straight back, so the dialog could not be
+// used at all. A repair that breaks a working path is worse than the fault it repairs.
+//
+// So it fires on EVENTS instead, and only ones where nothing else can reasonably own focus:
+//   * the menu becoming displayed (it should be the menu's, and briefly after, so the game's own
+//     setup finishes first);
+//   * the window being re-activated, which is the suspected trigger -- see _gameWasPausedBeforeAltTab.
+// A dialog opened while navigating the menu happens at neither moment, so it is never disturbed.
+//
+// What this gives up: if focus is lost at some third moment, nothing puts it back. Catching that
+// needs to ask Slate who actually holds focus, which needs another signature, and is worth doing only
+// if the fault is seen again. `PauseMenuFocusFix` in the ini turns the whole thing off.
 void PauseMenu_KeepFocus(bool menuDisplayed, void (*logf)(const char*));
+// WINDOW-MESSAGE THREAD: the window just became active again. Consumed by the next game frame.
+void PauseMenu_NoteWindowActivated();
 // How many times the IN-GAME pause page has been built. The start menu and the pause menu are the
 // same kind of thing to the rest of the mod; the page key is what tells them apart, and this counter
 // is the only place that distinction is available outside this file. Watch it for CHANGE, not value.

@@ -41,6 +41,9 @@ struct Release { const char* version; const char* notes; };
 // instead of anything else (field 2026-09-20, at 1600). `show` measures and trims, but keep the source
 // short enough that trimming never has to happen: budget ~300 characters a release, three releases.
 static const Release kReleases[] = {
+    { "1.2.6",
+      "- Fixes 1.2.5: the pause menu's confirm dialogs work again.\n"
+      "- Hold-to-apply on a graphics change could not be used." },
     { "1.2.5",
       "- Fixes a crash when changing maps with other players around.\n"
       "- Speech bubbles have a panel and a tail; the name sits on them.\n"

@@ -10,6 +10,7 @@
 // work combined with the Epic Online Services SDK and the proprietary game runtime it
 // loads into. See LICENSE-EXCEPTION.txt.
 // SessionOpenMP -- the in-game pause-menu integration. Design + the measured facts: pause_menu.h.
+#include <atomic>
 #include "pause_menu.h"
 #include "../debug.h"
 #include "overlay.h"
@@ -1142,19 +1143,33 @@ static bool pageOnScreen(void* page) {
 bool PauseMenu_IsShown() { return g_lastPage && pageOnScreen(g_lastPage); }
 // See pause_menu.h. The live container, focus put back on a slow beat, and one line the first time
 // it happens per menu so the log says whether this is doing anything at all.
-bool  g_focusFixOn   = true;         // PauseMenuFocusFix
-unsigned kFocusBeatMs = 250;
+bool  g_focusFixOn    = true;        // PauseMenuFocusFix
+// Long enough for the game's own focus handling to finish first, short enough not to be noticed.
+unsigned kFocusDelayMs = 200;
+
+// Set on the window-message thread, taken on the game thread.
+static std::atomic<bool> g_windowCameBack{false};
+void PauseMenu_NoteWindowActivated() { g_windowCameBack = true; }
 
 void PauseMenu_KeepFocus(bool menuDisplayed, void (*logf)(const char*)) {
-    static uint64_t lastMs = 0;
+    static bool     wasDisplayed = false;
+    static uint64_t dueAt = 0;
     static bool     saidThisMenu = false;
-    if (!menuDisplayed) { saidThisMenu = false; return; }
-    if (!g_focusFixOn) return;
+
+    const bool cameBack = g_windowCameBack.exchange(false);
+    if (!menuDisplayed) { wasDisplayed = false; dueAt = 0; saidThisMenu = false; return; }
+    if (!g_focusFixOn) { wasDisplayed = true; return; }
+
+    const uint64_t now = GetTickCount64();
+    // The two moments worth acting on -- see pause_menu.h. Both are armed with a short delay so the
+    // game's own focus handling runs first and this only has to correct what it left behind.
+    if (!wasDisplayed) { dueAt = now + kFocusDelayMs; wasDisplayed = true; }
+    else if (cameBack) { dueAt = now + kFocusDelayMs; }
+    if (!dueAt || now < dueAt) return;
+    dueAt = 0;
+
     const omp::game::Syms& S = omp::game::Get();
     if (!S.WidgetSetFocus) return;
-    const uint64_t now = GetTickCount64();
-    if (now - lastMs < kFocusBeatMs) return;
-    lastMs = now;
 
     void* pc = nullptr;
     void* gi = VersionTag_GameInstance();
@@ -1177,7 +1192,7 @@ void PauseMenu_KeepFocus(bool menuDisplayed, void (*logf)(const char*)) {
     __try { S.WidgetSetFocus(container); } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
     if (!saidThisMenu) {
         saidThisMenu = true;
-        if (logf) logf("[menu] holding keyboard focus on the pause menu while it is up");
+        if (logf) logf("[menu] put keyboard focus back on the pause menu");
     }
 }
 

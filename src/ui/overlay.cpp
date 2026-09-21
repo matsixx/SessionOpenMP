@@ -44,6 +44,7 @@
 #include "mp_name.h"
 #include "mp_prefs.h"
 #include "chat.h"
+#include "pause_menu.h"
 #include "nameplates.h"
 #include "game_hud.h"
 #include "../transport/eos_sideload.h"      // GameSdkWasReplaced: an older install overwrote the game's EOS file
@@ -163,6 +164,11 @@ static ID3D12CommandQueue* matchQueue(ID3D12Device* dev) {
 }
 
 static LRESULT CALLBACK hkWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    // THE WINDOW COMING BACK is the one moment the pause menu is known to lose its keyboard focus:
+    // the game restores the pause it thinks it had on the way in, and this mod refuses every pause.
+    // Reported here and acted on by the game thread -- nothing Unreal may be touched from here.
+    if (m == WM_ACTIVATEAPP && w != 0) PauseMenu_NoteWindowActivated();
+
     // Chat is in this list for the same reason the code prompt is: while it is OPEN the player is
     // typing, and a WASD that reaches the game would send them rolling down the street mid-sentence.
     const bool capturing = g_visible.load() || Overlay_PromptOpen() || Chat_IsOpen();
