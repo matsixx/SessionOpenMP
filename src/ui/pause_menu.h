@@ -69,6 +69,28 @@ bool PauseMenu_IsShown();
 // The world changed: whatever page was last built belongs to a menu that no longer exists, and its
 // memory may already hold something else. Forget it rather than read it.
 void PauseMenu_ForgetPage();
+
+// ==== KEEPING THE PAUSE MENU'S KEYBOARD FOCUS =========================================================
+// THE BUG: with the menu up, control sometimes goes to the SKATER instead -- the menu stops answering
+// and there is no way out of it. It has been around since the world-freeze was disabled.
+//
+// WHAT IT IS: the menu is a UMG widget and answers keys through UPauseMenuPageContainer::NativeOnKeyDown,
+// which only runs while it holds Slate keyboard focus. Lose that and the keys fall through to the
+// player controller -- so the skater moves and the menu is deaf. Field confirmation: the replay-editor
+// button still worked while stuck (it is a controller action, not a menu one), and going in and out of
+// the editor fixed it, because that transition sets focus properly on the way out.
+//
+// WHY THE FREEZE MATTERS: paused, the pawn does not tick, so losing focus was invisible -- the menu was
+// just as deaf, but nothing moved to tell you. Running, the same loss is obvious AND reachable. The
+// likely trigger is nearby in the same class: `_gameWasPausedBeforeAltTab`. Coming back from alt-tab
+// the game restores the pause it thinks it had, and our patch makes that fail.
+//
+// THE REPAIR: while the menu is really displayed, put focus back on the LIVE container (read off the
+// controller, never the cached page). Re-asserting focus that is already there costs nothing, so this
+// runs on a slow beat rather than trying to detect the fault -- there is no way to ask Slate who has
+// focus without another signature, and a repair that only needs to be right within a quarter second
+// does not need one. `PauseMenuFocusFix` in the ini turns it off.
+void PauseMenu_KeepFocus(bool menuDisplayed, void (*logf)(const char*));
 // How many times the IN-GAME pause page has been built. The start menu and the pause menu are the
 // same kind of thing to the rest of the mod; the page key is what tells them apart, and this counter
 // is the only place that distinction is available outside this file. Watch it for CHANGE, not value.

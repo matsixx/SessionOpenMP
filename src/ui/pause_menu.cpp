@@ -1140,6 +1140,47 @@ static bool pageOnScreen(void* page) {
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
 bool PauseMenu_IsShown() { return g_lastPage && pageOnScreen(g_lastPage); }
+// See pause_menu.h. The live container, focus put back on a slow beat, and one line the first time
+// it happens per menu so the log says whether this is doing anything at all.
+bool  g_focusFixOn   = true;         // PauseMenuFocusFix
+unsigned kFocusBeatMs = 250;
+
+void PauseMenu_KeepFocus(bool menuDisplayed, void (*logf)(const char*)) {
+    static uint64_t lastMs = 0;
+    static bool     saidThisMenu = false;
+    if (!menuDisplayed) { saidThisMenu = false; return; }
+    if (!g_focusFixOn) return;
+    const omp::game::Syms& S = omp::game::Get();
+    if (!S.WidgetSetFocus) return;
+    const uint64_t now = GetTickCount64();
+    if (now - lastMs < kFocusBeatMs) return;
+    lastMs = now;
+
+    void* pc = nullptr;
+    void* gi = VersionTag_GameInstance();
+    if (!gi) return;
+    __try {
+        struct TArr { void** data; int num, max; };
+        const TArr* lp = (const TArr*)((const uint8_t*)gi + omp::game::off::kGiLocalPlayers);
+        if (!lp->data || lp->num <= 0) return;
+        void* player = lp->data[0];
+        if (!player) return;
+        pc = *(void**)((uint8_t*)player + omp::game::off::kPlayerController);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    if (!pc) return;
+
+    void* container = nullptr;
+    __try { container = *(void**)((uint8_t*)pc + omp::game::off::kPcActivePauseMenu); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    if (!container) return;
+
+    __try { S.WidgetSetFocus(container); } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    if (!saidThisMenu) {
+        saidThisMenu = true;
+        if (logf) logf("[menu] holding keyboard focus on the pause menu while it is up");
+    }
+}
+
 void PauseMenu_ForgetPage() { g_lastPage = nullptr; }
 
 static uint32_t browseSig() {

@@ -1082,6 +1082,11 @@ namespace off {
     // the fact every earlier attempt was trying to infer from events and from whether a pawn existed;
     // the title screen HAS a pawn (field 2026-09-20), so that never could have worked.
     constexpr int kPcIntroUI          = 0x670;   // ASessionPlayerController::_introUI
+    // THE LIVE PAUSE MENU, as opposed to the last page we happened to see. Reading it off the
+    // controller is the only way to get the CURRENT one -- pause_menu's own g_lastPage is a
+    // browse-poll cache and goes stale the moment the menu is dismissed (which is what broke the
+    // chat's open gate for a whole release).
+    constexpr int kPcActivePauseMenu  = 0x710;   // ASessionPlayerController::_activePauseMenuPageContainer
     constexpr int kImageColor         = 0x1a0;   // UImage::ColorAndOpacity (FLinearColor) -- READ to
                                                  // keep the blueprint's own alpha when tinting
     constexpr int kSScrollDesired     = 0x340;   // SScrollBox::DesiredScrollOffset (float)
@@ -1094,6 +1099,18 @@ namespace off {
     constexpr int kBlurStrength       = 0x134;   // ::BlurStrength (float; the radius follows it)
     constexpr int kBlurAutoRadius     = 0x138;   // ::bOverrideAutoRadiusCalculation
     constexpr int kBlurRadius         = 0x13c;   // ::BlurRadius (int32, used when overridden)
+    // UImage::Brush, and the FSlateBrush fields a 9-slice needs. DrawAs = Box (1) keeps the
+    // corners at native size and stretches the edges; Margin is the slice, as a FRACTION of
+    // the texture (left, top, right, bottom).
+    constexpr int kImageBrush         = 0x108;   // UImage::Brush (FSlateBrush)
+    constexpr int kBrushMargin        = 0x10;    //   FSlateBrush::Margin (FMargin, 4 floats)
+    constexpr int kBrushResource      = 0x48;    //   ::ResourceObject (UObject*)
+    constexpr int kBrushDrawAs        = 0x6c;    //   ::DrawAs (ESlateBrushDrawType)
+    // UWidget::RenderTransform (FWidgetTransform: Translation, Scale, Shear, then Angle in
+    // degrees). The pivot next to it defaults to the widget's centre, which is what turns a
+    // rotated square into a diamond instead of swinging it about a corner.
+    constexpr int kWidgetRenderXform  = 0x90;    // UWidget::RenderTransform
+    constexpr int kXformAngle         = 0x18;    //   FWidgetTransform::Angle (float, degrees)
     constexpr int kWidgetSlot         = 0x28;    // UWidget::Slot (PDB)
     constexpr int kSlotParent         = 0x28;    // UPanelSlot::Parent -- the widget that CONTAINS it
     // UTextLayoutWidget, the PARENT of UTextBlock -- which is why neither is on UTextBlock itself.

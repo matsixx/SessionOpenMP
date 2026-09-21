@@ -75,6 +75,12 @@ static bool     g_inSession = false;                 // host/join pressed: gates
 // handed out, is never reused or renumbered, so a proxy can never inherit another player's stream.
 struct SPeer {
     int       slot = -1;
+    // WHO IS IN THAT SLOT. A slot INDEX is not an identity: a client that leaves gives its slot back,
+    // and the next process to claim one walks from zero and takes the first free -- very often the
+    // same index it just released. Keyed on the index alone, the peer entry left behind is reused for
+    // what is actually a different process, carrying its state (5, DEPARTED) and its consumed ticket
+    // counts with it. Which is how one side could see the other while the other saw nothing.
+    LONG      owner = 0;
     PeerStats st{};
     uint32_t  lastSeq = 0;
     uint32_t  lastRel = 0;                           // reliable tickets consumed from this peer
@@ -97,13 +103,26 @@ static bool pidAlive(LONG pid) {
     return alive;
 }
 
-static int peerForSlot(int slot) {
-    for (int i = 0; i < g_nPeers; i++) if (g_peers[i].slot == slot) return i;
+static int peerForSlot(int slot, LONG owner) {
+    for (int i = 0; i < g_nPeers; i++) {
+        if (g_peers[i].slot != slot) continue;
+        // Same slot, DIFFERENT PROCESS: not the peer we remember. Everything about the old occupant
+        // is wrong for this one -- its departed state, the tickets we had consumed, the sequence we
+        // had seen -- so the entry starts again rather than being handed on.
+        if (g_peers[i].owner != owner) {
+            const LONG was = g_peers[i].owner;
+            g_peers[i] = SPeer{};
+            g_peers[i].slot = slot; g_peers[i].owner = owner; g_peers[i].st.state = 1;
+            Log("[shm] peer #%d: slot %d changed hands (pid %ld -> %ld) -- treated as a new player",
+                i, slot, (long)was, (long)owner);
+        }
+        return i;
+    }
     if (g_nPeers >= kSlots) return -1;
     SPeer& p = g_peers[g_nPeers];
-    p = SPeer{}; p.slot = slot;
+    p = SPeer{}; p.slot = slot; p.owner = owner;
     p.st.state = 1;                                   // shared memory is as DIRECT as a link gets
-    Log("[shm] peer #%d = slot %d", g_nPeers, slot);
+    Log("[shm] peer #%d = slot %d (pid %ld)", g_nPeers, slot, (long)owner);
     return g_nPeers++;
 }
 
@@ -130,7 +149,12 @@ static bool claimSlot() {
     if (g_mine < 0) { Log("[shm] *** all %d slots held by LIVE processes -- cannot publish", kSlots); return false; }
 
     // Our slot may hold a previous process's bytes; start it clean so nobody reads a stale frame.
+    // THE RELIABLE RING TOO. It used to be left alone, so a recycled slot carried on counting from
+    // the last process's ticket -- and a reader that still remembered that number saw nothing newer
+    // than what it had already consumed, from a player who had only just arrived.
     g_mem->slot[g_mine].seq = 0; g_mem->slot[g_mine].len = 0;
+    g_mem->slot[g_mine].relHead = 0;
+    for (int r = 0; r < kRelRing; r++) g_mem->slot[g_mine].rel[r].ticket = 0;
     snprintf(g_myId, sizeof(g_myId), "shm:%d", g_mine);
     Log("[shm] mailbox ready: slot %d of %d is ours (pid %ld) -- no login, no network", g_mine, kSlots, (long)pid);
     return true;
@@ -215,7 +239,7 @@ void Tick(RecvFn onRecv, void* user) {
     for (int i = 0; i < kSlots; i++) {
         if (i == g_mine) continue;
         const LONG owner = g_mem->owner[i];
-        if (owner != 0 && pidAlive(owner)) { peerForSlot(i); continue; }
+        if (owner != 0 && pidAlive(owner)) { peerForSlot(i, owner); continue; }
         for (int p = 0; p < g_nPeers; p++)
             if (g_peers[p].slot == i && g_peers[p].st.state != 5) {
                 g_peers[p].st.state = 5;              // DEPARTED: index stays valid, sends stop

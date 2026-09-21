@@ -106,8 +106,56 @@ float kBaseSize    = 18.0f;
 // A line's height as a multiple of its font size -- only needed to sit the speech bubble on top of
 // the name, since the widgets themselves are placed by their own bottom edge and size themselves.
 float kLineFactor  = 1.25f;
-float kBubbleGap   = 0.30f;    // ...and the gap between the two, in font sizes
-float kBubbleWrapEm = 15.0f;   // wrap width as a multiple of the font size, as on the other surface
+// ---- SPEECH BUBBLES. The gap is in font sizes and is measured from the top of the NAME to the
+// bottom of the bubble's panel, so the two never look like one block of text (field: "it's too close
+// to their name. It's also not much of a chat bubble anymore").
+float kBubbleGap   = 1.05f;
+// A MESSAGE IS BODY TEXT; A NAME IS A LABEL. The bubble used to be drawn at exactly the name's size,
+// distance boost and all -- which at the 1.3x close-range clamp made it the biggest text anywhere in
+// the mod, bigger than the chat box it is quoting. This brings it to about the chat's own size at the
+// reference distance, and it still scales with distance like the plate it hangs over.
+float kBubbleSizeMul = 0.85f;
+int   kBubbleCols  = 26;
+enum { kBubbleMaxLines = 4 };  // past this a sentence is cut: a paragraph over a head is not readable       // characters per line before it wraps -- wrapped HERE, see `wrapInto`
+// Room inside the panel, in slate units. TOP AND BOTTOM ARE NOT THE SAME, because the text is placed
+// by its BOTTOM edge and a text block's box carries the font's descender space below the glyphs --
+// so an even padding lands low, and the ascenders come out of the top of the panel while the bottom
+// has room to spare. Measured off a field screenshot rather than reasoned about: the caps were
+// crossing the top edge with a clear gap underneath.
+float kBubblePadX = 9.0f, kBubblePadTop = 10.0f, kBubblePadBottom = 3.0f;
+// A THIN FRAME AROUND THE BUBBLE, drawn with the game's own `Border` texture 9-sliced -- the object
+// placement UI's selection frame: 111x109, a one-pixel light rule round the edge with L brackets
+// inset at the corners, hollow in the middle. Sliced at kFrameMargin of its width the corners keep
+// whatever falls inside the margin and the edges stretch the rule, so a small margin gives a plain
+// rectangle and a large one keeps the brackets. Square corners either way -- see the note on
+// `borderTexture` for why there is no rounded one to reach for.
+bool  kBubbleFrame  = true;
+// THE NAME HAS NO BOX. It was given one to match the reference picture and it did not look good in
+// the field -- a box round every name on screen is a lot of boxes, where a box round the occasional
+// sentence is not. The name moves to the bubble's top-left corner instead whenever there is a bubble
+// to sit on, which is the part of that picture worth having.
+//
+// THE TAIL is a square rotated 45 degrees, hung under the panel so the part below the edge is a
+// downward triangle. There is no triangle in the game's UI textures and there is no clipping to be
+// had, so the overlap is kept small rather than hidden: `kTailDrop` is how far the diamond's CENTRE
+// sits below the panel, and at the default only a sliver of it is behind the panel, where two
+// translucent layers would otherwise show as a darker patch.
+bool  kBubbleTail   = true;
+float kTailSize     = 13.0f;    // the square's side, slate units
+float kTailDrop     = 4.0f;     // its centre, this far below the panel's bottom edge
+float kFrameMargin  = 0.03f;                       // 0.03 = the plain rule; ~0.11 keeps the brackets
+float kFrameR = 1.0f, kFrameG = 1.0f, kFrameB = 1.0f;
+float kFrameAlpha   = 0.28f;
+bool  kBubblePanel = true;     // the dark panel behind it, the chat box's in miniature
+// NO FROST ON A BUBBLE. The chat box is one big surface and the blur earns its keep there; a bubble
+// is a couple of words over a head, where a plain dark panel reads just as well -- and a blur is a
+// real per-instance cost, so N people talking would have meant N of them. Dropping it is also what
+// lets there be one panel per peer instead of a pool small enough to bound the cost.
+bool  kBubbleBlur  = false;
+// HOW WIDE A CHARACTER IS, as a fraction of the font size. Nothing on this side can measure a
+// proportional font, so a panel that has to fit text is sized from a count and this number. Taken
+// from the chat's own wrap (620 slate units over 66 characters at size 15), so the two agree.
+float kCharWEm     = 0.63f;
 int   kZOrder      = 100;      // the floating names: over the world, under the menus
 // THE CHAT GOES OVER EVERYTHING, the pause menu included -- that is what was asked for, and it is
 // right anyway: a message arriving while somebody is in a menu is exactly when they most need to see
@@ -144,7 +192,9 @@ enum { kLaneName = 0, kLaneBubble = 1, kLaneChat = 100, kLaneChatIn = 90,
        kLaneChatEmpty = 95 };
 // The pool is two zones, because the two halves are added to the viewport at different depths and a
 // slot cannot change its mind afterwards. Names first, then the chat's rows and its furniture.
-enum { kSlotsName = OMP_MAX_PEERS * 2, kSlotsChat = 32, kSlots = kSlotsName + kSlotsChat };
+// A name and up to a few wrapped bubble lines per peer. Slots cost nothing until something claims
+// one -- a widget is built on demand -- so this is a ceiling, not an allocation.
+enum { kSlotsName = OMP_MAX_PEERS * 4, kSlotsChat = 32, kSlots = kSlotsName + kSlotsChat };
 
 struct Slot {
     void*    w    = nullptr;      // the UUserWidget
@@ -477,9 +527,9 @@ static void showIt(Slot& s, bool on) {
 //
 // Copies one line's worth out of `text` starting at `from`, breaking at the last space that fits.
 // Returns where the next line starts, or -1 when that was the last one.
-static int wrapInto(const char* text, int from, char* out, int cap) {
+static int wrapInto(const char* text, int from, char* out, int cap, int wantCols) {
     const int len = (int)strlen(text);
-    int cols = kChatCols; if (cols < 8) cols = 8; if (cols > cap - 1) cols = cap - 1;
+    int cols = wantCols; if (cols < 8) cols = 8; if (cols > cap - 1) cols = cap - 1;
     if (from >= len) { out[0] = 0; return -1; }
     int take = len - from;
     if (take > cols) {
@@ -519,12 +569,6 @@ static Slot* claim(uint64_t key, bool chat, void* cls, void* gi, int* madeThisFr
     return nullptr;
 }
 
-// =====================================================================================================
-// THE FLOATING NAMES
-// The alphas, the distance fade and the perspective scale are deliberately the SAME arithmetic as the
-// ImGui path (nameplates.cpp) -- the two surfaces have to agree about when a name is visible, or
-// switching between them would look like a bug in whichever one was on.
-// =====================================================================================================
 // ---- the frame ------------------------------------------------------------------------------------
 // What Begin works out and the rest of the frame borrows. Not statics with a longer life than a
 // frame: if Begin said no, none of this is valid and nothing may run.
@@ -533,141 +577,6 @@ static void* g_gi  = nullptr;
 static int   g_vw = 0, g_vh = 0, g_made = 0, g_drawn = 0;
 static void* g_frameWorld = nullptr;
 
-bool GameHud_Begin(void* world) {
-    g_cls = nullptr; g_gi = nullptr; g_vw = g_vh = 0; g_made = 0; g_drawn = 0; g_frameWorld = nullptr;
-    if (!g_enabled) return false;
-    // THE LIVENESS RULE, BEFORE ANYTHING ELSE IS READ. A world we do not recognise means every widget
-    // in the pool belongs to a level that is gone: drop them where they stand. No world at all means
-    // we cannot tell, so nothing is touched -- not drawn, not moved, not even hidden.
-    if (world && g_world && world != g_world) GameHud_Forget();
-    if (!world) return false;
-
-    // The name fade runs even with nothing to draw, so the alpha is already right the moment a peer
-    // turns up. Our own clock: this is a game-thread frame and there is no io.DeltaTime here.
-    const NameplateTuning& T = Nameplates_Tuning();
-    const uint64_t us = nowUs();
-    float dt = g_lastUs ? (float)(us - g_lastUs) / 1.0e6f : (1.0f / 60.0f);
-    g_lastUs = us;
-    if (dt <= 0.0f || dt > 0.25f) dt = 1.0f / 60.0f;
-    g_frameDt = dt;
-
-    for (Slot& s : g_slot) s.claimed = false;
-    g_frameWorld = world;
-    g_cls = findClass();
-    g_gi  = g_cls ? VersionTag_GameInstance() : nullptr;
-    if (!g_cls || !g_gi) return false;
-    if (!omp::game::ViewportSize(&g_vw, &g_vh) || g_vw <= 0 || g_vh <= 0) return false;
-    // The DPI scale, once a frame. Optional: without it everything is placed as though the screen
-    // were 1080p, which is exactly what this file did before the symbol existed.
-    g_dpi = 1.0f;
-    if (const Syms& S = Get(); S.ViewportScale) {
-        float d = 1.0f;
-        __try { d = S.ViewportScale(g_gi); } __except (EXCEPTION_EXECUTE_HANDLER) { d = 1.0f; }
-        if (d > 0.05f && d < 20.0f) g_dpi = d;
-    }
-    (void)T;
-    return true;
-}
-
-void GameHud_End() {
-    if (!g_enabled) return;
-    // Everything nobody claimed goes away. Collapsed, not removed: the widget is kept for whoever
-    // needs it next, and building one is the only part of this that costs anything.
-    // It runs even when Begin said no -- as long as there IS a world, because the reason Begin
-    // refused may be that the names were switched off, and their plates still have to come down.
-    if (g_frameWorld) for (Slot& s : g_slot) if (s.w && !s.claimed) { showIt(s, false); s.key = 0; }
-    g_lastDrawn = g_drawn; g_lastMade = g_made;
-    if (g_built > 0 && g_frameWorld) g_world = g_frameWorld;   // what the pool now belongs to
-}
-
-void GameHud_Names(const NameplateItem* items, int n, bool show) {
-    if (!g_cls || !g_gi) return;
-    const NameplateTuning& T = Nameplates_Tuning();
-    const float target = (show && T.enabled) ? 1.0f : 0.0f;
-    const float step = (T.fadeSec > 0.01f) ? (g_frameDt / T.fadeSec) : 1.0f;
-    if (g_fade < target)      g_fade = (g_fade + step > target) ? target : g_fade + step;
-    else if (g_fade > target) g_fade = (g_fade - step < target) ? target : g_fade - step;
-
-    void* const cls = g_cls; void* const gi = g_gi;
-    const int vw = g_vw, vh = g_vh;
-    int& drawn = g_drawn; int& made = g_made;
-    if (T.enabled && n > 0) {
-        for (int i = 0; i < n; i++) {
-            const NameplateItem& it = items[i];
-            if (it.x < -0.5f || it.x > 1.5f || it.y < -0.5f || it.y > 1.5f) continue;
-
-            float nameA = it.name[0] ? g_fade : 0.0f;
-            if (nameA > 0.0f) {
-                if (it.distCm > T.maxDistCm) nameA = 0.0f;
-                const float fs = T.maxDistCm * T.fadeDistFrac;
-                if (nameA > 0.0f && it.distCm > fs && T.maxDistCm > fs)
-                    nameA *= 1.0f - (it.distCm - fs) / (T.maxDistCm - fs);
-            }
-            float msgA = 0.0f;
-            if (T.bubbles && it.msg[0] && it.distCm <= T.bubbleMaxDistCm) {
-                const float age = (float)it.msgAgeMs / 1000.0f;
-                msgA = 1.0f;
-                if (age > T.bubbleHoldSec) {
-                    const float over = T.bubbleFadeSec > 0.01f ? T.bubbleFadeSec : 1.0f;
-                    msgA = 1.0f - (age - T.bubbleHoldSec) / over;
-                }
-                const float fs = T.bubbleMaxDistCm * T.bubbleFadeDistFrac;
-                if (msgA > 0.0f && it.distCm > fs && T.bubbleMaxDistCm > fs)
-                    msgA *= 1.0f - (it.distCm - fs) / (T.bubbleMaxDistCm - fs);
-            }
-            if (nameA <= 0.01f && msgA <= 0.01f) continue;
-
-            float scale = (it.distCm > 1.0f) ? (T.refDistCm / it.distCm) : T.maxScale;
-            if (scale < T.minScale) scale = T.minScale;
-            if (scale > T.maxScale) scale = T.maxScale;
-            int size = (int)(kBaseSize * scale + 0.5f);
-            if (size < 6) size = 6;
-
-            const float cx = it.x * (float)vw;
-            const float hy = it.y * (float)vh;
-            const float lineH = (float)size * kLineFactor;
-
-            // ---- the name, its bottom edge on the head point
-            if (nameA > 0.01f) {
-                Slot* s = claim(hashOf(it.name, kLaneName), false, cls, gi, &made);
-                if (s) {
-                    style(*s, size, rgba(kNameR, kNameG, kNameB, nameA), 0.0f);
-                    align(*s, 0.5f, 1.0f);      // hangs from its bottom centre, over the head
-                    say(*s, it.name);
-                    place(*s, cx, hy);
-                    showIt(*s, true);
-                    drawn++;
-                }
-            }
-            // ---- what they said, sitting on top of where the name is (whether or not it is showing,
-            // so mounting a board does not make an open bubble jump down the screen)
-            if (msgA > 0.01f) {
-                Slot* s = claim(hashOf(it.name, kLaneBubble), false, cls, gi, &made);
-                if (s) {
-                    style(*s, size, rgba(kMsgR, kMsgG, kMsgB, msgA), (float)size * kBubbleWrapEm);
-                    align(*s, 0.5f, 1.0f);
-                    say(*s, it.msg);
-                    place(*s, cx, hy - lineH - (float)size * kBubbleGap);
-                    showIt(*s, true);
-                    drawn++;
-                }
-            }
-        }
-    }
-}
-
-// =====================================================================================================
-// THE PANEL BEHIND THE CHAT
-//
-// A UTextBlock draws no background, and the mod has no way to construct a bare UImage -- so the box
-// is ONE MORE GAME WIDGET: WBP_FadeIn, the screen-fade overlay, which is a canvas holding a
-// full-bleed image and nothing else that matters. Confirmed resident during play from the field
-// heartbeat (`box=WBP_FadeIn resident`) before any of this was written.
-//
-// Its image is found by WALKING THE TREE for the first UImage rather than by name. The names inside
-// a blueprint are the designer's and could be anything; "the first image in the fade overlay" is a
-// description of the asset that stays true. The blur that sits with it is collapsed -- it is driven
-// by an animation we never play, so whatever strength it was authored at is not ours to inherit.
 // =====================================================================================================
 // THE FURNITURE: plain rectangles, borrowed.
 //
@@ -701,11 +610,75 @@ float kRuleThick  = 1.0f;
 float kRuleGap    = 7.0f;
 float kAccentW    = 3.0f;                            // the lit edge down the side of the input
 
-enum { kRectPanel = 0, kRectRuleTop, kRectRuleBot, kRectAccent, kRectCount };
+// The chat box's four, then one per peer for the speech bubbles -- they carry no blur (see
+// kBubbleBlur), so a panel is a tinted quad and there is no reason to ration them. They cost nothing
+// until somebody talks: a rect builds its widget the first time it is asked for, not before.
+// The chat box's four, then FOUR BANKS of one-per-peer: a fill and a frame for each speech bubble,
+// and the same again for each name. None of them carry a blur, so a rect is a tinted quad, and none
+// of them exist until something asks for one -- a rect builds its widget the first time it is placed.
+enum { kRectPanel = 0, kRectRuleTop, kRectRuleBot, kRectAccent,
+       kRectBubble0, kRectBubbles = OMP_MAX_PEERS,
+       kRectFrame0  = kRectBubble0 + kRectBubbles,          // the frame over each bubble's fill
+       kRectTail0   = kRectFrame0  + kRectBubbles,          // ...and the pointer under it
+       kRectCount   = kRectTail0   + kRectBubbles };
 struct Rect { void* w = nullptr; void* img = nullptr; void* blur = nullptr; bool shown = false; };
 static Rect g_rect[kRectCount];
 static int  g_rectTried = 0;
 static float g_boxFade = 0.0f;       // 0 = gone, 1 = fully up; eased by the frame clock
+
+// THE FRAME'S TEXTURE. `Border` is the object-placement UI's selection frame and it is the only
+// thing in the game's UI textures that is a frame at all -- everything else under Menus/Textures is
+// a button glyph or a slider bar. It is SQUARE-CORNERED, so the rounded-corner look a chat bubble
+// usually has is not available from the game's own assets; getting that would mean building a
+// UTexture2D at runtime, which is a different and much larger job.
+//
+// Found, never loaded -- if the object-placement UI has not been up this session the frame simply
+// does not appear, and a bubble without its frame is the bubble we had before.
+static const wchar_t* const kBorderTexPath =
+    L"/Game/ObjectPlacement/UI/Textures/UI/Border.Border";
+static void* g_borderTex = nullptr;
+static bool  g_borderLooked = false;
+// The earliest the texture may be LOADED (as opposed to found). Pushed out whenever the cache is
+// dropped, so a load never lands in the frames around a map change.
+static uint64_t g_borderTryAtMs = 0;
+unsigned kAssetSettleMs = 3000;
+static const char* g_borderHow = "not looked for yet";
+static void* borderTexture() {
+    const Syms& S = Get();
+    if (g_borderLooked) return g_borderTex;
+    if (!S.StaticFindObject) return nullptr;
+    g_borderLooked = true;
+    __try { g_borderTex = S.StaticFindObject(nullptr, (void*)(intptr_t)-1, kBorderTexPath, 0); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { g_borderTex = nullptr; }
+    if (g_borderTex) { g_borderHow = "already resident"; return g_borderTex; }
+    // NOT DURING A LEVEL CHANGE. What follows is a SYNCHRONOUS package load on the game thread, and
+    // the cache is dropped whenever the widget pool empties -- which is exactly what a map change
+    // does. So without this the load lands in the worst possible frame, and a hard freeze on a map
+    // switch was reported once and could not be reproduced. Unproven as the cause, but a synchronous
+    // load in a level transition is worth moving out of the way whether or not it was this one.
+    if (GetTickCount64() < g_borderTryAtMs) { g_borderLooked = false; return nullptr; }
+    // LOAD IT. "Found, never loaded" is the rule for a CLASS, where loading a UI package at an
+    // arbitrary moment can run construction script and cost a hitch. This is a 111x109 texture with
+    // no behaviour attached, and the alternative is the frame never appearing unless the player
+    // happens to have opened the object dropper -- so this one is worth loading outright.
+    //
+    // An FSoftObjectPath is FName + FString = 24 bytes (game_syms.h says so, from the TSoftObjectPtr
+    // layout), so it is built by hand: the name in the first 8, the string left empty.
+    if (S.SoftPathTryLoad && S.FNameCtor) {
+        __try {
+            uint8_t path[24] = {0};
+            char ansi[128];
+            int k = 0;
+            for (; kBorderTexPath[k] && k < (int)sizeof(ansi) - 1; k++) ansi[k] = (char)kBorderTexPath[k];
+            ansi[k] = 0;
+            S.FNameCtor(path, ansi, 1 /* FNAME_Add */);
+            memset(path + 8, 0, sizeof(path) - 8);      // the FString must be empty, whatever the ctor wrote
+            g_borderTex = S.SoftPathTryLoad(path, nullptr);
+        } __except (EXCEPTION_EXECUTE_HANDLER) { g_borderTex = nullptr; }
+    }
+    g_borderHow = g_borderTex ? "loaded on demand" : "NOT FOUND -- no frame";
+    return g_borderTex;
+}
 
 // A widget's class name, for telling a UImage from everything else in a tree.
 static bool classNameOf(void* obj, char* out, int cap) {
@@ -809,7 +782,10 @@ static bool ensureRect(int i) {
     // The blur is the PANEL's alone, and its strength is written BEFORE the widget is realised so the
     // Slate side picks it up when it is built -- a blur has no synchronise to call afterwards the way
     // a text block has. Everything else collapses the one it came with.
-    const bool wantBlur = (i == kRectPanel) && kBoxBlur;
+    // Which BANK this rect belongs to decides both its depth and whether it carries the frame
+    // brush, so it is worked out once, here, above the first thing that asks.
+    const bool isFrame = (i >= kRectFrame0 && i < kRectTail0);
+    const bool wantBlur = (i == kRectPanel) ? kBoxBlur : (i >= kRectBubble0 && kBubbleBlur);
     if (r.blur) __try {
         if (wantBlur) {
             *(uint8_t*)((uint8_t*)r.blur + off::kBlurApplyAlpha) = 0;   // full strength, whatever the tint
@@ -820,8 +796,39 @@ static bool ensureRect(int i) {
             S.WidgetSetVisible(r.blur, 1 /* Collapsed */);
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) { r.blur = nullptr; }
+    // THE BRUSH IS SET BEFORE THE WIDGET IS REALISED, so Slate picks it up when it builds the image
+    // -- the same rule as the blur's radius, and the reason no setter has to be signatured for it.
+    // DrawAs = Box is the 9-slice: corners kept, edges stretched.
+    if (isFrame && kBubbleFrame) {
+        void* tex = borderTexture();
+        if (tex) __try {
+            uint8_t* br = (uint8_t*)r.img + off::kImageBrush;
+            *(void**)  (br + off::kBrushResource) = tex;
+            *(uint8_t*)(br + off::kBrushDrawAs)   = 1;            // ESlateBrushDrawType::Box
+            float* m = (float*)(br + off::kBrushMargin);
+            m[0] = m[1] = m[2] = m[3] = kFrameMargin;             // left, top, right, bottom
+        } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; }
+    }
+    // THE TAIL IS THE SAME SQUARE, TURNED. RenderTransform is written before the widget is realised
+    // like everything else here, so Slate picks the angle up when it builds; the pivot is already
+    // the centre by default, which is what makes a rotated square a diamond rather than a lever.
+    if (i >= kRectTail0) __try {
+        *(float*)((uint8_t*)r.img + off::kWidgetRenderXform + off::kXformAngle) = 45.0f;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; }
     // UNDER the text, which is the entire point of them.
-    if (!addToScreen(w, kZOrderChat - 1, kChatPlayerLayer)) return false;
+    // DEPTH BELONGS TO WHAT THE RECT IS FOR. The chat's furniture goes just under the chat, over the
+    // menus; a speech bubble's panel goes just under the NAMES, under the menus -- it hangs in the
+    // world over somebody's head and has no business on top of a pause screen.
+    // Getting this wrong put every bubble panel at the chat's depth, which is both why the panels
+    // showed over the pause menu and why the words looked grey: the panel was drawing OVER its own
+    // text, tinting it 48% black.
+    const bool chatRect = (i < kRectBubble0);
+    // Fill UNDER frame UNDER text, and all three under the menus. A frame drawn beneath its own fill
+    // is invisible, and equal z-orders resolve by insertion order, which is not something to rely on.
+    const int z = chatRect ? (kZOrderChat - 1)
+                : isFrame  ? (kZOrder - 1)      // the frame
+                           : (kZOrder - 2);     // the fill it sits on
+    if (!addToScreen(w, z, chatRect && kChatPlayerLayer)) return false;
     __try {
         S.WidgetSetAlignInVp(w, pack2(0.0f, 1.0f));          // pinned by its own bottom-left, like a row
         S.WidgetSetVisible(w, 1 /* Collapsed */);
@@ -829,9 +836,10 @@ static bool ensureRect(int i) {
     r.w = w; r.shown = false;
     if (i == kRectPanel && g_hudLog) {
         char m[320];
-        snprintf(m, sizeof(m), "[hud] chat panel from WBP_FadeIn --%s (image %s, blur %s, z=%d via %s)",
+        snprintf(m, sizeof(m),
+                 "[hud] chat panel from WBP_FadeIn --%s (image %s, blur %s, z=%d via %s); bubble frame: %s",
                  shape, r.img ? "yes" : "NO", r.blur ? (kBoxBlur ? "ON" : "off") : "none", kZOrderChat - 1,
-                 g_addPath);
+                 g_addPath, (borderTexture(), g_borderHow));
         g_hudLog(m);
     }
     return true;
@@ -846,7 +854,8 @@ static void placeRect(int i, float xPx, float bottomPx, float wS, float hS,
     Rect& R = g_rect[i];
     __try {
         pinToRect(R.img, wS, hS);
-        if (R.blur && i == kRectPanel && kBoxBlur) {
+        const bool blurThis = (i == kRectPanel) ? kBoxBlur : (i >= kRectBubble0 && kBubbleBlur);
+        if (R.blur && blurThis) {
             pinToRect(R.blur, wS, hS);
             // THROUGH THE SETTERS, NOT THE PROPERTIES. UBackgroundBlur::SetBlurStrength stores the
             // value AND pushes it into the live SBackgroundBlur (MyBackgroundBlur, +0x1c8); a write
@@ -856,9 +865,12 @@ static void placeRect(int i, float xPx, float bottomPx, float wS, float hS,
             // every frame -- so Slate's copy stayed at zero and there was never any blur at all.
             // Measured on a field screenshot: edge energy per unit brightness INSIDE the panel was
             // higher than outside it, which is the opposite of blurred.
+            // A BUBBLE HAS ITS OWN FADE, not the chat box's: it is put up and taken down by what
+            // somebody said, and g_boxFade is about the box being open.
+            const float bf = (i == kRectPanel) ? g_boxFade : (a > 0.0f ? 1.0f : 0.0f);
             if (S.BlurSetRadius)   S.BlurSetRadius(R.blur, kBoxBlurRadius);
-            if (S.BlurSetStrength) S.BlurSetStrength(R.blur, kBoxBlurMax * g_boxFade);
-            else *(float*)((uint8_t*)R.blur + off::kBlurStrength) = kBoxBlurMax * g_boxFade;
+            if (S.BlurSetStrength) S.BlurSetStrength(R.blur, kBoxBlurMax * bf);
+            else *(float*)((uint8_t*)R.blur + off::kBlurStrength) = kBoxBlurMax * bf;
         }
         const float tint[4] = { toLinear(r), toLinear(g), toLinear(b), a };
         S.ImageSetColor(R.img, tint);
@@ -871,17 +883,265 @@ static void placeRect(int i, float xPx, float bottomPx, float wS, float hS,
         __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; }
     }
 }
+// The CHAT's rects only -- the bubbles are hidden by the names pass, which is the only thing that
+// knows whether anybody is still talking.
 static void hideRects() {
     const Syms& S = Get();
     g_boxFade = 0.0f;
     if (!S.WidgetSetVisible) return;
-    for (Rect& R : g_rect) {
+    for (int i = 0; i < kRectBubble0; i++) {
+        Rect& R = g_rect[i];
         if (!R.w || !R.shown) continue;
         R.shown = false;
         __try { S.WidgetSetVisible(R.w, 1 /* Collapsed */); } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; }
     }
 }
+// A dark box with the game's frame over it: the two rects the bubbles and the names both want, so
+// neither has to know that it takes two.
+static void placeFramedBox(int fillIdx, int frameIdx, float xPx, float bottomPx,
+                           float wS, float hS, float alpha) {
+    placeRect(fillIdx, xPx, bottomPx, wS, hS, kBoxR, kBoxG, kBoxB, kBoxAlpha * alpha);
+    if (kBubbleFrame && borderTexture())
+        placeRect(frameIdx, xPx, bottomPx, wS, hS, kFrameR, kFrameG, kFrameB, kFrameAlpha * alpha);
+}
 
+static void hideBubbleRects(int fromIndex) {
+    const Syms& S = Get();
+    if (!S.WidgetSetVisible) return;
+    // Every bank a bubble uses: its fill, its frame and its tail.
+    const int base[3] = { kRectBubble0, kRectFrame0, kRectTail0 };
+    for (int pass = 0; pass < 3; pass++) {
+        for (int i = base[pass] + fromIndex; i < base[pass] + kRectBubbles; i++) {
+            Rect& R = g_rect[i];
+            if (!R.w || !R.shown) continue;
+            R.shown = false;
+            __try { S.WidgetSetVisible(R.w, 1 /* Collapsed */); }
+            __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; }
+        }
+    }
+}
+
+// =====================================================================================================
+// THE FLOATING NAMES
+// The alphas, the distance fade and the perspective scale are deliberately the SAME arithmetic as the
+// ImGui path (nameplates.cpp) -- the two surfaces have to agree about when a name is visible, or
+// switching between them would look like a bug in whichever one was on.
+// =====================================================================================================
+// Declared with the rest of the lifetime code; used here, which is where the invariant lives.
+static void forgetCachedAssets();
+
+bool GameHud_Begin(void* world) {
+    g_cls = nullptr; g_gi = nullptr; g_vw = g_vh = 0; g_made = 0; g_drawn = 0; g_frameWorld = nullptr;
+    if (!g_enabled) return false;
+    // NO WIDGETS MEANS NO REFERENCES, AND NO REFERENCES MEANS THE CACHED ASSETS ARE SUSPECT. The font
+    // and the border texture are only kept alive by our own widgets pointing at them, so an empty
+    // pool is exactly the state in which the collector is free to take them. Stating it here makes it
+    // structural instead of something every teardown path has to remember -- and a teardown path that
+    // forgets is what the crash was.
+    if (g_built == 0) forgetCachedAssets();
+    // THE LIVENESS RULE, BEFORE ANYTHING ELSE IS READ. A world we do not recognise means every widget
+    // in the pool belongs to a level that is gone: drop them where they stand. No world at all means
+    // we cannot tell, so nothing is touched -- not drawn, not moved, not even hidden.
+    if (world && g_world && world != g_world) GameHud_Forget();
+    if (!world) return false;
+
+    // The name fade runs even with nothing to draw, so the alpha is already right the moment a peer
+    // turns up. Our own clock: this is a game-thread frame and there is no io.DeltaTime here.
+    const NameplateTuning& T = Nameplates_Tuning();
+    const uint64_t us = nowUs();
+    float dt = g_lastUs ? (float)(us - g_lastUs) / 1.0e6f : (1.0f / 60.0f);
+    g_lastUs = us;
+    if (dt <= 0.0f || dt > 0.25f) dt = 1.0f / 60.0f;
+    g_frameDt = dt;
+
+    for (Slot& s : g_slot) s.claimed = false;
+    g_frameWorld = world;
+    g_cls = findClass();
+    g_gi  = g_cls ? VersionTag_GameInstance() : nullptr;
+    if (!g_cls || !g_gi) return false;
+    if (!omp::game::ViewportSize(&g_vw, &g_vh) || g_vw <= 0 || g_vh <= 0) return false;
+    // The DPI scale, once a frame. Optional: without it everything is placed as though the screen
+    // were 1080p, which is exactly what this file did before the symbol existed.
+    g_dpi = 1.0f;
+    if (const Syms& S = Get(); S.ViewportScale) {
+        float d = 1.0f;
+        __try { d = S.ViewportScale(g_gi); } __except (EXCEPTION_EXECUTE_HANDLER) { d = 1.0f; }
+        if (d > 0.05f && d < 20.0f) g_dpi = d;
+    }
+    (void)T;
+    return true;
+}
+
+void GameHud_End() {
+    if (!g_enabled) return;
+    // Everything nobody claimed goes away. Collapsed, not removed: the widget is kept for whoever
+    // needs it next, and building one is the only part of this that costs anything.
+    // It runs even when Begin said no -- as long as there IS a world, because the reason Begin
+    // refused may be that the names were switched off, and their plates still have to come down.
+    if (g_frameWorld) for (Slot& s : g_slot) if (s.w && !s.claimed) { showIt(s, false); s.key = 0; }
+    // A frame that could not draw at all -- no class, no game instance -- still has to take the
+    // furniture down, or the last panel drawn hangs there with nothing in it.
+    if (g_frameWorld && !g_cls) { hideRects(); hideBubbleRects(0); }
+    g_lastDrawn = g_drawn; g_lastMade = g_made;
+    if (g_built > 0 && g_frameWorld) g_world = g_frameWorld;   // what the pool now belongs to
+}
+
+void GameHud_Names(const NameplateItem* items, int n, bool show) {
+    if (!g_cls || !g_gi) return;
+    int nBubblePanels = 0;       // how many of each bank have been handed out this frame
+    const NameplateTuning& T = Nameplates_Tuning();
+    const float target = (show && T.enabled) ? 1.0f : 0.0f;
+    const float step = (T.fadeSec > 0.01f) ? (g_frameDt / T.fadeSec) : 1.0f;
+    if (g_fade < target)      g_fade = (g_fade + step > target) ? target : g_fade + step;
+    else if (g_fade > target) g_fade = (g_fade - step < target) ? target : g_fade - step;
+
+    void* const cls = g_cls; void* const gi = g_gi;
+    const int vw = g_vw, vh = g_vh;
+    int& drawn = g_drawn; int& made = g_made;
+    if (T.enabled && n > 0) {
+        for (int i = 0; i < n; i++) {
+            const NameplateItem& it = items[i];
+            if (it.x < -0.5f || it.x > 1.5f || it.y < -0.5f || it.y > 1.5f) continue;
+
+            float nameA = it.name[0] ? g_fade : 0.0f;
+            if (nameA > 0.0f) {
+                if (it.distCm > T.maxDistCm) nameA = 0.0f;
+                const float fs = T.maxDistCm * T.fadeDistFrac;
+                if (nameA > 0.0f && it.distCm > fs && T.maxDistCm > fs)
+                    nameA *= 1.0f - (it.distCm - fs) / (T.maxDistCm - fs);
+            }
+            float msgA = 0.0f;
+            if (T.bubbles && it.msg[0] && it.distCm <= T.bubbleMaxDistCm) {
+                const float age = (float)it.msgAgeMs / 1000.0f;
+                msgA = 1.0f;
+                if (age > T.bubbleHoldSec) {
+                    const float over = T.bubbleFadeSec > 0.01f ? T.bubbleFadeSec : 1.0f;
+                    msgA = 1.0f - (age - T.bubbleHoldSec) / over;
+                }
+                const float fs = T.bubbleMaxDistCm * T.bubbleFadeDistFrac;
+                if (msgA > 0.0f && it.distCm > fs && T.bubbleMaxDistCm > fs)
+                    msgA *= 1.0f - (it.distCm - fs) / (T.bubbleMaxDistCm - fs);
+            }
+            if (nameA <= 0.01f && msgA <= 0.01f) continue;
+
+            float scale = (it.distCm > 1.0f) ? (T.refDistCm / it.distCm) : T.maxScale;
+            if (scale < T.minScale) scale = T.minScale;
+            if (scale > T.maxScale) scale = T.maxScale;
+            int size = (int)(kBaseSize * scale + 0.5f);
+            if (size < 6) size = 6;
+
+            const float cx = it.x * (float)vw;
+            const float hy = it.y * (float)vh;
+            // PIXELS. `size` is a font size in slate units and `hy` is a pixel, and these used to be
+            // added to each other -- which is exactly right at a DPI scale of 1 and too small at
+            // every other one, so the bubble sat closer to the name the higher the resolution.
+            const float lineH = px((float)size * kLineFactor);
+
+            // ---- WHAT THEY SAID, WORKED OUT FIRST, because the name hangs off it. The bubble sits
+            // ON TOP of where the name would be whether or not the name is showing, so mounting a
+            // board does not make an open bubble jump down the screen.
+            //
+            // It is wrapped HERE, never by Slate (see `wrapInto`), one widget per line, on a dark
+            // panel of its own -- which is what makes a sentence over somebody's shoulder readable
+            // against a bright wall, and what stops it reading as a second line of their name.
+            char  bl[kBubbleMaxLines][kChatColsMax + 1];
+            int   nLines = 0, cols = 0, bsize = 0;
+            float panelLeft = 0.0f, panelTop = 0.0f, panelBottom = 0.0f, bubBottom = 0.0f;
+            float bubLineH = 0.0f, wS = 0.0f, hS = 0.0f;
+            const bool haveBubble = msgA > 0.01f;
+            if (haveBubble) {
+                bsize = (int)((float)size * kBubbleSizeMul + 0.5f);
+                if (bsize < 6) bsize = 6;
+                for (int at = 0; at >= 0 && nLines < kBubbleMaxLines; ) {
+                    at = wrapInto(it.msg, at, bl[nLines], kChatColsMax + 1, kBubbleCols);
+                    const int len = (int)strlen(bl[nLines]);
+                    if (len > cols) cols = len;
+                    nLines++;
+                }
+                bubLineH    = px((float)bsize * kLineFactor);
+                bubBottom   = hy - lineH - px((float)size * kBubbleGap);
+                wS          = (float)cols * ((float)bsize * kCharWEm) + kBubblePadX * 2.0f;
+                hS          = (float)nLines * ((float)bsize * kLineFactor)
+                            + kBubblePadTop + kBubblePadBottom;
+                panelLeft   = cx - px(wS) * 0.5f;
+                panelBottom = bubBottom + px(kBubblePadBottom);
+                panelTop    = panelBottom - px(hS);
+            }
+
+            // ---- the name. Over the head normally; at the BUBBLE'S TOP-LEFT when there is one, so
+            // the two read as one object rather than as a label parked under a panel.
+            if (nameA > 0.01f) {
+                Slot* s = claim(hashOf(it.name, kLaneName), false, cls, gi, &made);
+                if (s) {
+                    style(*s, size, rgba(kNameR, kNameG, kNameB, nameA), 0.0f);
+                    if (haveBubble) {
+                        align(*s, 0.0f, 1.0f);              // by its bottom-LEFT, on the panel's corner
+                        say(*s, it.name);
+                        place(*s, panelLeft + px(kBubblePadX), panelTop);
+                    } else {
+                        align(*s, 0.5f, 1.0f);              // hangs from its bottom centre, over the head
+                        say(*s, it.name);
+                        place(*s, cx, hy);
+                    }
+                    showIt(*s, true);
+                    drawn++;
+                }
+            }
+
+            // ---- and the bubble itself: the panel, its frame, its tail, then the words
+            if (haveBubble) {
+                // The panel rides the frame's BUILD BUDGET like every other widget here: a first-time
+                // panel counts against it, an existing one is free. A lobby that all starts talking
+                // at once gets its panels over the next frame or two rather than in one hitch, and a
+                // bubble without its panel yet is a bubble with no panel -- readable, just plainer.
+                const int ri = kRectBubble0 + nBubblePanels;
+                const bool haveRect = (nBubblePanels < kRectBubbles) && g_rect[ri].w != nullptr;
+                if (kBubblePanel && nBubblePanels < kRectBubbles && (haveRect || made < kMakePerFrame)) {
+                    if (!haveRect) made++;
+                    placeFramedBox(ri, kRectFrame0 + nBubblePanels,
+                                   panelLeft, panelBottom, wS, hS, msgA);
+                    // THE TAIL, a square turned 45 degrees so the half below the panel is a downward
+                    // triangle. Placed by its CENTRE, which is why the rect is offset by half of
+                    // itself: `place` takes a bottom-left corner.
+                    if (kBubbleTail) {
+                        const float cy = panelBottom + px(kTailDrop);
+                        placeRect(kRectTail0 + nBubblePanels,
+                                  cx - px(kTailSize) * 0.5f, cy + px(kTailSize) * 0.5f,
+                                  kTailSize, kTailSize, kBoxR, kBoxG, kBoxB, kBoxAlpha * msgA);
+                    }
+                    nBubblePanels++;
+                }
+                for (int k = 0; k < nLines; k++) {
+                    // Bottom line first, so k counts UP the screen exactly as the chat's rows do.
+                    Slot* s = claim(hashOf(it.name, kLaneBubble + k), false, cls, gi, &made);
+                    if (!s) break;
+                    style(*s, bsize, rgba(kMsgR, kMsgG, kMsgB, msgA), 0.0f);
+                    align(*s, 0.5f, 1.0f);
+                    say(*s, bl[nLines - 1 - k]);
+                    place(*s, cx, bubBottom - (float)k * bubLineH);
+                    showIt(*s, true);
+                    drawn++;
+                }
+            }
+        }
+    }
+    // Whatever nobody talked into this frame comes down. The chat box's own rects are not touched --
+    // they belong to hideRects and to a different question entirely.
+    hideBubbleRects(nBubblePanels);
+}
+
+// =====================================================================================================
+// THE PANEL BEHIND THE CHAT
+//
+// A UTextBlock draws no background, and the mod has no way to construct a bare UImage -- so the box
+// is ONE MORE GAME WIDGET: WBP_FadeIn, the screen-fade overlay, which is a canvas holding a
+// full-bleed image and nothing else that matters. Confirmed resident during play from the field
+// heartbeat (`box=WBP_FadeIn resident`) before any of this was written.
+//
+// Its image is found by WALKING THE TREE for the first UImage rather than by name. The names inside
+// a blueprint are the designer's and could be anything; "the first image in the fade overlay" is a
+// description of the asset that stays true. The blur that sits with it is collapsed -- it is driven
+// by an animation we never play, so whatever strength it was authored at is not ours to inherit.
 // =====================================================================================================
 // THE CHAT
 //
@@ -951,7 +1211,7 @@ void GameHud_Chat(bool menuUp) {
         const float g = l.system ? kSysG : (l.mine ? kSayG : kNameG);
         const float b = l.system ? kSysB : (l.mine ? kSayB : kNameB);
         for (int at = 0; at >= 0 && nr < kChatRows; ) {
-            at = wrapInto(l.text, at, rowText[nr], kChatColsMax + 1);
+            at = wrapInto(l.text, at, rowText[nr], kChatColsMax + 1, kChatCols);
             rows[nr].text = rowText[nr];
             rows[nr].r = r; rows[nr].g = g; rows[nr].b = b; rows[nr].a = a;
             nr++;
@@ -1135,8 +1395,30 @@ void GameHud_Chat(bool menuUp) {
 // =====================================================================================================
 // LIFETIME
 // =====================================================================================================
+// EVERY ENGINE OBJECT WE CACHED, DROPPED. This is not housekeeping; it is the fix for a crash.
+//
+// The font and the border texture are looked up ONCE and remembered. What keeps them alive is OUR
+// widgets referencing them -- FSlateFontInfo::FontObject and FSlateBrush::ResourceObject are both
+// UPROPERTYs, so the collector sees them through the text block and the image. The moment the pool is
+// dropped, nothing references either one, the collector is free to take them, and the remembered
+// pointers are dangling. The next widget built then gets a dead UFont, and Slate asks it for its
+// composite font: "Pure virtual function being called", in FSlateFontInfo::GetCompositeFont, on the
+// first frame after a map change with somebody else in the session (field crash).
+//
+// So the rule the widgets already had -- nothing outlives the world it was found in -- applies to
+// these too. They cost one lookup each to re-resolve.
+static void forgetCachedAssets() {
+    g_regularFont = nullptr; g_fontLooked = false;
+    g_borderTex   = nullptr; g_borderLooked = false;
+    g_borderHow   = "not looked for yet";
+    // ...and hold the LOAD off until the world has settled. Finding it is free and happens at once;
+    // loading it is not, and the frames after a map change are the wrong ones to spend on it.
+    g_borderTryAtMs = GetTickCount64() + kAssetSettleMs;
+}
+
 void GameHud_Forget() {
     // The world went and took the viewport with it. NOTHING here may be dereferenced -- see game_hud.h.
+    forgetCachedAssets();
     for (Rect& r : g_rect) r = Rect{};
     g_rectTried = 0; g_boxFade = 0.0f;
     for (Slot& s : g_slot) s = Slot{};
@@ -1162,6 +1444,9 @@ void GameHud_Clear(void* world) {
         __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; }
     }
     g_built = 0; g_lastDrawn = 0; g_fade = 0.0f; g_lastUs = 0; g_world = nullptr;
+    // The world is still here, but OUR references to the font and the texture have just gone with the
+    // widgets -- which is exactly the state that leaves a remembered pointer dangling.
+    forgetCachedAssets();
 }
 
 // Every way this can come to nothing looks identical on screen -- no names -- so each is said in

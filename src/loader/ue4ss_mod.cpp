@@ -935,6 +935,10 @@ static void publishNameplates() {
     // session does, instead of hanging over a world that has moved on. The surface that is NOT in
     // use is published an empty list for exactly that reason: switching between them mid-session
     // must not leave the other one's names hanging.
+    // THE PAUSE MENU KEEPS ITS KEYBOARD FOCUS while it is up -- see pause_menu.h. Here because this
+    // is the one place per frame that already knows whether the menu is really displayed.
+    PauseMenu_KeepFocus(MenuDisplayed(), &logLine);
+
     const bool gameDrawn = omp::ui::GameHud_Enabled() && omp::ui::GameHud_Available();
     // The chat rides the same decision and the same frame -- Begin/End bracket BOTH surfaces, because
     // End is what hides whatever nobody claimed and it cannot tell one caller's widgets from
