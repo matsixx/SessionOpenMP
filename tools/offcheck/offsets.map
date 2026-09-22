@@ -33,6 +33,7 @@ kAirReplayMeshComp             UAnimInstanceReplayComponent::_skeletalMeshComp
 kAirReplayDataBoneIdx          FAnimInstanceReplayData::BoneIndex
 kActorOwnedComps               AActor::OwnedComponents
 kWidgetVisibility              UWidget::Visibility
+kWidgetRenderPivot             UWidget::RenderTransformPivot
 kRefCtlSharedCount             SharedPointerInternals::FReferenceControllerBase::SharedReferenceCount
 kCompQuat                      USceneComponent::ComponentToWorld
 kMeshSkeletalMesh              USkinnedMeshComponent::SkeletalMesh

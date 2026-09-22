@@ -952,6 +952,8 @@ static void publishNameplates() {
         C.fadeAfterSec = (float)MpPrefs_ChatHoldSec();
         omp::ui::GameHud_SetChatLook(MpPrefs_ChatTextSize(), MpPrefs_ChatSmallSize(),
                                      MpPrefs_ChatPanelPct(), MpPrefs_ChatBlurPct());
+        omp::ui::GameHud_SetBubbleLook(MpPrefs_BubblePanel() != 0, MpPrefs_BubbleBorder() != 0,
+                                       MpPrefs_BubblePanelPct(), MpPrefs_BubbleBlurPct());
     }
     Chat_SetGameDrawn(gameDrawn);
     omp::ui::GameHud_SetLog(&logLine);

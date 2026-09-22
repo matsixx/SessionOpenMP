@@ -70,7 +70,18 @@ int  MpPrefs_BubbleTextSize();
 void MpPrefs_SetBubbleTextSize(int size);
 // The slider limits, so the menu row and the setter's clamp cannot drift apart.
 enum { MPNAME_DIST_MIN = 10, MPNAME_DIST_MAX = 250, MPBUBBLE_DIST_MIN = 5, MPBUBBLE_DIST_MAX = 100 };
-enum { MPBUBBLE_TEXT_MIN = 8, MPBUBBLE_TEXT_MAX = 22, MPBUBBLE_TEXT_DEFAULT = 11 };
+enum { MPBUBBLE_TEXT_MIN = 8, MPBUBBLE_TEXT_MAX = 22, MPBUBBLE_TEXT_DEFAULT = 12 };
+
+// THE REST OF THE BUBBLE'S LOOK. Panel and border are on, because that is what a bubble has been
+// since 1.2.5. Blur DEFAULTS OFF and stays a choice: it was taken off bubbles for the cost of six of
+// them on screen at once, and one blur per talking player is a real bill on a busy lobby.
+// A bubble is a label in the world, not a slab to read a conversation off: light panel, no frame,
+// no blur. Blur especially -- it is one per talking player, so it is opt-in.
+enum { MPBUBBLE_BLUR_DEFAULT = 0, MPBUBBLE_PANEL_DEFAULT = 20 };   // both 0..100
+int  MpPrefs_BubblePanelPct(); void MpPrefs_SetBubblePanelPct(int v);
+int  MpPrefs_BubblePanel();   void MpPrefs_SetBubblePanel(int on);
+int  MpPrefs_BubbleBorder();  void MpPrefs_SetBubbleBorder(int on);
+int  MpPrefs_BubbleBlurPct(); void MpPrefs_SetBubbleBlurPct(int v);
 
 // ---- THE CHAT BOX's look. Stored here for the same reason the nameplate settings are: they are the
 // player's, they have to survive a restart, and the game-thread publish copies them into the live

@@ -142,7 +142,7 @@ float kBubblePadX = 9.0f, kBubblePadTop = 10.0f, kBubblePadBottom = 3.0f;
 // whatever falls inside the margin and the edges stretch the rule, so a small margin gives a plain
 // rectangle and a large one keeps the brackets. Square corners either way -- see the note on
 // `borderTexture` for why there is no rounded one to reach for.
-bool  kBubbleFrame  = true;
+bool  kBubbleFrame  = false;
 // THE NAME HAS NO BOX. It was given one to match the reference picture and it did not look good in
 // the field -- a box round every name on screen is a lot of boxes, where a box round the occasional
 // sentence is not. The name moves to the bubble's top-left corner instead whenever there is a bubble
@@ -165,6 +165,15 @@ bool  kBubblePanel = true;     // the dark panel behind it, the chat box's in mi
 // real per-instance cost, so N people talking would have meant N of them. Dropping it is also what
 // lets there be one panel per peer instead of a pool small enough to bound the cost.
 bool  kBubbleBlur  = false;
+// A BUBBLE'S BLUR IS ITS OWN, not the chat box's. They used to share kBoxBlurMax/kBoxBlurRadius, so
+// turning the box's blur up turned every bubble's up with it -- and a bubble is a tenth the size, so
+// the box's radius on one reads as a smeared square rather than frosted glass. Weaker and tighter.
+// A BUBBLE'S DARKNESS IS ITS OWN. It used to borrow the chat box's kBoxAlpha, so the two could not
+// be set apart -- and they want different answers: the box is a slab you read a conversation off,
+// a bubble is a label hanging over somebody's head in the world.
+float kBubbleAlpha      = 0.20f;
+float kBubbleBlurMax    = 17.0f;
+int   kBubbleBlurRadius = 14;
 // HOW WIDE A CHARACTER IS, as a fraction of the font size. Nothing on this side can measure a
 // proportional font, so a panel that has to fit text is sized from a count and this number. Taken
 // from the chat's own wrap (620 slate units over 66 characters at size 15), so the two agree.
@@ -651,7 +660,23 @@ enum { kRectPanel = 0, kRectRuleTop, kRectRuleBot, kRectAccent,
        kRectFrame0  = kRectBubble0 + kRectBubbles,          // the frame over each bubble's fill
        kRectTail0   = kRectFrame0  + kRectBubbles,          // ...and the pointer under it
        kRectCount   = kRectTail0   + kRectBubbles };
-struct Rect { void* w = nullptr; void* img = nullptr; void* blur = nullptr; bool shown = false; };
+
+// WHICH BLUR THIS RECT ANSWERS TO. The chat box and a speech bubble are set separately: one panel
+// against one per talking player, so they get their own strength, their own radius and their own off.
+static bool  rectWantsBlur (int i) {
+    if (i == kRectPanel) return kBoxBlur;
+    // THE FILL ONLY, never the frame or the tail. A blur child is NOT rotated with its image, so the
+    // tail -- a square turned 45 degrees into a diamond -- carried an axis-aligned blur square around
+    // itself. The frame and the tail also sit on glass the fill has already frosted, so blurring them
+    // is three blurs per bubble paying for one.
+    return (i >= kRectBubble0 && i < kRectFrame0) && kBubbleBlur;
+}
+static float rectBlurMax   (int i) { return (i == kRectPanel) ? kBoxBlurMax : kBubbleBlurMax; }
+static int   rectBlurRadius(int i) { return (i == kRectPanel) ? kBoxBlurRadius : kBubbleBlurRadius; }
+// `blurOn` is what we last told the blur child -- -1 nothing yet, 0 collapsed, 1 shown -- so the
+// per-frame check costs a compare instead of an engine call.
+struct Rect { void* w = nullptr; void* img = nullptr; void* blur = nullptr; bool shown = false;
+              int blurOn = -1; };
 static Rect g_rect[kRectCount];
 static int  g_rectTried = 0;
 static float g_boxFade = 0.0f;       // 0 = gone, 1 = fully up; eased by the frame clock
@@ -815,21 +840,29 @@ static bool ensureRect(int i) {
     // Which BANK this rect belongs to decides both its depth and whether it carries the frame
     // brush, so it is worked out once, here, above the first thing that asks.
     const bool isFrame = (i >= kRectFrame0 && i < kRectTail0);
-    const bool wantBlur = (i == kRectPanel) ? kBoxBlur : (i >= kRectBubble0 && kBubbleBlur);
+    // THESE TWO ARE WRITTEN WHETHER OR NOT THE BLUR IS WANTED, because they are the only ones that
+    // CANNOT be changed afterwards: a property write reaches Slate only before the widget is
+    // realised, and a blur has no SynchronizeProperties to call later the way a text block has.
+    // They are inert while the blur is collapsed, so writing them always costs nothing and means a
+    // blur switched on later is correctly configured instead of half-built.
+    // Everything that CAN change -- whether it shows at all, its radius, its strength -- moved to
+    // placeRect. It used to be decided here, once, and a bubble built while "Bubble blur" was 0
+    // (the default) kept a collapsed blur for the rest of the session: turning the slider up did
+    // nothing, for ever, which is exactly how it was reported.
     if (r.blur) __try {
-        if (wantBlur) {
-            *(uint8_t*)((uint8_t*)r.blur + off::kBlurApplyAlpha) = 0;   // full strength, whatever the tint
-            *(uint8_t*)((uint8_t*)r.blur + off::kBlurAutoRadius) = 1;   // ...and OUR radius, not a derived one
-            *(int32_t*)((uint8_t*)r.blur + off::kBlurRadius)     = kBoxBlurRadius;
-            if (S.WidgetSetVisible) S.WidgetSetVisible(r.blur, 4 /* SelfHitTestInvisible */);
-        } else if (S.WidgetSetVisible) {
-            S.WidgetSetVisible(r.blur, 1 /* Collapsed */);
-        }
+        *(uint8_t*)((uint8_t*)r.blur + off::kBlurApplyAlpha) = 0;   // full strength, whatever the tint
+        *(uint8_t*)((uint8_t*)r.blur + off::kBlurAutoRadius) = 1;   // ...and OUR radius, not a derived one
+        *(int32_t*)((uint8_t*)r.blur + off::kBlurRadius)     = rectBlurRadius(i);
     } __except (EXCEPTION_EXECUTE_HANDLER) { r.blur = nullptr; }
     // THE BRUSH IS SET BEFORE THE WIDGET IS REALISED, so Slate picks it up when it builds the image
     // -- the same rule as the blur's radius, and the reason no setter has to be signatured for it.
     // DrawAs = Box is the 9-slice: corners kept, edges stretched.
-    if (isFrame && kBubbleFrame) {
+    // NOT gated on kBubbleFrame. A frame rect built while the border was switched off never got the
+    // nine-slice texture, and a brushless image draws as a SOLID QUAD -- so turning the border back
+    // on painted a filled block over the bubble instead of a bracketed edge (reported as the bubble
+    // going 'a lot darker'). The brush is inert while the rect is hidden; visibility is what decides
+    // whether a border shows, not whether it was configured.
+    if (isFrame) {
         void* tex = borderTexture();
         if (tex) __try {
             uint8_t* br = (uint8_t*)r.img + off::kImageBrush;
@@ -840,10 +873,16 @@ static bool ensureRect(int i) {
         } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; }
     }
     // THE TAIL IS THE SAME SQUARE, TURNED. RenderTransform is written before the widget is realised
-    // like everything else here, so Slate picks the angle up when it builds; the pivot is already
-    // the centre by default, which is what makes a rotated square a diamond rather than a lever.
+    // like everything else here, so Slate picks the angle up when it builds.
+    // AND THE PIVOT WITH IT, which rotating about the centre is what makes a square a diamond rather
+    // than a lever. It was only ever assumed to be the centre; it is, on this asset, but the square
+    // reported next to the tail was not this -- it was the blur child, which is not rotated with the
+    // image (see rectWantsBlur). Written anyway: one store against an assumption about somebody
+    // else's blueprint.
     if (i >= kRectTail0) __try {
         *(float*)((uint8_t*)r.img + off::kWidgetRenderXform + off::kXformAngle) = 45.0f;
+        float* piv = (float*)((uint8_t*)r.img + off::kWidgetRenderPivot);
+        piv[0] = 0.5f; piv[1] = 0.5f;
     } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; }
     // UNDER the text, which is the entire point of them.
     // DEPTH BELONGS TO WHAT THE RECT IS FOR. The chat's furniture goes just under the chat, over the
@@ -877,14 +916,39 @@ static bool ensureRect(int i) {
 
 // Show one at a rect: SLATE units for the size, PIXELS for the corner -- the same split as everything
 // else here (see the note on GameHud_Chat).
+// The nine-slice, applied late. borderTexture() can still be loading when the first bubble goes up,
+// and the setting can be switched on at any time -- so a frame rect checks once per frame whether it
+// is still a plain quad and fixes itself when the texture is there. Cheap: one pointer compare.
+static void ensureFrameBrush(Rect& R) {
+    if (!R.img) return;
+    void* tex = borderTexture();
+    if (!tex) return;
+    __try {
+        uint8_t* br = (uint8_t*)R.img + off::kImageBrush;
+        if (*(void**)(br + off::kBrushResource) == tex) return;     // already ours
+        *(void**)  (br + off::kBrushResource) = tex;
+        *(uint8_t*)(br + off::kBrushDrawAs)   = 1;                  // ESlateBrushDrawType::Box
+        float* m = (float*)(br + off::kBrushMargin);
+        m[0] = m[1] = m[2] = m[3] = kFrameMargin;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; }
+}
+
 static void placeRect(int i, float xPx, float bottomPx, float wS, float hS,
                       float r, float g, float b, float a) {
     const Syms& S = Get();
     if (!ensureRect(i)) return;
     Rect& R = g_rect[i];
+    if (i >= kRectFrame0 && i < kRectTail0) ensureFrameBrush(R);
     __try {
         pinToRect(R.img, wS, hS);
-        const bool blurThis = (i == kRectPanel) ? kBoxBlur : (i >= kRectBubble0 && kBubbleBlur);
+        // EVERY FRAME, NOT AT BIRTH. Whether a blur shows is a setting the player can move at any
+        // moment; deciding it once when the widget was built is why turning bubble blur on did
+        // nothing until the level changed.
+        const bool blurThis = rectWantsBlur(i);
+        if (R.blur && S.WidgetSetVisible && R.blurOn != (blurThis ? 1 : 0)) {
+            R.blurOn = blurThis ? 1 : 0;
+            S.WidgetSetVisible(R.blur, blurThis ? 4 /* SelfHitTestInvisible */ : 1 /* Collapsed */);
+        }
         if (R.blur && blurThis) {
             pinToRect(R.blur, wS, hS);
             // THROUGH THE SETTERS, NOT THE PROPERTIES. UBackgroundBlur::SetBlurStrength stores the
@@ -898,9 +962,9 @@ static void placeRect(int i, float xPx, float bottomPx, float wS, float hS,
             // A BUBBLE HAS ITS OWN FADE, not the chat box's: it is put up and taken down by what
             // somebody said, and g_boxFade is about the box being open.
             const float bf = (i == kRectPanel) ? g_boxFade : (a > 0.0f ? 1.0f : 0.0f);
-            if (S.BlurSetRadius)   S.BlurSetRadius(R.blur, kBoxBlurRadius);
-            if (S.BlurSetStrength) S.BlurSetStrength(R.blur, kBoxBlurMax * bf);
-            else *(float*)((uint8_t*)R.blur + off::kBlurStrength) = kBoxBlurMax * bf;
+            if (S.BlurSetRadius)   S.BlurSetRadius(R.blur, rectBlurRadius(i));
+            if (S.BlurSetStrength) S.BlurSetStrength(R.blur, rectBlurMax(i) * bf);
+            else *(float*)((uint8_t*)R.blur + off::kBlurStrength) = rectBlurMax(i) * bf;
         }
         const float tint[4] = { toLinear(r), toLinear(g), toLinear(b), a };
         S.ImageSetColor(R.img, tint);
@@ -926,13 +990,27 @@ static void hideRects() {
         __try { S.WidgetSetVisible(R.w, 1 /* Collapsed */); } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; }
     }
 }
-// A dark box with the game's frame over it: the two rects the bubbles and the names both want, so
-// neither has to know that it takes two.
+// One rect down, for a piece the player has turned off. A rect that is simply not placed this frame
+// keeps whatever it was showing last frame, so "off" has to be said out loud.
+static void hideRect(int i) {
+    const Syms& S = Get();
+    if (!S.WidgetSetVisible || i < 0 || i >= kRectCount) return;
+    Rect& R = g_rect[i];
+    if (!R.w || !R.shown) return;
+    R.shown = false;
+    __try { S.WidgetSetVisible(R.w, 1 /* Collapsed */); } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; }
+}
+// A dark box with the game's frame over it.
+// THE TWO PIECES ARE INDEPENDENT: the player can have the panel, the border, both or neither, so
+// each is placed or collapsed on its own. The frame used to ride on the fill being drawn at all,
+// which made "no panel" silently mean "no border either" -- two settings, one of them a lie.
 static void placeFramedBox(int fillIdx, int frameIdx, float xPx, float bottomPx,
                            float wS, float hS, float alpha) {
-    placeRect(fillIdx, xPx, bottomPx, wS, hS, kBoxR, kBoxG, kBoxB, kBoxAlpha * alpha);
+    if (kBubblePanel) placeRect(fillIdx, xPx, bottomPx, wS, hS, kBoxR, kBoxG, kBoxB, kBubbleAlpha * alpha);
+    else              hideRect(fillIdx);
     if (kBubbleFrame && borderTexture())
         placeRect(frameIdx, xPx, bottomPx, wS, hS, kFrameR, kFrameG, kFrameB, kFrameAlpha * alpha);
+    else hideRect(frameIdx);
 }
 
 static void hideBubbleRects(int fromIndex) {
@@ -1126,18 +1204,23 @@ void GameHud_Names(const NameplateItem* items, int n, bool show) {
                 // bubble without its panel yet is a bubble with no panel -- readable, just plainer.
                 const int ri = kRectBubble0 + nBubblePanels;
                 const bool haveRect = (nBubblePanels < kRectBubbles) && g_rect[ri].w != nullptr;
-                if (kBubblePanel && nBubblePanels < kRectBubbles && (haveRect || made < kMakePerFrame)) {
+                if ((kBubblePanel || kBubbleFrame) && nBubblePanels < kRectBubbles
+                    && (haveRect || made < kMakePerFrame)) {
                     if (!haveRect) made++;
                     placeFramedBox(ri, kRectFrame0 + nBubblePanels,
                                    panelLeft, panelBottom, wS, hS, msgA);
                     // THE TAIL, a square turned 45 degrees so the half below the panel is a downward
                     // triangle. Placed by its CENTRE, which is why the rect is offset by half of
                     // itself: `place` takes a bottom-left corner.
-                    if (kBubbleTail) {
+                    // The tail points AT the panel. Without one it is a diamond floating under the
+                    // words, so it goes with the panel rather than standing on its own.
+                    if (kBubbleTail && kBubblePanel) {
                         const float cy = panelBottom + px(kTailDrop);
                         placeRect(kRectTail0 + nBubblePanels,
                                   cx - px(kTailSize) * 0.5f, cy + px(kTailSize) * 0.5f,
-                                  kTailSize, kTailSize, kBoxR, kBoxG, kBoxB, kBoxAlpha * msgA);
+                                  kTailSize, kTailSize, kBoxR, kBoxG, kBoxB, kBubbleAlpha * msgA);
+                    } else {
+                        hideRect(kRectTail0 + nBubblePanels);
                     }
                     nBubblePanels++;
                 }
@@ -1546,6 +1629,23 @@ void GameHud_Clear(void* world) {
     // The world is still here, but OUR references to the font and the texture have just gone with the
     // widgets -- which is exactly the state that leaves a remembered pointer dangling.
     forgetCachedAssets();
+}
+
+// THE SPEECH BUBBLE'S LOOK, from the player's settings. Its text size is not here: the bubble reads
+// MpPrefs_BubbleTextSize() where it draws, because the size it wants depends on how far away the
+// speaker is and that is only known there.
+void GameHud_SetBubbleLook(bool panel, bool border, int panelPct, int blurPct) {
+    kBubblePanel = panel;
+    kBubbleFrame = border;
+    if (panelPct >= 0 && panelPct <= 100) kBubbleAlpha = (float)panelPct / 100.0f;
+    if (blurPct >= 0 && blurPct <= 100) {
+        // Half the chat box's strength at the same number and a tighter radius: a bubble is small, and
+        // the box's settings on one read as a smear. The same percentage means "as frosted as the box"
+        // rather than "the same pixels".
+        kBubbleBlurMax    = (float)blurPct * 0.25f;
+        kBubbleBlurRadius = (int)((float)blurPct * 0.20f + 0.5f);
+        kBubbleBlur       = blurPct > 0;
+    }
 }
 
 void GameHud_SetChatLook(int textSize, int smallSize, int panelPct, int blurPct) {

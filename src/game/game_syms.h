@@ -1107,10 +1107,13 @@ namespace off {
     constexpr int kBrushResource      = 0x48;    //   ::ResourceObject (UObject*)
     constexpr int kBrushDrawAs        = 0x6c;    //   ::DrawAs (ESlateBrushDrawType)
     // UWidget::RenderTransform (FWidgetTransform: Translation, Scale, Shear, then Angle in
-    // degrees). The pivot next to it defaults to the widget's centre, which is what turns a
-    // rotated square into a diamond instead of swinging it about a corner.
+    // degrees), and the PIVOT it turns about.
+    // The pivot is WRITTEN rather than assumed. It does turn out to be the centre on the blueprint
+    // image we borrow -- the tail renders as a proper diamond -- but that was an assumption about
+    // somebody else's asset, and writing it costs one store.
     constexpr int kWidgetRenderXform  = 0x90;    // UWidget::RenderTransform
     constexpr int kXformAngle         = 0x18;    //   FWidgetTransform::Angle (float, degrees)
+    constexpr int kWidgetRenderPivot  = 0xac;    // UWidget::RenderTransformPivot (FVector2D), PDB
     constexpr int kWidgetSlot         = 0x28;    // UWidget::Slot (PDB)
     constexpr int kSlotParent         = 0x28;    // UPanelSlot::Parent -- the widget that CONTAINS it
     // UTextLayoutWidget, the PARENT of UTextBlock -- which is why neither is on UTextBlock itself.

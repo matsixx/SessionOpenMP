@@ -1486,6 +1486,50 @@ static bool dropSyncCheck() {
         OnPacket(2, empt[0].data(), (int)empt[0].size(), u2);
         if (g_dropPkts.size() != 1) { printf("  drop: a peer with NO set did not ask for one\n"); return false; }
 
+        // AN ASK MUST NOT TELL THE OTHER SIDE THEY RESET. The header's generation field means "the
+        // sender's generation" to every receiver, and an ask used to put the PINGER's generation
+        // there instead -- so asking a peer for their set told them WE thought THEY had reset, and a
+        // reset throws away every object we hold for them. Field (1.2.7): a joiner whose world had
+        // changed (generation 1) against a host who had not (generation 0) destroyed and respawned
+        // the host's 318 objects on every six-second heartbeat, for as long as they stayed. Restarting
+        // the client fixed it because a fresh process is back at generation 0 and the two agreed.
+        {
+            ResetAll();
+            g_dropPkts.clear();
+            SendSet(2, 0, 1234ull, set, 40, 0);            // peer 2 lives at generation 0
+            Update u;
+            for (auto& pk : g_dropPkts) OnPacket(2, pk.data(), (int)pk.size(), u);
+            g_dropPkts.clear();
+
+            // THEIR ping carries THEIR generation (0 -- it is their packet). The hash does not match
+            // what we hold, so we ask them for it. WE are at generation 7, having changed level.
+            SetOwnGen(7);
+            SendSetPing(2, 0, SetHash(set, 40) ^ 0x1234u, 40);
+            std::vector<std::vector<uint8_t>> ping = g_dropPkts;
+            g_dropPkts.clear();
+            OnPacket(2, ping[0].data(), (int)ping[0].size(), u);
+            if (g_dropPkts.size() != 1) { printf("  drop: a mismatched ping did not produce an ask\n"); return false; }
+            std::vector<uint8_t> ask = g_dropPkts[0];
+            g_dropPkts.clear();
+            if (ask.size() < 6 || ask[5] != 7) {
+                printf("  drop: an ask carries generation %d, not our own (7)\n", ask.size() >= 6 ? ask[5] : -1);
+                return false;
+            }
+
+            // ...and receiving an ask NEVER resets, whatever generation it claims -- so a peer still
+            // on an older build cannot throw our copy of their park away either.
+            Update ur;
+            uint8_t oldAsk[8] = { 0 };
+            memcpy(oldAsk, ask.data(), ask.size() < 8 ? ask.size() : 8);
+            oldAsk[5] = 99;                                 // an older build's ask: somebody else's gen
+            if (!OnPacket(2, oldAsk, (int)ask.size(), ur)) { printf("  drop: the ask did not parse\n"); return false; }
+            if (ur.genReset) { printf("  drop: an ask was allowed to reset the peer's generation\n"); return false; }
+            if (!ur.setWanted) { printf("  drop: the ask stopped being an ask\n"); return false; }
+            int keptN = 0; const Rec* kept = SetRecords(2, &keptN);
+            if (!kept || keptN != 40) { printf("  drop: an ask threw away the set we hold\n"); return false; }
+            SetOwnGen(0);
+        }
+
         // A GENERATION CHANGE is a different set by definition: their ids stopped meaning what they meant.
         ResetAll();
         g_dropPkts.clear();

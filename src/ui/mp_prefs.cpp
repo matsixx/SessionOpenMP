@@ -36,6 +36,10 @@ static int      g_nameMode    = MPNAME_OFFBOARD;
 static int      g_nameDistM   = 120;
 static int      g_bubbleDistM = 35;
 static int      g_bubbleTextSize = MPBUBBLE_TEXT_DEFAULT;
+static int      g_bubblePanel    = 1;
+static int      g_bubbleBorder   = 0;   // off: the panel alone reads cleaner over the world
+static int      g_bubbleBlurPct  = MPBUBBLE_BLUR_DEFAULT;
+static int      g_bubblePanelPct = MPBUBBLE_PANEL_DEFAULT;
 static int      g_chatTextSize = MPCHAT_TEXT_DEFAULT;
 static int      g_chatSmallSize = MPCHAT_SMALL_DEFAULT;
 static int      g_chatWidth    = MPCHAT_WIDTH_DEFAULT;
@@ -88,6 +92,12 @@ static void saveAll() {
     fprintf(f, "# How big the words in a speech bubble are, at the distance a name is drawn at its\n");
     fprintf(f, "# natural size. They still shrink with distance from there.\n");
     fprintf(f, "BubbleTextSize=%d\n", g_bubbleTextSize);
+    fprintf(f, "# The bubble itself: the dark panel behind the words, the bracketed border round\n");
+    fprintf(f, "# it, and how much the world behind it is blurred. Blur costs one per talker.\n");
+    fprintf(f, "BubblePanel=%d\n", g_bubblePanel);
+    fprintf(f, "BubbleBorder=%d\n", g_bubbleBorder);
+    fprintf(f, "BubbleBlurPct=%d\n", g_bubbleBlurPct);
+    fprintf(f, "BubblePanelPct=%d\n", g_bubblePanelPct);
     fprintf(f, "# The chat box: text and header size, how wide it is, how many lines the open box\n");
     fprintf(f, "# holds, how long a line lingers with the box closed, and the panel behind it.\n");
     fprintf(f, "ChatTextSize=%d\n", g_chatTextSize);
@@ -247,6 +257,10 @@ void MpPrefs_SetSyncSeconds(int seconds) {
 int  MpPrefs_NameDistM()   { return g_nameDistM; }
 int  MpPrefs_BubbleDistM() { return g_bubbleDistM; }
 int  MpPrefs_BubbleTextSize() { return g_bubbleTextSize; }
+int  MpPrefs_BubblePanel()    { return g_bubblePanel; }
+int  MpPrefs_BubbleBorder()   { return g_bubbleBorder; }
+int  MpPrefs_BubbleBlurPct()  { return g_bubbleBlurPct; }
+int  MpPrefs_BubblePanelPct() { return g_bubblePanelPct; }
 int  MpPrefs_ChatTextSize() { return g_chatTextSize; }
 int  MpPrefs_ChatSmallSize() { return g_chatSmallSize; }
 int  MpPrefs_ChatWidth()    { return g_chatWidth; }
@@ -298,6 +312,10 @@ OMP_CHAT_SETTER(MpPrefs_SetChatLines,    g_chatLines,    MPCHAT_LINES_MIN, MPCHA
 OMP_CHAT_SETTER(MpPrefs_SetChatHoldSec,  g_chatHoldSec,  MPCHAT_HOLD_MIN,  MPCHAT_HOLD_MAX)
 OMP_CHAT_SETTER(MpPrefs_SetChatPanelPct, g_chatPanelPct, 0, 100)
 OMP_CHAT_SETTER(MpPrefs_SetChatBlurPct,  g_chatBlurPct,  0, 100)
+OMP_CHAT_SETTER(MpPrefs_SetBubblePanel,  g_bubblePanel,  0, 1)
+OMP_CHAT_SETTER(MpPrefs_SetBubbleBorder, g_bubbleBorder, 0, 1)
+OMP_CHAT_SETTER(MpPrefs_SetBubbleBlurPct, g_bubbleBlurPct, 0, 100)
+OMP_CHAT_SETTER(MpPrefs_SetBubblePanelPct, g_bubblePanelPct, 0, 100)
 #undef OMP_CHAT_SETTER
 
 void MpPrefs_Init(const char* dir, void (*logf)(const char*)) {
@@ -327,6 +345,10 @@ void MpPrefs_Init(const char* dir, void (*logf)(const char*)) {
             else if (!_stricmp(key, "NameDistM"))   g_nameDistM   = clampI(atoi(val), MPNAME_DIST_MIN, MPNAME_DIST_MAX);
             else if (!_stricmp(key, "BubbleDistM")) g_bubbleDistM = clampI(atoi(val), MPBUBBLE_DIST_MIN, MPBUBBLE_DIST_MAX);
             else if (!_stricmp(key, "BubbleTextSize")) g_bubbleTextSize = clampI(atoi(val), MPBUBBLE_TEXT_MIN, MPBUBBLE_TEXT_MAX);
+            else if (!_stricmp(key, "BubblePanel"))  g_bubblePanel  = clampI(atoi(val), 0, 1);
+            else if (!_stricmp(key, "BubbleBorder")) g_bubbleBorder = clampI(atoi(val), 0, 1);
+            else if (!_stricmp(key, "BubbleBlurPct")) g_bubbleBlurPct = clampI(atoi(val), 0, 100);
+            else if (!_stricmp(key, "BubblePanelPct")) g_bubblePanelPct = clampI(atoi(val), 0, 100);
             else if (!_stricmp(key, "ChatTextSize")) g_chatTextSize = clampI(atoi(val), MPCHAT_TEXT_MIN, MPCHAT_TEXT_MAX);
             else if (!_stricmp(key, "ChatSmallSize")) g_chatSmallSize = clampI(atoi(val), MPCHAT_SMALL_MIN, MPCHAT_SMALL_MAX);
             else if (!_stricmp(key, "ChatWidth"))    g_chatWidth    = clampI(atoi(val), MPCHAT_WIDTH_MIN, MPCHAT_WIDTH_MAX);

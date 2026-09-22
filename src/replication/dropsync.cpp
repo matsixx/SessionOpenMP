@@ -30,6 +30,22 @@ static const uint32_t kMagic = 0x4F504D4Fu;   // "OMPO" -- OMPL/OMPM/OMPN retire
 // extension path replaysync's kAck established.
 enum : uint8_t { kSet = 1, kPlace = 2, kMove = 3, kRemove = 4, kWorldSet = 5, kWorldMove = 6,
                  kSetPing = 7, kSetWant = 8 };      // appended, same reason: an older build ignores them
+// For the log only: a generation reset throws away every object we hold for a peer, and which LANE
+// carried the disagreeing generation is the difference between a peer who really did reset and two
+// lanes of one peer that do not agree with each other.
+static const char* subName(uint8_t s) {
+    switch (s) {
+        case kSet:       return "a set";
+        case kPlace:     return "a place";
+        case kMove:      return "a move";
+        case kRemove:    return "a remove";
+        case kWorldSet:  return "a WORLD set";
+        case kWorldMove: return "a WORLD move";
+        case kSetPing:   return "a heartbeat ping";
+        case kSetWant:   return "an ask";
+        default:         return "an unknown subtype";
+    }
+}
 
 // Under the transport's ~1 KB message convention with room to spare for the name table.
 static const int kMaxPacket = 1000;
@@ -198,11 +214,21 @@ int SendSetPing(int peerIdx, uint8_t gen, uint32_t hash, uint16_t count) {
     return 1;
 }
 
-static int SendSetWant(int peerIdx, uint8_t gen) {
+// OUR generation, set by the session. Every packet out of this module carries the SENDER's, which
+// is what the receiver's reset check assumes; see SendSetWant.
+static uint8_t g_ownGen = 0;
+void SetOwnGen(uint8_t gen) { g_ownGen = gen; }
+
+// AN ASK CARRIES OUR OWN GENERATION, not the generation of the ask we are answering. It used to
+// carry the pinger's -- and since every receiver reads that field as "the sender's generation",
+// asking a peer for their set told them WE thought they had reset, which throws away every object
+// they hold for us. Two clients with different generations (a joiner whose world changed, a host
+// whose did not) then destroyed and respawned each other's parks on every heartbeat, forever.
+static int SendSetWant(int peerIdx) {
     if (!g_send) return 0;
     uint8_t pkt[8];
     Wr w{ pkt, (int)sizeof(pkt), 0, true };
-    w.u32(kMagic); w.u8(kSetWant); w.u8(gen);
+    w.u32(kMagic); w.u8(kSetWant); w.u8(g_ownGen);
     if (!w.ok) return 0;
     g_send(peerIdx, pkt, w.n, true);
     g_st.sent++; g_st.wantsSent++;
@@ -507,7 +533,14 @@ bool OnPacket(int peerIdx, const uint8_t* d, int len, Update& out) {
 
     // A generation change means this peer's ids stopped meaning what they meant. Reported to the
     // caller so it can drop what it holds BEFORE anything in this packet is applied.
-    if (!in.genSeen || in.gen != gen) {
+    // AN ASK NEVER DRIVES THIS. Builds up to 1.2.7 put the PINGER's generation in an ask's header
+    // instead of their own, so an ask from one of them says whatever we last told them -- and acting
+    // on it destroys every object we hold for that peer. The field carries nothing this lane needs
+    // (the ask handler reads only "they want it"), so it is ignored here rather than trusted, which
+    // also keeps a mixed lobby working while everyone updates.
+    if (sub != kSetWant && (!in.genSeen || in.gen != gen)) {
+        out.genResetFrom = subName(sub);
+        out.genResetWas  = in.genSeen ? in.gen : (uint8_t)0xff;   // 0xff = we had never heard from them
         in.genSeen = true; in.gen = gen;
         in.have = false; in.setN = 0;
         in.nextPart = -1; in.asmN = 0;
@@ -526,7 +559,7 @@ bool OnPacket(int peerIdx, const uint8_t* d, int len, Update& out) {
         if (!r.ok) { g_st.rejected++; return false; }
         g_st.pingsRecv++;
         const bool mine = in.have && in.setN == (int)count && SetHash(in.set, in.setN) == hash;
-        if (!mine) SendSetWant(peerIdx, gen);
+        if (!mine) SendSetWant(peerIdx);
         return true;
     }
     // ...and the ask itself, from a peer whose copy of OUR set is stale or missing. The session owns

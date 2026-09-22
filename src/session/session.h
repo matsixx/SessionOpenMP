@@ -198,4 +198,12 @@ int SyncedPeersForSave(SavedPeer* out, int cap);
 // second copy to keep in sync. This is the read-back, for logging and the overlay.
 uint8_t DropPolicy();
 
+// WHAT THE DROPPER FRAME DOES THIS TICK, as a decision on its own so the gate can check it.
+// These three used to be one `if`, and the difference between two of them cost a park: "the player
+// turned it off" and "we never resolved the symbols" are permanent, and the right answer is to put
+// the world back; "the level's dropper cannot be read RIGHT NOW" is a blink, and the right answer is
+// to hold. Treating the blink as the off switch wiped every peer's objects on a single bad frame.
+enum class DropTick { Run, Hold, PutBack };
+DropTick DropTickFor(bool policyOn, bool symbolsAvailable, bool managerReadable);
+
 }} // namespace omp::session

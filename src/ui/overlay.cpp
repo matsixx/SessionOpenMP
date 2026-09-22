@@ -580,47 +580,92 @@ static void buildUI() {
         if (ImGui::BeginTabItem("Chat")) {
         ImGui::Spacing();
         {
+            // `heading`, when set, prints a section title above the row. The tab covers two things
+            // that are the same subject and not the same object -- the box you open with ENTER, and
+            // the bubbles over people's heads -- and one flat list of sliders made them look like one.
             struct Knob {
+                const char* heading;
                 const char* label; const char* hint; int lo, hi; const char* fmt;
                 int  (*get)(); void (*set)(int);
             };
             static const Knob knobs[] = {
-                { "Text size",      "How big the talk is. The header and the key hints follow it.",
+                { "The chat box",
+                  "Text size",      "How big the talk is. The header and the key hints follow it.",
                   MPCHAT_TEXT_MIN,  MPCHAT_TEXT_MAX,  "%d",
                   &MpPrefs_ChatTextSize, &MpPrefs_SetChatTextSize },
-                { "Header size",    "The SESSION CHAT line and the key hints under the box. Its own "
+                { nullptr,
+                  "Header size",    "The SESSION CHAT line and the key hints under the box. Its own "
                                     "setting, so big talk need not mean a big header.",
                   MPCHAT_SMALL_MIN, MPCHAT_SMALL_MAX, "%d",
                   &MpPrefs_ChatSmallSize, &MpPrefs_SetChatSmallSize },
-                { "Box width",      "How wide the box is, and where a long line wraps.",
+                { nullptr,
+                  "Box width",      "How wide the box is, and where a long line wraps.",
                   MPCHAT_WIDTH_MIN, MPCHAT_WIDTH_MAX, "%d",
                   &MpPrefs_ChatWidth,    &MpPrefs_SetChatWidth },
-                { "Lines shown",    "How much history the open box holds. It is the same size every "
+                { nullptr,
+                  "Lines shown",    "How much history the open box holds. It is the same size every "
                                     "time it opens, so this sets that size.",
                   MPCHAT_LINES_MIN, MPCHAT_LINES_MAX, "%d",
                   &MpPrefs_ChatLines,    &MpPrefs_SetChatLines },
-                { "Lines linger",   "With the box CLOSED, how long a message stays on screen before "
+                { nullptr,
+                  "Lines linger",   "With the box CLOSED, how long a message stays on screen before "
                                     "it fades.",
                   MPCHAT_HOLD_MIN,  MPCHAT_HOLD_MAX,  "%d s",
                   &MpPrefs_ChatHoldSec,  &MpPrefs_SetChatHoldSec },
-                { "Panel darkness", "How dark the panel behind the open box is. 0 leaves the words "
+                { nullptr,
+                  "Panel darkness", "How dark the panel behind the open box is. 0 leaves the words "
                                     "on the world.",
                   0, 100, "%d%%",
                   &MpPrefs_ChatPanelPct, &MpPrefs_SetChatPanelPct },
-                { "Panel blur",     "How much the world behind the box is blurred. 0 turns it off.",
+                { nullptr,
+                  "Panel blur",     "How much the world behind the box is blurred. 0 turns it off.",
                   0, 100, "%d%%",
                   &MpPrefs_ChatBlurPct,  &MpPrefs_SetChatBlurPct },
+                { "Speech bubbles",
+                  "Bubble text",    "How big the words over a player's head are at the distance a "
+                                    "name is drawn at its natural size. They still shrink with "
+                                    "distance from there.",
+                  MPBUBBLE_TEXT_MIN, MPBUBBLE_TEXT_MAX, "%d",
+                  &MpPrefs_BubbleTextSize, &MpPrefs_SetBubbleTextSize },
+                { nullptr,
+                  "Bubble darkness", "How dark the panel behind a bubble is. Its own setting: a bubble "
+                                    "hangs in the world over somebody's head, a chat box does not.",
+                  0, 100, "%d%%",
+                  &MpPrefs_BubblePanelPct, &MpPrefs_SetBubblePanelPct },
+                { nullptr,
+                  "Bubble blur",    "How much the world behind a bubble is blurred. 0 turns it off, "
+                                    "which is the default -- this is one blur per talking player, so "
+                                    "a busy lobby pays for it several times over.",
+                  0, 100, "%d%%",
+                  &MpPrefs_BubbleBlurPct, &MpPrefs_SetBubbleBlurPct },
             };
             static int  vals[sizeof(knobs) / sizeof(knobs[0])] = {};
             static bool held[sizeof(knobs) / sizeof(knobs[0])] = {};
             for (int i = 0; i < (int)(sizeof(knobs) / sizeof(knobs[0])); i++) {
                 const Knob& k = knobs[i];
+                if (k.heading) {
+                    if (i) ImGui::Separator();
+                    ImGui::TextUnformatted(k.heading);
+                    ImGui::Spacing();
+                }
                 if (!held[i]) vals[i] = k.get();        // the store is authoritative while nobody drags
                 ImGui::SetNextItemWidth(220.0f);
                 ImGui::SliderInt(k.label, &vals[i], k.lo, k.hi, k.fmt);
                 held[i] = ImGui::IsItemActive();
                 if (ImGui::IsItemDeactivatedAfterEdit()) k.set(vals[i]);
                 ImGui::TextDisabled("%s", k.hint);
+                ImGui::Spacing();
+            }
+            // The bubble's two pieces, as plain on/off. Written straight through: a checkbox has no
+            // drag to wait out, so there is nothing to defer to a release the way a slider has.
+            {
+                bool panel = MpPrefs_BubblePanel() != 0;
+                if (ImGui::Checkbox("Panel behind the words", &panel)) MpPrefs_SetBubblePanel(panel ? 1 : 0);
+                ImGui::TextDisabled("Off leaves the words on the world, with their shadow to read against.");
+                ImGui::Spacing();
+                bool border = MpPrefs_BubbleBorder() != 0;
+                if (ImGui::Checkbox("Border round the bubble", &border)) MpPrefs_SetBubbleBorder(border ? 1 : 0);
+                ImGui::TextDisabled("The bracketed frame and its corners. Off is just the panel.");
                 ImGui::Spacing();
             }
             ImGui::Separator();

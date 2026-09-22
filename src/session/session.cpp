@@ -333,6 +333,7 @@ void Init(void (*logf)(const char*)) {
 // session reset, a policy change. Bump the generation, forget the baseline, and tell everyone.
 static void dropNewGeneration(const char* why) {
     g_dropGen++;
+    dropsync::SetOwnGen(g_dropGen);      // every packet it sends carries OURS, asks included
     g_ownDropN = 0; g_dropNextId = 1;
     g_dropResend = true;
     if (g_logf && why) { char m[140]; snprintf(m, sizeof(m), "[drop] generation %u (%s)",
@@ -463,6 +464,16 @@ static void applyDropUpdate(Slot& s, const dropsync::Update& up, int peerIdx, ui
         // Their ids stopped meaning what they meant (their world changed, or they reset). Everything
         // we hold for them is stale by definition -- including the ACTORS, which are still standing
         // in our world and must go.
+        // SAID OUT LOUD. This was the last path that could destroy every object a peer had given us
+        // without a word in the log, and chasing the 1.2.7 flashing cost a round precisely because
+        // the paths that do that were silent. Only when there is something to lose, so a peer's
+        // first-ever packet -- which always resets -- does not print for nothing.
+        int held = 0;
+        for (const auto& d : s.drop) if (d.used) held++;
+        if (held && g_logf) { char m[240]; snprintf(m, sizeof(m),
+            "[drop] peer %d changed generation (%u -> %u, told by %s) -- dropping the %d object(s)"
+            " we held for them", peerIdx, (unsigned)up.genResetWas, (unsigned)up.gen,
+            up.genResetFrom ? up.genResetFrom : "?", held); g_logf(m); }
         dropMarkAllDead(s);
         s.dropGenSeen = true; s.dropGen = up.gen;
     }
@@ -1127,6 +1138,16 @@ void ForgetProxies() {
     for (auto& s : g_slots) {
         for (auto& d : s.drop) d = Slot::DropObj();
         s.dropGenSeen = false;
+        // ...AND THE LANE'S OWN COPY OF THEIR SET. Emptying the table here without forgetting it in
+        // dropsync leaves the two disagreeing: the heartbeat is answered from dropsync's `in.set`,
+        // which still holds everything we had before the level died, so we tell the peer "I already
+        // have that set" and they never send it -- while our table, the one that actually spawns
+        // anything, is empty. Field (1.2.7): a joiner changed level into the host's map and their 320
+        // objects NEVER appeared, for as long as they stayed; leaving and rejoining fixed it, because
+        // releasing a slot is the one path that already did forget. Before 1.2.3 the blind six-second
+        // re-send hid this -- the set came back whether we asked or not.
+        // THE RULE: every place that empties a slot's drop table must forget that peer here too.
+        dropsync::ForgetPeer(s.peerIdx);
     }
     game::dropper::Forget();
     g_worldN = 0; g_worldOn = false; g_worldSeeded = false;   // the actors died with the level
@@ -1557,6 +1578,13 @@ static void worldFrame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, int nPeers
     g_st.dropWorld = g_worldN;
 }
 
+// See session.h. Deliberately free of every global so the gate can ask it directly.
+DropTick DropTickFor(bool policyOn, bool symbolsAvailable, bool managerReadable) {
+    if (!policyOn || !symbolsAvailable) return DropTick::PutBack;
+    if (!managerReadable)               return DropTick::Hold;
+    return DropTick::Run;
+}
+
 static void dropFrame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, int nPeers, uint64_t dropUs) {
     using namespace game;
     static uint64_t lastFrameUs = 0, lastEnumUs = 0, lastResyncUs = 0;
@@ -1575,11 +1603,31 @@ static void dropFrame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, int nPeers,
         }
     }
     const bool wanted = (g_dropPolicy != 0);
-    if (!wanted || !dropper::Available() || !dropper::Manager()) {
-        // Turned off, unavailable, or no manager in this level yet: leave the world exactly as we
-        // found it. Both of these are no-ops when there is nothing to undo.
+    // A MANAGER WE CANNOT READ THIS FRAME IS NOT THE OFF SWITCH. All three of these used to share one
+    // `if`, and the tear-down below wipes every peer's table AND destroys every actor they gave us --
+    // so one frame in which the level's dropper singleton came back null threw a whole park away.
+    // Field (1.2.7, a joiner on a big custom map): the host's 314 objects appeared and vanished on a
+    // six-second cycle for seven and a half minutes -- the resync beat putting them back, the next
+    // blink taking them away -- 16,050 spawns against 15,735 destroys, healing itself only once the
+    // level finished settling. It was invisible in the log because ResetAll says nothing when there
+    // is nothing of your OWN to undo, which is every joiner who has placed no props.
+    // Same mistake as EnumerateOwn returning 0 for "could not read": absence is not emptiness. That
+    // one was fixed on the publish side in 1.2.7 and this, the apply side, was missed.
+    const DropTick tick = DropTickFor(wanted, dropper::Available(), dropper::Manager() != nullptr);
+    if (tick == DropTick::PutBack) {
+        // Turned off, or symbols we never resolved. Both are permanent, so leave the world exactly as
+        // we found it. A no-op when there is nothing to undo.
         if (g_dropAdopted || dropper::RemoteCount() > 0) {
-            for (auto& s : g_slots) for (auto& d : s.drop) d = Slot::DropObj();
+            // SAID OUT LOUD. The silence here is the only reason the field bug above took two rounds
+            // of logs to find: a hundred actors went, and nothing in the log admitted to it.
+            if (g_logf) { char m[170]; snprintf(m, sizeof(m),
+                "[drop] putting the world back (%s) -- %d peer object(s) destroyed",
+                !wanted ? "the setting is Off" : "the dropper symbols are unavailable",
+                dropper::RemoteCount()); g_logf(m); }
+            for (auto& s : g_slots) {
+                for (auto& d : s.drop) d = Slot::DropObj();
+                dropsync::ForgetPeer(s.peerIdx);    // the table and the lane's copy go together
+            }
             dropper::ResetAll(g_logf);      // also puts the level's own props back
             g_dropAdopted = false;
         }
@@ -1591,6 +1639,25 @@ static void dropFrame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, int nPeers,
         if (g_worldOn) worldTearDown();
         g_st.dropOwn = 0; g_st.dropRemote = 0; g_st.dropWorld = 0;
         return;
+    }
+    // HOLD. Nothing below can run without the manager, but nothing above needs undoing either: the
+    // actors are still standing and the tables still describe them, so we wait. A real level change
+    // is caught by worldChanged further up, which clears properly and says so -- waiting loses
+    // nothing. The stats are left alone too, so the line keeps reporting what is actually in the
+    // world rather than blinking to zero with the read.
+    static uint64_t blinkFromUs = 0;
+    static uint32_t blinkFrames = 0;
+    if (tick == DropTick::Hold) {
+        if (!blinkFromUs) blinkFromUs = nowUs;
+        blinkFrames++;
+        return;
+    }
+    if (blinkFromUs) {
+        // Only on the way out, so a spell costs one line however many frames it lasted.
+        if (g_logf) { char m[190]; snprintf(m, sizeof(m),
+            "[drop] the level's dropper was unreadable for %llu ms (%u frame(s)) -- everything held",
+            (unsigned long long)(sinceUs(nowUs, blinkFromUs) / 1000ull), blinkFrames); g_logf(m); }
+        blinkFromUs = 0; blinkFrames = 0;
     }
 
     // ---- WHO IS CANONICAL. Lowest authority key among us and every peer who is present and has told

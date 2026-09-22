@@ -83,6 +83,8 @@ void GameHud_Clear(void* world);
 // tuning follows, so a change from either menu takes effect on the next frame with no apply step.
 // `panelPct` and `blurPct` are 0..100; the rest are in slate units.
 void GameHud_SetChatLook(int textSize, int smallSize, int panelPct, int blurPct);
+// The speech bubble's panel, its bracketed border, and how much it blurs what is behind it (0 = off).
+void GameHud_SetBubbleLook(bool panel, bool border, int panelPct, int blurPct);
 
 // Is the game-drawn path the one in use? When false the overlay still owns the names and
 // GameHud_Names does nothing -- the A/B, and the way back if the game's own widget ever misbehaves

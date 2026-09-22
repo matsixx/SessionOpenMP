@@ -86,6 +86,12 @@ int SendSet(int peerIdx, uint8_t gen, uint64_t authKey, const Rec* recs, int n, 
 // whose own copy does not match asks for it, and only then does anything large move.
 // The healing the blind re-send provided is kept exactly: a peer whose assembly was abandoned mid-way
 // holds no matching set, so it asks again on the very next beat.
+// OUR OWN GENERATION, so that every packet this module sends carries it. The header's generation
+// field means "the sender's generation" to every receiver, and an ask used to break that rule: it
+// echoed back the generation of the peer it was answering, which told that peer THEY had reset.
+// See the note on kSetWant in OnPacket for what that cost.
+void SetOwnGen(uint8_t gen);
+
 uint32_t SetHash(const Rec* recs, int n);                 // the same bytes on both ends: id, localId, pose
 int      SendableCount(const Rec* recs, int n);           // ...over the records the wire will actually carry
 int SendSetPing(int peerIdx, uint8_t gen, uint32_t hash, uint16_t count);
@@ -132,6 +138,12 @@ int SendWorldMove(int peerIdx, uint8_t gen, const char* name, const float loc[3]
 struct Update {
     uint8_t  gen       = 0;
     bool     genReset  = false;   // this peer's ids changed meaning: drop every object you hold for it
+    // WHICH PACKET said so, and what generation it replaced. A reset destroys every object we hold
+    // for a peer, so when one fires in a loop the only question that matters is which lane is
+    // disagreeing with the others -- and the subtype is the whole answer. Named, not numbered,
+    // because the caller logs it.
+    const char* genResetFrom = nullptr;
+    uint8_t     genResetWas  = 0;
     bool     setReady  = false;   // a COMPLETE set is available from SetRecords(peerIdx)
     bool     setWanted = false;   // this peer's copy of OUR set does not match: send it to them
     bool     haveAuth  = false;   // authKey below is from this packet (kSet only)

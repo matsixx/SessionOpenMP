@@ -359,6 +359,32 @@ int main() {
         check(g_mismatches == 2, "a DIFFERENT peer announces on its own");
     }
 
+    // ---- THE DROPPER'S THREE STATES. A joiner on a big custom map watched the host's 314 objects
+    // appear and vanish on a six-second cycle for seven and a half minutes: the level's dropper
+    // singleton was intermittently unreadable while things settled, and "cannot read it this frame"
+    // shared one `if` with "the player switched it off" -- so a single bad frame destroyed every
+    // actor every peer had given us, and the next resync beat brought them all back. 16,050 spawns
+    // against 15,735 destroys. The distinction below is the whole fix, so it is checked directly.
+    printf("\ndropped objects: run, hold or put back\n");
+    {
+        using session::DropTick;
+        using session::DropTickFor;
+        check(DropTickFor(true,  true,  true)  == DropTick::Run,
+              "everything readable: the frame runs");
+        check(DropTickFor(true,  true,  false) == DropTick::Hold,
+              "a manager we cannot read THIS FRAME holds -- it is not the off switch");
+        check(DropTickFor(false, true,  true)  == DropTick::PutBack,
+              "the setting turned Off puts the world back");
+        check(DropTickFor(true,  false, true)  == DropTick::PutBack,
+              "symbols we never resolved put the world back");
+        // Off outranks a blink: a player who turned it off while the level was mid-blink must still
+        // get their own arrangement back, not a hold that waits for a manager to come good.
+        check(DropTickFor(false, true,  false) == DropTick::PutBack,
+              "Off during a blink still puts the world back");
+        check(DropTickFor(false, false, false) == DropTick::PutBack,
+              "off AND unavailable is still just put back");
+    }
+
     modChannelCheck(us, step);
 
     if (!verOk) g_fails++;      // the version comparison is part of the verdict
