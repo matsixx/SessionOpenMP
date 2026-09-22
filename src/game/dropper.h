@@ -86,6 +86,9 @@ bool  LocalActive();            // the local player is IN the dropper right now 
 // remote actor of ours are excluded -- and remote actors found in there are REMOVED from the array as
 // a side effect, which is the primary guard against a peer's prop reaching the local save.
 // Returns the count written; `actorsOut` (optional) receives the matching actor pointers.
+// Fills `out` with the local player's own dropped objects and returns how many. NEGATIVE means the
+// dropper could not be read at all this frame -- say nothing and ask again, never publish it as an
+// empty set (the caller diffs, so empty reads as "everything was removed").
 int   EnumerateOwn(ObjRec* out, void** actorsOut, int cap);
 
 // ---- the pre-session baseline -----------------------------------------------------------------

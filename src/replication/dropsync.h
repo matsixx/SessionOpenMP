@@ -87,6 +87,7 @@ int SendSet(int peerIdx, uint8_t gen, uint64_t authKey, const Rec* recs, int n, 
 // The healing the blind re-send provided is kept exactly: a peer whose assembly was abandoned mid-way
 // holds no matching set, so it asks again on the very next beat.
 uint32_t SetHash(const Rec* recs, int n);                 // the same bytes on both ends: id, localId, pose
+int      SendableCount(const Rec* recs, int n);           // ...over the records the wire will actually carry
 int SendSetPing(int peerIdx, uint8_t gen, uint32_t hash, uint16_t count);
 // A set larger than one tick's packet budget goes out ACROSS ticks -- 1024 objects measures 103 parts
 // against a budget of 32 -- so SendSet returns the parts sent THIS call and the caller keeps calling

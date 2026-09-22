@@ -157,16 +157,27 @@ static int buildSetPart(uint8_t* out, int cap, uint8_t gen, uint64_t authKey,
 // pose -- so a sender and a receiver holding the same set compute the same value. The floats are
 // hashed as their BYTES, which is sound here because they are sent verbatim as f32 and arrive
 // bit-identical; nothing rounds or re-derives them on the way.
+// HOW MANY OF THESE WILL ACTUALLY ARRIVE. buildSetPart drops a record whose name the wire refuses,
+// so the set the other end assembles is this many, not `n` -- and the heartbeat comparing OUR `n`
+// against THEIR assembled count made the two permanently unequal, which is an ask on every ping that
+// nothing can ever satisfy.
+int SendableCount(const Rec* recs, int n) {
+    int c = 0;
+    for (int i = 0; i < (n > 0 ? n : 0); i++) if (recs && NameIsSendable(recs[i].id)) c++;
+    return c;
+}
+
 uint32_t SetHash(const Rec* recs, int n) {
     uint32_t h = 2166136261u;
     auto feed = [&h](const void* p, size_t len) {
         const uint8_t* b = (const uint8_t*)p;
         for (size_t i = 0; i < len; i++) { h ^= b[i]; h *= 16777619u; }
     };
-    const uint32_t cnt = (uint32_t)(n < 0 ? 0 : n);
+    const uint32_t cnt = (uint32_t)SendableCount(recs, n);
     feed(&cnt, sizeof(cnt));                       // so 3 records can never hash like 4
     for (int i = 0; i < (n > 0 ? n : 0); i++) {
         const Rec& r = recs[i];
+        if (!NameIsSendable(r.id)) continue;       // it will not reach them: it is not in the answer
         size_t idLen = 0; while (idLen < sizeof(r.id) && r.id[idLen]) idLen++;
         feed(r.id, idLen);
         feed(&r.localId, sizeof(r.localId));
@@ -454,6 +465,35 @@ static bool readRec(Rd& r, Rec& out, const char* const* names, int nameN) {
     return true;
 }
 
+// THE CACHED SET MUST TRACK WHAT WE ACTUALLY HOLD. `in.set` is the only thing the heartbeat's hash is
+// compared against, and it was written in exactly ONE place -- the completion of a full set -- while
+// moves, places and removals changed the objects under it. So the first time anybody nudged a prop the
+// cache disagreed with its owner forever: an ask on every ping, answered with a whole set, each one a
+// mark-and-sweep on the receiver. Applying the deltas here is what lets the comparison settle.
+// Order is kept the same way the sender keeps it -- append on arrival, compact in place on removal --
+// because the hash walks the records in order.
+static void setUpsert(PeerIn& in, const Rec& r, bool withClass) {
+    for (int i = 0; i < in.setN; i++) {
+        if (in.set[i].localId != r.localId) continue;
+        memcpy(in.set[i].loc,  r.loc,  sizeof(in.set[i].loc));
+        memcpy(in.set[i].quat, r.quat, sizeof(in.set[i].quat));
+        if (withClass && r.id[0]) strncpy_s(in.set[i].id, sizeof(in.set[i].id), r.id, _TRUNCATE);
+        return;
+    }
+    // A MOVE for an id we do not hold is not an object: it carries no class name, so there is nothing
+    // to put in the set. The next set or place brings it.
+    if (!withClass || !r.id[0] || in.setN >= kMaxSetRecords) return;
+    in.set[in.setN++] = r;
+}
+static void setErase(PeerIn& in, uint16_t localId) {
+    for (int i = 0; i < in.setN; i++) {
+        if (in.set[i].localId != localId) continue;
+        for (int k = i + 1; k < in.setN; k++) in.set[k - 1] = in.set[k];
+        in.setN--;
+        return;
+    }
+}
+
 bool OnPacket(int peerIdx, const uint8_t* d, int len, Update& out) {
     out = Update();
     if (!IsPacket(d, len) || peerIdx < 0 || peerIdx >= kPeers) return false;
@@ -554,6 +594,7 @@ bool OnPacket(int peerIdx, const uint8_t* d, int len, Update& out) {
         if (!readRec(r, in.scratch[0], names, 1)) { g_st.rejected++; return false; }
         if (r.n != len) { g_st.rejected++; return false; }
         out.nPlace = 1; out.place = in.scratch;
+        if (in.have) setUpsert(in, in.scratch[0], true);
         g_st.recv++;
         return true;
     }
@@ -563,6 +604,7 @@ bool OnPacket(int peerIdx, const uint8_t* d, int len, Update& out) {
         for (int i = 0; i < n; i++) if (!readRec(r, in.scratch[i], nullptr, 0)) { g_st.rejected++; return false; }
         if (r.n != len) { g_st.rejected++; return false; }
         out.nMove = n; out.move = in.scratch;
+        if (in.have) for (int i = 0; i < n; i++) setUpsert(in, in.scratch[i], false);
         g_st.recv++;
         return true;
     }
@@ -646,6 +688,7 @@ bool OnPacket(int peerIdx, const uint8_t* d, int len, Update& out) {
         for (int i = 0; i < n; i++) in.ids[i] = r.u16();
         if (!r.ok || r.n != len) { g_st.rejected++; return false; }
         out.nRemove = n; out.remove = in.ids;
+        if (in.have) for (int i = 0; i < n; i++) setErase(in, in.ids[i]);
         g_st.recv++;
         return true;
     }

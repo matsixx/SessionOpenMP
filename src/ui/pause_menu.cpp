@@ -2652,10 +2652,10 @@ static bool handleValueChange(void* params, bool isSlider) {
         if (isSlider && (k == g_voiceRangeKey || k == g_voiceVolKey || k == g_voiceSensKey)) {
             const float pct = *(const float*)((const uint8_t*)params + off::kChangeParamsNew);
             if (k == g_voiceRangeKey && g_voiceRangeKey) {
-                const float v = MPVOICE_RANGE_MIN + pct * (float)(MPVOICE_RANGE_MAX - MPVOICE_RANGE_MIN);
+                const float v = (float)MPVOICE_RANGE_MIN + pct * (float)(MPVOICE_RANGE_MAX - MPVOICE_RANGE_MIN);
                 MpPrefs_SetVoiceRangeM((int)(v + 0.5f));
             } else if (k == g_voiceVolKey && g_voiceVolKey) {
-                const float v = MPVOICE_VOL_MIN + pct * (float)(MPVOICE_VOL_MAX - MPVOICE_VOL_MIN);
+                const float v = (float)MPVOICE_VOL_MIN + pct * (float)(MPVOICE_VOL_MAX - MPVOICE_VOL_MIN);
                 MpPrefs_SetVoiceVolume((int)(v + 0.5f));
             } else if (g_voiceSensKey) {
                 MpPrefs_SetVoiceSensitivity((int)(pct * 100.0f + 0.5f));
@@ -2668,13 +2668,13 @@ static bool handleValueChange(void* params, bool isSlider) {
             // game prints.
             const float pct = *(const float*)((const uint8_t*)params + off::kChangeParamsNew);
             if (k == g_nameDistKey && g_nameDistKey) {
-                const float v = MPNAME_DIST_MIN + pct * (float)(MPNAME_DIST_MAX - MPNAME_DIST_MIN);
+                const float v = (float)MPNAME_DIST_MIN + pct * (float)(MPNAME_DIST_MAX - MPNAME_DIST_MIN);
                 MpPrefs_SetNameDistM((int)(v + 0.5f));
             } else if (k == g_bubbleDistKey && g_bubbleDistKey) {
-                const float v = MPBUBBLE_DIST_MIN + pct * (float)(MPBUBBLE_DIST_MAX - MPBUBBLE_DIST_MIN);
+                const float v = (float)MPBUBBLE_DIST_MIN + pct * (float)(MPBUBBLE_DIST_MAX - MPBUBBLE_DIST_MIN);
                 MpPrefs_SetBubbleDistM((int)(v + 0.5f));
             } else if (g_bubbleTextKey) {
-                const float v = MPBUBBLE_TEXT_MIN + pct * (float)(MPBUBBLE_TEXT_MAX - MPBUBBLE_TEXT_MIN);
+                const float v = (float)MPBUBBLE_TEXT_MIN + pct * (float)(MPBUBBLE_TEXT_MAX - MPBUBBLE_TEXT_MIN);
                 MpPrefs_SetBubbleTextSize((int)(v + 0.5f));
             }
             return true;

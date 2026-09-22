@@ -1359,6 +1359,108 @@ static bool dropSyncCheck() {
         if (!OnPacket(2, beat[0].data(), (int)beat[0].size(), u2)) { printf("  drop: a ping did not parse\n"); return false; }
         if (!g_dropPkts.empty()) { printf("  drop: a peer holding the SAME set still asked for it\n"); return false; }
 
+        // A DELTA MUST NOT DESYNC THE CACHE. This is the one the field found, and the gate above
+        // could never have caught it: it only ever pinged a set that nothing had touched. The
+        // heartbeat compares the sender's LIVE hash against the set the receiver last assembled, and
+        // a move used to change the objects without touching that copy -- so the first nudge of any
+        // prop made the two disagree forever. An ask on every ping, answered with a whole set, and
+        // every set is a destroy-and-respawn sweep on the receiver: objects flashing, at the publish
+        // rate, on props nobody was touching.
+        {
+            Rec moved[40];
+            memcpy(moved, set, sizeof(moved));
+            moved[7].loc[0] += 12.5f; moved[7].loc[2] -= 3.25f;
+            Rec mv = moved[7]; mv.id[0] = 0;                     // a move carries no class name
+            g_dropPkts.clear();
+            SendMove(2, 5, &mv, 1);
+            std::vector<std::vector<uint8_t>> mvp = g_dropPkts;
+            g_dropPkts.clear();
+            Update um;
+            for (auto& pk : mvp) OnPacket(2, pk.data(), (int)pk.size(), um);
+            if (um.nMove != 1) { printf("  drop: the move did not arrive\n"); return false; }
+            int mn = 0; const Rec* ms = SetRecords(2, &mn);
+            if (!ms || mn != 40 || SetHash(ms, mn) != SetHash(moved, 40)) {
+                printf("  drop: after a move the held set no longer hashes like the sender's\n");
+                return false;
+            }
+            g_dropPkts.clear();
+            SendSetPing(2, 5, SetHash(moved, 40), 40);
+            std::vector<std::vector<uint8_t>> pb = g_dropPkts;
+            g_dropPkts.clear();
+            OnPacket(2, pb[0].data(), (int)pb[0].size(), um);
+            if (!g_dropPkts.empty()) {
+                printf("  drop: after a move a peer asked for a set it already holds -- the loop\n");
+                return false;
+            }
+        }
+
+        // ...and a REMOVAL, the same way round: what is gone must leave the cache with it.
+        {
+            int bn0 = 0; const Rec* bs0 = SetRecords(2, &bn0);
+            if (!bs0 || bn0 != 40) { printf("  drop: removal setup lost the set\n"); return false; }
+            const uint16_t goneId = bs0[3].localId;
+            g_dropPkts.clear();
+            SendRemove(2, 5, &goneId, 1);
+            std::vector<std::vector<uint8_t>> rmp = g_dropPkts;
+            g_dropPkts.clear();
+            Update ur;
+            for (auto& pk : rmp) OnPacket(2, pk.data(), (int)pk.size(), ur);
+            if (ur.nRemove != 1) { printf("  drop: the removal did not arrive\n"); return false; }
+            int rn = 0; const Rec* rs = SetRecords(2, &rn);
+            if (!rs || rn != 39) { printf("  drop: a removal did not shrink the held set\n"); return false; }
+            for (int i = 0; i < rn; i++) if (rs[i].localId == goneId) {
+                printf("  drop: the removed object is still in the held set\n"); return false;
+            }
+            g_dropPkts.clear();
+            SendSetPing(2, 5, SetHash(rs, rn), 39);
+            std::vector<std::vector<uint8_t>> rb = g_dropPkts;
+            g_dropPkts.clear();
+            OnPacket(2, rb[0].data(), (int)rb[0].size(), ur);
+            if (!g_dropPkts.empty()) {
+                printf("  drop: after a removal a peer asked for a set it already holds\n");
+                return false;
+            }
+        }
+
+        // A RECORD THE WIRE REFUSES IS NOT IN THE ANSWER. buildSetPart drops a record whose name it
+        // cannot carry, so the set that assembles is smaller than the one published -- and a
+        // heartbeat that counts the published one compares against a number the other end can never
+        // report. That is an ask on every ping for as long as the object exists.
+        {
+            ResetAll();
+            Rec bad[8];
+            memcpy(bad, set, sizeof(bad));
+            bad[5].id[0] = 0;                                    // a name the wire will not take
+            if (SendableCount(bad, 8) != 7) { printf("  drop: SendableCount counted the unsendable\n"); return false; }
+            g_dropPkts.clear();
+            SendSet(2, 5, 1234ull, bad, 8, 0);
+            std::vector<std::vector<uint8_t>> bp = g_dropPkts;
+            g_dropPkts.clear();
+            Update ub;
+            for (auto& pk : bp) OnPacket(2, pk.data(), (int)pk.size(), ub);
+            int bn = 0; const Rec* bs = SetRecords(2, &bn);
+            if (!bs || bn != 7) { printf("  drop: the unsendable record was not dropped in transit\n"); return false; }
+            if (SetHash(bad, 8) != SetHash(bs, bn)) {
+                printf("  drop: the published set and the arrived set hash differently\n"); return false;
+            }
+            g_dropPkts.clear();
+            SendSetPing(2, 5, SetHash(bad, 8), (uint16_t)SendableCount(bad, 8));
+            std::vector<std::vector<uint8_t>> bb = g_dropPkts;
+            g_dropPkts.clear();
+            OnPacket(2, bb[0].data(), (int)bb[0].size(), ub);
+            if (!g_dropPkts.empty()) {
+                printf("  drop: an unsendable record left the heartbeat permanently unsatisfiable\n");
+                return false;
+            }
+            // put the rig back the way the checks below expect it
+            ResetAll();
+            g_dropPkts.clear();
+            SendSet(2, 5, 1234ull, set, 40, 0);
+            Update ur2;
+            for (auto& pk : g_dropPkts) OnPacket(2, pk.data(), (int)pk.size(), ur2);
+            g_dropPkts.clear();
+        }
+
         // A DIFFERENT SET OF THE SAME SIZE: the hash is the only thing that can tell, and it must.
         g_dropPkts.clear();
         SendSetPing(2, 5, h ^ 0x5A5A5A5Au, 40);

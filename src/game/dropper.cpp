@@ -219,10 +219,15 @@ int EnumerateOwn(ObjRec* out, void** actorsOut, int cap) {
     g_st.own = 0; g_st.remote = g_remoteN; g_st.overCap = 0;
     g_st.arrayNum = 0; g_st.skipWorld = 0;
     g_st.skipRemote = g_st.skipHidden = g_st.skipNoClass = g_st.skipNoRoot = 0;
+    // NEGATIVE MEANS "NO ANSWER", AND IT IS NOT THE SAME AS ZERO. Both of these used to return 0, so a
+    // frame that could not read the manager was indistinguishable from a player who owns nothing --
+    // and the publisher diffs against the last list, so "nothing" is broadcast as "every object was
+    // removed". One unreadable pointer would take a whole park off every peer's screen.
     void* m = Manager();
-    if (!m || cap <= 0) return 0;
+    if (cap <= 0) return 0;
+    if (!m) return -1;
     TArrayHdr a;
-    if (!readArray(m, off::kDropMgrAllObjects, &a)) return 0;
+    if (!readArray(m, off::kDropMgrAllObjects, &a)) return -1;
     g_st.arrayNum = a.num;
 
     int n = 0;

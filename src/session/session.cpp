@@ -471,13 +471,47 @@ static void applyDropUpdate(Slot& s, const dropsync::Update& up, int peerIdx, ui
         const dropsync::Rec* set = dropsync::SetRecords(peerIdx, &n);
         // The other half of the publish line above. A set that arrives and a set that publishes are
         // the two facts that, together, say which side of the wire lost it.
-        static int lastN = -1; static uint8_t lastGen = 0xff;
-        if (g_logf && (n != lastN || up.gen != lastGen)) {
-            lastN = n; lastGen = up.gen;
-            char m[220];
-            snprintf(m, sizeof(m), "[drop] peer %d set gen=%u: %d object(s)%s%s", peerIdx,
-                     (unsigned)up.gen, n, n ? " -- first is " : "", n ? set[0].id : "");
-            g_logf(m);
+        // PER PEER, not per process. One shared pair of "last" values printed a line whenever ANY
+        // peer's count differed from the previous line's, so the peer index printed and the set
+        // described could belong to different peers -- reading those logs, a peer that never changed
+        // looked like it was alternating. A diagnostic that misattributes is worse than none.
+        if (g_logf && peerIdx >= 0 && peerIdx < kMaxPeers) {
+            static int     lastN[kMaxPeers]   = { 0 };
+            static uint8_t lastGen[kMaxPeers] = { 0 };
+            static bool    saidOnce[kMaxPeers] = { false };
+            if (!saidOnce[peerIdx] || n != lastN[peerIdx] || up.gen != lastGen[peerIdx]) {
+                saidOnce[peerIdx] = true; lastN[peerIdx] = n; lastGen[peerIdx] = up.gen;
+                char m[220];
+                snprintf(m, sizeof(m), "[drop] peer %d set gen=%u: %d object(s)%s%s", peerIdx,
+                         (unsigned)up.gen, n, n ? " -- first is " : "", n ? set[0].id : "");
+                g_logf(m);
+            }
+        }
+        // IS THIS THE SAME SET WE ALREADY HOLD? A set whose ids we already have is free -- the sweep
+        // below revives them where they stand. A set of ids we have never seen destroys everything we
+        // hold for this peer and spawns the lot again, one for one, which is what an object flashing
+        // actually IS. The counters say which of the two is happening and which way round.
+        if (g_logf && n > 0) {
+            int fresh = 0;
+            for (int i = 0; i < n; i++) if (!dropFind(s, set[i].localId)) fresh++;
+            int stale = 0;
+            for (auto& d : s.drop) {
+                if (!d.used) continue;
+                bool kept = false;
+                for (int i = 0; i < n && !kept; i++) kept = (set[i].localId == d.id);
+                if (!kept) stale++;
+            }
+            if (fresh || stale) {
+                static uint64_t lastChurnUs = 0;
+                if (!lastChurnUs || sinceUs(nowUs, lastChurnUs) > 1000000ull) {
+                    lastChurnUs = nowUs;
+                    char m[220];
+                    snprintf(m, sizeof(m), "[drop] peer %d set churn: %d of %d id(s) are new to us,"
+                             " %d of ours are not in it -- each is a destroy and a respawn",
+                             peerIdx, fresh, n, stale);
+                    g_logf(m);
+                }
+            }
         }
         // MARK AND SWEEP against the full set: what is in it lives, what is not is gone. This is the
         // one message that may delete, which is why an incomplete set is never applied (dropsync only
@@ -1150,8 +1184,17 @@ static void dropSendToAll(int kind, int nPeers, uint8_t gen,
 // Enumerate our own visible set, diff it against the baseline, and publish what changed. This is the
 // whole sender: place, duplicate, drag, stick-to-ground, revert and call-back are all just an added,
 // removed or moved entry, so none of them needs its own hook.
-static void dropPublishOwn(uint64_t nowUs, int nPeers, bool forceResync, bool includeBaseline,
-                           bool heartbeatOnly = false) {
+// THREE REASONS, KEPT APART. `beatDue` is the slow heartbeat (a 12-byte ping); `answerWants` means a
+// peer asked for the set on the last beat; `changed` means our own set actually moved, and it is the
+// ONLY thing that sends a full set to everybody.
+// They used to arrive as one `forceResync` flag, and that closed a loop: the ping is what provokes an
+// ask, so answering an ask also pinged, which provoked another ask, on the next tick. With the dropper
+// open the enum period is 33 ms, so a peer whose copy could not match -- for any reason at all -- was
+// answered thirty times a second instead of once every six, and every full set runs a mark-and-sweep
+// on the receiver. That is the object flashing. Separated, a gate that can never agree costs exactly
+// one set per peer per beat, which is what the blind re-send did before any of this existed.
+static void dropPublishOwn(uint64_t nowUs, int nPeers, bool beatDue, bool answerWants,
+                           bool includeBaseline, bool changed) {
     using namespace game;
     // STATIC, not stack: 1024 objects across five buffers is ~400 KB, which is not something to put
     // on the game thread's frame several times a second -- it was ~100 KB at the old cap of 256 and
@@ -1159,7 +1202,13 @@ static void dropPublishOwn(uint64_t nowUs, int nPeers, bool forceResync, bool in
     // of the session.
     static dropper::ObjRec recs[dropper::kMaxObjects];
     static void*           actors[dropper::kMaxObjects];
-    int n = dropper::EnumerateOwn(recs, actors, dropper::kMaxObjects);
+    const int n0 = dropper::EnumerateOwn(recs, actors, dropper::kMaxObjects);
+    // NO ANSWER IS NOT AN EMPTY SET. EnumerateOwn returns a negative when the dropper manager or its
+    // array could not be read at all; treating that as "the player has nothing" would diff every
+    // object we own against nothing and broadcast the lot as removed -- every peer destroying a park
+    // because one frame could not read a pointer. Say nothing and ask again next tick.
+    if (n0 < 0) return;
+    int n = n0;
     // The publish filter (see dropFrame): pre-session objects travel only for the canonical set.
     // Filtered here, before the diff, so an excluded object never enters the baseline table at all --
     // to the wire it simply does not exist, and when canonical status flips the resync that the flip
@@ -1219,7 +1268,7 @@ static void dropPublishOwn(uint64_t nowUs, int nPeers, bool forceResync, bool in
     g_ownDropN = w;
 
     if (nPeers <= 0) return;
-    if (forceResync) {
+    if (beatDue || answerWants) {
         // The set supersedes every delta this pass would have sent -- it IS the current state.
         static dropsync::Rec full[dropper::kMaxObjects];
         for (int k = 0; k < g_ownDropN; k++) {
@@ -1245,28 +1294,34 @@ static void dropPublishOwn(uint64_t nowUs, int nPeers, bool forceResync, bool in
                      (unsigned)g_dropGen, g_ownDropN, nPeers, g_ownDropN ? " -- " : "", names);
             g_logf(m);
         }
-        // THE BEAT SENDS THE HASH, NOT THE SET. `heartbeatOnly` is the 6 s tick: every peer is told
-        // what our set IS (gen, hash, count) in 12 bytes, and the ones whose copy disagrees ask --
-        // which is what fills g_dropWant for the next tick. A real change (forceResync without
-        // heartbeatOnly) still goes to everybody at once, so an edit is no slower to arrive.
-        if (heartbeatOnly) {
+        // A REAL CHANGE goes to everybody at once, and it is the only thing that does -- so an edit
+        // is no slower to arrive than it ever was.
+        if (changed) {
+            dropSendToAll(0, nPeers, g_dropGen, full, g_ownDropN, nullptr);
+            for (int i = 0; i < kMaxPeers; i++) g_dropWant[i] = false;      // they just got it
+            g_dropWantAny = false;
+            return;
+        }
+        // THE BEAT SENDS THE HASH, NOT THE SET: every peer is told what our set IS (gen, hash, count)
+        // in 12 bytes, and the ones whose copy disagrees ask, which fills g_dropWant for the next
+        // beat. The count is what will actually reach them -- a record the wire refuses is not in the
+        // set they assemble, and counting it here made the comparison unsatisfiable forever.
+        if (beatDue) {
             const uint32_t h = dropsync::SetHash(full, g_ownDropN);
+            const uint16_t c = (uint16_t)dropsync::SendableCount(full, g_ownDropN);
             PeerStats ps;
             for (int i = 0; i < nPeers; i++) {
                 if (!GetStats(i, &ps) || ps.state == 5) continue;
-                dropsync::SendSetPing(i, g_dropGen, h, (uint16_t)g_ownDropN);
+                dropsync::SendSetPing(i, g_dropGen, h, c);
             }
-            // ...and answer anyone who asked on the PREVIOUS beat, them only.
-            if (g_dropWantAny) {
-                dropSendToAll(0, nPeers, g_dropGen, full, g_ownDropN, nullptr, g_dropWant);
-                for (int i = 0; i < kMaxPeers; i++) g_dropWant[i] = false;
-                g_dropWantAny = false;
-            }
-            return;
         }
-        dropSendToAll(0, nPeers, g_dropGen, full, g_ownDropN, nullptr);
-        for (int i = 0; i < kMaxPeers; i++) g_dropWant[i] = false;      // they just got it
-        g_dropWantAny = false;
+        // ...and anyone who asked on the PREVIOUS beat is answered ONCE, them only, WITHOUT pinging
+        // again. The missing "without" is what made this a loop.
+        if (answerWants && g_dropWantAny) {
+            dropSendToAll(0, nPeers, g_dropGen, full, g_ownDropN, nullptr, g_dropWant);
+            for (int i = 0; i < kMaxPeers; i++) g_dropWant[i] = false;
+            g_dropWantAny = false;
+        }
         return;
     }
     if (nPlace) dropSendToAll(1, nPeers, g_dropGen, place, nPlace, nullptr);
@@ -1663,13 +1718,16 @@ static void dropFrame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, int nPeers,
     // set nobody has is at most 6 s away exactly as before.
     const bool changed   = g_dropResend || !lastResyncUs;
     const bool beatDue   = changed || sinceUs(nowUs, lastResyncUs) > 6000000ull;
-    // ...and a set too big for one tick keeps the pump running until its last part has gone.
+    // ...and a set too big for one tick keeps the pump running until its last part has gone. This is
+    // a reason to keep PUBLISHING, never a reason to force a resync: re-entering the publish
+    // re-enumerates and re-measures, and because SendSet restarts from part 0 whenever the set's hash
+    // moves -- and the hash covers the poses -- a big set being dragged restarted every single frame
+    // and could never finish. Continuing the send is all that is wanted here.
     bool sending = false;
     for (int i = 0; i < nPeers && !sending; i++) sending = dropsync::SetSendInProgress(i);
-    const bool wantsPending = g_dropWantAny || sending;
-    if (!lastEnumUs || sinceUs(nowUs, lastEnumUs) >= enumPeriod || beatDue || wantsPending) {
+    if (!lastEnumUs || sinceUs(nowUs, lastEnumUs) >= enumPeriod || beatDue || g_dropWantAny || sending) {
         lastEnumUs = nowUs;
-        dropPublishOwn(nowUs, nPeers, beatDue || wantsPending, includeBaseline, !changed);
+        dropPublishOwn(nowUs, nPeers, beatDue, g_dropWantAny, includeBaseline, changed);
         if (beatDue) { lastResyncUs = nowUs; g_dropResend = false; }
     }
 

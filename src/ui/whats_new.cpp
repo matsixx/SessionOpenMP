@@ -41,6 +41,10 @@ struct Release { const char* version; const char* notes; };
 // instead of anything else (field 2026-09-20, at 1600). `show` measures and trims, but keep the source
 // short enough that trimming never has to happen: budget ~300 characters a release, three releases.
 static const Release kReleases[] = {
+    { "1.2.7",
+      "- Fixes other players' dropped objects flashing in and out constantly.\n"
+      "- Props nobody was touching were re-sent to everyone 30 times a second.\n"
+      "- Far less network traffic while anyone has the object dropper open." },
     { "1.2.6",
       "- Set up the chat box yourself: size, width, lines, blur (F1 -> Chat).\n"
       "- Chat text is white; only names carry colour. Bubble size is in Player names.\n"
