@@ -105,6 +105,15 @@ enum {
     SM_REFSKEL    = 0x1b0,   // USkeletalMesh::RefSkeleton
     RS_FINAL_INFO = 0x20,    // FReferenceSkeleton::FinalRefBoneInfo (FMeshBoneInfo: FName, int parent; 12 B)
     RS_FINAL_POSE = 0x30,    //   ...FinalRefBonePose (FTransform each, parent-relative): the board lies FLAT in it
+    // THE SESSION MARKER, polled -- never hooked (the co-op host already owns a MinHook on
+    // ASkaterCharacter::PopulateMarkerInfo, and one address cannot be hooked twice).
+    // IT LIVES ON THE GAME'S OWN MARKER CONTROLLER, not on the pawn. The pawn's +0xac0 is the PENDING copy,
+    // which `SpotMarkerController::GotoMarker` fills in ON THE WAY BACK as well -- field 3.19.385: reading it
+    // made the return look like the marker being set again, which wiped what had been remembered about it.
+    PAWN_CONTROLLER = 0x258,  // APawn::Controller (PDB)
+    PC_SPOT_MARKER  = 0x7b0,  // ASessionPlayerController::_spotMarkerController
+    SMC_ACTIVE      = 0x05,   // SpotMarkerController::_isMarkerActive
+    SMC_INFO        = 0x40,   // ::_markerInfo (FSessionPlayerMarkerInfo: +0x00 IsSet, +0x04 FVector SkaterLoc)
     SK_BOARD      = 0x568,   // ASkaterCharacterBase::_skateboard
     BD_FLIPPER    = 0x4e8,   // ASkateboardEx::_flipper (UStaticMeshComponent*): THE DECK YOU SEE. Then, each its own component:
     BD_TRUCK_B    = 0x4f0,   //   ..._truckBack
@@ -183,7 +192,11 @@ float clampf(float v, float lo, float hi) { return v < lo ? lo : v > hi ? hi : v
 float smooth(float x) { x = clampf(x, 0.0f, 1.0f); return x * x * (3.0f - 2.0f * x); }
 // 1 between t0 and t1, easing over `edge` seconds at each end.
 float window(float t, float t0, float t1, float edge) { return smooth((t - t0) / edge) * smooth((t1 - t) / edge); }
-const float TAU = 6.2831853f;
+const float TAU = 6.2831853f, PI = 3.14159265f;
+// THE DANCES, named here because kDefs below counts them. What each one is: see THE DANCES, further down.
+// A running man, a step-and-snap and a breakdance were built too, and thrown out in the field: "you did
+// terrible with those". What is left is what reads as dancing on this rig -- weight, not choreography.
+enum { DS_TWO_STEP = 0, DS_SWAY, DS_TWIST, DS_COUNT };
 
 // ------------------------------------------------------------------ the emotes, in wheel order
 // EM_CARRY is NOT ON THE WHEEL: a prop asks for it (radio.cpp) -- a box held under the free arm, long ways. Everything
@@ -194,16 +207,18 @@ enum { EM_NONE = -1, EM_WAVE = 0, EM_THUMBS, EM_POINT, EM_FACEPALM, EM_CLAP, EM_
 // `wheel`: does it appear on the emote wheel? Some are reached by a button instead -- a throw is armed
 // by holding the left trigger -- and those are hidden rather than renumbered, because an emote's index
 // IS its identity everywhere else in this file.
-struct Def { const char* name; float dur; bool loop; bool lower; bool board; bool wheel; };
+// `variants`: how many ways there are to do it. B TAPPED goes round them, B HELD puts the emote away
+// (an emote with one way is stopped by either -- there is nothing to go round).
+struct Def { const char* name; float dur; bool loop; bool lower; bool board; bool wheel; int variants; };
 const Def kDefs[EM_COUNT] = {
-    { "Wave",      0.0f, true, false, false, true }, { "Thumbs up", 0.0f, true, false, false, true }, { "Point", 0.0f, true, false, false, true },
-    { "Facepalm",  0.0f, true, false, false, true }, { "Clap",      0.0f, true, false, false, true },
+    { "Wave",      0.0f, true, false, false, true, 1 }, { "Thumbs up", 0.0f, true, false, false, true, 1 }, { "Point", 0.0f, true, false, false, true, 1 },
+    { "Facepalm",  0.0f, true, false, false, true, 1 }, { "Clap",      0.0f, true, false, false, true, 1 },
     // EM_TAP is NOT on the wheel either: RB holds the board in the tap pose, and HOLDING RB takes the
     // right stick to work it. No lower body -- you stand as you stand.
-    { "Board tap", 0.0f, true, false, true,  false },
+    { "Board tap", 0.0f, true, false, true,  false, 1 },
     // EM_RAGE is NOT on the wheel: holding the left trigger off the board arms it, the right throws.
-    { "Throw board", 0.0f, true, false, true, false }, { "Dance",  0.0f, true, true,  false, true },
-    { "Carry",     0.0f, true, false, false, false },      // EM_CARRY: internal (a held prop)
+    { "Throw board", 0.0f, true, false, true, false, 1 }, { "Dance",  0.0f, true, true,  false, true, DS_COUNT },
+    { "Carry",     0.0f, true, false, false, false, 1 },   // EM_CARRY: internal (a held prop)
 };
 // The wheel's entries are the ones flagged above, in order -- so its Nth entry is not necessarily
 // emote N, and everything that takes a wheel index maps through here.
@@ -223,11 +238,30 @@ const float kRageWind = 0.50f, kRageLetGo = 0.14f, kRageSwingLen = 0.30f;
 const float kRageAfter = 2.36f;
 const float kTrigOn = 0.12f, kTrigOff = 0.07f;      // felt / let go (the pad's own "pressed" is at 0.12 too)
 const float kBlendIn = 0.24f, kBlendOut = 0.34f, kBlendSwap = 0.12f;
+const float kVarBlend = 0.45f;      // one way of doing it into the next
 
 // ------------------------------------------------------------------ state (game thread: the pump and the hook both)
 int       g_on = 1;                       // EmotesEnabled
 int       g_id = EM_NONE, g_next = EM_NONE, g_req = EM_NONE;
 float     g_t = 0.0f, g_w = 0.0f, g_lowerW = 0.0f, g_moveS = 0.0f;
+// WHICH WAY OF DOING IT (the dances: two-step, sway, twist, running man, step and snap, breakdance), the one
+// before it, and the change-over between the two. The choice is remembered per emote, so picking Dance again
+// carries on with the one you were doing.
+int       g_var = 0, g_varPrev = 0, g_lastVar[EM_COUNT] = { 0 };
+float     g_varMix = 1.0f;
+float     g_danceBpm = 120.0f;                 // EmoteDanceBpm: what the dances are counting to
+// B: TAPPED it is the next variation, HELD it puts the emote away. Timed in the pump, since the key hook has
+// no clock of its own; the bar's ring shows the hold filling up.
+bool      g_bDown = false, g_bUsed = false; float g_bHeld = 0.0f;
+float     g_stopHold = 0.28f;                  // EmoteStopHoldMs
+// THE MARKER REMEMBERS THE BOARD TAP: set your marker with the board up in the tap pose and coming back to
+// that marker puts it back up. Where the marker is, whether the tap was up when it was set, the goto flag as
+// it was last seen, and the countdown that waits for the graph reset a return leaves behind.
+int       g_mkTapOn = 1; float g_mkDelay = 0.35f;      // EmoteTapMarker, EmoteTapMarkerMs
+bool      g_mkSeen = false, g_mkHasTap = false, g_mkFound = false, g_mkPosOk = false;
+V3        g_mkLoc = { 0.0f, 0.0f, 0.0f }, g_mkPos = { 0.0f, 0.0f, 0.0f };
+float     g_mkWait = -1.0f, g_mkTry = 0.0f;
+int       g_mkSaid = 0;
 bool      g_ending = false; float g_outTime = kBlendOut;
 void*     g_skater = nullptr, *g_mesh = nullptr;
 SitObjRef g_meshRef = { nullptr, 0, 0, nullptr };
@@ -1257,25 +1291,159 @@ void DoRage(const void* mesh, float t) {
     const V3 dc = add(mul(dirH, cosf(g_ragePitch)), mul(U, sinf(g_ragePitch)));    // already unit: dirH is
     g_throwDirW[0] = dc.x; g_throwDirW[1] = dc.y; g_throwDirW[2] = dc.z;       // component space; turned to the world in Apply
 }
-void DoDance(float t) {
-    const float ph = TAU * 2.0f * t, half = ph * 0.5f;         // 120 to the minute; the body sways once per two beats
+// ------------------------------------------------------------------ THE DANCES
+// SIX of them, and B goes round them: a TAP is the next dance, a HOLD puts the emote away. Five are built
+// the same way -- a `DPose` filled in from the beat (hips, spine, head, where each ankle goes, where each
+// wrist goes) and applied in ONE place. That is what makes another one cheap, and what makes two of them
+// mixable: a change-over is the two sets of numbers lerped. The breakdance cannot be said in those terms --
+// the body leaves its feet -- so it poses the skeleton directly, and is mixed the other way about:
+// POSE ONE, KEEP IT, POSE THE OTHER, BLEND THE BONES (`PoseMix`), which also carries every change-over
+// between styles, whichever two they are.
+const char* const kDanceName[DS_COUNT] = { "two-step", "sway", "twist" };
+
+// Everything a standing dance has to say. Feet are in CENTIMETRES off the ankle the game gave it (ahead /
+// to the skater's RIGHT / up), wrists in ARM LENGTHS off the shoulder (ahead / OUTWARD / up), so the same
+// numbers serve either arm. The float block must stay in one piece: MixPose lerps it by the yard.
+struct DPose {
+    float hipDown, hipSide, hipFwd, hipYaw, hipLean;
+    float spinePitch, spineLean, spineYaw, headYaw, headNod, headTilt;
+    V3    foot[2]; float footYaw[2], footPitch[2];
+    float aF[2], aO[2], aU[2], pU[2], pO[2], pF[2];
+    float fF[2], fU[2], fO[2], mF[2], mU[2], mO[2];
+    float curl[2], shoulder[2];
+    bool  arm[2]; int thumb[2];                   // NOT lerped: taken from whichever side of a mix is winning
+};
+DPose Rest() {
+    DPose p = {};
+    for (int sd = 0; sd < 2; sd++) {
+        p.arm[sd] = true;
+        p.aF[sd] = 0.30f; p.aO[sd] = 0.26f; p.aU[sd] = -0.42f;
+        p.pU[sd] = -1.0f; p.pO[sd] = 0.55f; p.pF[sd] = -0.30f;
+        p.fF[sd] = 1.0f;  p.mO[sd] = -1.0f;
+        p.curl[sd] = 0.9f; p.thumb[sd] = TH_IN;
+    }
+    return p;
+}
+DPose MixPose(const DPose& a, const DPose& b, float m) {
+    DPose r = m < 0.5f ? a : b;
+    const float* fa = &a.hipDown; const float* fb = &b.hipDown; float* fr = &r.hipDown;
+    const int n = (int)(((const char*)&a.arm[0] - (const char*)&a.hipDown) / (int)sizeof(float));
+    for (int i = 0; i < n; i++) fr[i] = fa[i] + (fb[i] - fa[i]) * m;
+    return r;
+}
+void ApplyDance(const DPose& p) {
     const float lw = g_legsOk ? smooth(g_lowerW) : 0.0f;
     if (lw > 0.001f) {
-        const float upL = sinf(half), upR = sinf(half + 3.14159265f);
-        Hips(3.2f * SC * (0.5f - 0.5f * cosf(ph)) * lw, 3.6f * SC * sinf(half) * lw, 7.0f * sinf(half) * lw,
-             upL > 0.0f ? 2.6f * SC * upL * upL * lw : 0.0f, upR > 0.0f ? 2.6f * SC * upR * upR * lw : 0.0f);      // a heel comes off the floor on its beat
+        const TF f0[2] = { g_Ct[g_foot[0]], g_Ct[g_foot[1]] };
+        SetComp(g_pelvis, qmul(qmul(qaxis(U, p.hipYaw * lw), qaxis(BF, -p.hipLean * lw)), g_Ct[g_pelvis].q),
+                add(g_Ct[g_pelvis].p, mul(mix3(U, -p.hipDown, BR, p.hipSide, BF, p.hipFwd), SC * lw)));
+        for (int sd = 0; sd < 2; sd++) {
+            LegTo(sd, add(f0[sd].p, mul(mix3(BF, p.foot[sd].x, BR, p.foot[sd].y, U, p.foot[sd].z), SC * lw)),
+                  add(BF, mul(BR, 0.25f * Sg(sd))));
+            SetComp(g_foot[sd], qmul(qmul(qaxis(U, p.footYaw[sd] * lw), qaxis(BR, p.footPitch[sd] * lw)), f0[sd].q),
+                    g_Ct[g_foot[sd]].p);
+        }
     }
-    SpineLean(3.0f * sinf(ph), 3.0f * sinf(half), -4.5f * sinf(half) * (lw > 0.001f ? 1.0f : 0.4f));
+    SpineLean(p.spinePitch, p.spineLean, p.spineYaw);
     TorsoFrame();
-    HeadTurn(6.0f * sinf(half + 0.6f), 5.0f * sinf(ph), 3.0f * sinf(half));
+    HeadTurn(p.headYaw, p.headNod, p.headTilt);
     for (int sd = 0; sd < 2; sd++) {
-        if (Holding(sd)) continue;                              // the arm with the board rides the body, and the board rides it
-        const float o = sd ? 3.14159265f : 0.0f;
-        ArmTo(sd, P(sd, 0.40f + 0.10f * sinf(half + o), 0.28f, -0.30f + 0.16f * sinf(ph + o)), mix3(tu, -1.0f, Out(sd), 0.6f, tf, -0.3f), 0.3f);
-        HandPose(sd, add(tf, mul(tu, 0.35f)), mul(Out(sd), -1.0f));
-        Fist(sd, TH_IN);
+        if (!p.arm[sd] || Holding(sd)) continue;          // the arm with the board rides the body, and the board rides it
+        if (p.shoulder[sd] > 0.001f) RaiseShoulder(sd, p.shoulder[sd]);
+        ArmTo(sd, P(sd, p.aF[sd], p.aO[sd], p.aU[sd]), mix3(tu, p.pU[sd], Out(sd), p.pO[sd], tf, p.pF[sd]), 0.3f);
+        HandPose(sd, mix3(tf, p.fF[sd], tu, p.fU[sd], Out(sd), p.fO[sd]), mix3(tf, p.mF[sd], tu, p.mU[sd], Out(sd), p.mO[sd]));
+        const float c = p.curl[sd];
+        Fingers(sd, p.thumb[sd], c, c, c, c, 0.4f, 0.0f);
     }
 }
+// TWO POSES, BLENDED. Pose the first, keep its local transforms, put the skeleton back to the animation and
+// pose the second, then lerp the two. Local space, like the emote's own blend: a limb swings across rather
+// than sliding. Nested once at most (a style change-over during the breakdance's own).
+typedef void (*PoseFn)(float);
+TF  g_mixL[2][MAX_BONES]; int g_mixDepth = 0;
+void PoseMix(PoseFn a, float ba, PoseFn b, float bb, float m) {
+    if (!(m > 0.001f)) { a(ba); return; }
+    if (m >= 0.999f)   { b(bb); return; }
+    const int d = g_mixDepth < 2 ? g_mixDepth++ : 1;
+    a(ba);
+    for (int i = 0; i < g_nBones; i++) g_mixL[d][i] = g_Lt[i];
+    for (int i = 0; i < g_nBones; i++) { g_Ct[i] = g_C[i]; g_Lt[i] = g_L[i]; }
+    b(bb);
+    const float k = smooth(m);
+    for (int i = 0; i < g_nBones; i++) {
+        g_Lt[i].q = qblend(g_mixL[d][i].q, g_Lt[i].q, k);
+        g_Lt[i].p = lerp(g_mixL[d][i].p, g_Lt[i].p, k);
+    }
+    for (int i = 0; i < g_nBones; i++) CompOf(i, g_Lt, g_Ct);
+    if (g_mixDepth > 0) g_mixDepth--;
+}
+
+// ---- 1. the two-step: the one that shipped. Weight from foot to foot, a heel off the floor on its beat.
+void StyleTwoStep(float b) {
+    const float ph = TAU * b, half = PI * b;
+    DPose p = Rest();
+    p.hipDown = 3.2f * (0.5f - 0.5f * cosf(ph)); p.hipSide = 3.6f * sinf(half); p.hipYaw = 7.0f * sinf(half);
+    const float upL = sinf(half), upR = -upL;
+    p.foot[0].z = upL > 0.0f ? 2.6f * upL * upL : 0.0f;
+    p.foot[1].z = upR > 0.0f ? 2.6f * upR * upR : 0.0f;
+    p.spinePitch = 3.0f * sinf(ph); p.spineLean = 3.0f * sinf(half); p.spineYaw = -4.5f * sinf(half);
+    p.headYaw = 6.0f * sinf(half + 0.6f); p.headNod = 5.0f * sinf(ph); p.headTilt = 3.0f * sinf(half);
+    for (int sd = 0; sd < 2; sd++) {
+        const float o = sd ? PI : 0.0f;
+        p.aF[sd] = 0.40f + 0.10f * sinf(half + o); p.aO[sd] = 0.28f; p.aU[sd] = -0.30f + 0.16f * sinf(ph + o);
+        p.pU[sd] = -1.0f; p.pO[sd] = 0.6f; p.pF[sd] = -0.3f;
+        p.fF[sd] = 1.0f; p.fU[sd] = 0.35f; p.mO[sd] = -1.0f;
+        p.curl[sd] = 1.0f; p.thumb[sd] = TH_IN;
+    }
+    ApplyDance(p);
+}
+// ---- 2. the sway: slow, for a slow song. The hips go round, the shoulders roll, the hands are open.
+void StyleSway(float b) {
+    const float half = PI * b, ph = TAU * b;
+    DPose p = Rest();
+    p.hipSide = 6.5f * sinf(half); p.hipDown = 2.0f * (0.5f - 0.5f * cosf(ph)); p.hipFwd = 2.0f * sinf(ph);
+    p.hipYaw = 5.0f * sinf(half); p.hipLean = 3.0f * sinf(half);
+    p.spinePitch = 2.0f * sinf(ph); p.spineLean = 5.0f * sinf(half); p.spineYaw = -3.0f * sinf(half);
+    p.headYaw = 8.0f * sinf(half); p.headNod = 4.0f * sinf(ph); p.headTilt = 5.0f * sinf(half);
+    for (int sd = 0; sd < 2; sd++) {
+        const float o = sd ? PI : 0.0f;
+        p.shoulder[sd] = 0.10f + 0.10f * sinf(ph + o);
+        p.aF[sd] = 0.28f + 0.06f * sinf(half + o); p.aO[sd] = 0.34f + 0.07f * sinf(half + o);
+        p.aU[sd] = -0.16f + 0.13f * sinf(half + o);
+        p.pU[sd] = -0.7f; p.pO[sd] = 0.8f; p.pF[sd] = -0.2f;
+        p.fF[sd] = 0.55f; p.fU[sd] = 0.85f; p.mF[sd] = 1.0f; p.mO[sd] = -0.25f;
+        p.curl[sd] = 0.12f; p.thumb[sd] = TH_OPEN;
+    }
+    ApplyDance(p);
+}
+// ---- 3. the twist: heels pivot one way, the shoulders the other, knees soft.
+void StyleTwist(float b) {
+    const float w = TAU * b;
+    DPose p = Rest();
+    p.hipDown = 4.0f + 2.0f * (0.5f - 0.5f * cosf(2.0f * w)); p.hipYaw = 17.0f * sinf(w);
+    p.spinePitch = 6.0f; p.spineYaw = -13.0f * sinf(w); p.spineLean = 2.0f * sinf(w);
+    p.headYaw = 6.0f * sinf(w + 0.4f); p.headNod = 3.0f + 2.0f * sinf(2.0f * w);
+    for (int sd = 0; sd < 2; sd++) {
+        p.footYaw[sd] = 14.0f * sinf(w);                       // the heels turn with the hips
+        p.foot[sd].z = 0.8f + 0.8f * sinf(w + (sd ? PI : 0.0f));
+        p.aF[sd] = 0.26f + 0.05f * sinf(w); p.aO[sd] = 0.24f + 0.05f * sinf(w + (sd ? PI : 0.0f));
+        p.aU[sd] = -0.34f + 0.05f * sinf(2.0f * w);
+        p.pU[sd] = -0.8f; p.pO[sd] = 0.9f; p.pF[sd] = -0.2f;
+        p.fF[sd] = 1.0f; p.fU[sd] = 0.2f; p.mO[sd] = -1.0f;
+        p.curl[sd] = 1.0f; p.thumb[sd] = TH_IN;
+    }
+    ApplyDance(p);
+}
+PoseFn kDanceFn[DS_COUNT] = { StyleTwoStep, StyleSway, StyleTwist };
+
+void DoDance(float t) {
+    const float b = t * (g_danceBpm / 60.0f);
+    const int cur = (g_var >= 0 && g_var < DS_COUNT) ? g_var : 0;
+    const int prev = (g_varPrev >= 0 && g_varPrev < DS_COUNT) ? g_varPrev : cur;
+    if (prev == cur || g_varMix >= 0.999f) kDanceFn[cur](b);
+    else PoseMix(kDanceFn[prev], b, kDanceFn[cur], b, g_varMix);
+}
+
 // A CLAP. Where in its cycle it is: 0 = hands apart, closing faster and faster to CONTACT at kClapContact, then
 // opening again, easing out. The pump reads the same clock to make the sound on the contact.
 const float kClapRate = 3.1f, kClapStart = 0.40f, kClapContact = 0.38f;
@@ -1479,6 +1647,7 @@ void Drop(const char* why) {
     g_id = EM_NONE; g_next = EM_NONE; g_w = 0.0f; g_t = 0.0f; g_ending = false; g_lowerW = 0.0f; g_moveS = 0.0f;
     g_mesh = nullptr; g_skater = nullptr; g_meshRef.obj = nullptr; g_carry = -2; g_ptSet = false;
     g_throwDirSet = false; g_thrown = false; g_rageSwingAt = -1.0f;
+    g_bDown = false; g_bUsed = false; g_bHeld = 0.0f; g_varMix = 1.0f; g_mixDepth = 0;
 }
 float Rand01() { g_rng = g_rng * 1664525u + 1013904223u; return (float)((g_rng >> 8) & 0xFFFF) / 65535.0f; }
 bool OnFoot(void* sk) {
@@ -1497,6 +1666,9 @@ bool Begin(int id, void* sk) {
     g_skater = sk; g_mesh = mesh; g_id = id; g_next = EM_NONE;
     g_t = 0.0f; g_w = 0.0f; g_ending = false; g_outTime = kBlendOut; g_lowerW = 0.0f; g_moveS = 0.0f; g_carry = -2; g_ptSet = false;
     g_throwDirSet = false; g_thrown = false; g_tapSay = (id == EM_TAP);
+    g_var = g_lastVar[id] % (kDefs[id].variants > 0 ? kDefs[id].variants : 1); g_varPrev = g_var; g_varMix = 1.0f;
+    g_bDown = false; g_bUsed = false; g_bHeld = 0.0f;
+    if (id == EM_DANCE && g_var != DS_TWO_STEP) TwkLog("[emote] Dance: %s", kDanceName[g_var]);
     g_clapPhase = 0.0f; g_clapCount = 0; g_clapMuted = 0; g_clapEchoAt = -1.0f; if (!g_clapCue) g_clapCueTried = false;
     if (!g_tapCue) g_tapCueTried = false;
     g_tapLift = 14.0f; g_tapVel = 0.0f; g_tapSwing = 0.0f; g_tapHit = 0.0f; g_tapWalk = 0.0f; g_tapStickLift = false; g_tapDown = false; g_tapTipSet = false; g_tapCount = 0; g_tapGroundSet = false; g_tapGroundUSet = false; g_tapSurface = 0;
@@ -1709,6 +1881,73 @@ const LONGLONG kTapHoldMs = 220;                  // longer than a press, shorte
 static bool     g_tapBtn = false, g_tapBeganHere = false;
 static LONGLONG g_tapDownMs = 0;
 // Is RB being HELD right now -- the stick is the tap's, and the camera is pinned?
+// Close enough to the marker to be a RETURN to it, rather than any other placement? The co-op host fills in
+// the same struct and sets the same flag to put you next to a peer, so "the flag went by" is not enough on
+// its own -- but landing on the marker is.
+bool MarkerLanded(float distCm) { return distCm >= 0.0f && distCm < 250.0f; }
+// GAME THREAD, every pump frame. Watches two things and joins them: the marker being SET (its location
+// changing while it says it is set) remembers whether the board was up; the pending-return flag going away
+// means the game has just placed you, and the board goes back up a moment later -- after the reset, never
+// into it.
+void PumpMarker(void* sk, float dt) {
+    if (!g_mkTapOn || !sk) return;
+    // A NEW SKATER IS A NEW WORLD: the marker it had belongs to the level that has gone, and a stale one
+    // would make some other placement look like a return to it.
+    static void* mkFor = nullptr;
+    if (sk != mkFor) {
+        mkFor = sk; g_mkSeen = false; g_mkHasTap = false; g_mkPosOk = false;
+        g_mkWait = -1.0f; g_mkTry = 0.0f; g_mkSaid = 0;
+    }
+    __try {
+        void* pc  = twkP(sk, PAWN_CONTROLLER);
+        void* smc = pc ? twkP(pc, PC_SPOT_MARKER) : nullptr;
+        if (!smc) return;                                   // no controller of our own: a proxy, or not in play yet
+        if (!g_mkFound) { g_mkFound = true; TwkLog("[emote] the game's marker controller found -- the marker can remember the board tap"); }
+        // ---- SET: the controller's own marker moving. It is written when you save one, and at no other time.
+        const bool has = twkB(smc, SMC_ACTIVE) != 0 || twkB(smc, SMC_INFO) != 0;
+        const V3 loc = v3(twkF(smc, SMC_INFO + 4), twkF(smc, SMC_INFO + 8), twkF(smc, SMC_INFO + 12));
+        if (has && (!g_mkSeen || len(sub(loc, g_mkLoc)) > 5.0f)) {
+            g_mkSeen = true; g_mkLoc = loc;
+            g_mkHasTap = (g_id == EM_TAP && !g_ending);
+            TwkLog("[emote] session marker set%s", g_mkHasTap ? " with the board up: coming back to it puts the board back up" : "");
+        }
+        // ---- RETURN: spotted as what it physically is -- the skater JUMPS, and lands on the marker. Nothing
+        // covers three metres in one frame by skating. The landing is what tells a marker return from the
+        // co-op host putting you beside a peer, which uses the same pending struct and the same flag.
+        void* root = twkP(sk, ACT_ROOT);
+        const float* w = root ? (const float*)((const uint8_t*)root + SC_C2W) : nullptr;
+        if (w) {
+            const V3 now = v3(w[4], w[5], w[6]);
+            if (g_mkPosOk) {
+                const float moved = len(sub(now, g_mkPos));
+                if (moved > 300.0f) {
+                    const float d = g_mkSeen ? len(sub(now, g_mkLoc)) : -1.0f;
+                    if (g_mkHasTap && MarkerLanded(d)) {
+                        g_mkWait = g_mkDelay; g_mkTry = 1.5f;
+                        TwkLog("[emote] marker return (a %.0f cm jump, landing %.0f cm from the marker): the board goes back up", moved, d);
+                    } else if (g_mkSaid++ < 8) {
+                        TwkLog("[emote] a %.0f cm jump, %.0f cm from the marker%s -- left as it is", moved, d,
+                               g_mkHasTap ? "" : " (the marker was not set with the board up)");
+                    }
+                }
+            }
+            g_mkPos = now; g_mkPosOk = true;
+        }
+        if (g_mkWait > 0.0f) {
+            g_mkWait -= dt;
+            if (g_mkWait <= 0.0f) g_mkWait = 0.0f;           // ...the wait is up: from here it tries
+        }
+        // Keep trying for a moment once it is: the board may still be arriving in the hand after a return.
+        if (g_mkWait == 0.0f && g_mkTry > 0.0f) {
+            g_mkTry -= dt;
+            if (g_id == EM_NONE && g_req == EM_NONE && !g_tapBtn && Sit_BoardInHand(sk)) {
+                Emote_TapButton(true); Emote_TapButton(false);     // through the button's own gates, not round them
+                if (g_id != EM_NONE || g_req != EM_NONE) { g_mkWait = -1.0f; g_mkTry = 0.0f; TwkLog("[emote] marker return: the board is up again"); }
+            }
+            if (g_mkTry <= 0.0f) { g_mkWait = -1.0f; TwkLog("[emote] marker return: the board could not go back up just now"); }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; }
+}
 static bool TapWorking() {
     return g_tapBtn && g_id == EM_TAP && !g_ending &&
            (LONGLONG)GetTickCount64() - g_tapDownMs >= kTapHoldMs;
@@ -1748,6 +1987,30 @@ bool Emote_WantsTrigger() {
 // B puts ANY emote away -- and only that: whatever else B means (the seat's next position, sitting down) waits for
 // the next press. False once it is already on its way out, and false with no pump: a stopped pump must never
 // leave a button held (the radial menu's lesson).
+// THE NEXT WAY OF DOING IT. The change-over is a blend of the two poses (PoseMix), so it can be taken at
+// any moment of either.
+void Emote_NextVariant() {
+    const int n = (g_id >= 0 && g_id < EM_COUNT) ? kDefs[g_id].variants : 1;
+    if (g_id == EM_NONE || g_ending || n <= 1) return;
+    g_varPrev = g_var; g_var = (g_var + 1) % n; g_varMix = 0.0f;
+    g_lastVar[g_id] = g_var;
+    TwkLog("[emote] %s: %s", kDefs[g_id].name, g_id == EM_DANCE ? kDanceName[g_var] : "next");
+}
+// B, pressed and let go. A TAP is the next variation (or, for an emote that has only one way, the old
+// "B stops it"); HELD past EmoteStopHoldMs the pump stops the emote, and this release has nothing left to do.
+void Emote_StopButton(bool down) {
+    if (down) {
+        if (g_id == EM_NONE || g_ending) return;
+        g_bDown = true; g_bUsed = false; g_bHeld = 0.0f;
+        return;
+    }
+    if (!g_bDown) return;
+    g_bDown = false;
+    if (g_bUsed) return;                            // the hold already did it
+    const int n = (g_id >= 0 && g_id < EM_COUNT) ? kDefs[g_id].variants : 1;
+    if (n > 1) Emote_NextVariant(); else Emote_Stop();
+}
+float Emote_StopRing() { return g_bDown && !g_bUsed && g_stopHold > 0.01f ? clampf(g_bHeld / g_stopHold, 0.0f, 1.0f) : 0.0f; }
 bool Emote_Stoppable() {
     return g_id != EM_NONE && g_id != EM_CARRY && !g_ending && (LONGLONG)GetTickCount64() - g_pumpMs < 300;      // a carry is the PROP's to end
 }
@@ -1765,7 +2028,11 @@ int Emote_Prompts(SitPromptEntry* out, int cap) {
     // The tap says what RB does now, because RB is what put the board up and it is not obvious that
     // holding it does something else again.
     if (g_id == EM_TAP && n < cap) out[n++] = { TapWorking() ? "Tapping" : "Hold to tap", 'S', 0.0f };
-    if (n < cap) out[n++] = { aiming ? "Cancel" : "Stop emote", 'B', 0.0f };
+    if (n < cap) {
+        const bool many = kDefs[g_id].variants > 1;
+        out[n++] = { aiming ? "Cancel (hold)" : many ? "Next dance, hold to stop" : "Hold to stop",
+                     'B', Emote_StopRing() };
+    }
     return n;
 }
 // ---- the F1 "Board tap hand" page ------------------------------------------------------------------
@@ -1865,6 +2132,10 @@ void Emote_DrawTapHandMenu(const OmpMenuApi* api) {
 // Everything the F1 page can change, written back so a pose someone built survives the game closing.
 // TwkIniSetInt APPENDS a key it cannot find, so a file written by an older build simply grows these.
 void Emote_SaveConfig(char* buf, size_t cap) {
+    TwkIniSetInt(buf, cap, "EmoteDanceBpm",   (int)(g_danceBpm + 0.5f));
+    TwkIniSetInt(buf, cap, "EmoteStopHoldMs", (int)(g_stopHold * 1000.0f + 0.5f));
+    TwkIniSetInt(buf, cap, "EmoteTapMarker",   g_mkTapOn);
+    TwkIniSetInt(buf, cap, "EmoteTapMarkerMs", (int)(g_mkDelay * 1000.0f + 0.5f));
     TwkIniSetInt(buf, cap, "EmoteTapHandTwistDeg",  (int)g_tapHandTwist);
     TwkIniSetInt(buf, cap, "EmoteTapHandPitchDeg",  (int)g_tapHandPitch);
     TwkIniSetInt(buf, cap, "EmoteTapHandRollDeg",   (int)g_tapHandRoll);
@@ -1889,6 +2160,10 @@ void Emote_SaveConfig(char* buf, size_t cap) {
 }
 
 void Emote_ReadConfig(const char* buf) {
+    { const int bpm = TwkIniIntQuiet(buf, "EmoteDanceBpm", 120);   g_danceBpm = (float)(bpm < 50 ? 50 : bpm > 220 ? 220 : bpm); }
+    { const int ms  = TwkIniIntQuiet(buf, "EmoteStopHoldMs", 280); g_stopHold = (float)(ms < 80 ? 80 : ms > 1500 ? 1500 : ms) * 0.001f; }
+    g_mkTapOn = TwkIniIntQuiet(buf, "EmoteTapMarker", 1) ? 1 : 0;
+    { const int ms = TwkIniIntQuiet(buf, "EmoteTapMarkerMs", 350); g_mkDelay = (float)(ms < 0 ? 0 : ms > 3000 ? 3000 : ms) * 0.001f; }
     g_on = TwkIniIntQuiet(buf, "EmotesEnabled", 1) ? 1 : 0;
     g_tapVolume = clampf((float)TwkIniIntQuiet(buf, "EmoteTapVolumePct", 250), 0.0f, 400.0f) / 100.0f;
     // HOW FAST A PULL COUNTS AS HARD, in tenths of a trigger-unit per second (15 = 1.5/s, a deliberate
@@ -2069,6 +2344,7 @@ void Emote_PumpFrame() {
 
     void* sk = CatchTweaks_Skater();
     PollArmTrigger(sk);                  // holding the left trigger arms a throw; letting go lowers the arm
+    PumpMarker(sk, dt);                  // the marker remembers the board tap, and a return puts it back up
     // ---- a thrown board: the throw's second frame, and everything that brings it back
     if (Sit_BoardOut()) {
         g_outS += dt;
@@ -2116,6 +2392,11 @@ void Emote_PumpFrame() {
         if (g_moveS > 0.35f) Emote_Stop();
     }
     g_t += dt;
+    if (g_varMix < 1.0f) { g_varMix += dt / kVarBlend; if (g_varMix > 1.0f) g_varMix = 1.0f; }
+    if (g_bDown && !g_bUsed) {                     // held long enough: that is the emote put away
+        g_bHeld += dt;
+        if (g_bHeld >= g_stopHold) { g_bUsed = true; Emote_Stop(); }
+    }
     g_boardInHand = Sit_BoardInHand(sk);
     if (g_id == EM_TAP && !g_ending) {
         if (!g_boardInHand)            Emote_Stop();                    // the board went somewhere (a seat, a throw)

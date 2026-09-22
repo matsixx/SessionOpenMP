@@ -999,13 +999,17 @@ int main(int argc, char** argv) {
             SitPromptEntry e[2];
             g_thrown = false; g_rageSwingAt = -1.0f;
             int n = Emote_Prompts(e, 2);
-            Check(n == 2 && e[0].button == 'T' && e[1].button == 'B' && !strcmp(e[1].label, "Cancel"), "prompts: an aiming Rage says the trigger throws and B cancels", Fmt("(%d)", n));
+            Check(n == 2 && e[0].button == 'T' && e[1].button == 'B' && strstr(e[1].label, "Cancel"), "prompts: an aiming Rage says the trigger throws and B cancels", Fmt("(%d)", n));
             g_rageSwingAt = 1.0f; g_thrown = true;
             n = Emote_Prompts(e, 2);
             Check(n == 1 && e[0].button == 'B', "prompts: ...thrown, only how to put it away");
             g_id = EM_CLAP; g_thrown = false;
             n = Emote_Prompts(e, 2);
-            Check(n == 1 && e[0].button == 'B' && !strcmp(e[0].label, "Stop emote"), "prompts: any held emote shows B");
+            Check(n == 1 && e[0].button == 'B' && strstr(e[0].label, "Hold to stop"), "prompts: any held emote shows B");
+            g_id = EM_DANCE;
+            n = Emote_Prompts(e, 2);
+            Check(n == 1 && strstr(e[0].label, "Next dance"), "prompts: a dance says B changes it too");
+            g_id = EM_CLAP;
             g_ending = true;
             Check(Emote_Prompts(e, 2) == 0, "prompts: ...and not once it is on its way out");
             g_ending = false; g_id = EM_RAGE;
@@ -1072,19 +1076,147 @@ int main(int argc, char** argv) {
         g_id = EM_NONE; g_w = 0.0f;
     }
 
-    // ---- the dance leaves the feet where the game put them, and moves the hips
-    for (float t = 0.1f; t < 2.0f; t += 0.23f) {
-        Play(EM_DANCE, t, -1);
-        for (int sd = 0; sd < 2; sd++) {
-            const V3 d = sub(g_Ct[g_foot[sd]].p, g_C[g_foot[sd]].p);
-            Check(len(v3(d.x, d.y, 0.0f)) < 0.6f, "dance: the foot does not slide", Fmt("(%.2f cm at t=%.2f)", len(v3(d.x, d.y, 0.0f)), t));
-            Check(d.z > -0.3f && d.z < 3.5f, "dance: the foot only lifts a little", Fmt("(%.2f cm)", d.z));
-            const int toe = ChildNamed(g_foot[sd], "toe", sd);
-            Check(dot(norm(sub(g_Ct[toe].p, g_Ct[g_foot[sd]].p)), norm(sub(g_C[toe].p, g_C[g_foot[sd]].p))) > 0.995f, "dance: the foot still points the way it did");
-            Check(dot(sub(g_Ct[g_calf[sd]].p, g_Ct[g_thigh[sd]].p), kF) > -1.0f, "dance: the knee bends forward, not back");
+    // ---- THE DANCES. Six of them; each is checked for what IT must do, since a running man whose feet
+    //      stay put is not a running man and a breakdance whose hands stay up is not a breakdance.
+    {
+        Play(EM_DANCE, 0.1f, -1);
+        const float floorZ = GroundU();                       // the floor, as the game's own feet have it
+        for (int st = 0; st < DS_COUNT; st++) {
+            g_var = g_varPrev = st; g_varMix = 1.0f;
+            const char* who = kDanceName[st];
+            float lowestHand = 1e9f, hipLow = 1e9f, hipHigh = -1e9f, turned = 0.0f;
+            V3 firstFwd = v3(0, 0, 0);
+            for (float t = 0.1f; t < 9.0f; t += 0.21f) {
+                Play(EM_DANCE, t, -1);
+                Check(Finite(), "dance: finite", who);
+                Check(WorstStretch() < 0.05f, "dance: no bone stretched", Fmt("(%s t=%.2f: %.3f cm)", who, t, WorstStretch()));
+                for (int sd = 0; sd < 2; sd++) {
+                    Check(g_Ct[g_foot[sd]].p.z > floorZ - 1.0f, "dance: no foot goes through the floor",
+                          Fmt("(%s t=%.2f: %.1f cm under)", who, t, floorZ - g_Ct[g_foot[sd]].p.z));
+                    const float hand = g_Ct[g_hand[sd]].p.z - floorZ;
+                    if (hand < lowestHand) lowestHand = hand;
+                }
+                const float hip = g_Ct[g_pelvis].p.z - floorZ;
+                if (hip < hipLow) hipLow = hip;
+                if (hip > hipHigh) hipHigh = hip;
+                const V3 f = norm(qrot(g_Ct[g_pelvis].q, qinv(g_C[g_pelvis].q, kF)));     // how far round the body has turned
+                if (t < 0.15f) firstFwd = f; else { const float a = fabsf(atan2f(dot(cross(firstFwd, f), kU), dot(firstFwd, f))); if (a > turned) turned = a; }
+            }
+            Check(lowestHand > 35.0f, "dance: the hands stay off the floor", Fmt("(%s: %.1f cm)", who, lowestHand));
+            Check(hipLow > 70.0f, "dance: it stays on its feet", Fmt("(%s: hips %.1f cm)", who, hipLow));
+            Check(hipHigh > 80.0f && turned < 1.2f, "dance: it stays upright and facing much the same way", who);
+            for (int sd = 0; sd < 2; sd++)
+                Check(dot(sub(g_Ct[g_calf[sd]].p, g_Ct[g_thigh[sd]].p), kF) > -1.0f, "dance: the knee bends forward, not back", who);
         }
+        // every one of them keeps its feet under it: the ones that stepped about were thrown out
+        float slid[DS_COUNT] = { 0 };
+        for (int st = 0; st < DS_COUNT; st++) {
+            g_var = g_varPrev = st; g_varMix = 1.0f;
+            for (float t = 0.1f; t < 4.0f; t += 0.17f) {
+                Play(EM_DANCE, t, -1);
+                for (int sd = 0; sd < 2; sd++) {
+                    const V3 d = sub(g_Ct[g_foot[sd]].p, g_C[g_foot[sd]].p);
+                    const float f = len(v3(d.x, d.y, 0.0f));
+                    if (f > slid[st]) slid[st] = f;
+                }
+            }
+        }
+        for (int st = 0; st < DS_COUNT; st++)
+            Check(slid[st] < 1.2f, "dance: the feet stay where the game put them", Fmt("(%s: %.2f cm)", kDanceName[st], slid[st]));
+        // a change-over is a blend: part way through, the pose is neither one nor the other
+        g_varPrev = DS_TWO_STEP; g_var = DS_TWIST; g_varMix = 0.5f;
+        Play(EM_DANCE, 1.3f, -1);
+        const V3 mixHand = g_Ct[g_hand[1]].p;
+        g_varMix = 1.0f; Play(EM_DANCE, 1.3f, -1); const V3 runHand = g_Ct[g_hand[1]].p;      // the one it is changing TO
+        g_var = g_varPrev = DS_TWO_STEP; Play(EM_DANCE, 1.3f, -1); const V3 stepHand = g_Ct[g_hand[1]].p;
+        Check(Finite() && len(sub(mixHand, runHand)) > 0.3f && len(sub(mixHand, stepHand)) > 0.3f,
+              "dance: a change-over is a blend of the two, not a cut");
+        g_var = g_varPrev = DS_TWO_STEP; g_varMix = 1.0f;
+        { Play(EM_DANCE, 0.25f, -1); Check(g_Ct[g_pelvis].p.z < g_C[g_pelvis].p.z - 1.0f, "dance: the hips dip on the beat"); }
     }
-    { Play(EM_DANCE, 0.25f, -1); Check(g_Ct[g_pelvis].p.z < g_C[g_pelvis].p.z - 1.0f, "dance: the hips dip on the beat"); }
+
+    // ---- THE MARKER REMEMBERS THE BOARD TAP. Fake pawn -> controller -> marker controller, which is where
+    //      the marker really lives, and a fake root transform to jump about with.
+    {
+        static unsigned char sk[0xC00] = { 0 }, pc[0x900] = { 0 }, smc[0x100] = { 0 }, root[0x300] = { 0 };
+        *(void**)(sk + ACT_ROOT) = root;
+        *(void**)(sk + PAWN_CONTROLLER) = pc;
+        *(void**)(pc + PC_SPOT_MARKER) = smc;
+        auto At = [&](float x, float y, float z) {
+            float* c = (float*)(root + SC_C2W);
+            c[0] = 0.0f; c[1] = 0.0f; c[2] = 0.0f; c[3] = 1.0f; c[4] = x; c[5] = y; c[6] = z;
+            c[8] = c[9] = c[10] = 1.0f;
+        };
+        auto SetMarker = [&](float x, float y, float z) {
+            smc[SMC_ACTIVE] = 1; smc[SMC_INFO] = 1;
+            float* m = (float*)(smc + SMC_INFO + 4); m[0] = x; m[1] = y; m[2] = z;
+        };
+        auto Reset = [&]() {
+            g_mkSeen = false; g_mkHasTap = false; g_mkPosOk = false; g_mkWait = -1.0f; g_mkTry = 0.0f;
+            g_mkSaid = 0; g_mkTapOn = 1; g_id = EM_NONE; g_ending = false; g_req = EM_NONE; g_tapBtn = false;
+            PumpMarker(nullptr, 0.016f);          // a null pawn is the "new skater" reset the pump does
+        };
+        Check(MarkerLanded(10.0f) && MarkerLanded(240.0f) && !MarkerLanded(600.0f) && !MarkerLanded(-1.0f),
+              "marker: a return lands ON the marker; a placement anywhere else does not count");
+        g_stubInHand = true;
+        // set with nothing up: nothing is remembered
+        Reset(); At(100.0f, 200.0f, 50.0f); SetMarker(100.0f, 200.0f, 50.0f);
+        PumpMarker(sk, 0.016f);
+        Check(g_mkSeen && !g_mkHasTap, "marker: set with nothing up, nothing is remembered");
+        // ...and with the board tap up, it is
+        g_id = EM_TAP; SetMarker(300.0f, 200.0f, 50.0f);
+        PumpMarker(sk, 0.016f);
+        Check(g_mkHasTap, "marker: set with the board up, that is what is remembered");
+        // skating away does not look like a return, however far it goes in total
+        g_id = EM_NONE;
+        for (int i = 0; i < 40; i++) { At(300.0f + 40.0f * i, 200.0f, 50.0f); PumpMarker(sk, 0.016f); }
+        Check(g_mkWait < 0.0f, "marker: skating away is not a return");
+        // a jump back onto it is
+        At(305.0f, 203.0f, 50.0f); PumpMarker(sk, 0.016f);
+        Check(g_mkWait > 0.0f, "marker: a jump that lands on the marker puts the board back up", Fmt("(wait %.2f)", g_mkWait));
+        PumpMarker(sk, 1.0f);
+        Check(g_mkWait <= 0.0f, "marker: ...after the wait, not into the graph reset a return leaves");
+        // a jump somewhere else (the co-op host putting you beside a peer) is not
+        Reset(); At(100.0f, 200.0f, 50.0f); SetMarker(100.0f, 200.0f, 50.0f); g_id = EM_TAP;
+        PumpMarker(sk, 0.016f); g_id = EM_NONE;
+        At(9000.0f, 200.0f, 50.0f); PumpMarker(sk, 0.016f);
+        Check(g_mkWait < 0.0f, "marker: a jump anywhere else leaves the board alone");
+        // the pawn's own pending copy is NOT what is read: writing it changes nothing
+        Reset(); At(100.0f, 200.0f, 50.0f); SetMarker(100.0f, 200.0f, 50.0f);
+        PumpMarker(sk, 0.016f);
+        { float* pend = (float*)(sk + 0xac4); pend[0] = 4242.0f; sk[0xac0] = 1; sk[0xb30] = 1; }
+        PumpMarker(sk, 0.016f);
+        Check(len(sub(g_mkLoc, v3(100.0f, 200.0f, 50.0f))) < 0.1f, "marker: the pawn's pending copy is not mistaken for the marker");
+        // switched off, none of it runs
+        Reset(); g_mkTapOn = 0; SetMarker(700.0f, 200.0f, 50.0f);
+        PumpMarker(sk, 0.016f);
+        Check(!g_mkSeen, "marker: EmoteTapMarker=0 and none of it runs");
+        g_mkTapOn = 1; Reset(); g_stubInHand = false;
+    }
+
+    // ---- B: a tap is the next dance, a hold puts it away
+    {
+        g_pumpMs = (LONGLONG)GetTickCount64();
+        g_id = EM_DANCE; g_ending = false; g_w = 1.0f; g_var = g_varPrev = DS_TWO_STEP; g_varMix = 1.0f;
+        Emote_StopButton(true);
+        Check(Emote_StopRing() == 0.0f, "B: the ring starts empty");
+        g_bHeld = g_stopHold * 0.5f;
+        Check(Emote_StopRing() > 0.45f && Emote_StopRing() < 0.55f, "B: ...and fills as it is held");
+        Emote_StopButton(false);
+        Check(g_var == DS_SWAY && g_varPrev == DS_TWO_STEP && g_varMix == 0.0f && !g_ending,
+              "B: let go before the hold, the dance changes", Fmt("(var %d)", g_var));
+        Emote_StopButton(true);
+        g_bHeld = g_stopHold; g_bUsed = true; Emote_Stop();      // what the pump does once it is held long enough
+        Check(g_ending, "B: held, the emote is put away");
+        Emote_StopButton(false);
+        Check(g_var == DS_SWAY, "B: ...and letting go after that does not also change it");
+        // an emote with one way of doing it: a tap still stops it, as B always did
+        g_id = EM_WAVE; g_ending = false; g_w = 1.0f;
+        Emote_StopButton(true); Emote_StopButton(false);
+        Check(g_ending, "B: on an emote with one way of doing it, a tap still stops it");
+        g_id = EM_NONE; g_ending = false; g_w = 0.0f; g_var = g_varPrev = DS_TWO_STEP; g_varMix = 1.0f;
+        for (int i = 0; i < EM_COUNT; i++) g_lastVar[i] = 0;
+    }
 
     // ---- the named senses of rotation, which everything else leans on
     {

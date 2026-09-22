@@ -528,9 +528,11 @@ int Radial_OnInputKey(const void* key, int ev, float* amount) {
     if (ev == 1) {                                          // a release pairs with the press we took
         if (!g_swallowUp[b]) return 0;
         g_swallowUp[b] = 0;
+        if (kind == 3 && !g_open) Emote_StopButton(false);  // B let go: a tap is the next dance, a hold has already stopped it
         return 1;
     }
-    if (ev != 0) return g_open ? 1 : 0;                     // repeats while open are ours to ignore
+    // repeats: ours while the wheel is up, and while B is being HELD on an emote (the game must not see them)
+    if (ev != 0) return (g_open || (kind == 3 && g_swallowUp[2])) ? 1 : 0;
     if (kind == 1) {
         if (!g_open && !Allowed()) return 0;                // on the board the click is the game's
         g_reqToggle = 1; g_swallowUp[0] = 1;
@@ -541,7 +543,9 @@ int Radial_OnInputKey(const void* key, int ev, float* amount) {
         // seat's key (sit down; seated, the next position). Asked first here, so the seat never sees this press --
         // seated in the middle of a wave, B ends the wave, and only the NEXT B changes how you sit.
         if (kind == 3 && Radio_Holding()) { Radio_RequestPutDown(); g_swallowUp[b] = 1; return 1; }      // a radio under the arm: B puts it down
-        if (kind == 3 && Emote_Stoppable()) { Emote_Stop(); g_swallowUp[b] = 1; return 1; }
+        // B IS TIMED, NOT TAKEN: a tap goes to the next variation, holding it puts the emote away (the pump
+        // owns the clock; this hook has none). Both the press and its release are swallowed either way.
+        if (kind == 3 && Emote_Stoppable()) { Emote_StopButton(true); g_swallowUp[b] = 1; return 1; }
         return 0;
     }
     if (kind == 2) g_reqConfirm = 1; else g_reqBack = 1;

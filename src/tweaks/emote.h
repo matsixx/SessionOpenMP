@@ -21,6 +21,11 @@ void        Emote_TapButton(bool down);
 bool        Emote_TapHeld();             // RB held: the stick is the tap's and the camera is pinned
 const char* Emote_WhyNot();              // ...and so does this, in words for the wheel
 void        Emote_Stop();
+// B while an emote is up: pressed and let go. A TAP is the next way of doing it (the dances go round);
+// HELD for EmoteStopHoldMs it puts the emote away. `Emote_StopRing` is how full that hold is, for the bar.
+void        Emote_StopButton(bool down);
+void        Emote_NextVariant();
+float       Emote_StopRing();
 bool        Emote_Active();
 bool        Emote_WantsStick();          // the right stick is an emote's just now (the board tap): the camera does not get it
 void        Emote_Stick(float rx, float ry);    // ...and this is where it goes, every input tick
