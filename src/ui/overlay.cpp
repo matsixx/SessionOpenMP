@@ -163,6 +163,49 @@ static ID3D12CommandQueue* matchQueue(ID3D12Device* dev) {
     return nullptr;
 }
 
+// IMGUI IS NOT THREAD-SAFE, and it was being used from two threads. Input is fed from the WINDOW'S
+// thread -- the game thread, which pumps messages into this hook -- while frames run on the thread that
+// calls Present, and ImGui::NewFrame drains the very queue the feed appends to. With nothing between
+// them, an event appended while a frame was draining could land where the drain had already been:
+// held there, then released later in a burst. Field symptom: the cursor sticks with the F1 menu open,
+// then plays back the movements and clicks it missed. This lock is taken around exactly the two
+// places that touch ImGui's input -- the feed below, and NewFrame in the render paths -- and held for
+// well under a millisecond, so neither thread waits on the other in any way that matters.
+// RECURSIVE, and it has to be. On a click ImGui's handler calls SetCapture/ReleaseCapture, and
+// Windows answers with WM_CAPTURECHANGED delivered SYNCHRONOUSLY into this same hook on this same
+// thread -- while the feed above it still holds the lock. A plain std::mutex locked twice by one thread
+// makes MSVC throw resource_deadlock_would_occur, and an exception escaping a window procedure is
+// 0xC000041D (STATUS_FATAL_USER_CALLBACK_EXCEPTION): the game died on the first click into the menu.
+// Dump-confirmed: hkWndProc -> user32 nested dispatch -> hkWndProc -> msvcp140 mutex::lock -> throw.
+static std::recursive_mutex g_imguiInputMx;
+static void imguiFeed(HWND h, UINT m, WPARAM w, LPARAM l) {
+    // ...and nothing may throw out of a window procedure at all, whatever the reason: the cost of a
+    // dropped input event is nothing, the cost of an escaped exception is the game.
+    try {
+        std::lock_guard<std::recursive_mutex> lk(g_imguiInputMx);
+        ImGui_ImplWin32_WndProcHandler(h, m, w, l);
+    } catch (...) { }
+}
+
+// A FROZEN SCREEN LOOKS LIKE A STUCK CURSOR while a menu is open, so the two are told apart here: a
+// long gap between the game thread's messages, or between frames, is logged with whether F1 was up.
+// Measured on FRAMES, not messages: a stalled game thread stalls Present too, while a quiet
+// message queue only means the mouse is still. If the cursor sticks again, this says whether the game froze.
+static void noteGap(const char* which, uint64_t& lastMs) {
+    const uint64_t now = GetTickCount64();
+    if (lastMs && now - lastMs > 300) {
+        static uint64_t lastSaidMs = 0;
+        if (now - lastSaidMs > 2000) {
+            lastSaidMs = now;
+            char b[160];
+            snprintf(b, sizeof(b), "[overlay] %s stalled for %llu ms (F1 menu %s)", which,
+                     (unsigned long long)(now - lastMs), g_visible.load() ? "open" : "closed");
+            OvLog(b);
+        }
+    }
+    lastMs = now;
+}
+
 static LRESULT CALLBACK hkWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     // THE WINDOW COMING BACK is the one moment the pause menu is known to lose its keyboard focus:
     // the game restores the pause it thinks it had on the way in, and this mod refuses every pause.
@@ -173,7 +216,7 @@ static LRESULT CALLBACK hkWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     // typing, and a WASD that reaches the game would send them rolling down the street mid-sentence.
     const bool capturing = g_visible.load() || Overlay_PromptOpen() || Chat_IsOpen();
     if (capturing) {
-        ImGui_ImplWin32_WndProcHandler(h, m, w, l);
+        imguiFeed(h, m, w, l);
         // THE TYPING, WHEN THE GAME IS DRAWING THE BOX. The keys are already being swallowed here --
         // they have to be, or a WASD typed mid-sentence rolls you down the street -- so this is the
         // one place they exist at all. Chat decides whether it wants them (they are a no-op unless
@@ -224,7 +267,7 @@ static LRESULT CALLBACK hkWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         // harmless (it clears a key that is genuinely up); withholding one corrupts its state until
         // restart. The message still falls through to the game below -- this adds a listener, it
         // swallows nothing.
-        ImGui_ImplWin32_WndProcHandler(h, m, w, l);
+        imguiFeed(h, m, w, l);
     }
     return CallWindowProcW(g_origWndProc, h, m, w, l);
 }
@@ -621,6 +664,11 @@ static void buildUI() {
                   "Panel blur",     "How much the world behind the box is blurred. 0 turns it off.",
                   0, 100, "%d%%",
                   &MpPrefs_ChatBlurPct,  &MpPrefs_SetChatBlurPct },
+                { "Nameplates",
+                  "Name text",      "How big the name over a player's head is at the distance it is "
+                                    "drawn at its natural size. It still shrinks with distance.",
+                  MPNAME_TEXT_MIN, MPNAME_TEXT_MAX, "%d",
+                  &MpPrefs_NameTextSize, &MpPrefs_SetNameTextSize },
                 { "Speech bubbles",
                   "Bubble text",    "How big the words over a player's head are at the distance a "
                                     "name is drawn at its natural size. They still shrink with "
@@ -885,7 +933,8 @@ static void renderD3D11(IDXGISwapChain* sc) {
     // device objects going with it so the new texture is uploaded.
     if (Theme_ConsumePendingFont()) ImGui_ImplDX11_InvalidateDeviceObjects();
     frameCursorPolicy();
-    ImGui_ImplDX11_NewFrame(); ImGui_ImplWin32_NewFrame(); ImGui::NewFrame();
+    ImGui_ImplDX11_NewFrame();
+    { std::lock_guard<std::recursive_mutex> lk(g_imguiInputMx); ImGui_ImplWin32_NewFrame(); ImGui::NewFrame(); }
     buildUI();
     buildPrompt();
     Nameplates_Draw();
@@ -920,7 +969,8 @@ static void renderD3D12(IDXGISwapChain* sc) {
     // device objects going with it so the new texture is uploaded.
     if (Theme_ConsumePendingFont()) ImGui_ImplDX12_InvalidateDeviceObjects();
     frameCursorPolicy();
-    ImGui_ImplDX12_NewFrame(); ImGui_ImplWin32_NewFrame(); ImGui::NewFrame();
+    ImGui_ImplDX12_NewFrame();
+    { std::lock_guard<std::recursive_mutex> lk(g_imguiInputMx); ImGui_ImplWin32_NewFrame(); ImGui::NewFrame(); }
     buildUI();
     buildPrompt();
     Nameplates_Draw();
@@ -1023,9 +1073,28 @@ static HRESULT WINAPI hkPresent(IDXGISwapChain* sc, UINT sync, UINT flags) {
                 bool now = (GetAsyncKeyState(VK_F1) & 0x8000) && GetForegroundWindow() == g_gameHwnd;
                 if (now && !f1Held) g_visible = !g_visible.load();
                 f1Held = now;
+                { static uint64_t lastFrameMs = 0;
+                  if (g_visible.load()) noteGap("drawing frames", lastFrameMs); else lastFrameMs = 0; }
                 if (g_visible.load() || Overlay_PromptOpen() || Chat_HasVisible()
                     || Nameplates_HasVisible()) {
                     if (g_isD3D12) renderD3D12(sc); else renderD3D11(sc);
+                } else {
+                    // NO FRAME, SO NOTHING MAY PILE UP. Since 1.2.4 the game draws the names and the
+                    // chat, so ImGui runs NO frames at all during normal play -- but the window hook
+                    // still feeds it: every key release, and everything typed while chat is open, each
+                    // one five events (the key plus Ctrl/Shift/Alt/Super). Nothing drained them, so a
+                    // session's worth of typing waited in the queue until F1 next opened, and ImGui
+                    // trickles a queue one repeated key-change per frame -- every capital letter is a
+                    // Shift toggle. The cursor's new moves sat behind the whole backlog: stuck for
+                    // seconds, then played back. Worse the longer the session. Field-reported exactly so.
+                    // Nobody is looking at ImGui here, so its input is simply discarded, and every key
+                    // and button released -- which also covers what feeding the releases was for (an
+                    // Escape left held down when the gate shut mid-keystroke).
+                    std::lock_guard<std::recursive_mutex> lk(g_imguiInputMx);
+                    ImGuiIO& io = ImGui::GetIO();
+                    io.ClearEventsQueue();
+                    io.ClearInputKeys();
+                    io.ClearInputMouse();
                 }
             }
         }

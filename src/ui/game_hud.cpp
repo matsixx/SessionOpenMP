@@ -211,7 +211,7 @@ int   kMakePerFrame = 2;
 enum { kChatLines = 48 };
 enum { kLaneName = 0, kLaneBubble = 1, kLaneChat = 100, kLaneChatIn = 90,
        kLaneChatHdr = 91, kLaneChatOnline = 92, kLaneChatHints = 93, kLaneChatCount = 94,
-       kLaneChatEmpty = 95, kLaneChatName = 200 };
+       kLaneChatEmpty = 95, kLaneChatName = 200, kLaneObjTag = 300 };
 // The pool is two zones, because the two halves are added to the viewport at different depths and a
 // slot cannot change its mind afterwards. Names first, then the chat's rows and its furniture.
 // A name and up to a few wrapped bubble lines per peer. Slots cost nothing until something claims
@@ -1080,6 +1080,28 @@ bool GameHud_Begin(void* world) {
     return true;
 }
 
+// WHOSE OBJECT THIS IS. One widget per tagged object, keyed by the object so it keeps its widget as
+// the camera moves; the nameplates' zone (under the menus, and names are claimed first, so a full
+// pool costs a tag, never a name) and their distance scale, a little smaller and in the message white
+// so it never reads as somebody standing there. Unclaimed frames take them down in End.
+void GameHud_Tag(const char* text, uint32_t key, float nx, float ny, float distCm) {
+    if (!g_cls || !g_gi || !text || !*text || g_vw <= 0 || g_vh <= 0) return;
+    const NameplateTuning& T = Nameplates_Tuning();
+    float scale = (distCm > 1.0f) ? (T.refDistCm / distCm) : T.maxScale;
+    if (scale < T.minScale) scale = T.minScale;
+    if (scale > T.maxScale) scale = T.maxScale;
+    int size = (int)((float)MpPrefs_NameTextSize() * 0.8f * scale + 0.5f);
+    if (size < 6) size = 6;
+    Slot* s = claim(hashOf("objtag", kLaneObjTag + (int)(key & 0x00ffffff)), kZoneName, g_cls, g_gi, &g_made);
+    if (!s) return;
+    style(*s, size, rgba(kMsgR, kMsgG, kMsgB, 0.95f), 0.0f);
+    align(*s, 0.5f, 1.0f);
+    say(*s, text);
+    place(*s, nx * (float)g_vw, ny * (float)g_vh);
+    showIt(*s, true);
+    g_drawn++;
+}
+
 void GameHud_End() {
     if (!g_enabled) return;
     // Everything nobody claimed goes away. Collapsed, not removed: the widget is kept for whoever
@@ -1135,7 +1157,9 @@ void GameHud_Names(const NameplateItem* items, int n, bool show) {
             float scale = (it.distCm > 1.0f) ? (T.refDistCm / it.distCm) : T.maxScale;
             if (scale < T.minScale) scale = T.minScale;
             if (scale > T.maxScale) scale = T.maxScale;
-            int size = (int)(kBaseSize * scale + 0.5f);
+            // The player's size, not kBaseSize (which stays as the default it always was). The bubble
+            // above is placed from this same `size`, so it stays seated on a bigger or smaller name.
+            int size = (int)((float)MpPrefs_NameTextSize() * scale + 0.5f);
             if (size < 6) size = 6;
 
             const float cx = it.x * (float)vw;

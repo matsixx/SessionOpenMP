@@ -1359,7 +1359,13 @@ bool LobbyPromote(const char* peerId) {
 // is in our lobby") may use every slot; a peer learned only because a packet arrived may use
 // kMaxLearned, leaving the rest for people who are actually in the session. A refusal is never silent
 // -- it says which budget ran out.
-static const int kPeerCap    = 16;
+// THE LOBBY CAP, not a number of its own. This stayed 16 when 1.2.4 raised lobbies to 32: the table
+// (g_peers[OMP_MAX_PEERS]) and the lobby Epic creates (MaxLobbyMembers = OMP_MAX_PEERS) both grew, and
+// this budget did not -- so Epic admitted the 18th player and we refused to open a connection to them,
+// "REFUSED peer ...: roster budget full (16/16 used)" every five seconds until somebody left. Field,
+// 2026-09-24, a 17-player lobby.
+static const int kPeerCap    = OMP_MAX_PEERS;
+static_assert(kPeerCap == OMP_MAX_PEERS, "per-peer table out of step with omp_peers.h");
 static const int kRosterOnly = 4;                            // slots a packet-learned peer may not touch
 static const int kMaxLearned = kPeerCap - kRosterOnly;
 static uint64_t  g_lastFullLogMs = 0;

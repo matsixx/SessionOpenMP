@@ -780,11 +780,116 @@ static bool ftextToAscii(const void* ftext, char* out, int cap) {
     } __except (EXCEPTION_EXECUTE_HANDLER) { out[0] = 0; return false; }
 }
 
+// ---- LABELS HARVESTED FROM THE SELECT MAP SCREEN --------------------------------------------------
+// Fixed storage, no allocation: this is read on the game thread from paths that must not fault.
+struct MapLabel { char level[64]; char label[64]; };
+static MapLabel g_labels[256];
+static int      g_nLabels = 0;
+
+// A level id as the wire carries it against one a transit node holds. The wire carries the UWorld
+// object's own name (CAL01_WTP_Persistent, which is exactly the persistent .umap), and a node's
+// LevelID is what the level load opens -- the same string on every map checked. The _Persistent tail
+// is tolerated on either side anyway, because one of them not carrying it would otherwise mean no
+// label at all, silently, which is the failure this whole thing exists to end.
+static bool sameLevelId(const char* a, const char* b) {
+    if (!a || !b || !*a || !*b) return false;
+    if (_stricmp(a, b) == 0) return true;
+    static const char kTail[] = "_Persistent";
+    const size_t la = strlen(a), lb = strlen(b), lt = sizeof(kTail) - 1;
+    size_t ca = la, cb = lb;
+    if (ca > lt && _stricmp(a + ca - lt, kTail) == 0) ca -= lt;
+    if (cb > lt && _stricmp(b + cb - lt, kTail) == 0) cb -= lt;
+    return ca == cb && ca > 0 && _strnicmp(a, b, ca) == 0;
+}
+
+static bool lookupHarvested(const char* internalName, char* out, int cap) {
+    for (int i = 0; i < g_nLabels; i++)
+        if (sameLevelId(g_labels[i].level, internalName)) {
+            strncpy_s(out, (size_t)cap, g_labels[i].label, _TRUNCATE);
+            return out[0] != 0;
+        }
+    return false;
+}
+
+int MapLabelsKnown() { return g_nLabels; }
+
+void HarvestTransitLabels(void* transitAsset) {
+    if (!transitAsset) return;
+    // ONCE PER ASSET. fnameToAscii leaks the FString FName::ToString allocates (see LocalMapName), so
+    // walking every node on every Select Map open would leak a little each time for an answer that
+    // cannot have changed -- the node list only moves when DLC is installed, which needs a restart.
+    // Our own custom-map nodes are injected before this runs, so they come along with the rest.
+    // ...and again only if the list has GROWN: nodes can arrive after the first look (our own custom
+    // maps are injected when Select Map opens, and a DLC's entries need not be there the moment the
+    // asset loads). Bounded by how often that can happen, which is a handful of times a session.
+    static void* s_done = nullptr;
+    static int32_t s_num = -1;
+    int32_t num = 0;
+    __try {
+        num = *(const int32_t*)((const uint8_t*)transitAsset + off::kTransitAssetNodes + 8);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    if (s_done == transitAsset && num <= s_num) return;
+    s_done = transitAsset; s_num = num;
+    __try {
+        const uint8_t* arr = *(const uint8_t* const*)((const uint8_t*)transitAsset + off::kTransitAssetNodes);
+        if (!arr || num <= 0 || num > 1024) return;
+        for (int i = 0; i < num && g_nLabels < (int)(sizeof(g_labels) / sizeof(g_labels[0])); i++) {
+            const uint8_t* n = arr + (size_t)i * off::kTransitNodeStride;
+            char level[64], label[64];
+            if (!fnameToAscii(n + off::kTransitNodeLevel, level, sizeof(level)) || !level[0]) continue;
+            if (!ftextToAscii(n + off::kTransitNodeDisplay, label, sizeof(label)) || !label[0]) continue;
+            bool have = false;
+            for (int k = 0; k < g_nLabels && !have; k++) have = sameLevelId(g_labels[k].level, level);
+            if (have) continue;
+            // THE NETWORK, in front. A node's City is the network's own short code (NYC, PHL, SFC --
+            // the same codes the screen's PBP_TransitMapCity_* widgets are named by), so it is shown
+            // as it stands, except the Extra Network, which is where the DLC maps live and reads
+            // better as "DLC". Our own custom maps (CST) get no tag: the name is the map's, and a
+            // made-up network in front of it would be noise.
+            char city[16] = {0}, full[64];
+            const char* tag = nullptr;
+            if (fnameToAscii(n + off::kTransitNodeCity, city, sizeof(city)) && city[0]) {
+                if      (!_stricmp(city, "EXT")) tag = "DLC";
+                else if (!_stricmp(city, "CST")) tag = nullptr;
+                else                             tag = city;
+            }
+            if (tag) snprintf(full, sizeof(full), "%s - %s", tag, label);
+            else     strncpy_s(full, sizeof(full), label, _TRUNCATE);
+            strncpy_s(g_labels[g_nLabels].level, sizeof(g_labels[0].level), level, _TRUNCATE);
+            strncpy_s(g_labels[g_nLabels].label, sizeof(g_labels[0].label), full, _TRUNCATE);
+            g_nLabels++;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { }
+}
+
+// THE ASSET, WITHOUT THE SCREEN. StaticFindObject only FINDS -- it never loads -- so this costs one
+// lookup and answers the moment the menu that references the asset has brought it in. That is well
+// before a lobby list is on screen, which is where the raw level names were being seen.
+// If it is somehow never resident, the Select Map hook still harvests the same table: this is the
+// early path, not the only one.
+bool LoadTransitLabels() {
+    if (g_nLabels) return true;
+    const Syms& S = Get();
+    if (!S.StaticFindObject) return false;
+    void* asset = nullptr;
+    __try {
+        asset = S.StaticFindObject(nullptr, (void*)(intptr_t)-1,
+                                   L"/Game/Transit/TransitDataAsset.TransitDataAsset", 0);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    if (!asset) return false;
+    HarvestTransitLabels(asset);
+    return g_nLabels > 0;
+}
+
 bool PrettyMapName(const char* internalName, char* out, int cap) {
     if (!out || cap <= 0) return false;
     out[0] = 0;
     if (!internalName || !*internalName) return false;
     strncpy_s(out, (size_t)cap, internalName, _TRUNCATE);         // fall back to the name given
+    // THE SCREEN'S OWN WORDS FIRST. The player asked for "the same names they use in the map select
+    // menu", and this table was taken off that screen -- base, DLC and custom maps in one place.
+    // UMapSelectDataAsset below stays as the answer before the screen has been opened this run.
+    if (lookupHarvested(internalName, out, cap)) return true;
     if (!g_mapData) return false;
     __try {
         // UMapSelectDataAsset::_maps at +0x30; FMapSelectData is 120 bytes with MapName at +0x00 and

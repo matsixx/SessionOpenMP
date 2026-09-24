@@ -10,6 +10,7 @@
 // work combined with the Epic Online Services SDK and the proprietary game runtime it
 // loads into. See LICENSE-EXCEPTION.txt.
 // SessionOpenMP -- the in-game pause-menu integration. Design + the measured facts: pause_menu.h.
+#include "omp_peers.h"   // OMP_MAX_PEERS -- the one place the lobby cap lives
 #include <atomic>
 #include "pause_menu.h"
 #include "../debug.h"
@@ -382,11 +383,12 @@ static uint64_t  g_namesOpenKey = 0;
 static uint8_t   g_nameModeRow[0x90];
 static FTextBlob g_nameModeOpts[3];
 static uint64_t  g_nameModeKey = 0;
-static uint8_t   g_nameDistRow[0x90], g_bubbleDistRow[0x90], g_bubbleTextRow[0x90];
-static uint64_t  g_nameDistKey = 0, g_bubbleDistKey = 0, g_bubbleTextKey = 0;
+static uint8_t   g_nameDistRow[0x90], g_bubbleDistRow[0x90], g_bubbleTextRow[0x90], g_nameTextRow[0x90];
+static uint64_t  g_nameDistKey = 0, g_bubbleDistKey = 0, g_bubbleTextKey = 0, g_nameTextKey = 0;
 // Widget indices within the LAST build, so the current values can be stamped once the whole rebuild
 // is finished (they cannot be stamped any earlier -- see stampValues). -1 = not on this page.
-static int       g_nameModeAt = -1, g_nameDistAt = -1, g_bubbleDistAt = -1, g_bubbleTextAt = -1;
+static int       g_nameModeAt = -1, g_nameDistAt = -1, g_bubbleDistAt = -1, g_bubbleTextAt = -1,
+                 g_nameTextAt = -1;
 static const int kMpNamesAfter = 0;      // directly under "Your name": both are about who you see
 // ---- DROPPED OBJECTS. A three-state MultiOption on the multiplayer page: off / live edits only /
 // share one set. It sits with "Player names" rather than with the connect buttons because it is about
@@ -423,6 +425,10 @@ static uint8_t   g_muteRow[0x90];                        // "Voice", on PG_PLAYE
 static FTextBlob g_muteOpts[2];
 static uint64_t  g_muteKey = 0;
 static int       g_muteAt = -1;
+static uint8_t   g_objRow[0x90];                         // "Objects", on PG_PLAYER: Shown / Hidden
+static FTextBlob g_objOpts[2];
+static uint64_t  g_objKey = 0;
+static int       g_objAt = -1;
 static int       g_selPid = -1;                          // the selected player's transport index
 static const int kMpDropAfter = 0;       // beside "Player names", under "Your name"
 // ---- THE LEVEL'S OWN PROPS. Its own row rather than another state on "Dropped objects", because it
@@ -439,18 +445,21 @@ static uint64_t  g_postureKey = 0;
 // Rows are rebuilt from the transport's result list every time the page is built, so they are storage
 // we own like every other row: a "Join online" opener, a Refresh, one row per lobby, and Back.
 static const int kMaxLobbyRows = 12;
+// Everyone in YOUR session, so the lobby cap -- this list used to share kMaxLobbyRows (12) with the
+// lobby BROWSER, so in a bigger lobby only the first twelve players could be muted, hidden or kicked.
+static const int kMaxPlayerRows = OMP_MAX_PEERS;
 static uint8_t   g_browseOpenRow[0x90];                       // the "Join online" row on the MP page
 // ---- MODERATION. Your session, your rules -- and only your session, because that is the only lobby
 // EOS lets you remove anyone from.
 static uint8_t   g_playersOpenRow[0x90];                      // "Players" on the MP page
-static uint8_t   g_playerRows[kMaxLobbyRows * 0x90];          // one per peer in YOUR session
-static FTextBlob g_playerOptText[kMaxLobbyRows];
+static uint8_t   g_playerRows[kMaxPlayerRows * 0x90];         // one per peer in YOUR session
+static FTextBlob g_playerOptText[kMaxPlayerRows];
 static uint64_t  g_playersOpenKey = 0;
-static uint64_t  g_playerRowKeys[kMaxLobbyRows];
+static uint64_t  g_playerRowKeys[kMaxPlayerRows];
 static int       g_playerRowCount = 0;
-static char      g_playerRowIds[kMaxLobbyRows][80];
-static int       g_playerRowPids[kMaxLobbyRows];                // transport index per row (mute)
-static char      g_playerRowNames[kMaxLobbyRows][40];
+static char      g_playerRowIds[kMaxPlayerRows][80];
+static int       g_playerRowPids[kMaxPlayerRows];               // transport index per row (mute)
+static char      g_playerRowNames[kMaxPlayerRows][40];
 static uint8_t   g_kickRow[0x90], g_banRow[0x90];
 static uint64_t  g_kickKey = 0, g_banKey = 0;
 static uint8_t   g_promoteRow[0x90];     // "Transfer host", on PG_PLAYER, host only
@@ -900,6 +909,12 @@ static void buildRows() {
                             "Muted: you do not hear this player. Only on your end; they are not told.",
                             kMuteOpts, 2, &g_muteKey, g_muteOpts))
             g_muteKey = 0;
+        static const char* kObjOpts[2] = { "Shown", "Hidden" };
+        if (!buildOptionRow(g_objRow, "OmpObjHide", "Objects",
+                            "Hidden: what this player drops is not in your world -- you do not see it and "
+                            "cannot ride it. Only on your end; they are not told.",
+                            kObjOpts, 2, &g_objKey, g_objOpts))
+            g_objKey = 0;
         static const char* kModeOpts[3] = { "Off", "Off board only", "Always" };
         if (!buildOptionRow(g_nameModeRow, "OmpNameMode", "Show names",
                             "When to show a player's name above their head. Off board only keeps "
@@ -932,6 +947,15 @@ static void buildRows() {
                            "like the name under them; this is the size they shrink from.", _TRUNCATE);
         t.minValue = (float)MPBUBBLE_TEXT_MIN; t.maxValue = (float)MPBUBBLE_TEXT_MAX; t.step = 1.0f;
         if (!buildSliderRow(g_bubbleTextRow, t, &g_bubbleTextKey)) g_bubbleTextKey = 0;
+    }
+    {
+        GuestItem t{};
+        strncpy_s(t.key,   "OmpNameText", _TRUNCATE);
+        strncpy_s(t.label, "Name text size", _TRUNCATE);
+        strncpy_s(t.desc,  "How big the name over a player's head is. It still shrinks with distance; "
+                           "this is the size it shrinks from.", _TRUNCATE);
+        t.minValue = (float)MPNAME_TEXT_MIN; t.maxValue = (float)MPNAME_TEXT_MAX; t.step = 1.0f;
+        if (!buildSliderRow(g_nameTextRow, t, &g_nameTextKey)) g_nameTextKey = 0;
     }
     // The replay-editor row. A failure here disables only this row: the page key not interning, or
     // the row not building, must never take the multiplayer menu down with it.
@@ -1608,12 +1632,13 @@ static const TArrayHdr* chooseArray(void* page, const TArrayHdr* items, TArrayHd
         // index goes on the definition here (so the row is right even if the stamp is skipped), and
         // stampValues writes both it and the slider positions onto the widgets after the whole
         // rebuild, which is the only point at which they survive (see the note there).
-        g_nameModeAt = g_nameDistAt = g_bubbleDistAt = g_bubbleTextAt = -1;
+        g_nameModeAt = g_nameDistAt = g_bubbleDistAt = g_bubbleTextAt = g_nameTextAt = -1;
         if (g_nameModeKey) {
             *(int32_t*)(g_nameModeRow + off::kItemMultiStart) = MpPrefs_NameMode();
             g_nameModeAt = n; add(g_nameModeRow, true);
         }
         if (g_nameDistKey)   { g_nameDistAt   = n; add(g_nameDistRow, true); }
+        if (g_nameTextKey)   { g_nameTextAt   = n; add(g_nameTextRow, true); }
         if (g_bubbleDistKey) { g_bubbleDistAt = n; add(g_bubbleDistRow, true); }
         if (g_bubbleTextKey) { g_bubbleTextAt = n; add(g_bubbleTextRow, true); }
         add(g_mpRows + (size_t)(kMpRowCount - 1) * off::kItemSize, true);       // the shared Back row
@@ -1622,7 +1647,7 @@ static const TArrayHdr* chooseArray(void* page, const TArrayHdr* items, TArrayHd
         // you do not -- "the button is missing" is never a good explanation.
         g_playerRowCount = 0;
         const bool hosting = omp::LobbyIsHost();
-        for (int i = 0; i < omp::session::PeerSlots() && g_playerRowCount < kMaxLobbyRows; i++) {
+        for (int i = 0; i < omp::session::PeerSlots() && g_playerRowCount < kMaxPlayerRows; i++) {
             char who[48] = {0}; void* actor = nullptr; int pid = -1;
             if (!omp::session::PeerAt(i, who, sizeof(who), &actor, &pid)) continue;
             const char* id = (pid >= 0) ? omp::PeerIdStr(pid) : "";
@@ -1663,10 +1688,21 @@ static const TArrayHdr* chooseArray(void* page, const TArrayHdr* items, TArrayHd
         setRowStatus(g_kickRow, "Remove them from your session now");
         setRowStatus(g_banRow,  banned ? "Already on your ban list"
                                        : "Remove them and never host them again");
-        g_muteAt = -1; g_tpAt = -1;
+        g_muteAt = -1; g_tpAt = -1; g_objAt = -1;
         if (g_muteKey) {                 // anyone can mute anyone; it is applied on your end only
             *(int32_t*)(g_muteRow + off::kItemMultiStart) = omp::session::VoiceIsMuted(g_selPid) ? 1 : 0;
             g_muteAt = n; add(g_muteRow, true);
+        }
+        if (g_objKey) {                  // and hide anyone's objects, the same way
+            const bool hid = omp::session::ObjectsHidden(g_selPid);
+            *(int32_t*)(g_objRow + off::kItemMultiStart) = hid ? 1 : 0;
+            char cnt[80];
+            const int c = omp::session::ObjectCount(g_selPid);
+            if (hid) snprintf(cnt, sizeof(cnt), "Their objects are hidden from you");
+            else     snprintf(cnt, sizeof(cnt), c == 1 ? "1 object of theirs in the world"
+                                                        : "%d objects of theirs in the world", c);
+            setRowStatus(g_objRow, cnt);
+            g_objAt = n; add(g_objRow, true);
         }
         if (g_tpKey) {
             // The row is GREYED OUT when there is nowhere to go (stampValues disables the widget
@@ -1878,8 +1914,10 @@ static void stampValues(void* page) {
                 S.MenuProgressSetPct(w, pct(MpPrefs_BubbleDistM(), MPBUBBLE_DIST_MIN, MPBUBBLE_DIST_MAX));
             if (void* w = widgetAt(g_bubbleTextAt))
                 S.MenuProgressSetPct(w, pct(MpPrefs_BubbleTextSize(), MPBUBBLE_TEXT_MIN, MPBUBBLE_TEXT_MAX));
+            if (void* w = widgetAt(g_nameTextAt))
+                S.MenuProgressSetPct(w, pct(MpPrefs_NameTextSize(), MPNAME_TEXT_MIN, MPNAME_TEXT_MAX));
         }
-        g_nameModeAt = g_nameDistAt = g_bubbleDistAt = g_bubbleTextAt = -1;   // one shot per build
+        g_nameModeAt = g_nameDistAt = g_bubbleDistAt = g_bubbleTextAt = g_nameTextAt = -1;   // one shot per build
     }
     // The voice page and the player page's mute switch, same argument.
     if (g_muteAt >= 0 && S.MenuMultiSetIndex) {
@@ -1888,6 +1926,13 @@ static void stampValues(void* page) {
             if (void* widget = ((void**)pw->data)[g_muteAt])
                 S.MenuMultiSetIndex(widget, omp::session::VoiceIsMuted(g_selPid) ? 1 : 0);
         g_muteAt = -1;
+    }
+    if (g_objAt >= 0 && S.MenuMultiSetIndex) {
+        const TArrayHdr* pw = (const TArrayHdr*)((uint8_t*)page + off::kPageItemWidgets);
+        if (pw->data && g_objAt < pw->num)
+            if (void* widget = ((void**)pw->data)[g_objAt])
+                S.MenuMultiSetIndex(widget, omp::session::ObjectsHidden(g_selPid) ? 1 : 0);
+        g_objAt = -1;
     }
     // The teleport row: greyed out unless that player is in our level. A definition has no enabled
     // flag, so this can only be done on the WIDGET, after the page is built -- same argument as the
@@ -2627,6 +2672,11 @@ static bool handleValueChange(void* params, bool isSlider) {
             MpPrefs_SetPeerBodyPhysics(*(const int32_t*)((const uint8_t*)params + off::kChangeParamsNew));
             return true;
         }
+        if (g_objKey && k == g_objKey && !isSlider) {
+            const int idx = *(const int32_t*)((const uint8_t*)params + off::kChangeParamsNew);
+            omp::session::SetObjectsHidden(g_selPid, idx != 0);
+            return true;
+        }
         if (g_muteKey && k == g_muteKey && !isSlider) {
             const int idx = *(const int32_t*)((const uint8_t*)params + off::kChangeParamsNew);
             omp::session::VoiceSetMuted(g_selPid, idx != 0);
@@ -2662,7 +2712,8 @@ static bool handleValueChange(void* params, bool isSlider) {
             }
             return true;
         }
-        if (isSlider && (k == g_nameDistKey || k == g_bubbleDistKey || k == g_bubbleTextKey)) {
+        if (isSlider && (k == g_nameDistKey || k == g_bubbleDistKey || k == g_bubbleTextKey ||
+                         k == g_nameTextKey)) {
             // NewPercent is the normalised bar position; the displayed number -- and the value the
             // player thinks they chose -- is min + pct*(max-min) rounded, which is exactly what the
             // game prints.
@@ -2673,9 +2724,12 @@ static bool handleValueChange(void* params, bool isSlider) {
             } else if (k == g_bubbleDistKey && g_bubbleDistKey) {
                 const float v = (float)MPBUBBLE_DIST_MIN + pct * (float)(MPBUBBLE_DIST_MAX - MPBUBBLE_DIST_MIN);
                 MpPrefs_SetBubbleDistM((int)(v + 0.5f));
-            } else if (g_bubbleTextKey) {
+            } else if (k == g_bubbleTextKey && g_bubbleTextKey) {
                 const float v = (float)MPBUBBLE_TEXT_MIN + pct * (float)(MPBUBBLE_TEXT_MAX - MPBUBBLE_TEXT_MIN);
                 MpPrefs_SetBubbleTextSize((int)(v + 0.5f));
+            } else if (k == g_nameTextKey && g_nameTextKey) {
+                const float v = (float)MPNAME_TEXT_MIN + pct * (float)(MPNAME_TEXT_MAX - MPNAME_TEXT_MIN);
+                MpPrefs_SetNameTextSize((int)(v + 0.5f));
             }
             return true;
         }

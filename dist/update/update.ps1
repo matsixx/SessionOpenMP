@@ -228,7 +228,14 @@ function Clear-OldFiles {
 }
 
 # ---------------------------------------------------------------- 5. get the package
-$tmp = Join-Path $env:TEMP ("SessionOpenMP_update_" + [Guid]::NewGuid().ToString("N"))
+# THE LONG FORM OF TEMP, when Windows will give it. %TEMP% is handed out in 8.3 short form whenever
+# the profile name needed shortening (C:\Users\BILLR~1\AppData\Local\Temp), and on a volume where 8.3
+# name creation has been turned off that short path cannot be walked -- the field saw the cleanup at
+# the bottom of this script fail on exactly that component. GetFullPath on the real directory hands
+# back the long name; if anything about that fails, the raw value is no worse than before.
+$tmpRoot = $env:TEMP
+try { $tmpRoot = (Get-Item -LiteralPath $env:TEMP -ErrorAction Stop).FullName } catch { }
+$tmp = Join-Path $tmpRoot ("SessionOpenMP_update_" + [Guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $tmp | Out-Null
 try {
     if ($localZip -ne "") {
@@ -348,5 +355,22 @@ try {
     }
 }
 finally {
-    if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+    # A CATCH THAT CANNOT BE ESCAPED. -ErrorAction does NOT cover this: a path the provider cannot
+    # resolve throws a PSArgumentException, which is TERMINATING, so SilentlyContinue let it straight
+    # through. Field report: a successful update ("23 file(s) updated", "Updated to SessionOpenMP
+    # 1.2.7") followed by a wall of red about a temp folder -- nothing was wrong with their install.
+    #   Remove-Item : An object at the specified path C:\Users\BILLR~1 does not exist.
+    # Note WHICH path it names: the 8.3 short component, not the full $tmp. That is the provider
+    # reporting the first component it could not resolve, which is why $tmp is resolved to its long
+    # form above -- a machine with 8.3 name creation disabled has a %TEMP% it cannot walk.
+    # -LiteralPath because this is a path we built and never want interpreted. It is not what failed
+    # here (a tilde in a name resolves fine -- tested), but -Path would also expand [ ] * ?, and no
+    # path we construct ourselves wants that.
+    # A leftover temp directory is worth nothing; the last thing a finished update prints is worth a
+    # lot. If this cannot clean up, it says nothing and Windows clears TEMP in its own time.
+    try {
+        if ($tmp -and (Test-Path -LiteralPath $tmp)) {
+            Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    } catch { }
 }

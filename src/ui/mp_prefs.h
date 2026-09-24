@@ -66,6 +66,11 @@ int  MpPrefs_BubbleDistM();              // ...and a chat bubble, which is delib
 void MpPrefs_SetBubbleDistM(int metres);
 // How big the text in a speech bubble is, at the distance a nameplate is drawn at its natural size.
 // It still shrinks and grows with distance from there; this is what it grows and shrinks AROUND.
+// How big a player's floating NAME is at the distance it is drawn at its natural size; it still
+// shrinks with distance from there. 18 is what it always was.
+enum { MPNAME_TEXT_MIN = 10, MPNAME_TEXT_MAX = 32, MPNAME_TEXT_DEFAULT = 18 };
+int  MpPrefs_NameTextSize();
+void MpPrefs_SetNameTextSize(int size);
 int  MpPrefs_BubbleTextSize();
 void MpPrefs_SetBubbleTextSize(int size);
 // The slider limits, so the menu row and the setter's clamp cannot drift apart.

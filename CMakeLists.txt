@@ -82,7 +82,7 @@ target_link_libraries(omp_symcheck PRIVATE omp_game)
 
 # M2.3: session orchestration (transport <-> streams <-> proxies)
 add_library(omp_session STATIC src/session/session.cpp src/session/banlist.cpp src/session/modapi.cpp
-                               src/session/replay_ghosts.cpp)
+                               src/session/replay_ghosts.cpp src/session/objhide.cpp)
 target_include_directories(omp_session PUBLIC src)
 # NOT linked against omp_transport on purpose: session.cpp needs only the transport's HEADER, and
 # omp_sessiontest substitutes its own Send/GetStats/PeerCount. Linking the real router here would drag
@@ -205,6 +205,7 @@ if(EXISTS "${UE4SS_LIB}")
         src/session/session.cpp
         src/session/banlist.cpp
         src/session/mutelist.cpp
+        src/session/objhide.cpp
         src/session/modapi.cpp
         src/session/replay_ghosts.cpp
         src/loader/lua_api.cpp

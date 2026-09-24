@@ -64,6 +64,9 @@ bool GameHud_Begin(void* world);
 // name fade's TARGET (true = the local player is off their board), and an empty list is normal and
 // meaningful. Chat bubbles ride the items' `msg` and ignore `show`, as on the other surface.
 void GameHud_Names(const NameplateItem* items, int n, bool show);
+// One small label at a normalised viewport point: whose dropped object that is. `key` identifies the
+// object, so each keeps its own widget. Between Begin/End.
+void GameHud_Tag(const char* text, uint32_t key, float nx, float ny, float distCm);
 
 // THE CHAT: recent lines up a bottom corner, and the line being typed under them. Reads ui/chat.h
 // directly -- the model is surface-agnostic and this is one of its two surfaces.

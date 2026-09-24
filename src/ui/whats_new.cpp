@@ -41,6 +41,11 @@ struct Release { const char* version; const char* notes; };
 // instead of anything else (field 2026-09-20, at 1600). `show` measures and trims, but keep the source
 // short enough that trimming never has to happen: budget ~300 characters a release, three releases.
 static const Release kReleases[] = {
+    { "1.2.9",
+      "- Lobbies past 17 players let newcomers in again.\n"
+      "- DLC maps show their real names, with the network (NYC, PHL, DLC).\n"
+      "- Hide a player's objects; see whose is whose in the dropper.\n"
+      "- Name text size setting. The F1 menu's mouse no longer sticks." },
     { "1.2.8",
       "- Fixes the host's dropped objects flashing after you join a second game.\n"
       "- Fixes objects never appearing when you change level into someone's map.\n"

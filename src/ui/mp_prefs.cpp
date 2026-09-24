@@ -36,6 +36,7 @@ static int      g_nameMode    = MPNAME_OFFBOARD;
 static int      g_nameDistM   = 120;
 static int      g_bubbleDistM = 35;
 static int      g_bubbleTextSize = MPBUBBLE_TEXT_DEFAULT;
+static int      g_nameTextSize   = MPNAME_TEXT_DEFAULT;
 static int      g_bubblePanel    = 1;
 static int      g_bubbleBorder   = 0;   // off: the panel alone reads cleaner over the world
 static int      g_bubbleBlurPct  = MPBUBBLE_BLUR_DEFAULT;
@@ -89,6 +90,7 @@ static void saveAll() {
     fprintf(f, "SyncSeconds=%d\n", g_syncSeconds);
     fprintf(f, "NameDistM=%d\n", g_nameDistM);
     fprintf(f, "BubbleDistM=%d\n", g_bubbleDistM);
+    fprintf(f, "NameTextSize=%d\n", g_nameTextSize);
     fprintf(f, "# How big the words in a speech bubble are, at the distance a name is drawn at its\n");
     fprintf(f, "# natural size. They still shrink with distance from there.\n");
     fprintf(f, "BubbleTextSize=%d\n", g_bubbleTextSize);
@@ -257,6 +259,7 @@ void MpPrefs_SetSyncSeconds(int seconds) {
 int  MpPrefs_NameDistM()   { return g_nameDistM; }
 int  MpPrefs_BubbleDistM() { return g_bubbleDistM; }
 int  MpPrefs_BubbleTextSize() { return g_bubbleTextSize; }
+int  MpPrefs_NameTextSize()   { return g_nameTextSize; }
 int  MpPrefs_BubblePanel()    { return g_bubblePanel; }
 int  MpPrefs_BubbleBorder()   { return g_bubbleBorder; }
 int  MpPrefs_BubbleBlurPct()  { return g_bubbleBlurPct; }
@@ -315,6 +318,7 @@ OMP_CHAT_SETTER(MpPrefs_SetChatBlurPct,  g_chatBlurPct,  0, 100)
 OMP_CHAT_SETTER(MpPrefs_SetBubblePanel,  g_bubblePanel,  0, 1)
 OMP_CHAT_SETTER(MpPrefs_SetBubbleBorder, g_bubbleBorder, 0, 1)
 OMP_CHAT_SETTER(MpPrefs_SetBubbleBlurPct, g_bubbleBlurPct, 0, 100)
+OMP_CHAT_SETTER(MpPrefs_SetNameTextSize,  g_nameTextSize,  MPNAME_TEXT_MIN, MPNAME_TEXT_MAX)
 OMP_CHAT_SETTER(MpPrefs_SetBubblePanelPct, g_bubblePanelPct, 0, 100)
 #undef OMP_CHAT_SETTER
 
@@ -345,6 +349,7 @@ void MpPrefs_Init(const char* dir, void (*logf)(const char*)) {
             else if (!_stricmp(key, "NameDistM"))   g_nameDistM   = clampI(atoi(val), MPNAME_DIST_MIN, MPNAME_DIST_MAX);
             else if (!_stricmp(key, "BubbleDistM")) g_bubbleDistM = clampI(atoi(val), MPBUBBLE_DIST_MIN, MPBUBBLE_DIST_MAX);
             else if (!_stricmp(key, "BubbleTextSize")) g_bubbleTextSize = clampI(atoi(val), MPBUBBLE_TEXT_MIN, MPBUBBLE_TEXT_MAX);
+            else if (!_stricmp(key, "NameTextSize")) g_nameTextSize = clampI(atoi(val), MPNAME_TEXT_MIN, MPNAME_TEXT_MAX);
             else if (!_stricmp(key, "BubblePanel"))  g_bubblePanel  = clampI(atoi(val), 0, 1);
             else if (!_stricmp(key, "BubbleBorder")) g_bubbleBorder = clampI(atoi(val), 0, 1);
             else if (!_stricmp(key, "BubbleBlurPct")) g_bubbleBlurPct = clampI(atoi(val), 0, 100);

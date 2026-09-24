@@ -53,6 +53,7 @@
 #include "game/game_font.h"
 #include "session/banlist.h"
 #include "session/mutelist.h"
+#include "session/objhide.h"
 #include "session/modapi.h"
 #include "session/replay_ghosts.h"
 #include "replication/sidecar.h"
@@ -290,6 +291,24 @@ static void publishUi() {
             __except (EXCEPTION_EXECUTE_HANDLER) { pc = nullptr; }
             if (pc && game::CacheMapSelectData(pc))
                 logLine("[mod] map labels available (UMapSelectDataAsset via the game instance)");
+        }
+    }
+    // THE SELECT MAP SCREEN'S OWN LABELS, and the only place a DLC map's human name is readable.
+    // Found by path rather than waited for: the Select Map hook harvests the same table, but a player
+    // who has not opened that screen this session was seeing raw level names in the lobby list until
+    // they did. Same slow beat, and it stops the moment it answers.
+    {
+        static uint64_t lastTransitTry = 0;
+        static bool transitDone = false;
+        const uint64_t ms = GetTickCount64();
+        if (!transitDone && ms - lastTransitTry > 2000) {
+            lastTransitTry = ms;
+            if (game::LoadTransitLabels()) {
+                transitDone = true;
+                char m[120];
+                snprintf(m, sizeof(m), "[mod] map names: %d from the Select Map data", game::MapLabelsKnown());
+                logLine(m);
+            }
         }
     }
     // The chat box would like the game's own typeface (game_font.h). Same throttle and the same
@@ -707,10 +726,11 @@ static void MpPump() {
     // is exactly "you decide who plays in YOUR game". A kick is async and the member takes a moment
     // to leave, so each target is re-kicked at most once every few seconds rather than every frame.
     if (omp::LobbyIsHost()) {
-        static uint64_t lastKickMs[32] = {0};
+        // The lobby cap, not 16: a banned player who landed in slot 17 or later was never kicked.
+        static uint64_t lastKickMs[OMP_MAX_PEERS] = {0};
         const uint64_t nowMs = GetTickCount64();
         const int n = omp::PeerCount();
-        for (int i = 0; i < n && i < 16; i++) {
+        for (int i = 0; i < n && i < OMP_MAX_PEERS; i++) {
             const char* id = omp::PeerIdStr(i);
             if (!id || !*id || !Ban_Is(id)) continue;
             if (nowMs - lastKickMs[i] < 5000) continue;
@@ -959,6 +979,29 @@ static void publishNameplates() {
     omp::ui::GameHud_SetLog(&logLine);
     if (omp::ui::GameHud_Begin(liveWorld())) {
         if (gameDrawn) omp::ui::GameHud_Names(items, n, show);
+        // WHOSE OBJECTS THESE ARE -- only while the local player is in the object dropper, where the
+        // question is actually asked. Each nearby remote object gets its owner's name. The PICK walks
+        // every remote object, so it runs on a slow beat; the chosen ones are re-projected every
+        // frame so the tags stay glued to them while the camera moves.
+        {
+            static uint64_t lastPickMs = 0;
+            static session::DropTagView tags[24];
+            static int nTags = 0;
+            const bool inDropper = gameDrawn && !MenuDisplayed() && game::dropper::LocalActive() && vw > 0 && vh > 0;
+            if (!inDropper) { nTags = 0; lastPickMs = 0; }
+            else {
+                const uint64_t nowMs = GetTickCount64();
+                if (!lastPickMs || nowMs - lastPickMs > 150) {
+                    lastPickMs = nowMs;
+                    nTags = session::NearbyDropObjects(tags, 24, 3000.0f, vw, vh);
+                }
+                for (int i = 0; i < nTags; i++) {
+                    float tp[2], td = 0.0f;
+                    if (!game::ProjectWorldToViewport(tags[i].loc, tp, &td)) continue;
+                    omp::ui::GameHud_Tag(tags[i].owner, tags[i].key, tp[0] / (float)vw, tp[1] / (float)vh, td);
+                }
+            }
+        }
         omp::ui::GameHud_Chat(MenuDisplayed());
     }
     omp::ui::GameHud_End();
@@ -1833,6 +1876,7 @@ public:
         MpName_Init(dir, logLine);   // multiplayer name + word filter (mp_name.h)
         Ban_Init(dir, logLine);     // who this host refuses to play with (banlist.h)
         Mute_Init(dir, logLine);    // whose voice this player does not hear (mutelist.h)
+        ObjHide_Init(dir, logLine); // whose dropped objects this player does not see (objhide.h)
         MpPrefs_Init(dir, logLine);  // multiplayer preferences (mp_prefs.h) -- must precede any Init
         // Our permanent identity, handed to the transport before any backend starts. EOS ignores it
         // (a ProductUserId already identifies you); the direct-UDP wire has nothing else to go on.

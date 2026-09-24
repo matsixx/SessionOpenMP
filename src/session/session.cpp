@@ -26,6 +26,8 @@
 #include "../ui/mp_prefs.h"
 // Voice is built into the mod only (OMP_VOICE): the tools' library build of this file has neither
 // Opus nor the engine-side sound, so the same names collapse to nothing there.
+// Not voice: hiding a player's dropped objects has nothing to do with the microphone.
+#include "objhide.h"
 #ifdef OMP_VOICE
 #include "../game/voice_audio.h"
 #include "../voice/voice_capture.h"
@@ -317,6 +319,63 @@ static int     g_ownDropN = 0;
 static int     g_dropSpawnCapSaid = 0;
 
 uint8_t DropPolicy() { return g_dropPolicy; }
+
+// ---- WHOSE OBJECTS, AND WHETHER YOU SEE THEM ------------------------------------------------------
+bool ObjectsHidden(int peerId) {
+    const char* id = omp::PeerIdStr(peerId);
+    return id && *id && ObjHide_Is(id);
+}
+void SetObjectsHidden(int peerId, bool hidden) {
+    const char* id = omp::PeerIdStr(peerId);
+    if (!id || !*id) return;
+    const char* name = "?";
+    for (auto& s : g_slots) if (s.used && s.peerIdx == peerId && s.cosmetics.skaterName[0]) { name = s.cosmetics.skaterName; break; }
+    if (hidden) ObjHide_Add(id, name);
+    else        ObjHide_Remove(id);
+}
+int ObjectCount(int peerId) {
+    for (auto& s : g_slots) {
+        if (!s.used || s.peerIdx != peerId) continue;
+        int n = 0;
+        for (auto& d : s.drop) if (d.used && !d.dead) n++;
+        return n;
+    }
+    return 0;
+}
+// THE NEAREST REMOTE OBJECTS ON SCREEN, for owner tags while the local player is in the dropper.
+// Only objects actually STANDING in our world (a hidden or away player's have no actor, so they are
+// never tagged). The point sits a little above the object's root, which for most props is its base,
+// so the tag reads as ON it. `key` is stable per object, so a tag keeps its widget as the ranking moves.
+int NearbyDropObjects(DropTagView* out, int cap, float maxDistCm, int vw, int vh) {
+    if (!out || cap <= 0) return 0;
+    if (cap > 64) cap = 64;
+    const float kLiftCm = 60.0f;
+    float dists[64];
+    int n = 0;
+    for (auto& sl : g_slots) {
+        if (!sl.used || sl.away) continue;
+        const char* owner = sl.cosmetics.skaterName[0] ? sl.cosmetics.skaterName : "?";
+        for (auto& d : sl.drop) {
+            if (!d.used || d.dead || !d.actor) continue;
+            const float p[3] = { d.curLoc[0], d.curLoc[1], d.curLoc[2] + kLiftCm };
+            float px[2], dist = 0.0f;
+            if (!game::ProjectWorldToViewport(p, px, &dist) || dist > maxDistCm) continue;
+            if (px[0] < 0.0f || px[1] < 0.0f || px[0] > (float)vw || px[1] > (float)vh) continue;
+            // Keep the nearest `cap`, sorted by distance.
+            int at = n;
+            while (at > 0 && dists[at - 1] > dist) at--;
+            if (at >= cap) continue;
+            const int last = (n < cap) ? n : cap - 1;
+            for (int k = last; k > at; k--) { out[k] = out[k - 1]; dists[k] = dists[k - 1]; }
+            memcpy(out[at].loc, p, sizeof(p));
+            strncpy_s(out[at].owner, sizeof(out[at].owner), owner, _TRUNCATE);
+            out[at].key = ((uint32_t)(sl.peerIdx & 0xff) << 16) | (uint32_t)d.id;
+            dists[at] = dist;
+            if (n < cap) n++;
+        }
+    }
+    return n;
+}
 
 void Init(void (*logf)(const char*)) {
     g_logf = logf;
@@ -1811,7 +1870,10 @@ static void dropFrame(void* ownPawn, uint64_t nowUs, uint64_t nowMs, int nPeers,
         if (!s.used) continue;
         // A peer in ANOTHER level: their props describe a world that is not ours, exactly like their
         // body position does. Their table is kept (nothing is forgotten), the actors are not.
-        const bool elsewhere = s.away;
+        // ...OR SOMEBODY THIS PLAYER HAS CHOSEN NOT TO SEE. The same path as a map away: their actors
+        // leave our world (visual and collision) and their table is kept, so unhiding respawns the lot
+        // on the next frame with no resync. Per viewer, applied here, never told to anyone.
+        const bool elsewhere = s.away || ObjHide_Is(s.peerId);
         for (auto& d : s.drop) {
             if (!d.used) continue;
             if (d.dead || elsewhere) {

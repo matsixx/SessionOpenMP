@@ -198,6 +198,17 @@ int SyncedPeersForSave(SavedPeer* out, int cap);
 // second copy to keep in sync. This is the read-back, for logging and the overlay.
 uint8_t DropPolicy();
 
+// A player's dropped objects, per viewer. Hidden = not in YOUR world (seen or ridden); they are not
+// told and nobody else is affected. Persisted by player id, like the mute list.
+bool ObjectsHidden(int peerId);
+void SetObjectsHidden(int peerId, bool hidden);
+int  ObjectCount(int peerId);                  // how many of theirs are in play right now
+// The nearest remote objects on screen (within maxDistCm), nearest first: where to hang a tag
+// (world cm), whose it is, and a key that stays the same for the same object. For owner tags while
+// the local player is in the object dropper.
+struct DropTagView { float loc[3]; char owner[40]; uint32_t key; };
+int NearbyDropObjects(DropTagView* out, int cap, float maxDistCm, int vw, int vh);
+
 // WHAT THE DROPPER FRAME DOES THIS TICK, as a decision on its own so the gate can check it.
 // These three used to be one `if`, and the difference between two of them cost a park: "the player
 // turned it off" and "we never resolved the symbols" are permanent, and the right answer is to put

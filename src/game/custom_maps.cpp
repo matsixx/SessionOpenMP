@@ -524,9 +524,21 @@ const std::vector<Entry>* listForOpen() {
 // the city widgets and the enabled-city list.
 void hkOpen(void* widget, uintptr_t a2, uintptr_t a3, uintptr_t a4, uintptr_t a5, uintptr_t a6, uintptr_t a7, uintptr_t a8) {
     const std::vector<Entry>* maps = listForOpen();
+    void* asset = nullptr;
     __try {
-        Inject(*(uint8_t**)((uint8_t*)widget + off::kTransitWidgetAsset), maps);
+        asset = *(void**)((uint8_t*)widget + off::kTransitWidgetAsset);
+        Inject((uint8_t*)asset, maps);
     } __except (EXCEPTION_EXECUTE_HANDLER) { logv("[maps] transit map: adding custom maps faulted -- the screen is unchanged"); }
+    // AND TAKE THE NAMES WHILE THE SCREEN HAS THEM. This asset is the only place a DLC map's human
+    // name is readable during play, and it is readable right here -- so the labels are copied out
+    // once and kept, and multiplayer stops showing people standing on 'CAL01_WTP_Persistent'.
+    // After Inject, so our own custom maps are in the list too.
+    if (asset) {
+        const int before = MapLabelsKnown();
+        HarvestTransitLabels(asset);
+        const int now = MapLabelsKnown();
+        if (now != before) logv("[maps] map names: %d taken from the Select Map screen", now);
+    }
     o_Open(widget, a2, a3, a4, a5, a6, a7, a8);
 }
 } // namespace

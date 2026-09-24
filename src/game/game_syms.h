@@ -722,9 +722,21 @@ bool LocalMapName(void* pawn, char* out, int cap);      // the UWorld object's o
 bool CacheMapSelectData(void* pawn);                    // resolves gi+0x388; true once it is cached
 bool HaveMapSelectData();
 bool PrettyMapName(const char* internalName, char* out, int cap);
-// DLC maps are NOT resolvable: their label tables live in per-DLC instances of UMapSelectDataAsset
-// that are not resident during play (FindAllOf found nothing while standing in one -- field-tested
-// 2026-08-07, the whole hunt was reverted). A DLC map shows its internal level name, accepted.
+// ...AND THE ONES UMapSelectDataAsset DOES NOT HAVE. DLC maps are not in the game instance's copy --
+// their label tables live in per-DLC instances that are not resident during play (FindAllOf found
+// nothing while standing in one, field-tested 2026-08-07, and that hunt was reverted). So they are
+// taken from the other end: the SELECT MAP SCREEN ITSELF. That screen is the transit map asset, and
+// every FTransitNodeData pairs LevelID (what the level load opens) with DisplayName (what the screen
+// prints) -- for base, DLC and our own injected custom maps alike, because they are all nodes on it.
+// Harvested once, while the screen has the asset open, into a table that outlives the level.
+// Ask the screen what it displays instead of looking for the data it displays.
+void HarvestTransitLabels(void* transitAsset);   // from the Select Map hook; safe to call repeatedly
+// ...and without waiting for the player to open that screen. The asset is /Game/Transit/
+// TransitDataAsset, so once it is resident it can simply be found by path -- no widget, no hook, no
+// menu. Retried on a slow beat until it answers, like the map-select cache beside it: names are then
+// right on the first lobby list of the session instead of the first trip to Select Map.
+bool LoadTransitLabels();
+int  MapLabelsKnown();
 
 // ---- member offsets + vtable slots (PDB-derived; a wrong one here is silent, so each cites its source)
 namespace off {
