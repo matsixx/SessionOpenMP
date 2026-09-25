@@ -116,6 +116,21 @@ try {
     Write-Host "expanding $Zip"
     Expand-Archive -LiteralPath $Zip -DestinationPath $stage -Force
 
+    # A RELEASE WITHOUT EOS CREDENTIALS IS NOT A RELEASE. src\transport\eos_creds.h is gitignored (the
+    # values are secret), and a build from a checkout that lacks it silently compiles the TEMPLATE's
+    # placeholders instead: a DLL that loads, shows its version, and can never reach Epic ("Could not
+    # reach Epic Online Services"). 1.2.9 was published that way for a few minutes, built from a clean
+    # worktree. Refused here, where the release is actually assembled.
+    # The marker is the FULL placeholder value. "PUT_YOUR_" alone is in every DLL -- the transport's own
+    # placeholder check compares against it -- so matching that would refuse good builds too.
+    $ompDll = ($mods | Where-Object { $_.Name -eq "SessionOpenMP" }).Dll
+    if (Test-Path $ompDll) {
+        $raw = [System.Text.Encoding]::GetEncoding(28591).GetString([System.IO.File]::ReadAllBytes($ompDll))
+        if ($raw.Contains("PUT_YOUR_PRODUCT_ID_HERE")) {
+            throw ("REFUSING to write the zip -- {0} was built WITHOUT EOS credentials (the eos_creds.h.template placeholders are compiled in). Put the real src\transport\eos_creds.h in place BEFORE configuring, then rebuild." -f $ompDll)
+        }
+    }
+
     foreach ($m in $mods) {
         if (-not (Test-Path $m.Dll)) {
             if ($m.Required) {

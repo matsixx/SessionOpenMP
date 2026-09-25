@@ -41,6 +41,9 @@ struct Release { const char* version; const char* notes; };
 // instead of anything else (field 2026-09-20, at 1600). `show` measures and trims, but keep the source
 // short enough that trimming never has to happen: budget ~300 characters a release, three releases.
 static const Release kReleases[] = {
+    { "1.2.10",
+      "- Fixes 1.2.9: online play could not reach Epic Online Services.\n"
+      "- Everything else from 1.2.9 is here too." },
     { "1.2.9",
       "- Lobbies past 17 players let newcomers in again.\n"
       "- DLC maps show their real names, with the network (NYC, PHL, DLC).\n"
