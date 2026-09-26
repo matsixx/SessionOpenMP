@@ -166,6 +166,10 @@ static uint32_t randU32() {
     if (rand_s(&v) != 0) v = (unsigned)GetTickCount64() ^ (unsigned)(uintptr_t)&v;
     return v ? (uint32_t)v : 0x9e3779b9u;        // a token of 0 means "none"; never issue it
 }
+// Milliseconds since `t`, never negative. Tick reads the clock once, but a packet it handles stamps its
+// peer (and a send from inside it stamps its message) with a later reading -- and an unsigned `now - t`
+// on that wraps to "forever": a peer joining mid-tick was dropped as silent 2 ms after it arrived.
+static uint64_t since(uint64_t now, uint64_t t) { return now > t ? now - t : 0; }
 static bool sameAddr(const sockaddr_in& a, const sockaddr_in& b) {
     return a.sin_addr.s_addr == b.sin_addr.s_addr && a.sin_port == b.sin_port;
 }
@@ -555,11 +559,11 @@ void Tick(RecvFn onRecv, void* user) {
     for (int di = 0; di < kPeers; di++) {
         Dial& d = g_dials[di];
         if (!d.active) continue;
-        if (now - d.lastMs >= (uint64_t)kHelloResendMs) {
+        if (since(now, d.lastMs) >= (uint64_t)kHelloResendMs) {
             d.lastMs = now;
             sendHello(d.target, PT_HELLO, d.token);
         }
-        if (now - d.startMs >= (uint64_t)kHelloGiveUpMs) {
+        if (since(now, d.startMs) >= (uint64_t)kHelloGiveUpMs) {
             char a[64]; addrStr(d.target, a, sizeof(a));
             if (!d.primary) {
                 // An introduced peer that never answers is the NORMAL case off a LAN: two joiners
@@ -684,7 +688,7 @@ void Tick(RecvFn onRecv, void* user) {
     // other, and those dials time out quietly. That limit is NAT, not addressing, and lifting it
     // needs hole punching -- which needs a rendezvous server this backend deliberately does not have.
     static uint64_t s_lastGossipMs = 0;
-    if (g_nPeers > 1 && now - s_lastGossipMs >= (uint64_t)kGossipMs) {
+    if (g_nPeers > 1 && since(now, s_lastGossipMs) >= (uint64_t)kGossipMs) {
         s_lastGossipMs = now;
         uint8_t body[1 + kPeers * (kIdLen + 6)];
         for (int i = 0; i < g_nPeers; i++) {
@@ -715,23 +719,23 @@ void Tick(RecvFn onRecv, void* user) {
 
         for (auto& o : p.out) {
             if (!o.live) continue;
-            if (now - o.firstMs >= (uint64_t)kRelGiveUpMs) {
+            if (since(now, o.firstMs) >= (uint64_t)kRelGiveUpMs) {
                 o.live = false;
                 Log("[udp] peer #%d: reliable seq %u never acknowledged -- given up after %d s",
                     i, o.seq, kRelGiveUpMs / 1000);
                 continue;
             }
-            if (now - o.lastMs >= (uint64_t)kRelResendMs) {
+            if (since(now, o.lastMs) >= (uint64_t)kRelResendMs) {
                 o.lastMs = now;
                 sendTo(p.addr, PT_REL, p.remoteToken, &o.seq, 4, o.data, o.len);
             }
         }
 
-        if (p.remoteToken && now - p.lastSendMs >= (uint64_t)kPingMs) {
+        if (p.remoteToken && since(now, p.lastSendMs) >= (uint64_t)kPingMs) {
             p.lastSendMs = now;
             sendTo(p.addr, PT_PING, p.remoteToken, nullptr, 0);
         }
-        if (p.lastRecvMs && now - p.lastRecvMs >= (uint64_t)kPeerTimeoutMs) {
+        if (p.lastRecvMs && since(now, p.lastRecvMs) >= (uint64_t)kPeerTimeoutMs) {
             p.st.state = 5;
             Log("[udp] peer %s timed out after %d s of silence -- treating them as gone",
                 p.idStr, kPeerTimeoutMs / 1000);

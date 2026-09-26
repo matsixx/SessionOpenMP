@@ -31,6 +31,7 @@
 #include "tweaks_mod.h"
 #include "pop_probe.h"       // the injection experiment's two write points in this module's tick hook
 #include "catch_tweaks.h"    // CatchTweaks_LocalInputHandler: whose tick is this
+#include "pad_sampler.h"     // the controller on its own clock: the preferred measure
 #include "radial.h"          // Radial_TickSticks: the same tick buffer, for the radial menu
 #include <cmath>
 #include "MinHook.h"
@@ -297,7 +298,7 @@ static void trackOne(StickTracker& T, float x, float y, double t) {
 static float  g_rawL[2] = { 0.0f, 0.0f }, g_rawR[2] = { 0.0f, 0.0f };
 static double g_rawT = 0.0;
 
-static void trackStick(void* handler) {
+static void trackStick(void* handler, const float* entrySticks) {
     const double t = nowSeconds();
     float lx, ly, rx, ry;
     // While the pop scheme rewrites the pad, the input fields hold what the GAME is being shown,
@@ -305,9 +306,18 @@ static void trackStick(void* handler) {
     // speed swing with thumb depth (the trick flick reached the fields clamped). The pad hook
     // publishes the pre-rewrite sticks; with the scheme off this returns false and the fields are
     // the truth exactly as before.
+    // THIS FRAME'S sticks. The handler's own fields still hold LAST frame's here (Tick writes them
+    // from its stick buffer), and so did the pop scheme's physical copy before its tick write ran --
+    // measured, a flick that finished inside one frame was seen as its first step only (the game's
+    // record at 1.0, ours at 0.2), and read as slow. The caller now runs this AFTER the scheme's
+    // write, and hands in the tick buffer as it arrived, before anything rewrote it.
     if (!PopProbe_PhysSticks(&lx, &ly, &rx, &ry)) {
-        lx = twkF(handler, IH_FRAME_RAW_LEFT);  ly = twkF(handler, IH_FRAME_RAW_LEFT + 4);
-        rx = twkF(handler, IH_FRAME_RAW_RIGHT); ry = twkF(handler, IH_FRAME_RAW_RIGHT + 4);
+        if (entrySticks) {
+            lx = entrySticks[0]; ly = entrySticks[1]; rx = entrySticks[2]; ry = entrySticks[3];
+        } else {
+            lx = twkF(handler, IH_FRAME_RAW_LEFT);  ly = twkF(handler, IH_FRAME_RAW_LEFT + 4);
+            rx = twkF(handler, IH_FRAME_RAW_RIGHT); ry = twkF(handler, IH_FRAME_RAW_RIGHT + 4);
+        }
     }
     trackOne(g_trkL, lx, ly, t);
     trackOne(g_trkR, rx, ry, t);
@@ -420,9 +430,15 @@ static void* hkInputTick(void* self, double a, double b, void* d) {
             g_ihSeenReportMs = ms; g_ihSeenN = 0; g_ihMineSeen = false;
         }
     }
-    if (self && mine) {
-        __try { trackStick(self); }
-        __except (EXCEPTION_EXECUTE_HANDLER) { g_useTracker = 0; }
+    // The tick's stick buffer as it ARRIVED -- this frame's sticks, before the pop scheme or the radial
+    // menu rewrites them below. Only a plausible stick range is taken as sticks.
+    float entry[4]; bool haveEntry = false;
+    if (d) {
+        __try {
+            memcpy(entry, d, sizeof(entry));
+            haveEntry = true;
+            for (int k = 0; k < 4; ++k) if (!(entry[k] >= -1.5f && entry[k] <= 1.5f)) haveEntry = false;
+        } __except (EXCEPTION_EXECUTE_HANDLER) { haveEntry = false; }
     }
     if (mine) {
         // The injection experiment's early write point: the physical sticks are already sampled
@@ -435,7 +451,24 @@ static void* hkInputTick(void* self, double a, double b, void* d) {
         // The radial menu: the right stick points at an entry, and is zero to the game while it is open.
         Radial_TickSticks((float*)d);
     }
-    Tweaks_PumpFrame();                           // menu-registration retry etc. (shell)
+    // AFTER the scheme's tick write, so its physical copy is this frame's (see trackStick).
+    if (self && mine) {
+        __try { trackStick(self, haveEntry ? entry : nullptr); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { g_useTracker = 0; }
+    }
+    // ONCE PER FRAME. This hook runs for every ticking InputHandler, so in a lobby with ticking
+    // proxies the whole per-frame pump ran once per skater. The local handler owns it; while that is
+    // unknown, or has gone quiet for 100 ms (respawn swaps the handler before the new one is learned),
+    // whichever handler ticks first stands in until the owner is back.
+    static void*  s_pumpBy = nullptr;
+    static double s_pumpByLast = 0.0;
+    const double tPump = nowSeconds();
+    if (localIh && self == localIh) s_pumpBy = self;
+    else if (!s_pumpBy || tPump - s_pumpByLast > 0.10) s_pumpBy = self;
+    if (self == s_pumpBy) {
+        s_pumpByLast = tPump;
+        Tweaks_PumpFrame();                       // menu-registration retry etc. (shell)
+    }
     void* ret = nullptr;
     __try { ret = ((InputTickFn)g_origTick)(self, a, b, d); }
     __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -523,6 +556,16 @@ static float hkScoopSpeed(void* handler, uint64_t bArg, void* inputs, void* d) {
                 if (ty >= 0) scoopStick = (ty >= 50) ? 1 : 0;
             }
         }
+        // THE CONTROLLER'S OWN CLOCK (pad_sampler.h): the same sustained-sweep measure, on the pad's
+        // reports at ~1 kHz instead of one sample per frame. Preferred whenever it has the gesture;
+        // the per-frame trackers below remain the fallback (no XInput pad, or sampling off).
+        PadSweep psL, psR;
+        const bool pOkL = PadSampler_Sweep(false, g_trackMinMag, g_trackWindow, g_sustainFrac, &psL);
+        const bool pOkR = PadSampler_Sweep(true,  g_trackMinMag, g_trackWindow, g_sustainFrac, &psR);
+        if (scoopStick < 0 && (pOkL || pOkR) &&
+            ((pOkL && psL.sweep >= g_minAngle) || (pOkR && psR.sweep >= g_minAngle)))
+            scoopStick = (pOkL && (!pOkR || psL.sweep >= psR.sweep)) ? 0 : 1;
+        const PadSweep* PS = (scoopStick == 0 && pOkL) ? &psL : (scoopStick == 1 && pOkR) ? &psR : nullptr;
         const StickTracker* T = nullptr;
         if      (scoopStick == 0) T = &g_trkL;
         else if (scoopStick == 1) T = &g_trkR;
@@ -534,9 +577,11 @@ static float hkScoopSpeed(void* handler, uint64_t bArg, void* inputs, void* d) {
             }
         }
         const float arcVel   = vel;
-        const float rawTrack = T ? sustainedStickVel(*T) : 0.0f;
-        const float peakVel  = T ? peakStickVel(*T)      : 0.0f;
-        const float sweep    = T ? gestureSweep(*T)      : 0.0f;
+        const float frameRaw = T ? sustainedStickVel(*T) : 0.0f;       // logged beside the pad's
+        const bool  fromPad  = PS && PS->sustained > 0.0f;
+        const float rawTrack = fromPad ? PS->sustained : frameRaw;
+        const float peakVel  = fromPad ? PS->peak  : (T ? peakStickVel(*T) : 0.0f);
+        const float sweep    = fromPad ? PS->sweep : (T ? gestureSweep(*T) : 0.0f);
         float trackVel = rawTrack;
         if (g_normArc && rawTrack > 0.0f && sweep > 0.0f) {
             float expected = 90.0f * floorf(sweep / 90.0f + 0.5f);
@@ -545,7 +590,7 @@ static float hkScoopSpeed(void* handler, uint64_t bArg, void* inputs, void* d) {
         }
         const char* src = "arc";
         bool unmeasured = false;
-        if (g_useTracker && trackVel > 0.0f) { vel = trackVel; src = "tracker"; }
+        if ((g_useTracker || fromPad) && trackVel > 0.0f) { vel = trackVel; src = fromPad ? "pad" : "tracker"; }
 
         if (g_scoopFix && mode == 2 && vel > 0.0f) {
             float r = (vel - g_velMin) / (g_velMax - g_velMin);
@@ -572,10 +617,10 @@ static float hkScoopSpeed(void* handler, uint64_t bArg, void* inputs, void* d) {
 
         if (g_scoopLog) {
             TwkLog("[scoop] SCOOP mode=%d n=%d pick=%d stick=%s | angle=%.1f totalTime=%.4f | arcVel=%.0f "
-                   "sweep=%.0f raw=%.0f norm=%.0f (peak=%.0f) used=%s(%.0f) | min=%.3f max=%.3f "
+                   "sweep=%.0f raw=%.0f norm=%.0f (peak=%.0f, frame raw %.0f, pad %d samples) used=%s(%.0f) | min=%.3f max=%.3f "
                    "| STOCK=%.3f -> OURS=%.3f%s%s",
                    mode, num, pick, scoopStick == 0 ? "L" : scoopStick == 1 ? "R" : "-",
-                   pAngle, pTotal, arcVel, sweep, rawTrack, trackVel, peakVel,
+                   pAngle, pTotal, arcVel, sweep, rawTrack, trackVel, peakVel, frameRaw, fromPad ? PS->samples : 0,
                    src, vel, minM, maxM, stock, out, g_scoopFix ? "" : "  (measure only -- stock returned)",
                    unmeasured ? "  <-- NO SWEEP MEASURED, neutralised (was a raw-arc max)" : "");
         }

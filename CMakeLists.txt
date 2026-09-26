@@ -138,6 +138,11 @@ target_link_libraries(omp_radiotest PRIVATE omp_replication)
 add_executable(omp_posetest tools/posetest/pose_test.cpp)
 target_include_directories(omp_posetest PRIVATE src)
 
+# The controller sampler's flick and scoop measurements (src/tweaks/pad_sampler.cpp) against a simulated
+# pad: the same flick must measure the same whatever the report rate or phase.
+add_executable(omp_padtest tools/padtest/pad_test.cpp)
+target_include_directories(omp_padtest PRIVATE src src/tweaks)
+
 # Two EOS SDKs in one process: the game's own, and ours loaded beside it under another name (the mod no
 # longer overwrites the game's -- that broke Epic DLC). Links NO import library on purpose: both copies are
 # loaded by full path and bound by name, which is the whole point.  omp_eosdual <game's dll> <our dll>
@@ -370,6 +375,7 @@ if(EXISTS "${UE4SS_LIB}")
             src/tweaks/grind_rock.cpp
             src/tweaks/grind_lean.cpp
             src/tweaks/pop_probe.cpp
+            src/tweaks/pad_sampler.cpp
             src/tweaks/body_feel.cpp
             src/tweaks/proxy_body_feel.cpp
             src/tweaks/camera_height.cpp

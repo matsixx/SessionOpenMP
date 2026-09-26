@@ -39,6 +39,7 @@
 #include "tweaks_mod.h"
 #include "scoop_speed.h"
 #include "flip_speed.h"
+#include "pad_sampler.h"
 #include "catch_tweaks.h"
 #include "run_out.h"
 #include "catch_level.h"
@@ -68,7 +69,7 @@
 #include "ue4ss_abi.h"
 #include "ui/menu_ext.h"
 
-#define TWEAKS_VERSION "3.19.544"
+#define TWEAKS_VERSION "3.19.546"
 #define TWK_WIDEN(x) STR(x)   // STR() prepends L before the macro expands; expand first
 
 // ------------------------------------------------------------------ log (own file, fresh per launch)
@@ -98,6 +99,7 @@ static void saveSettings() {
     if (f) { size_t n = fread(buf, 1, sizeof(buf) - 1, f); buf[n] = 0; fclose(f); }
     ScoopSpeed_SaveConfig(buf, sizeof(buf));
     FlipSpeed_SaveConfig(buf, sizeof(buf));
+    PadSampler_SaveConfig(buf, sizeof(buf));
     CatchTweaks_SaveConfig(buf, sizeof(buf));
     RunOut_SaveConfig(buf, sizeof(buf));
     CatchLevel_SaveConfig(buf, sizeof(buf));
@@ -145,6 +147,7 @@ static void readConfig(const char* dir) {
     // visible at load time.
     ScoopSpeed_ReadConfig(buf);
     FlipSpeed_ReadConfig(buf);
+    PadSampler_ReadConfig(buf);
     CatchTweaks_ReadConfig(buf);
     RunOut_ReadConfig(buf);
     CatchLevel_ReadConfig(buf);
@@ -184,6 +187,7 @@ static void readConfig(const char* dir) {
 static void resetAllDefaults() {
     ScoopSpeed_ResetDefaults();
     FlipSpeed_ResetDefaults();
+    PadSampler_ResetDefaults();
     CatchTweaks_ResetDefaults();
     RunOut_ResetDefaults();
     CatchLevel_ResetDefaults();
@@ -1168,6 +1172,7 @@ static bool tryRegisterMenu() {
 }
 void Tweaks_PumpFrame() {
     RunOut_PumpFrame();              // the armed post-conversion fall watch + facing
+    PadSampler_PumpFrame();          // the controller sampler's status line (time-throttled)
     CatchTweaks_PumpFrame();         // per-trick board-rotation watch
     CatchLevel_PumpFrame();          // catch-triggered board leveling
     CatchSound_PumpFrame();
@@ -1220,6 +1225,7 @@ public:
         readConfig(dir);
     }
     ~SessionTweaks() override {
+        PadSampler_Stop();
         TwkLog("=== SessionTweaks unloaded ===");
         if (g_log) { fclose(g_log); g_log = nullptr; }
     }
@@ -1248,6 +1254,7 @@ public:
         Radial_Install();
         RunOut_Install();
         PopProbe_Install();
+        PadSampler_Start();              // after PopProbe_Install: it reads the pad through those hooks' trampolines
         // Registration is attempted once now (host usually loaded already; mods.txt order) and
         // re-offered from the frame pump until the host appears, or forever if it never does:
         // without SessionOpenMP this mod still works fully, configured by the ini alone.

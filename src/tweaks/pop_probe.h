@@ -53,6 +53,10 @@ void PopProbe_OnArm(float trickPopRatio);
 // speed) measured the REWRITTEN fields once the scheme shipped -- the trick flick reached them
 // clamped, and flip speed went inconsistent with thumb depth (field report).
 bool PopProbe_PhysSticks(float* lx, float* ly, float* rx, float* ry);
+// The pad the game polls (-1 = none yet), and a read of it that bypasses this module's hooks
+// (pad_sampler's own thread). False = not connected.
+long PopProbe_PadUser();
+bool PopProbe_ReadPadUnhooked(unsigned long user, unsigned long* packet, short sticks[4]);
 // The pop scheme's live crouch depth, 0..1 (0 when not crouched or the scheme is off).
 // Read-only, for modules that shape the body to the load (body_feel).
 float PopProbe_CrouchDepth01();

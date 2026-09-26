@@ -47,6 +47,7 @@
 #include "tweaks_common.h"
 #include "flip_speed.h"
 #include "scoop_speed.h"
+#include "pad_sampler.h"
 #include "catch_sound.h"
 #include "ui/menu_ext.h"
 #include "tweaks_mod.h"
@@ -369,13 +370,24 @@ static float hkFlipMult(void* self, void* def, unsigned char inputType, void* in
         rightStick = (rSpeed > lSpeed);
         speed = rightStick ? rSpeed : lSpeed;
         peak  = rightStick ? rPeak  : lPeak;
+        const float frameSpeed = speed;                    // the per-frame measure, logged beside
+        // ---- THE CONTROLLER'S OWN CLOCK (pad_sampler.h), whenever it has the flick. Read at ~1 kHz
+        // off the game thread, so the timing is the thumb's -- not the frame's, and not whatever the
+        // frame was doing between the pad poll and now. Same stick rule as above: whichever flicked.
+        PadFlick padL, padR;
+        const bool padOkL = PadSampler_Flick(false, lookback + 0.10f, &padL);
+        const bool padOkR = PadSampler_Flick(true,  lookback + 0.10f, &padR);
+        const bool fromPad = padOkL || padOkR;
+        const bool padRight = padOkR && (!padOkL || padR.speed > padL.speed);
+        const PadFlick& pf = padRight ? padR : padL;
+        if (fromPad) { rightStick = padRight; speed = pf.speed; }
         // With the window sized correctly, our own sampling is the better measure: it finds the
         // MOVEMENT BURST inside the gesture, so a flick scores the same whether it was released or
         // held afterwards. The game's record stays as the fallback for when we have no samples --
         // it cannot separate the flick from the hold, because TotalTime covers both.
-        const bool fromGame = (!sampled && gameSpeed > 0.0f);
+        const bool fromGame = (!fromPad && !sampled && gameSpeed > 0.0f);
         if (fromGame) speed = gameSpeed;
-        if (!fromGame && !sampled) {
+        if (!fromPad && !fromGame && !sampled) {
             // No usable gesture: the game's own value stands. Mapping an unknown onto our range would
             // quietly ask for the slowest flip on every trick we failed to measure.
             if (g_log) {
@@ -404,17 +416,21 @@ static float hkFlipMult(void* self, void* def, unsigned char inputType, void* in
             // anyone can make from one log rather than a claim: the same flick at 8 ms and at 16 ms
             // per frame must read the same number.
             TwkLog("[flip] #%ld '%s' type=%u stick=%c mode=%u | %s: %.0f "
-                   "(game mag %.2f / %.0f ms, lookback %.0f ms, entry L%.2f R%.2f%s; "
-                   "flick L%.0f R%.0f -> %c, peak %.2f) | "
+                   "(pad L%.0f R%.0f, rise %.1f ms over %d reports, D %.2f, onset %.0f ms ago | "
+                   "frame measure %.0f; game mag %.2f / %.0f ms, lookback %.0f ms, entry L%.2f R%.2f%s; "
+                   "flick L%.0f R%.0f, peak %.2f) | "
                    "stock %.3f -> ours %.3f "
                    "(ratio %.3f of %.3f..%.3f)",
                    n, trick, (unsigned)inputType, rightStick ? 'R' : 'L', (unsigned)mode,
+                   fromPad ? "PAD 1kHz" :
                    fromGame ? (gameExact ? "GAME RECORD" : "GAME RECORD~") : (gameExact ? "sampled" : "sampled~"),
                    fromGame ? speed : speed * 10.0f,
+                   padOkL ? padL.speed * 10.0f : -1.0f, padOkR ? padR.speed * 10.0f : -1.0f,
+                   fromPad ? pf.riseMs : 0.0f, fromPad ? pf.samples : 0, fromPad ? pf.dist : 0.0f,
+                   fromPad ? pf.onsetAgoMs : 0.0f, frameSpeed * 10.0f,
                    gameMag, gameTime * 1000.0f, lookback * 1000.0f, entryLm, entryRm,
                    gameExact ? "" : " NO EXACT TYPE MATCH", lSpeed * 10.0f, rSpeed * 10.0f,
-                   rightStick ? 'R' : 'L', peak,
-                   stock, ours, ratio, minM, maxM);
+                   peak, stock, ours, ratio, minM, maxM);
         }
         return ours;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -469,6 +485,10 @@ void FlipSpeed_DrawMenu(const OmpMenuApi* api) {
     snprintf(b, sizeof(b), "last flick: %.2f u/s (peak push %.2f)   stock %.3f -> ours %.3f",
              g_uiSpeed, g_uiPeak, g_uiStock, g_uiOurs);
     api->TextDisabled(b);
+    bool pad = PadSampler_Enabled();
+    if (api->Checkbox("Time flicks from the controller itself (1000 Hz)", &pad)) PadSampler_SetEnabled(pad);
+    api->SameLine(); api->TextDisabled("(flips and scoops; independent of frame rate and of the game thread)");
+    PadSampler_DrawStatus(api);
     api->TextDisabled("Stock maps most flicks to one speed (a flat spot in the game's curve) and "
                       "reads the stick on a single frame, so frame rate changes the result.");
     bool pk = g_usePeak != 0;

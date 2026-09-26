@@ -41,6 +41,11 @@ struct Release { const char* version; const char* notes; };
 // instead of anything else (field 2026-09-20, at 1600). `show` measures and trims, but keep the source
 // short enough that trimming never has to happen: budget ~300 characters a release, three releases.
 static const Release kReleases[] = {
+    { "1.3.2",
+      "- SessionTweaks: flick and scoop speed are read straight from the controller,\n"
+      "  so they no longer change with your frame rate or a busy lobby.\n"
+      "- SessionTweaks: another skater's catch can no longer cancel yours.\n"
+      "- Direct (non-Epic) connections no longer drop a player as they join." },
     { "1.3.1",
       "- Fixed other skaters' grinds sometimes showing the wrong animation\n"
       "  (a tailslide showing as a noseslide or noseblunt).\n"

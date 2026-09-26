@@ -1738,6 +1738,37 @@ static int PopProbe_InstallPadHooks() {
     }
     return added;
 }
+// THE PAD, READ AROUND THIS MODULE'S HOOKS, for pad_sampler's own thread. Its reads must never
+// reach PadCommon: the pad machine would run on them, off the game's cadence. So the call goes
+// through the TRAMPOLINE of the target the game actually polls; before the game has polled one (or
+// with no hook installed), through the plain export -- still via the trampoline if that export has
+// been hooked since, which is re-checked on every call because hooks can be installed later.
+long PopProbe_PadUser() { return g_padUserSeen; }
+bool PopProbe_ReadPadUnhooked(unsigned long user, unsigned long* packet, short sticks[4]) {
+    XInputGetStateFn fn = nullptr;
+    long most = 0;
+    for (int i = 0; i < g_padHooked; ++i)
+        if (g_padOrig[i] && g_padCalls[i] > most) { most = g_padCalls[i]; fn = g_padOrig[i]; }
+    if (!fn) {
+        static void* direct = nullptr;
+        if (!direct) {
+            static const char* kDlls[] = { "xinput1_4.dll", "xinput1_3.dll", "xinput9_1_0.dll" };
+            for (int d = 0; d < 3 && !direct; ++d) {
+                HMODULE m = GetModuleHandleA(kDlls[d]);
+                if (m) direct = (void*)GetProcAddress(m, "XInputGetState");
+            }
+        }
+        if (!direct) return false;
+        for (int i = 0; i < g_padHooked; ++i) if (g_padProc[i] == direct && g_padOrig[i]) fn = g_padOrig[i];
+        if (!fn) fn = (XInputGetStateFn)direct;
+    }
+    PadState st = {};
+    if (fn(user, &st) != 0) return false;                  // ERROR_SUCCESS only: connected
+    if (packet) *packet = st.dwPacketNumber;
+    sticks[0] = st.Gamepad.sThumbLX; sticks[1] = st.Gamepad.sThumbLY;
+    sticks[2] = st.Gamepad.sThumbRX; sticks[3] = st.Gamepad.sThumbRY;
+    return true;
+}
 // True once a hooked target has actually been CALLED -- i.e. the game really reads this pad
 // through XInput, which is the one precondition the scheme cannot work without.
 static bool PopProbe_PadPolled() {

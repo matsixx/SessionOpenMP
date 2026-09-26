@@ -2151,11 +2151,22 @@ static void hkSetCatchOrient(void* self, uint8_t state, float pitchRatio, float 
     }
     uint8_t use = state;
     float usePitch = pitchRatio, useYaw = yawRatio;
-    if (state == 0) {   // catch ended -- release the latch, the pose hold and the veto admission
+    // WHOSE CATCH IS THIS. The setter runs for EVERY skater in the world -- in co-op each remote
+    // player's proxy has an in-air handler of its own -- and everything below that is catch STATE
+    // (the flicked-foot latch, the pose hold, the veto admission, the one-catch-per-air record) is the
+    // LOCAL player's. A remote skater's catch ending cleared ours mid-air, and a remote skater catching
+    // while we were mid-trick was recorded as OUR first catch -- so our real catch was then swallowed
+    // as "a second catch input this air". Only our own skater's calls may touch any of it.
+    bool mineCall = true;
+    __try { void* mineTop = CatchTweaks_Skater(); mineCall = (!mineTop || self == mineTop); }
+    __except (EXCEPTION_EXECUTE_HANDLER) { mineCall = true; }
+    if (state == 0 && mineCall) {   // our catch ended -- release the latch, the pose hold and the veto admission
         g_flickLatch = 0; g_latchIdle = 0;
         g_holdState = 0; g_holdLoggedState = 0;
         g_vetoAdmitted = 0;
         if (g_airCaughtFoot != 0) ++g_airCatchZeros;
+    }
+    if (state == 0) {
         // Post-catch orient calls flow through HERE with live ratios; a held-over stick's are
         // zeroed (field: landing pitch tracked the held stick like a dial -- scoop-down -36,
         // flick-up +28, clean ~0 -- while every downstream pitch funnel measured untouched).
@@ -2175,11 +2186,11 @@ static void hkSetCatchOrient(void* self, uint8_t state, float pitchRatio, float 
         } __except (EXCEPTION_EXECUTE_HANDLER) {}
     } else {
         __try {
-            g_latchIdle = 0;
             // Co-op: this fires per skater and the flick record is the LOCAL player's sticks, so a
             // proxy must keep the vanilla selection rather than inherit our foot.
             void* mine = CatchTweaks_Skater();
             const bool isMine = (!mine || self == mine);
+            if (isMine) g_latchIdle = 0;
             // Only ever touch a real flip/rotation catch. On an ollie the orient is the game's own
             // board control (the bone) and must be left exactly as authored.
             // TWO-FOOT ORIENTS MUST BE NARROWED TOO, not just 1<->2 swapped. MEASURED: a catch
@@ -2281,7 +2292,7 @@ static void hkSetCatchOrient(void* self, uint8_t state, float pitchRatio, float 
                            "caught) -- swallowed, one catch per air", (int)state, g_airCaughtFoot);
                 }
             }
-            if (!swallowed && !vetoed) {
+            if (!swallowed && !vetoed && isMine) {
                 g_airCatchZeros = 0;
                 if (g_airCaughtFoot == 0 && (oneFoot || twoFoot) && CatchAirIsTrick())
                     g_airCaughtFoot = (int)state;
