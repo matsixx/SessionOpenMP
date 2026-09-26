@@ -24,8 +24,9 @@ void FootSteer_DrawMenu(const OmpMenuApi* api);   // RENDER THREAD (menu_ext con
 
 // The pause-menu accessors run on the GAME THREAD (the other menu_ext contract).
 bool  FootSteer_Enabled();      void FootSteer_SetEnabled(bool on);
-float FootSteer_ReachCm();      void FootSteer_SetReachCm(float cm);
-float FootSteer_ResponseMs();   void FootSteer_SetResponseMs(float ms);
+// Reach, response and twist are per foot: back = 0 for the front (leading) foot, 1 for the back one.
+float FootSteer_ReachCm(int back);      void FootSteer_SetReachCm(int back, float cm);
+float FootSteer_ResponseMs(int back);   void FootSteer_SetResponseMs(int back, float ms);
 float FootSteer_DeadzonePct();  void FootSteer_SetDeadzonePct(float pct);
 // What the stick directions are measured against, and which basis axis each stick component drives.
 // Live because the answer is something to look at in-game, not to derive: frame 0..3, axes 0..5.
@@ -34,7 +35,7 @@ float FootSteer_AxisX();        void FootSteer_SetAxisX(float a);
 float FootSteer_AxisY();        void FootSteer_SetAxisY(float a);
 // How far the foot twists with a forward/back push, and which axis of the chosen frame it turns
 // about. Degrees at full stick (0 = position only); axis 0..5 = +X/+Y/+Z then the same negated.
-float FootSteer_TwistDeg();     void FootSteer_SetTwistDeg(float deg);
+float FootSteer_TwistDeg(int back);     void FootSteer_SetTwistDeg(int back, float deg);
 float FootSteer_TwistAxis();    void FootSteer_SetTwistAxis(float a);
 // Riding switch turns you around relative to the board, so the control reads backwards unless it is
 // mirrored with you. Bit 1 = flip sideways, bit 2 = flip forward/back (and the twist); 3 = both.

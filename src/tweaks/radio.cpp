@@ -690,6 +690,9 @@ void BuildWheel(void* sk) {
 
 } // namespace
 
+// Any asset by its full path (the clap's sound and falloff, 539): found if loaded, loaded if not.
+void* Radio_LoadAsset(const char* path) { Look(); return path && path[0] ? LoadByPath(path) : nullptr; }
+
 // ------------------------------------------------------------------ the module's face
 void Radio_ReadConfig(const char* buf) {
     g_on = TwkIniIntQuiet(buf, "RadioEnabled", 1) ? 1 : 0;

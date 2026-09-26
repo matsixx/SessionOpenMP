@@ -240,7 +240,7 @@ if(EXISTS "${UE4SS_LIB}")
     if(NOT IMGUI_SRC)
         FetchContent_Declare(imgui
             GIT_REPOSITORY https://github.com/ocornut/imgui.git
-            GIT_TAG        cb16be3a3fc1f9cd146ae24d52b615f8a05fa93d)  # v1.90.9
+            GIT_TAG        3369cbd2776d7567ac198b1a3017a4fa2d547cc3)  # v1.90.9-docking (multi-viewport: the F1 pop-out)
         FetchContent_MakeAvailable(imgui)   # header-only drop: no CMakeLists, so this just populates
         set(IMGUI_SRC "${imgui_SOURCE_DIR}")
     endif()
@@ -315,7 +315,9 @@ if(EXISTS "${UE4SS_LIB}")
             ${IMGUI_SRC}/imgui_widgets.cpp
             ${IMGUI_SRC}/backends/imgui_impl_win32.cpp
             ${IMGUI_SRC}/backends/imgui_impl_dx11.cpp
-            ${IMGUI_SRC}/backends/imgui_impl_dx12.cpp
+            # The DX12 backend is OUR COPY of the pinned one: identical for the game's swapchain, but
+            # the F1 pop-out window does not stall the render thread waiting on the GPU (see its header).
+            src/ui/imgui_impl_dx12_omp.cpp
             ${MINHOOK_SRC}/src/buffer.c
             ${MINHOOK_SRC}/src/hook.c
             ${MINHOOK_SRC}/src/trampoline.c
@@ -360,8 +362,11 @@ if(EXISTS "${UE4SS_LIB}")
             src/tweaks/cloth_sim.cpp
             src/tweaks/pitch_range.cpp
             src/tweaks/foot_place.cpp
+            src/tweaks/board_stance.cpp
             src/tweaks/foot_steer.cpp
             src/tweaks/grind_pop.cpp
+            src/tweaks/grind_rock.cpp
+            src/tweaks/grind_lean.cpp
             src/tweaks/pop_probe.cpp
             src/tweaks/body_feel.cpp
             src/tweaks/proxy_body_feel.cpp

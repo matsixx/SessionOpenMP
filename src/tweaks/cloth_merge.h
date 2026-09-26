@@ -27,6 +27,7 @@
 enum { kClothMaxGarments = 12 };
 struct OmpMenuApi;
 void ClothMerge_ReadConfig(const char* iniText);
+bool ClothMerge_RootObject(void* obj, const char* what);   // into the GC root set (kept loaded for good)
 void ClothMerge_SaveConfig(char* iniText, size_t cap);
 void ClothMerge_ResetDefaults();
 void ClothMerge_Install();

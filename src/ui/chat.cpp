@@ -13,6 +13,7 @@
 #include "chat.h"
 #include "overlay.h"
 #include "theme.h"
+#include "mp_prefs.h"
 #include "imgui.h"
 #include <windows.h>
 #include <mutex>
@@ -164,8 +165,11 @@ void drawClosed(const Shown* shown, int n) {
     // because no window is current here.
     const float size = snapf(font->FontSize * sc);
     const float w = snapf(g_tune.width * sc), gap = snapf(5.0f * sc);
-    const float x0 = snapf(g_tune.marginX * sc);
-    const float y1 = snapf(io.DisplaySize.y - g_tune.marginY * sc);
+    // Relative to the GAME's window: with the F1 pop-out on, ImGui works in desktop coordinates and
+    // the game's corner is not (0,0). Off, it is, and this is the old arithmetic exactly.
+    const ImVec2 org = ImGui::GetMainViewport()->Pos;
+    const float x0 = snapf(org.x + g_tune.marginX * sc);
+    const float y1 = snapf(org.y + io.DisplaySize.y - g_tune.marginY * sc);
 
     LineLayout L[kMaxLines];
     float total = 0.0f, peak = 0.0f;
@@ -176,7 +180,7 @@ void drawClosed(const Shown* shown, int n) {
     }
     if (peak <= 0.005f || total <= 0.5f) { Theme_Pop(); return; }
 
-    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+    ImDrawList* dl = ImGui::GetBackgroundDrawList(ImGui::GetMainViewport());
     const float rim = 3.0f;                              // room for the rim and shadow at the edges
     float y = snapf(y1 - total);
     for (int i = 0; i < n; i++) {
@@ -216,7 +220,9 @@ void drawOpen(const Shown* shown, int n) {
     const float sc = io.FontGlobalScale > 0.01f ? io.FontGlobalScale : 1.0f;
     const float w = snapf(g_tune.width * sc), histH = snapf(g_tune.height * sc), padX = snapf(16.0f * sc);
 
-    ImGui::SetNextWindowPos(ImVec2(snapf(g_tune.marginX * sc), snapf(io.DisplaySize.y - g_tune.marginY * sc)),
+    const ImVec2 org = ImGui::GetMainViewport()->Pos;   // the game's corner -- see drawClosed
+    ImGui::SetNextWindowViewport(ImGui::GetMainViewport()->ID);
+    ImGui::SetNextWindowPos(ImVec2(snapf(org.x + g_tune.marginX * sc), snapf(org.y + io.DisplaySize.y - g_tune.marginY * sc)),
                             ImGuiCond_Always, ImVec2(0.0f, 1.0f));
     ImGui::SetNextWindowSize(ImVec2(w, 0.0f), ImGuiCond_Always);
     // AlwaysAutoResize OVERRIDES SetNextWindowSize: constrain the WIDTH to exactly `w` and let the
@@ -357,6 +363,7 @@ bool Chat_Take(char* out, int cap) {
 bool Chat_HasVisible() {
     if (!g_tune.enabled || g_gameDrawn.load()) return false;
     if (g_open.load()) return true;
+    if (g_tune.hidden) return false;                 // F2: the talk is hidden; the box still opens
     const uint64_t t = nowUs();
     const float keep = g_tune.fadeAfterSec + g_tune.fadeOverSec + g_tune.collapseSec;
     std::lock_guard<std::mutex> lk(g_mx);
@@ -419,6 +426,19 @@ void pasteClipboard() {
 } // namespace
 
 void Chat_SetGameDrawn(bool on) { g_gameDrawn = on; }
+
+static std::atomic<uint64_t> g_previewUntilMs{0};
+static std::atomic<int>      g_previewX{MPCHAT_POSX_DEFAULT}, g_previewY{MPCHAT_POSY_DEFAULT};
+void Chat_PreviewBox(int xPct, int yPct) {
+    g_previewX = xPct; g_previewY = yPct;
+    g_previewUntilMs = GetTickCount64() + 1500;      // lingers a moment after the slider is let go
+}
+bool Chat_Preview(int* xPct, int* yPct) {
+    if (GetTickCount64() > g_previewUntilMs.load()) return false;
+    if (xPct) *xPct = g_previewX.load();
+    if (yPct) *yPct = g_previewY.load();
+    return true;
+}
 int  Chat_TypedMax() { return kTextLen - 1; }
 void Chat_Scroll(int lines) {
     if (!g_gameDrawn.load() || !g_open.load() || !lines) return;
@@ -521,7 +541,8 @@ int Chat_Compose(char* out, int cap) {
 
 int Chat_Lines(ChatLineView* out, int cap) {
     if (!out || cap <= 0) return 0;
-    const bool open = g_open.load();
+    // Placing the box from F1 draws it open, so it holds what an open box holds.
+    const bool open = g_open.load() || Chat_Preview(nullptr, nullptr);
     const uint64_t t = nowUs();
     // Closed, a line is kept until it has faded AND given its height back -- the same life the ImGui
     // surface gives it, so switching between the two does not change how long anything stays up.
@@ -560,6 +581,7 @@ int Chat_Lines(ChatLineView* out, int cap) {
 void Chat_Draw() {
     if (!g_tune.enabled || g_gameDrawn.load()) return;
     const bool open = g_open.load();
+    if (g_tune.hidden && !open) return;              // F2: the talk is hidden; the box still opens
     const uint64_t t = nowUs();
 
     // Snapshot under the lock, draw outside it: the game thread must never wait on a frame.

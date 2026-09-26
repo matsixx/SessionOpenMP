@@ -85,12 +85,16 @@
 #include "camera_height.h"    // CameraHeight_ViewForward: where the camera looks, for Point
 #include "ui/menu_ext.h"      // the F1 "Board tap hand" page
 #include "catch_sound.h"      // CatchSound_SpawnAttached: the replay-aware one-shot, for the knock of the tap
+#include "radio.h"            // Radio_LoadAsset: the clap's sound and falloff, by path (539)
+#include "cloth_merge.h"      // ClothMerge_RootObject: the clap's sound stays loaded for other players' claps
 
 namespace {
 
 // ------------------------------------------------------------------ layouts (the same names and values as sit.cpp)
 enum {
     AN_ON_BOARD   = 0x300,   // USkaterAnimInstance::IsOnBoard
+    AN_THROWING_DOWN = 0x302,  // USkaterAnimInstance::IsThrowingDown
+    SK_THROWDOWN  = 0xa28,   // ASkaterCharacterBase::_isDoingThrowdown (run_out reads the same)
     ACT_ROOT      = 0x130,   // AActor::RootComponent
     CH_MESH       = 0x280,   // ACharacter::Mesh
     CH_MOVE       = 0x288,   // ACharacter::CharacterMovement
@@ -306,7 +310,26 @@ static bool PoseIsLive(int id) {
     return g_posedId == id && g_posedMs && (LONGLONG)GetTickCount64() - (LONGLONG)g_posedMs <= 120;
 }
 void*     g_clapCue = nullptr; SitObjRef g_clapCueRef = {}; bool g_clapCueTried = false;
-char      g_clapSound[64] = ""; float g_clapPitch = 1.6f, g_clapVolume = 1.5f;
+char      g_clapSound[160] = "WAV_Cinematic_HandLand_03"; float g_clapPitch = 2.0f, g_clapVolume = 4.0f;
+// THE CLAP'S SOUND AND ITS REACH (539). "it just doesnt sound good and also is heard from everywhere in the map".
+// It was SCU_HandLand -- a palm landing on the ground, pitched up -- and that cue has NO attenuation, so it
+// played at full volume anywhere; worse, OpenMP replays a peer's sound with attenuation left to the sound's own
+// (null), so every player heard every clap map-wide. The falloff is put ON THE ASSET (USoundBase::
+// AttenuationSettings +0x118, walking's own SAT_Sfx_Walk-Run: silent past 50 m), on every client, so the local
+// clap and every replayed one fade alike with nothing on the wire; a cue's own override (+0x530 bit 0) would
+// beat it, so that is cleared. 540: the user tried WAV_Cinematic_HandFace (539) and kept the palm -- pitch 200,
+// volume 400, one strike. The game's own hand landings now fade the same way (they were map-wide too).
+// 541: "the hand sound we have right now seems to be multiple different sounds. One of them sounds kinda like a
+// clap, the rest sound like a thump" -- SCU_HandLand picks at random among WAV_Cinematic_HandLand_01..03.
+// Decoded out of the pak: 03 is the clap (the sharpest onset 15 ms, centroid 4.6 kHz, 67% above 1.5 kHz, 13%
+// below 300 Hz), 02 the thump (2.2 kHz, rings 186 ms), 01 between. The clap plays 03 alone (loaded with the
+// cue, so every client finds it by name); the cue keeps its falloff too (older peers' claps play the cue).
+char      g_clapAtten[160] = "";
+static const char* const kClapAtten = "/Game/Audio/SAT_Sfx_Walk-Run.SAT_Sfx_Walk-Run";
+enum { SB_ATTENUATION = 0x118,                // USoundBase::AttenuationSettings (PDB)
+       SCUE_FLAGS = 0x530,                     // USoundCue: bit 0 bOverrideAttenuation (then AttenuationOverrides rule)
+       SCUE_NODEFLAGS = 0x538 };               // USoundCue: bit 1 bHasAttenuationNode (an attenuation node in the graph)
+static char g_clapUsing[64] = "";
 // the tap: THE POP OF AN OLLIE (asked for: "that seems like it'd fit a lot better" than the knock of a loose board).
 // The game keeps it as a cue of its own, SCU_Pop_Hi_Jump, with a recording per surface behind it -- so the same
 // surface switch the knock had applies. Found by name and watched, like the clap's; the board's own knock is
@@ -368,6 +391,16 @@ float     g_tapTipW[3] = { 0, 0, 0 }; bool g_tapTipSet = false;
 // hook. Believed only near where the feet say the floor is -- a tail poked out over a drop is not an
 // invitation to reach down it.
 float     g_tapGroundW[3] = { 0, 0, 0 }; bool g_tapGroundSet = false; float g_tapGroundU = 0.0f; bool g_tapGroundUSet = false;
+// THE KEPT BOARD OF A SEAT (sit.cpp's SitKeepBoard; SeatBoard below). Per frame, off Sit_BoardSpot.
+void*     g_seatMesh = nullptr;              // the seated body whose board is laid down (the pump keeps its rig up)
+SitObjRef g_seatMeshRef = { nullptr, 0, 0, nullptr };
+bool      g_seatSpot = false;                // the seat gave a spot this frame
+float     g_seatSet = 0.0f;                  // how far the board is set down: 0 in the hand .. 1 on its spot
+V3        g_seatOs = { 0.0f, 0.0f, 0.0f }, g_seatU = { 0.0f, 0.0f, 1.0f };   // the seat plane, component space
+int       g_seatCarry = -1;                  // the hand it rode in (sit.cpp's read of the carry)
+float     g_seatMeasureT = 0.0f;
+bool      g_seatGap = true;                  // the seat had no board to lay down (thrown, or not seated)
+LONGLONG  g_seatBackMs = 0;                  // when a fetched board came back to a seat already sat in
 int       g_tapSurface = 0;
 int       g_tapCount = 0;
 // void FSessionUtils::UpdateAudioWithSurfaceType(UAudioComponent*, EPhysicalSurface) -- Epic 0x11981e0 /
@@ -394,6 +427,7 @@ int   g_thigh[2], g_calf[2], g_foot[2], g_clav[2], g_uarm[2], g_larm[2], g_hand[
 int   g_fing[2][5][3];                    // [side][0 thumb .. 4 little][joint], -1 = not there
 int   g_boardRoot[4], g_nBoardRoot = 0;   // the board rig's top bones (SKXX_SkateSkel_*): what is carried with a hand
 int   g_truckF = -1, g_truckB = -1, g_flipper = -1;
+int   g_wheel[4] = { -1, -1, -1, -1 };       // what a board lying down rests on
 bool  g_rigOk = false, g_legsOk = false, g_fingersOk[2] = { false, false };
 
 int SideOf(const char* n) {
@@ -458,6 +492,7 @@ bool ResolveNames() {
         if (pa < 0 || !strstr(g_bones[pa].name, "skateskel")) g_boardRoot[g_nBoardRoot++] = i;
     }
     g_truckF = AnyNamed("truck_front"); g_truckB = AnyNamed("truck_back"); g_flipper = AnyNamed("skateskel_flipper");
+    { static const char* const kW[4] = { "wheel_fl", "wheel_fr", "wheel_bl", "wheel_br" }; for (int w = 0; w < 4; w++) g_wheel[w] = AnyNamed(kW[w]); }
     return g_rigOk;
 }
 void ReadRefPose(const uint8_t* refSkeleton, int n);      // below, with the pose buffers it needs
@@ -1060,6 +1095,10 @@ void DropShoulder(int sd, float cm) {
 // Where the floor is under the tail, as a height along the body's up: the trace's answer when it has one and
 // it is near where the feet say the floor is, else the feet's.
 float TapGround() {
+    if (g_seated && g_seatSpot) {                    // seated: the surface you sit on, under the tail if the trace found it there
+        const float seat = dot(g_seatOs, U);
+        return g_tapGroundUSet ? clampf(g_tapGroundU, seat - 20.0f * SC, seat + 20.0f * SC) : seat;
+    }
     const float feet = GroundU();
     if (!g_tapGroundUSet) return feet;
     return clampf(g_tapGroundU, feet - 35.0f * SC, feet + 35.0f * SC);
@@ -1081,7 +1120,11 @@ void DoTap(float) {
     // outside it -- so the board leans back to the hand, and a walking leg swings past it, not through it --
     // the GRAPHIC to the front, so the deck's top faces the skater (turned a touch to their middle); swung
     // by the stick.
-    const V3 ax = norm(mix3(U, -1.0f, BF, 0.26f, BR, 0.05f * sg + 0.22f * g_tapSwing));           // nose -> tail
+    // SEATED it leans out to the carrying side and forward, a third off upright: the tail knocks on the seat's
+    // surface beside the thigh and the nose comes to about shoulder height, where a sitting arm can hold it.
+    const bool seat = g_seated && g_seatSpot;
+    const V3 ax = seat ? norm(mix3(U, -1.0f, BF, 0.45f, BR, 0.55f * sg + 0.22f * g_tapSwing))
+                       : norm(mix3(U, -1.0f, BF, 0.26f, BR, 0.05f * sg + 0.22f * g_tapSwing));           // nose -> tail
     V3 top = mix3(BF, -1.0f, BR, -0.12f * sg, U, 0.0f);
     top = norm(sub(top, mul(ax, dot(top, ax))));
     const Q4 r1 = qfromto(axis0, mul(ax, -1.0f));
@@ -1095,7 +1138,8 @@ void DoTap(float) {
     // where the nose is: ahead of the shoulder and outside it, at the height that puts the tail's end on the ground
     const float hit = g_tapHit;
     const V3 S0 = g_Ct[g_uarm[c]].p;
-    V3 Nc = add(S0, mix3(BF, 0.22f * g_arm[c], BR, 0.27f * g_arm[c] * sg, U, 0.0f));
+    V3 Nc = add(S0, seat ? mix3(BF, 0.30f * g_arm[c], BR, 0.36f * g_arm[c] * sg, U, 0.0f)
+                         : mix3(BF, 0.22f * g_arm[c], BR, 0.27f * g_arm[c] * sg, U, 0.0f));
     Nc = add(Nc, mul(U, TapGround() - L * dot(ax, U) - dot(e, U) - dot(Nc, U)));
     // THE HAND CLOSES ON THE NOSE'S END: the wrist above the tip, the fingers running straight DOWN the board
     // and curling ROUND the end onto the graphic, so the wood passes through the fist. `f` is the way the
@@ -1562,6 +1606,10 @@ void Perform(int id, const void* mesh, float t) {
 void FindCarry() {
     g_carry = -1;
     if (!g_boardInHand) return;
+    if (g_seatSpot && g_seatSet > 0.0f) {          // seated, the board laid down: only the tap and the throw take it up
+        g_carry = (g_id == EM_TAP || g_id == EM_RAGE) ? g_seatCarry : -1;
+        return;
+    }
     const int b = g_flipper >= 0 ? g_flipper : (g_nBoardRoot ? g_boardRoot[0] : -1);
     if (b < 0) return;
     g_carry = len(sub(g_C[b].p, g_C[g_hand[0]].p)) < len(sub(g_C[b].p, g_C[g_hand[1]].p)) ? 0 : 1;
@@ -1570,12 +1618,88 @@ void FindCarry() {
 // emote made to that hand, position and turn, so the grip the animation drew is the grip that is kept.
 void CarryBoard() {
     if (g_carry < 0 || !g_nBoardRoot || g_thrown || g_boardPosed) return;      // posed: the emote put the board somewhere itself (the tap's regrip)
+    if (g_seatSet > 0.0f && g_id != EM_RAGE) return;                           // laid down beside a seat: no hand has it
     const int h = g_hand[g_carry];
     const Q4 d = qmul(g_Ct[h].q, qconj(g_C[h].q));
     if (len(sub(g_Ct[h].p, g_C[h].p)) < 0.02f && fabsf(d.w) > 0.999999f) return;        // the hand did not move: nor does the board
     for (int i = 0; i < g_nBoardRoot; i++) {
         const int b = g_boardRoot[i];
         SetComp(b, qmul(d, g_C[b].q), add(g_Ct[h].p, qrot(d, sub(g_C[b].p, g_C[h].p))));
+    }
+}
+
+// THE KEPT BOARD, LAID DOWN (sit.cpp's SitKeepBoard). sit.cpp keeps it riding the hand that carries it; here
+// it goes onto the seat's spot for it -- flat, its wheels' bottoms on the surface, its nose where the spot says
+// -- as the hands settle into the seat, and comes back up into the hand as they rise. The throw takes it back
+// into the hand as the throw comes up (and the tap regrips it from where it lies, itself). No emote need run.
+const float kWheelR = 2.7f;                  // a skate wheel's radius, cm
+void SeatBoard(void* mesh) {
+    g_seatSpot = false; g_seatSet = 0.0f;
+    if (mesh != g_seatMesh || !g_rigOk || !g_nBoardRoot || g_truckF < 0 || g_truckB < 0) return;
+    SitBoardSpot sp;
+    if (!Sit_BoardSpot(&sp)) { g_seatGap = true; return; }
+    // Back from a throw while seated (Y): it arrives in the hand, like standing, and is then set down again.
+    // (A sit just begun has its hands at the start of the way down: that is its own set-down.)
+    const LONGLONG nowMs = (LONGLONG)GetTickCount64();
+    if (g_seatGap) { g_seatGap = false; g_seatBackMs = sp.arms > 0.99f ? nowMs : 0; }
+    const float back = g_seatBackMs ? smooth((float)(nowMs - g_seatBackMs) / 600.0f) : 1.0f;
+    if (back >= 1.0f) g_seatBackMs = 0;
+    const int idx = *(const int*)((const uint8_t*)mesh + SKM_EDIT);
+    if (idx < 0 || idx > 1) return;
+    const uint8_t* arr = (const uint8_t*)mesh + SKM_CST + idx * 0x10;
+    uint8_t* data = *(uint8_t**)arr;
+    const int n = *(const int*)(arr + 8);
+    if (!data || n != g_nBones) return;
+    for (int i = 0; i < n; i++) {
+        const float* t = (const float*)(data + i * 48);
+        g_C[i].q = q4(t[0], t[1], t[2], t[3]); g_C[i].p = v3(t[4], t[5], t[6]); g_C[i].s = v3(t[8], t[9], t[10]);
+    }
+    for (int i = 0; i < n; i++) { LocalOf(i, g_C, g_L); g_Ct[i] = g_C[i]; g_Lt[i] = g_L[i]; }
+    const V3 os = v3(sp.os[0], sp.os[1], sp.os[2]), f = v3(sp.f[0], sp.f[1], sp.f[2]);
+    const V3 r = v3(sp.r[0], sp.r[1], sp.r[2]), u = v3(sp.u[0], sp.u[1], sp.u[2]);
+    g_seatSpot = true; g_seatCarry = sp.carry; g_seatOs = os; g_seatU = u;
+    // set down once the hands are most of the way there; picked up as soon as they start back
+    float s = smooth((sp.arms - 0.35f) / 0.65f) * back;
+    if (g_id == EM_RAGE) s *= 1.0f - smooth(g_w);          // the throwing hand takes it back up
+    g_seatSet = s;
+    if (s <= 0.0005f) return;
+    V3 axis0 = sub(g_C[g_truckF].p, g_C[g_truckB].p);
+    const float wb = len(axis0);
+    if (wb < 5.0f) return;
+    axis0 = mul(axis0, 1.0f / wb);
+    const V3 mid0 = mul(add(g_C[g_truckF].p, g_C[g_truckB].p), 0.5f);
+    const V3 top0 = DeckTop(axis0);
+    const float yr = sp.yawDeg * 0.0174532925f;
+    const V3 ax = norm(add(mul(f, cosf(yr)), mul(r, sinf(yr))));      // tail -> nose, level
+    const Q4 r1 = qfromto(axis0, ax);
+    const V3 t1 = norm(qrot(r1, top0));
+    const float roll = atan2f(dot(cross(t1, u), ax), dot(t1, u)) * 57.2957795f;
+    const Q4 Rb = qmul(qaxis(ax, roll), r1);                          // deck top up, wheels down
+    // how far under the truck line its wheels' bottoms are once it is turned so: that is what meets the surface
+    float low = 1e9f;
+    for (int w = 0; w < 4; w++) if (g_wheel[w] >= 0) low = fminf(low, dot(qrot(Rb, sub(g_C[g_wheel[w]].p, mid0)), u));
+    if (low > 1e8f) low = -(g_deckRise + 6.0f);
+    low -= kWheelR;
+    const V3 P = add(add(add(os, mul(f, sp.fx)), mul(r, sp.ry)), mul(u, sp.uz));    // the middle of its footprint, on the surface
+    const V3 mid = add(P, mul(u, -low));
+    for (int i = 0; i < g_nBoardRoot; i++) {
+        const int b = g_boardRoot[i];
+        const Q4 qT = qmul(Rb, g_C[b].q);
+        const V3 pT = sub(add(mid, qrot(Rb, sub(g_C[b].p, mid0))), g_visOff);    // less what the drawn one sits off by
+        SetComp(b, qblend(g_C[b].q, qT, s), lerp(g_C[b].p, pT, s));
+    }
+    for (int i = 0; i < n; i++) {
+        float* t = (float*)(data + i * 48);
+        t[0] = g_Ct[i].q.x; t[1] = g_Ct[i].q.y; t[2] = g_Ct[i].q.z; t[3] = g_Ct[i].q.w;
+        t[4] = g_Ct[i].p.x; t[5] = g_Ct[i].p.y; t[6] = g_Ct[i].p.z;
+    }
+    static int s_said = 0;
+    if (s >= 0.999f && s_said < 12) {
+        s_said++;
+        TwkLog("[emote] the board is down beside the seat: %.0f cm ahead, %.0f cm %s, %.0f cm %s the seat, nose %.0f deg off ahead | wheels x%d, deck top by %s",
+               sp.fx, fabsf(sp.ry), sp.ry >= 0.0f ? "right" : "left", fabsf(sp.uz), sp.uz >= 0.0f ? "over" : "under", sp.yawDeg,
+               (g_wheel[0] >= 0) + (g_wheel[1] >= 0) + (g_wheel[2] >= 0) + (g_wheel[3] >= 0),
+               g_deckTopSrc == 2 ? "the drawn board" : g_deckTopSrc == 1 ? "the reference pose" : "the anchors");
     }
 }
 
@@ -1742,24 +1866,79 @@ float RageSpeed(float rate) { return 420.0f + 1130.0f * powf(RageStrength(rate),
 // (SCU_HandLand) and the slaps a board makes on feet and hands -- played pitched up, the first of them that is
 // loaded. Found by NAME (only a loaded cue is found), watched like any object since a cue can be unloaded, and
 // spawned through the replay's audio manager like the tap's knock: it is in replays and other players hear it.
-void ClapSound(void* sk) {
-    if (g_clapCue && !SitUI_Alive(&g_clapCueRef)) { g_clapCue = nullptr; g_clapCueTried = false; }
-    if (!g_clapCue && !g_clapCueTried) {
-        g_clapCueTried = true;
-        const char* const names[4] = { g_clapSound, "SCU_HandLand", "SCU_FootOnBoard", "SCU_Board_Catch" };
-        for (int i = 0; i < 4 && !g_clapCue; i++) {
-            if (!names[i][0]) continue;
-            void* o = CatchSound_FindSound(names[i]);
-            if (!o) continue;
-            SitUI_Track(&g_clapCueRef, o);
-            if (g_clapCueRef.obj) { g_clapCue = o; TwkLog("[emote] clap: the sound is '%s', at pitch x%.2f volume x%.2f", names[i], g_clapPitch, g_clapVolume); }
+// The sound, and its falloff put on it (see THE CLAP'S SOUND AND ITS REACH). Game thread. A name with a '/' is a
+// full path (loaded if need be), else a short name (found only if loaded).
+// Walking's falloff onto a sound, and a cue's own override cleared (see THE CLAP'S SOUND AND ITS REACH).
+static const char* GiveFalloff(void* snd, const char* name, void* at) {
+    const char* reach = "its own (could not be set)";
+    __try {
+        void** slot = (void**)((uint8_t*)snd + SB_ATTENUATION);
+        if (!*slot || *slot == at) { *slot = at; reach = "walking's (silent past 50 m)"; }
+        else reach = "its own (it already had one)";
+        // A CUE can override its base attenuation (+0x530 bit 0 -> AttenuationOverrides) or carry an attenuation
+        // node; either would beat the pointer set above. The override is cleared (the cue was heard map-wide, so
+        // whatever it held did not attenuate); a node is only reported.
+        if (CatchSound_FindObject(name, "SoundCue") == snd) {
+            uint8_t* f = (uint8_t*)snd + SCUE_FLAGS;
+            if (*f & 1) { *f &= (uint8_t)~1; reach = "walking's (silent past 50 m; the cue's own override cleared)"; }
+            if (*((uint8_t*)snd + SCUE_NODEFLAGS) & 2)
+                TwkLog("[emote] clap: '%s' has an attenuation node of its own -- it may not fade as set", name);
         }
-        if (!g_clapCue) TwkLog("[emote] clap: none of its sounds is loaded here -- a silent clap");
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    return reach;
+}
+static void ResolveClap() {
+    if (g_clapCue && !SitUI_Alive(&g_clapCueRef)) { g_clapCue = nullptr; g_clapCueTried = false; }
+    if (g_clapCue || g_clapCueTried) return;
+    g_clapCueTried = true;
+    const char* const names[5] = { g_clapSound, "WAV_Cinematic_HandLand_03", "SCU_HandLand", "SCU_FootOnBoard", "SCU_Board_Catch" };
+    for (int i = 0; i < 5 && !g_clapCue; i++) {
+        if (!names[i][0]) continue;
+        const bool path = strchr(names[i], '/') != nullptr;
+        void* o = nullptr;
+        if (path) {
+            const char* dot = strrchr(names[i], '.');
+            o = CatchSound_FindSound(dot ? dot + 1 : names[i]);
+            if (!o) o = Radio_LoadAsset(names[i]);
+        } else o = CatchSound_FindSound(names[i]);
+        if (!o) continue;
+        SitUI_Track(&g_clapCueRef, o);
+        if (!g_clapCueRef.obj) continue;
+        g_clapCue = o;
+        const char* nm = path ? (strrchr(names[i], '.') ? strrchr(names[i], '.') + 1 : names[i]) : names[i];
+        snprintf(g_clapUsing, sizeof(g_clapUsing), "%s", nm);
+        if (path) ClothMerge_RootObject(o, nm);          // stays loaded: other players' claps resolve to it
     }
+    if (!g_clapCue) { g_clapUsing[0] = 0; TwkLog("[emote] clap: none of its sounds could be found or loaded -- a silent clap"); return; }
+    const char* reach = "its own";
+    if (_stricmp(g_clapAtten, "none") != 0) {
+        void* at = Radio_LoadAsset(g_clapAtten[0] ? g_clapAtten : kClapAtten);
+        if (!at && g_clapAtten[0]) at = Radio_LoadAsset(kClapAtten);
+        if (at) {
+            ClothMerge_RootObject(at, "clap falloff");
+            reach = GiveFalloff(g_clapCue, g_clapUsing, at);
+            // The whole cue too: an older player's clap plays it, and it is the game's hand landing (map-wide).
+            if (_stricmp(g_clapUsing, "SCU_HandLand") != 0) {
+                void* cue = CatchSound_FindObject("SCU_HandLand", "SoundCue");
+                if (cue) TwkLog("[emote] clap: older players' claps (SCU_HandLand): %s", GiveFalloff(cue, "SCU_HandLand", at));
+            }
+        } else reach = "its own (the falloff asset could not be loaded)";
+    }
+    TwkLog("[emote] clap: the sound is '%s' at pitch x%.2f volume x%.2f, second strike %d ms; its reach: %s",
+           g_clapUsing, g_clapPitch, g_clapVolume, g_clapDoubleMs, reach);
+}
+static void* ClapStrike(void* root, bool second) {
+    if (!g_clapCue || !root) return nullptr;
+    const float vol = g_clapVolume * (second ? 0.55f + 0.20f * Rand01() : 0.85f + 0.30f * Rand01());
+    const float pitch = g_clapPitch * (second ? 1.04f + 0.08f * Rand01() : 0.95f + 0.10f * Rand01());
+    return CatchSound_SpawnAttached(g_clapCue, root, vol, pitch);
+}
+void ClapSound(void* sk) {
+    ResolveClap();
     void* root = sk ? twkP(sk, ACT_ROOT) : nullptr;
     if (!g_clapCue || !root) return;
-    const float vol = g_clapVolume * (0.85f + 0.30f * Rand01()), pitch = g_clapPitch * (0.95f + 0.10f * Rand01());
-    void* ac = CatchSound_SpawnAttached(g_clapCue, root, vol, pitch);
+    const float vol = g_clapVolume, pitch = g_clapPitch;
+    void* ac = ClapStrike(root, false);
     // THE SECOND STRIKE, a moment later and pitched apart. The game has no clap asset, so a clap is
     // built out of SCU_HandLand -- which is the game's OWN hand-landing foley, played on your character
     // every time a hand touches down. One knock of it IS a hand landing, and the field report was
@@ -1948,6 +2127,19 @@ void PumpMarker(void* sk, float dt) {
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; }
 }
+// GETTING ON THE BOARD (542: every emote, as 521 did for the throw). Either flag, whichever the game raises first
+// -- and from the Y press itself (sit stamps it): the flags come up a beat after the press, and an emote asked for
+// inside that beat still started in the middle of the throwdown.
+static bool Mounting(void* sk, int* td1 = nullptr, int* td2 = nullptr) {
+    bool m = Sit_MountPending();
+    int a = -1, b = -1;
+    void* ai = FootPlace_AnimInstance();
+    __try { a = sk ? twkB(sk, SK_THROWDOWN) : -1; b = ai ? twkB(ai, AN_THROWING_DOWN) : -1; m = m || a > 0 || b > 0; }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+    if (td1) *td1 = a;
+    if (td2) *td2 = b;
+    return m;
+}
 static bool TapWorking() {
     return g_tapBtn && g_id == EM_TAP && !g_ending &&
            (LONGLONG)GetTickCount64() - g_tapDownMs >= kTapHoldMs;
@@ -1962,8 +2154,9 @@ void Emote_TapButton(bool down) {
         if (g_id == EM_TAP && !g_ending) return;             // already in it: this press may end it on release
         void* sk = CatchTweaks_Skater();
         if (g_id != EM_NONE || g_req != EM_NONE) return;
-        if (!g_on || !sk || Twk_IsProxy(sk) || !OnFoot(sk) || Sit_EditorOpen() || Sit_PoseHeld()) return;
+        if (!g_on || !sk || Twk_IsProxy(sk) || !OnFoot(sk) || Sit_EditorOpen() || (Sit_PoseHeld() && !Sit_BoardKept())) return;
         if (Emote_Carrying() || Radial_Open() || Radial_Busy() || !Sit_BoardInHand(sk)) return;
+        if (Mounting(sk)) return;                              // not in the middle of getting on (542)
         g_req = EM_TAP;
         g_tapBeganHere = true;
         TwkLog("[emote] board tap (RB)");
@@ -2132,6 +2325,11 @@ void Emote_DrawTapHandMenu(const OmpMenuApi* api) {
 // Everything the F1 page can change, written back so a pose someone built survives the game closing.
 // TwkIniSetInt APPENDS a key it cannot find, so a file written by an older build simply grows these.
 void Emote_SaveConfig(char* buf, size_t cap) {
+    TwkIniSetStr(buf, cap, "EmoteClapWave",        g_clapSound);          // the clap (ini only since 543)
+    TwkIniSetInt(buf, cap, "EmoteClapPitchPct",    (int)(g_clapPitch * 100.0f + 0.5f));
+    TwkIniSetInt(buf, cap, "EmoteClapVolumePct",   (int)(g_clapVolume * 100.0f + 0.5f));
+    TwkIniSetInt(buf, cap, "EmoteClapDoubleMs",    g_clapDoubleMs);
+    TwkIniSetStr(buf, cap, "EmoteClapAttenuation", g_clapAtten);
     TwkIniSetInt(buf, cap, "EmoteDanceBpm",   (int)(g_danceBpm + 0.5f));
     TwkIniSetInt(buf, cap, "EmoteStopHoldMs", (int)(g_stopHold * 1000.0f + 0.5f));
     TwkIniSetInt(buf, cap, "EmoteTapMarker",   g_mkTapOn);
@@ -2203,11 +2401,13 @@ void Emote_ReadConfig(const char* buf) {
     // EmoteTapVolumePct is the KNOCK's, which needed lifting; the pop does not.
     TwkIniStr(buf, "EmoteTapSound", g_tapSoundName, sizeof(g_tapSoundName), "SCU_Pop_Hi_Jump");
     g_tapPopVolume = clampf((float)TwkIniIntQuiet(buf, "EmoteTapPopVolumePct", 100), 0.0f, 400.0f) / 100.0f;
-    // the clap's sound: a cue's short name (empty = the built-in list), and how it is played
-    TwkIniStr(buf, "EmoteClapSound", g_clapSound, sizeof(g_clapSound), "");
-    g_clapPitch  = clampf((float)TwkIniIntQuiet(buf, "EmoteClapPitchPct", 160), 40.0f, 300.0f) / 100.0f;
-    g_clapVolume = clampf((float)TwkIniIntQuiet(buf, "EmoteClapVolumePct", 150), 0.0f, 400.0f) / 100.0f;
-    g_clapDoubleMs = (int)clampf((float)TwkIniIntQuiet(buf, "EmoteClapDoubleMs", 45), 0.0f, 400.0f);
+    // the clap's sound: a short name or a full path (empty = the built-in list), how it is played, and its
+    // falloff (a SoundAttenuation path; empty = walking's; "none" = the sound's own). Saved since 539; ini only (543).
+    TwkIniStr(buf, "EmoteClapWave", g_clapSound, sizeof(g_clapSound), "WAV_Cinematic_HandLand_03");   // 541 (was EmoteClapSound)
+    g_clapPitch  = clampf((float)TwkIniIntQuiet(buf, "EmoteClapPitchPct", 200), 40.0f, 300.0f) / 100.0f;
+    g_clapVolume = clampf((float)TwkIniIntQuiet(buf, "EmoteClapVolumePct", 400), 0.0f, 400.0f) / 100.0f;
+    g_clapDoubleMs = (int)clampf((float)TwkIniIntQuiet(buf, "EmoteClapDoubleMs", 0), 0.0f, 400.0f);
+    TwkIniStr(buf, "EmoteClapAttenuation", g_clapAtten, sizeof(g_clapAtten), "");
 }
 int  Emote_Count() { BuildWheelIndex(); return g_wheelN; }   // only the ones ON the wheel
 const char* Emote_Name(int i) { BuildWheelIndex(); return (i >= 0 && i < g_wheelN) ? kDefs[g_wheelIdx[i]].name : ""; }
@@ -2258,6 +2458,7 @@ unsigned long long Emote_ChestBoneOf(void* meshComp) {
 bool Emote_CarryStart(const float origin[3], const float extent[3]) {
     void* sk = CatchTweaks_Skater();
     if (!g_on || !sk || Twk_IsProxy(sk) || !OnFoot(sk) || Sit_EditorOpen() || Sit_PoseHeld()) return false;
+    if (Mounting(sk)) return false;                            // not in the middle of getting on (542)
     for (int i = 0; i < 3; i++) { g_boxO[i] = origin[i]; g_boxE[i] = extent[i] > 1.0f ? extent[i] : 1.0f; }
     g_boxWorldOk = false;
     g_req = EM_CARRY;
@@ -2288,6 +2489,7 @@ bool Emote_Play(int wheelIndex) {
     if (Emote_Carrying()) { g_whyNot = "Put the radio down first"; return false; }
     void* sk = CatchTweaks_Skater();
     if (!sk || Twk_IsProxy(sk) || !OnFoot(sk) || Sit_EditorOpen()) { TwkLog("[emote] %s: not now (on the board, in an editor, or no skater)", kDefs[index].name); return false; }
+    if (Mounting(sk)) { g_whyNot = "Getting on the board"; TwkLog("[emote] %s: not while getting on the board", kDefs[index].name); return false; }
     if (kDefs[index].board && !Sit_BoardInHand(sk)) {
         g_whyNot = Sit_BoardOut() ? "Get your board back first (Y)" : "You need your board in hand";
         TwkLog("[emote] %s: the board is not in hand", kDefs[index].name);
@@ -2308,18 +2510,53 @@ bool Emote_Play(int wheelIndex) {
 // left trigger is not consulted again until the next throw.
 const float kArmOn = 0.35f, kArmOff = 0.20f;    // hysteresis: a trigger resting near the edge must not flutter
 static bool g_armed = false;
+static bool g_armSaid = false;             // this press's refusal is in the log (a refused press retries every frame)
 static void PollArmTrigger(void* sk) {
     float lt = 0.0f;
-    if (!CatchTweaks_LeftTrigger(&lt)) return;               // no analogue value to be had: leave it alone
+    if (!CatchTweaks_LeftTrigger(&lt)) {                     // no analogue value to be had: leave it alone
+        static ULONGLONG s_ms = 0; const ULONGLONG now = GetTickCount64();
+        if (now - s_ms > 10000) { s_ms = now; TwkLog("[emote] throw: the left trigger cannot be read -- %s", CatchTweaks_TriggerWhy()); }
+        return;
+    }
+    if (lt < kArmOff) g_armSaid = false;
     const bool wants = g_armed ? (lt > kArmOff) : (lt > kArmOn);
     if (wants == g_armed) return;
     g_armed = wants;
     if (g_armed) {
         // The same gates the wheel applied, minus the wheel: on foot, board in hand, nothing else going on.
-        if (g_id != EM_NONE || g_req != EM_NONE) { g_armed = false; return; }
-        if (!g_on || !sk || Twk_IsProxy(sk) || !OnFoot(sk) || Sit_EditorOpen() || Sit_PoseHeld()) { g_armed = false; return; }
-        if (Emote_Carrying() || Radial_Open() || Radial_Busy()) { g_armed = false; return; }
-        if (!Sit_BoardInHand(sk)) { g_armed = false; return; }
+        // Every refusal names itself, once per press ("why cant I throw my board?" -- they were all silent).
+        const char* why = nullptr;
+        if (g_id != EM_NONE || g_req != EM_NONE) why = "an emote is already running or asked for";
+        else if (!g_on) why = "emotes are off";
+        else if (!sk || Twk_IsProxy(sk)) why = "no local skater";
+        else if (!OnFoot(sk)) why = "not on foot";
+        else if (Sit_EditorOpen()) why = "a replay or the prop editor is open";
+        else if (Sit_PoseHeld() && !Sit_BoardKept()) why = "the sit pose is still held";
+        else if (Emote_Carrying()) why = "carrying the radio";
+        else if (Radial_Open() || Radial_Busy()) why = "the radial menu or the shop is up";
+        else if (!Sit_BoardInHand(sk)) why = Sit_BoardOut() ? "the board is out (thrown, not picked up)" : "the board is not in hand";
+        if (why) {
+            g_armed = false;
+            if (!g_armSaid) {
+                g_armSaid = true;
+                TwkLog("[emote] throw NOT armed (left trigger %.2f): %s | emote %d req %d, sit pose %d kept %d, radial %d/%d", lt, why,
+                       (int)g_id, (int)g_req, Sit_PoseHeld() ? 1 : 0, Sit_BoardKept() ? 1 : 0, Radial_Open() ? 1 : 0, Radial_Busy() ? 1 : 0);
+            }
+            return;
+        }
+        // Not while getting on the board (Y): the board is still in hand and you are still on foot for the
+        // start of the throwdown, so LT armed a throw in the middle of it. Either flag, whichever the game
+        // raises first -- and from the Y press itself (sit stamps it): the flags come up a beat after the
+        // press, and LT inside that beat still armed one (3.19.521, "press Y then LT right after").
+        {
+            int td1 = -1, td2 = -1;
+            if (Mounting(sk, &td1, &td2)) {
+                g_armed = false;
+                if (!g_armSaid) { g_armSaid = true; TwkLog("[emote] throw NOT armed (left trigger %.2f): getting on the board (Y pressed %s, throwdown flags %d/%d)", lt,
+                                                           Sit_MountPending() ? "just now" : "not recently", td1, td2); }
+                return;
+            }
+        }
         g_req = EM_RAGE;
         TwkLog("[emote] throw armed (left trigger)");
     } else if (g_id == EM_RAGE && !g_ending && !g_thrown) {
@@ -2332,6 +2569,31 @@ void Emote_Watchdog() {
     const LONGLONG last = g_pumpMs;
     if (last && (LONGLONG)GetTickCount64() - last > 300) { Drop("nothing is driving it (paused, or an editor opened)"); Twk_SetPoseHold(Sit_PoseHeld()); }
 }
+// ---- THE AIM (camera_height.cpp reads it): while a throw is up and has not gone, the camera eases over the
+// shoulder AWAY from the throwing arm -- so the wind-up does not swing through the view -- and back out after.
+static float g_aimW = 0.0f;
+static int   g_aimSide = 1;                  // +1 over the right shoulder, -1 the left
+static void PumpAim(float dt) {
+    const bool want = g_id == EM_RAGE && !g_ending && !g_thrown;
+    if (want && g_carry >= 0) g_aimSide = g_carry == 1 ? -1 : 1;
+    const float rate = want ? 1.0f / 0.22f : 1.0f / 0.45f;
+    g_aimW += clampf((want ? 1.0f : 0.0f) - g_aimW, -dt * rate, dt * rate);
+}
+// An emote is up (or asked for): Y must not get on the board under it (542). The carry is the radio's, not an
+// emote to the player, and keeps its own rules; one already blending out lets Y through.
+bool Emote_BlocksMount() {
+    return (g_req != EM_NONE && g_req != EM_CARRY) || (g_id != EM_NONE && g_id != EM_CARRY && !g_ending);
+}
+bool Emote_ThrowHeld() {
+    return g_armed || g_req == EM_RAGE || (g_id == EM_RAGE && !g_ending && !g_thrown);
+}
+bool Emote_AimView(float* weight, int* side) {
+    if (g_aimW <= 0.0005f) return false;
+    *weight = smooth(g_aimW); *side = g_aimSide;
+    return true;
+}
+static const float kOutAt[4] = { 0.1f, 0.3f, 1.0f, 4.0f };   // when a thrown board says where it is
+static float g_outPrev[3] = { 0, 0, 0 }, g_outPrevT = 0.0f; static bool g_outPrevOk = false;
 void Emote_PumpFrame() {
     const LONGLONG nowMs = (LONGLONG)GetTickCount64();
     const bool gap = g_pumpMs && nowMs - g_pumpMs > 300;
@@ -2343,8 +2605,43 @@ void Emote_PumpFrame() {
     if (dt > 0.1f) dt = 0.1f;
 
     void* sk = CatchTweaks_Skater();
+    // THE CLAP'S SOUND, loaded and given its reach as soon as there is a skater -- not at the first clap:
+    // another player's clap resolves by name, so it has to be in memory here before anyone claps (539).
+    {
+        static ULONGLONG s_clapLookMs = 0;
+        const ULONGLONG ms = GetTickCount64();
+        if (sk && ms - s_clapLookMs > 2000) {
+            s_clapLookMs = ms;
+            static int s_retries = 0;                               // a failed first look (assets not up yet) tries again
+            if ((g_clapCue && !SitUI_Alive(&g_clapCueRef)) || (!g_clapCue && g_clapCueTried && s_retries < 5)) { g_clapCueTried = false; if (!g_clapCue) s_retries++; }
+            __try { ResolveClap(); } __except (EXCEPTION_EXECUTE_HANDLER) { g_clapCue = nullptr; }
+        }
+    }
     PollArmTrigger(sk);                  // holding the left trigger arms a throw; letting go lowers the arm
+    PumpAim(dt);                         // ...and the camera goes over the shoulder while it is up
     PumpMarker(sk, dt);                  // the marker remembers the board tap, and a return puts it back up
+    // ---- a seat that keeps the board: the rig and the board's measurements SeatBoard needs, emote or none
+    {
+        void* seatMesh = (sk && Sit_PoseHeld() && Sit_BoardInHand(sk)) ? twkP(sk, CH_MESH) : nullptr;
+        if (!seatMesh) { g_seatMesh = nullptr; g_seatSpot = false; g_seatSet = 0.0f; }
+        else if (seatMesh != g_seatMesh || !SitUI_Alive(&g_seatMeshRef)) {
+            g_seatMesh = nullptr;
+            bool ok = false;
+            if (g_id != EM_NONE && g_mesh == seatMesh) ok = g_rigOk;         // the running emote read this very body
+            else { __try { ok = ResolveRig(seatMesh); } __except (EXCEPTION_EXECUTE_HANDLER) { ok = false; g_faults++; } }
+            if (ok && g_nBoardRoot) {
+                SitUI_Track(&g_seatMeshRef, seatMesh);
+                if (g_seatMeshRef.obj) {
+                    g_seatMesh = seatMesh; g_seatMeasureT = 0.0f;
+                    g_visSay = true;
+                    __try { MeasureBoard(sk, seatMesh, true); } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; }
+                }
+            }
+        } else if (g_id == EM_NONE && (g_seatMeasureT += dt) > 0.5f) {
+            g_seatMeasureT = 0.0f;
+            __try { MeasureBoard(sk, seatMesh, false); } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; }
+        }
+    }
     // ---- a thrown board: the throw's second frame, and everything that brings it back
     if (Sit_BoardOut()) {
         g_outS += dt;
@@ -2360,17 +2657,23 @@ void Emote_PumpFrame() {
             const float* w = twkP(sk, ACT_ROOT) ? (const float*)((const uint8_t*)twkP(sk, ACT_ROOT) + SC_C2W) : nullptr;
             const float d = w ? len(v3(bw[0] - w[4], bw[1] - w[5], bw[2] - w[6])) : 0.0f;
             if (w && (d > 15000.0f || bw[2] < w[6] - 6000.0f)) Sit_BoardBack("it has left the world");
-            else if (g_outSaid < 2 && g_outS > (g_outSaid ? 4.0f : 1.0f)) {       // twice: did it FLY, and where did it stop
+            else if (g_outSaid < 4 && g_outS > kOutAt[g_outSaid]) {    // did it get AWAY, did it FLY, where did it stop
                 g_outSaid++;
-                TwkLog("[emote] Throw board: %.0f s on, the board is %.0f cm away", g_outS, d);
+                const float sp = (g_outPrevOk && g_outS > g_outPrevT) ? len(v3(bw[0] - g_outPrev[0], bw[1] - g_outPrev[1], bw[2] - g_outPrev[2])) / (g_outS - g_outPrevT) : -1.0f;
+                TwkLog("[emote] Throw board: %.1f s on, the board is %.0f cm away, going %.0f cm/s%s", g_outS, d, sp, Sit_PoseHeld() ? " (seated)" : "");
             }
+            g_outPrev[0] = bw[0]; g_outPrev[1] = bw[1]; g_outPrev[2] = bw[2]; g_outPrevT = g_outS; g_outPrevOk = true;
         }
-    } else g_outS = 0.0f;
+    } else { g_outS = 0.0f; g_outPrevOk = false; }
     if (g_id != EM_NONE) {
         if (gap)                                   Drop("the pump had stopped");
         else if (!sk || sk != g_skater)            Drop("the skater is gone");
         else if (!SitUI_Alive(&g_meshRef) || twkP(sk, CH_MESH) != g_mesh) Drop("the body changed");
         else if (Sit_EditorOpen())                 Drop("an editor opened");
+    }
+    if (g_req != EM_NONE && g_req != EM_CARRY && g_id == EM_NONE && Mounting(sk)) {
+        TwkLog("[emote] %s: dropped -- getting on the board", kDefs[g_req].name);
+        g_req = EM_NONE;
     }
     if (g_req != EM_NONE) {
         const int want = g_req; g_req = EM_NONE;
@@ -2422,9 +2725,7 @@ void Emote_PumpFrame() {
         if (g_clapEchoAt >= 0.0f && g_t >= g_clapEchoAt) {
             g_clapEchoAt = -1.0f;
             void* root = sk ? twkP(sk, ACT_ROOT) : nullptr;
-            if (g_clapCue && root && PoseIsLive(EM_CLAP))
-                CatchSound_SpawnAttached(g_clapCue, root, g_clapVolume * (0.55f + 0.20f * Rand01()),
-                                         g_clapPitch * (1.04f + 0.08f * Rand01()));
+            if (g_clapCue && root && PoseIsLive(EM_CLAP)) ClapStrike(root, true);
         }
     }
     if (g_id == EM_RAGE && !g_ending && !g_thrown) { PollTrigger(); RageTrigger(g_t); }
@@ -2451,6 +2752,15 @@ void Emote_PumpFrame() {
     } else if (g_w < 1.0f) { g_w += dt / (g_id == EM_TAP ? 0.36f : kBlendIn); if (g_w > 1.0f) g_w = 1.0f; }      // a regrip takes a moment longer
 }
 void Emote_OnFlip(void* mesh) {
+    if (mesh && mesh == g_seatMesh) {                // first the seat's board, so an emote on top reads it where it lies
+        if (g_rigOk && (LONGLONG)GetTickCount64() - g_pumpMs <= 300 && !Sit_EditorOpen()) {
+            __try { SeatBoard(mesh); }
+            __except (EXCEPTION_EXECUTE_HANDLER) {
+                g_faults++; g_seatMesh = nullptr; g_seatSpot = false; g_seatSet = 0.0f;
+                TwkLog("[emote] fault laying the board down -- it stays in the hand");
+            }
+        } else { g_seatSpot = false; g_seatSet = 0.0f; }
+    }
     if (g_id == EM_NONE || mesh != g_mesh || g_w <= 0.0f || !g_rigOk) return;
     if ((LONGLONG)GetTickCount64() - g_pumpMs > 300) return;      // nobody is driving the clock: the skeleton is not ours to write
     if (Sit_EditorOpen()) return;

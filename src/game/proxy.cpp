@@ -66,6 +66,58 @@ static int   safeByte(void*, int) { return -1; }
 static bool  safeRead(void*, void*, int) { return false; }
 #endif
 
+// ---- YOUR BODY ON A PEER'S LOOSE BOARD (see Tuning::touchSoften). Your capsule -- on foot only: a rider's own
+// board does the pushing, as it always has -- against the board's line (its trucks, out to the ends), as
+// capsules. USkaterAnimInstance::IsOnBoard is +0x300 (PDB; SessionTweaks reads the same byte);
+// UCapsuleComponent::CapsuleRadius is the class's other tail member, +0x46c beside CapsuleHalfHeight.
+static float SegDist3(const float* p1, const float* q1, const float* p2, const float* q2) {
+    float d1[3], d2[3], r[3];
+    for (int i = 0; i < 3; i++) { d1[i] = q1[i] - p1[i]; d2[i] = q2[i] - p2[i]; r[i] = p1[i] - p2[i]; }
+    auto dt = [](const float* a, const float* b) { return a[0]*b[0] + a[1]*b[1] + a[2]*b[2]; };
+    auto cl = [](float v) { return v < 0.f ? 0.f : (v > 1.f ? 1.f : v); };
+    const float a = dt(d1, d1), e = dt(d2, d2), f = dt(d2, r);
+    float s = 0.f, t = 0.f;
+    if (a > 1e-6f || e > 1e-6f) {
+        if (a <= 1e-6f) t = cl(f / e);
+        else {
+            const float c = dt(d1, r);
+            if (e <= 1e-6f) s = cl(-c / a);
+            else {
+                const float b = dt(d1, d2), den = a * e - b * b;
+                s = den > 1e-6f ? cl((b * f - c * e) / den) : 0.f;
+                t = (b * s + f) / e;
+                if (t < 0.f) { t = 0.f; s = cl(-c / a); } else if (t > 1.f) { t = 1.f; s = cl((b - c) / a); }
+            }
+        }
+    }
+    float w[3];
+    for (int i = 0; i < 3; i++) w[i] = (p1[i] + d1[i] * s) - (p2[i] + d2[i] * t);
+    return sqrtf(dt(w, w));
+}
+static bool LocalBodyTouches(void* bd) {
+    void* me = spectate::LocalSkater();
+    if (!me || !bd) return false;
+    void* mesh = safePtr(me, off::kSkaterMesh);
+    void* an = mesh ? safePtr(mesh, off::kMeshAnimInstance) : nullptr;
+    if (!an || safeByte(an, 0x300) != 0) return false;            // riding (or unreadable): not a walking body
+    void* cap = safePtr(me, off::kActorRootComp);
+    float c[3], half = 0.f, rad = 0.f;
+    if (!cap || !safeRead((uint8_t*)cap + off::kCompPos, c, 12)) return false;
+    if (!safeRead((uint8_t*)cap + off::kCapsuleHalfHeight, &half, 4) || !safeRead((uint8_t*)cap + off::kCapsuleHalfHeight + 4, &rad, 4)) return false;
+    if (!(half > 20.f && half < 250.f) || !(rad > 5.f && rad < 150.f) || rad > half) return false;
+    void* tf = safePtr(bd, off::kBoardTruckFront);
+    void* tb = safePtr(bd, off::kBoardTruckBack);
+    float F[3], B[3];
+    if (!tf || !tb || !safeRead((uint8_t*)tf + off::kCompPos, F, 12) || !safeRead((uint8_t*)tb + off::kCompPos, B, 12)) return false;
+    float ax[3] = { F[0] - B[0], F[1] - B[1], F[2] - B[2] };
+    const float wb = sqrtf(ax[0]*ax[0] + ax[1]*ax[1] + ax[2]*ax[2]);
+    if (!(wb > 5.f && wb < 200.f)) return false;
+    float nose[3], tail[3];
+    for (int i = 0; i < 3; i++) { const float m = (F[i] + B[i]) * 0.5f, h = ax[i] / wb * 0.97f * wb; nose[i] = m + h; tail[i] = m - h; }
+    const float lo[3] = { c[0], c[1], c[2] - (half - rad) }, hi[3] = { c[0], c[1], c[2] + (half - rad) };
+    return SegDist3(lo, hi, tail, nose) < rad + 9.f + 4.f;          // the board's half-thickness, and a little early
+}
+
 // quaternion helpers (same conventions as the replication core)
 static void qConj(const float* q, float* o) { o[0]=-q[0]; o[1]=-q[1]; o[2]=-q[2]; o[3]=q[3]; }
 static void qMul(const float* a, const float* b, float* o) {
@@ -1063,7 +1115,7 @@ if (s.poseN) NoteProxyPosed(this, nowMs);   // the look-at must stand down while
             // body for another skater to stall on, so it could be shoved around by depenetration but
             // never ridden. Driven, it is the same live rigid body a bailed board already is.
             const bool loose = s.boardSim && g_tun.looseBoardSim && boardNear_ && !noCollide_ && g_tun.velocityDrive;
-            if (!loose || !VelocityDrive(s, nowUs)) {
+            if (!loose || !VelocityDrive(s, nowUs, true)) {
                 StampBoard(s);
                 st_.carryStamps++;
             }
@@ -1107,7 +1159,7 @@ if (s.poseN) NoteProxyPosed(this, nowMs);   // the look-at must stand down while
         if (!boardNear_ || noCollide_) { if (simOn_) StopBoardSim(); StampBoard(s); }
         else if (handHeld) { st_.carryStamps++; StampBoard(s); }
         else if (!g_tun.velocityDrive || airborne) { if (airborne) st_.airSkips++; StampBoard(s); }
-        else if (!VelocityDrive(s, nowUs)) StampBoard(s);
+        else if (!VelocityDrive(s, nowUs, s.bailing != 0)) StampBoard(s);     // a bailed board is loose; a ridden one is not
     }
 
     // ---- offscreen anim throttle -- but NEVER while peers are recorded into the replay (the
@@ -1234,10 +1286,10 @@ if (s.poseN) NoteProxyPosed(this, nowMs);   // the look-at must stand down while
             // (~0 = our writes hold; the full lean = a parent recomputed them away; -1 = never applied).
             snprintf(m, sizeof(m),
                      "[proxy] board err=%.0fcm driven=%u snaps=%u stamps(air)=%u carry=%u stops=%u sim=%d"
-                     " onBoard=%d grounded=%d bail=%d mode=%d broken=%d rej=%u art=%d/%.2f",
+                     " onBoard=%d grounded=%d bail=%d mode=%d broken=%d rej=%u art=%d/%.2f touch=%.2f",
                      st_.driveErrCm, st_.driven, st_.snaps, st_.airSkips, st_.carryStamps, st_.stops,
                      (int)simOn_, (int)(s.onBoard != 0), (int)(s.grounded != 0), (int)(s.bailing != 0),
-                     (int)s.boardMode, (int)s.brokenState, TypeRejects(), (int)s.artOk, (double)artErrDeg_);
+                     (int)s.boardMode, (int)s.brokenState, TypeRejects(), (int)s.artOk, (double)artErrDeg_, (double)touchW_);
             logf(m);
         }
         // GAME BODY PHYSICS ON PROXIES (syncPhysAnim). The lifecycle that switches physical animation
@@ -1349,7 +1401,7 @@ if (s.poseN) NoteProxyPosed(this, nowMs);   // the look-at must stand down while
 // board-vs-board contact (impulses both ways + the game's own contact sounds), while the drive springs
 // it back to the transported truth. Stamping instead does the opposite -- TeleportTo internally does
 // StopMovementImmediately + SetSimulatePhysics, lobotomising the body 60x/s.
-bool Proxy::VelocityDrive(const repl::State& s, uint64_t nowUs) {
+bool Proxy::VelocityDrive(const repl::State& s, uint64_t nowUs, bool loose) {
     const Syms& S = Get();
     void* bd = OwnBoard();
     if (!bd || !S.BoardSetLinVel) return false;
@@ -1396,9 +1448,20 @@ bool Proxy::VelocityDrive(const repl::State& s, uint64_t nowUs) {
         __try { S.SetSimulatePhysics(bd, true, false); simOn_ = true; } __except (EXCEPTION_EXECUTE_HANDLER) {}
 #endif
     }
+    // YOUR BODY ON IT (a loose board only): the chase eases toward a gentle pull (Tuning::touchSoften).
+    float soft = 0.f;
+    if (loose && g_tun.touchSoften) {
+        const bool touching = LocalBodyTouches(bd);
+        const float rate = touching ? g_tun.touchInRate : g_tun.touchOutRate;
+        float k = rate * dt; if (k > 1.f) k = 1.f;
+        touchW_ += ((touching ? 1.f : 0.f) - touchW_) * k;
+        if (touchW_ < 0.001f) touchW_ = 0.f;
+        soft = touchW_;
+    } else touchW_ = 0.f;
     float vel[3]; const float inv = 1.f / dt;
+    const float linGain = inv * (1.f - soft) + g_tun.touchPullRate * soft;
     for (int i = 0; i < 3; i++) {
-        float v = err[i] * inv;
+        float v = err[i] * linGain;
         if (v >  g_tun.driveMaxVel) v =  g_tun.driveMaxVel;
         if (v < -g_tun.driveMaxVel) v = -g_tun.driveMaxVel;
         vel[i] = v;
@@ -1415,7 +1478,7 @@ bool Proxy::VelocityDrive(const repl::State& s, uint64_t nowUs) {
             if (qe[3] < 0) for (int i = 0; i < 4; i++) qe[i] = -qe[i];      // short way round
             const float sn = sqrtf(qe[0]*qe[0] + qe[1]*qe[1] + qe[2]*qe[2]);
             if (sn > 1e-5f) {
-                float rate = 2.f * atan2f(sn, qe[3]) * inv;
+                float rate = 2.f * atan2f(sn, qe[3]) * linGain;
                 if (rate > g_tun.driveMaxAngRad) rate = g_tun.driveMaxAngRad;
                 const float k = rate / sn;
                 const float w[3] = { qe[0]*k, qe[1]*k, qe[2]*k };

@@ -45,6 +45,8 @@ void  Sit_BoardKick(const float*, const float*) {}
 bool  Sit_BoardOut() { return false; }
 bool  Sit_BoardWhere(float*) { return false; }
 void  Sit_BoardBack(const char*) {}
+bool  Sit_BoardKept() { return false; }
+bool  Sit_BoardSpot(SitBoardSpot*) { return false; }
 static int g_soundsPlayed = 0;
 bool  Sit_TraceSurface(void*, const float*, const float*, float*, int* surface) { if (surface) *surface = 3; return true; }
 void* CatchSound_SpawnAttached(void*, void*, float, float) { g_soundsPlayed++; return nullptr; }
@@ -57,6 +59,15 @@ static int g_stubSound = 0;          // what CatchSound_FindSound hands back (a 
 void* CatchSound_FindSound(const char*) { return g_stubSound ? (void*)&g_stubSound : nullptr; }
 void  TwkIniStr(const char*, const char*, char* out, size_t cap, const char* def) { snprintf(out, cap, "%s", def ? def : ""); }
 int   TwkIniSetInt(char*, size_t, const char*, int) { return 0; }      // the tap hand's page saves; nothing here reads it back
+int   TwkIniSetStr(char*, size_t, const char*, const char*) { return 0; }
+// 3.19.539-543 (the clap, mounting vs emotes): neutral answers -- no mount pending, no wheel, no clap asset.
+bool  Sit_MountPending() { return false; }
+const char* CatchTweaks_TriggerWhy() { return ""; }
+bool  Radial_Open() { return false; }
+bool  Radial_Busy() { return false; }
+void* CatchSound_FindObject(const char*, const char*) { return nullptr; }
+void* Radio_LoadAsset(const char*) { return nullptr; }
+bool  ClothMerge_RootObject(void*, const char*) { return false; }
 void  TwkMarkDirty() {}
 void  SitUI_Track(SitObjRef* r, void* o) { if (r) { r->obj = o; r->index = 0; r->serial = 0; r->cls = nullptr; } }
 bool  SitUI_Alive(const SitObjRef* r) { return r && r->obj; }

@@ -34,6 +34,7 @@ namespace omp { namespace game { namespace spectate {
 // Your own skater, republished every frame by the loader -- lets us tell "watch a peer" (an override)
 // apart from "watch myself" (an undo of it).
 void SetLocalSkater(void* pawn);
+void* LocalSkater();      // ...and read back (proxy.cpp: is YOUR body touching a peer's loose board)
 
 // `actor` = the peer's proxy skater, or null for "Me".
 // The replay camera belongs to the USER -- they placed it and chose its mode. Aiming at a peer is an

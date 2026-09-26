@@ -120,8 +120,11 @@ static int   g_probeCm    = 0;      // FootSteerProbeCm -- non-zero pushes BOTH 
 // past the leg's reach the two-bone IK saturates and the foot chatters at the limit rather than
 // travelling further. Where that sits was never measured, so the range here is deliberately generous
 // and the judgement is left to the eye. The hard clamp only exists to keep a typo out of orbit.
-static float g_reachCm    = 40.0f;
-static float g_responseMs = 250.0f; // FootSteerResponseMs -- stick to full steer; the discriminator
+// FRONT FOOT [0] AND BACK FOOT [1] each have their own reach, response and twist. Which physical foot
+// is which comes from the stance -- the right foot leads when goofy XOR switch -- and is blended on the
+// same ramp as the switch flip below, so a half-cab cannot snap a foot from one set to the other.
+static float g_reach[2]   = { 40.0f, 40.0f };    // FootSteerFront/BackReachCm
+static float g_resp[2]    = { 250.0f, 250.0f };  // FootSteerFront/BackResponseMs -- stick to full steer
 static float g_returnMs   = 150.0f; // FootSteerReturnMs -- back to neutral, deliberately quicker
 static float g_deadzone   = 0.0f;  // FootSteerDeadzone (pct) -- radial, rescaled so 1.0 still reaches
 static float g_flickVeto  = 10.0f;  // FootSteerFlickVeto (tenths) -- stick units/s that count as a
@@ -166,7 +169,7 @@ static int   g_axisY      = 0;      // FootSteerAxisY -- stick Y drives +X (forw
 // the stick's Y only, off the same filtered steer as the position, and applied as a rotation about
 // a stable axis in the SAME frame the position uses (0..5, defaults to the skater's right, so the
 // twist is toe-up / toe-down). 0 degrees = position only.
-static float g_twistDeg   = 5.0f;   // FootSteerTwistDeg -- a little goes a long way here
+static float g_twist[2]   = { 5.0f, 5.0f };      // FootSteerFront/BackTwistDeg -- a little goes a long way
 static int   g_twistAxis  = 4;      // FootSteerTwistAxis -- -Y of the chosen frame (measured, the
                                     // +Y guess tipped the foot the wrong way)
 // The game switches foot IK OFF during parts of an air (alpha 0, and the sockets zeroed with it) --
@@ -206,8 +209,15 @@ void FootSteer_ReadConfig(const char* buf) {
     g_probe      = TwkIniInt(buf, "FootSteerProbe", 1);
     g_probeAxis  = TwkIniInt(buf, "FootSteerProbeAxis", 0);
     g_probeCm    = TwkIniInt(buf, "FootSteerProbeCm", 0);
-    g_reachCm    = (float)TwkIniInt(buf, "FootSteerReachCm", 40);
-    g_responseMs = (float)TwkIniInt(buf, "FootSteerResponseMs", 250);
+    // The single values from before the split are the starting point for both feet, so the feel a
+    // rider had tuned carries over untouched until they choose to split it.
+    {
+        const int r = TwkIniInt(buf, "FootSteerReachCm", 40), m = TwkIniInt(buf, "FootSteerResponseMs", 250);
+        g_reach[0] = (float)TwkIniInt(buf, "FootSteerFrontReachCm", r);
+        g_reach[1] = (float)TwkIniInt(buf, "FootSteerBackReachCm",  r);
+        g_resp[0]  = (float)TwkIniInt(buf, "FootSteerFrontResponseMs", m);
+        g_resp[1]  = (float)TwkIniInt(buf, "FootSteerBackResponseMs",  m);
+    }
     g_returnMs   = (float)TwkIniInt(buf, "FootSteerReturnMs", 150);
     g_deadzone   = (float)TwkIniInt(buf, "FootSteerDeadzone", 0) / 100.0f;
     g_flickVeto  = (float)TwkIniInt(buf, "FootSteerFlickVeto", 100) / 10.0f;
@@ -224,31 +234,37 @@ void FootSteer_ReadConfig(const char* buf) {
     if (g_liftAxis < 0 || g_liftAxis > 5) g_liftAxis = 2;
     g_axisX      = TwkIniInt(buf, "FootSteerAxisX", 1);
     g_axisY      = TwkIniInt(buf, "FootSteerAxisY", 0);
-    g_twistDeg   = (float)TwkIniInt(buf, "FootSteerTwistDeg", 5);
+    {
+        const int t = TwkIniInt(buf, "FootSteerTwistDeg", 5);
+        g_twist[0] = (float)TwkIniInt(buf, "FootSteerFrontTwistDeg", t);
+        g_twist[1] = (float)TwkIniInt(buf, "FootSteerBackTwistDeg",  t);
+    }
     g_twistAxis  = TwkIniInt(buf, "FootSteerTwistAxis", 4);
     g_switchInv  = TwkIniInt(buf, "FootSteerSwitchInvert", 3);
     if (g_switchInv < 0 || g_switchInv > 3) g_switchInv = 3;
     g_followIK   = TwkIniInt(buf, "FootSteerFollowIK", 1);
     // Divide-by-zero and reach-nothing guards, before anything can use the values.
     if (g_deadzone < 0.0f)   g_deadzone = 0.0f;   else if (g_deadzone > 0.90f) g_deadzone = 0.90f;
-    if (g_reachCm < 0.0f) g_reachCm = 0.0f; else if (g_reachCm > 200.0f) g_reachCm = 200.0f;
-    if (g_responseMs < 20.0f) g_responseMs = 20.0f;
+    for (int k = 0; k < 2; k++) {
+        if (g_reach[k] < 0.0f) g_reach[k] = 0.0f; else if (g_reach[k] > 200.0f) g_reach[k] = 200.0f;
+        if (g_resp[k] < 20.0f) g_resp[k] = 20.0f;
+        if (g_twist[k] < 0.0f) g_twist[k] = 0.0f; else if (g_twist[k] > 90.0f) g_twist[k] = 90.0f;
+    }
     if (g_returnMs   < 20.0f) g_returnMs   = 20.0f;
     if (g_probeAxis < 0 || g_probeAxis > 5) g_probeAxis = 0;
     if (g_frame < 0 || g_frame > 3) g_frame = 3;
     if (g_axisX < 0 || g_axisX > 5) g_axisX = 1;
     if (g_axisY < 0 || g_axisY > 5) g_axisY = 0;
     if (g_twistAxis < 0 || g_twistAxis > 5) g_twistAxis = 4;
-    if (g_twistDeg < 0.0f) g_twistDeg = 0.0f; else if (g_twistDeg > 90.0f) g_twistDeg = 90.0f;
     // Every parsed key echoed: a value disagreeing with the ini has to be visible before any of the
     // behaviour built on it is worth interpreting.
-    TwkLog("[steer] config: FootSteer=%d Probe=%d ProbeAxis=%d ProbeCm=%d ReachCm=%.0f "
-           "ResponseMs=%.0f ReturnMs=%.0f Deadzone=%.2f FlickVeto=%.1f BlankMs=%d CatchVeto=%d "
-           "Frame=%d AxisX=%d AxisY=%d TwistDeg=%.0f TwistAxis=%d SwitchInvert=%d FollowIK=%d "
+    TwkLog("[steer] config: FootSteer=%d Probe=%d ProbeAxis=%d ProbeCm=%d ReachCm front %.0f back %.0f "
+           "ResponseMs front %.0f back %.0f ReturnMs=%.0f Deadzone=%.2f FlickVeto=%.1f BlankMs=%d CatchVeto=%d "
+           "Frame=%d AxisX=%d AxisY=%d TwistDeg front %.0f back %.0f TwistAxis=%d SwitchInvert=%d FollowIK=%d "
            "SettleMs=%d SettleEps=%.2f (air only)",
-           g_on, g_probe, g_probeAxis, g_probeCm, g_reachCm, g_responseMs, g_returnMs,
+           g_on, g_probe, g_probeAxis, g_probeCm, g_reach[0], g_reach[1], g_resp[0], g_resp[1], g_returnMs,
            g_deadzone, g_flickVeto, g_blankMs, g_catchVeto, g_frame, g_axisX, g_axisY,
-           g_twistDeg, g_twistAxis, g_switchInv, g_followIK, g_settleMs, g_settleEps);
+           g_twist[0], g_twist[1], g_twistAxis, g_switchInv, g_followIK, g_settleMs, g_settleEps);
 }
 
 void FootSteer_SaveConfig(char* buf, size_t cap) {
@@ -256,8 +272,10 @@ void FootSteer_SaveConfig(char* buf, size_t cap) {
     TwkIniSetInt(buf, cap, "FootSteerProbe",       g_probe);
     TwkIniSetInt(buf, cap, "FootSteerProbeAxis",   g_probeAxis);
     TwkIniSetInt(buf, cap, "FootSteerProbeCm",     g_probeCm);
-    TwkIniSetInt(buf, cap, "FootSteerReachCm",     (int)g_reachCm);
-    TwkIniSetInt(buf, cap, "FootSteerResponseMs",  (int)g_responseMs);
+    TwkIniSetInt(buf, cap, "FootSteerFrontReachCm",    (int)g_reach[0]);
+    TwkIniSetInt(buf, cap, "FootSteerBackReachCm",     (int)g_reach[1]);
+    TwkIniSetInt(buf, cap, "FootSteerFrontResponseMs", (int)g_resp[0]);
+    TwkIniSetInt(buf, cap, "FootSteerBackResponseMs",  (int)g_resp[1]);
     TwkIniSetInt(buf, cap, "FootSteerReturnMs",    (int)g_returnMs);
     TwkIniSetInt(buf, cap, "FootSteerDeadzone",    (int)(g_deadzone * 100.0f + 0.5f));
     TwkIniSetInt(buf, cap, "FootSteerFlickVeto",   (int)(g_flickVeto * 10.0f + 0.5f));
@@ -270,7 +288,8 @@ void FootSteer_SaveConfig(char* buf, size_t cap) {
     TwkIniSetInt(buf, cap, "FootSteerReturnLiftAxis", g_liftAxis);
     TwkIniSetInt(buf, cap, "FootSteerAxisX",       g_axisX);
     TwkIniSetInt(buf, cap, "FootSteerAxisY",       g_axisY);
-    TwkIniSetInt(buf, cap, "FootSteerTwistDeg",    (int)g_twistDeg);
+    TwkIniSetInt(buf, cap, "FootSteerFrontTwistDeg",   (int)g_twist[0]);
+    TwkIniSetInt(buf, cap, "FootSteerBackTwistDeg",    (int)g_twist[1]);
     TwkIniSetInt(buf, cap, "FootSteerTwistAxis",   g_twistAxis);
     TwkIniSetInt(buf, cap, "FootSteerSwitchInvert", g_switchInv);
     TwkIniSetInt(buf, cap, "FootSteerFollowIK",    g_followIK);
@@ -439,7 +458,7 @@ static void dumpSamples() {
 // One stick -> one filtered steer vector. Left stick drives the LEFT foot and right the RIGHT: the
 // sliders follow the FOOT, not front/back, which is what keeps switch stance correct with no stance
 // logic (the same rule foot placement settled).
-static bool updateFoot(Foot& F, bool rightStick, bool armed, bool catchNow, float dt, double now) {
+static bool updateFoot(Foot& F, bool rightStick, bool armed, bool catchNow, float dt, double now, float respMs) {
     float sx = 0.0f, sy = 0.0f;
     const bool have = ScoopSpeed_StickRaw(rightStick, &sx, &sy);
     float tx = 0.0f, ty = 0.0f;
@@ -496,7 +515,7 @@ static bool updateFoot(Foot& F, bool rightStick, bool armed, bool catchNow, floa
         const bool arcOk = returning;
         if (!arcOk) { F.retFrom = 0.0f; if (F.lift > 0.0f) { F.lift -= F.lift * dt * 20.0f; if (F.lift < 0.01f) F.lift = 0.0f; } }
         else if (F.retFrom <= 0.0f) F.retFrom = curMag;
-        const float rate = returning ? (1000.0f / g_returnMs) : (1000.0f / g_responseMs);
+        const float rate = returning ? (1000.0f / g_returnMs) : (1000.0f / respMs);
         const float step = rate * dt;
         if (d <= step) { F.s[0] = tx; F.s[1] = ty; }
         else           { F.s[0] += dx * (step / d); F.s[1] += dy * (step / d); }
@@ -759,9 +778,14 @@ bool FootSteer_AddOffset(void* a, float dt, float outL[3], float outR[3]) {
         // see the flip as a step change and chase its own sign.
         const float lX = g_footL.s[0] * invX, lY = g_footL.s[1] * invY;
         const float rX = g_footR.s[0] * invX, rY = g_footR.s[1] * invY;
+        // Front and back per PHYSICAL foot: the right foot leads when goofy XOR switch, on the same ramp.
+        const float wRF = (twkB(a, AN_IS_GOOFY) > 0) ? (1.0f - g_swBlend) : g_swBlend;   // right foot = front
+        const float reachL = g_reach[0] * (1.0f - wRF) + g_reach[1] * wRF, reachR = g_reach[0] * wRF + g_reach[1] * (1.0f - wRF);
+        const float respL  = g_resp[0]  * (1.0f - wRF) + g_resp[1]  * wRF, respR  = g_resp[0]  * wRF + g_resp[1]  * (1.0f - wRF);
+        const float twistL = g_twist[0] * (1.0f - wRF) + g_twist[1] * wRF, twistR = g_twist[0] * wRF + g_twist[1] * (1.0f - wRF);
 
-        const bool blankL = updateFoot(g_footL, false, armed, catchNowL, dt, now);
-        const bool blankR = updateFoot(g_footR, true,  armed, catchNowR, dt, now);
+        const bool blankL = updateFoot(g_footL, false, armed, catchNowL, dt, now, respL);
+        const bool blankR = updateFoot(g_footR, true,  armed, catchNowR, dt, now, respR);
         InterlockedExchange(&g_uiBlanked, (blankL || blankR) ? 1 : 0);
         g_uiEase = g_ease;
         g_uiLx = g_footL.s[0]; g_uiLy = g_footL.s[1];
@@ -794,8 +818,8 @@ bool FootSteer_AddOffset(void* a, float dt, float outL[3], float outR[3]) {
             if (wL > 0.0f) buildDelta(a, g_probeAxis, -1, 1.0f, 0.0f, (float)g_probeCm * g_ease * wL, dL);
             if (wR > 0.0f) buildDelta(a, g_probeAxis, -1, 1.0f, 0.0f, (float)g_probeCm * g_ease * wR, dR);
         } else if (g_ease > 0.0f) {
-            if (wL > 0.0f) buildDelta(a, g_axisX, g_axisY, lX, lY, g_reachCm * g_ease * wL, dL);
-            if (wR > 0.0f) buildDelta(a, g_axisX, g_axisY, rX, rY, g_reachCm * g_ease * wR, dR);
+            if (wL > 0.0f) buildDelta(a, g_axisX, g_axisY, lX, lY, reachL * g_ease * wL, dL);
+            if (wR > 0.0f) buildDelta(a, g_axisX, g_axisY, rX, rY, reachR * g_ease * wR, dR);
             // ... plus the return arc, in the SAME frame as the steer (buildDelta handles the basis),
             // so it lifts along the foot's own up rather than along world up on a tilted board.
             if (g_liftCm > 0.0f) {
@@ -820,12 +844,12 @@ bool FootSteer_AddOffset(void* a, float dt, float outL[3], float outR[3]) {
         // ---- the twist. Stick Y only: push up and the toe swings forward, pull down and it swings
         // back. Same filtered steer as the position, so the two can never disagree.
         float axis[3] = { 0, 0, 0 };
-        const bool haveAxis = (!probing && g_twistDeg > 0.0f && g_ease > 0.0f)
+        const bool haveAxis = (!probing && (twistL > 0.0f || twistR > 0.0f) && g_ease > 0.0f)
                               ? frameAxis(a, g_twistAxis, axis) : false;
         // The twist takes the same inverted Y, so "push forward, toe forward" still means forward
         // from where YOU are standing when you are riding switch.
-        applyTwist(a, AN_L_SOCK_ROT, 0, axis, haveAxis ? lY * g_twistDeg * g_ease * wL : 0.0f);
-        applyTwist(a, AN_R_SOCK_ROT, 1, axis, haveAxis ? rY * g_twistDeg * g_ease * wR : 0.0f);
+        applyTwist(a, AN_L_SOCK_ROT, 0, axis, haveAxis ? lY * twistL * g_ease * wL : 0.0f);
+        applyTwist(a, AN_R_SOCK_ROT, 1, axis, haveAxis ? rY * twistR * g_ease * wR : 0.0f);
         if (haveAxis && (lY != 0.0f || rY != 0.0f)) wrote = true;
 
 
@@ -952,13 +976,14 @@ bool FootSteer_Steer(bool rightStick, float* x, float* y) {
 
 bool  FootSteer_Enabled()     { return g_on != 0; }
 void  FootSteer_SetEnabled(bool on) { g_on = on ? 1 : 0; TwkMarkDirty(); }
-float FootSteer_ReachCm()     { return g_reachCm; }
-void  FootSteer_SetReachCm(float cm) {
+// [0] = the front foot, [1] = the back foot.
+float FootSteer_ReachCm(int back)     { return g_reach[back ? 1 : 0]; }
+void  FootSteer_SetReachCm(int back, float cm) {
     if (cm < 0.0f) cm = 0.0f; else if (cm > 200.0f) cm = 200.0f;
-    g_reachCm = cm; TwkMarkDirty();
+    g_reach[back ? 1 : 0] = cm; TwkMarkDirty();
 }
-float FootSteer_ResponseMs()  { return g_responseMs; }
-void  FootSteer_SetResponseMs(float ms) { g_responseMs = (ms < 20.0f) ? 20.0f : ms; TwkMarkDirty(); }
+float FootSteer_ResponseMs(int back)  { return g_resp[back ? 1 : 0]; }
+void  FootSteer_SetResponseMs(int back, float ms) { g_resp[back ? 1 : 0] = (ms < 20.0f) ? 20.0f : ms; TwkMarkDirty(); }
 float FootSteer_DeadzonePct() { return g_deadzone * 100.0f; }
 void  FootSteer_SetDeadzonePct(float pct) {
     g_deadzone = pct / 100.0f;
@@ -981,10 +1006,10 @@ void  FootSteer_SetAxisY(float a) {
     int v = (int)(a + 0.5f); if (v < 0) v = 0; else if (v > 5) v = 5;
     g_axisY = v; TwkMarkDirty();
 }
-float FootSteer_TwistDeg()    { return g_twistDeg; }
-void  FootSteer_SetTwistDeg(float deg) {
+float FootSteer_TwistDeg(int back)    { return g_twist[back ? 1 : 0]; }
+void  FootSteer_SetTwistDeg(int back, float deg) {
     if (deg < 0.0f) deg = 0.0f; else if (deg > 90.0f) deg = 90.0f;
-    g_twistDeg = deg; TwkMarkDirty();
+    g_twist[back ? 1 : 0] = deg; TwkMarkDirty();
 }
 float FootSteer_SwitchInvert() { return (float)g_switchInv; }
 void  FootSteer_SetSwitchInvert(float v) {
@@ -1012,11 +1037,11 @@ void FootSteer_ResetDefaults() {
     // "Reset to defaults" would have quietly restored the pre-tuning feel.
     // Same numbers as ReadConfig's fallbacks -- they had drifted apart a THIRD time (30/300/5 here
     // against 40/250/0 there), so "Reset to defaults" changed the feel. ReadConfig is the truth.
-    g_reachCm = 40.0f; g_responseMs = 250.0f; g_returnMs = 150.0f;
+    g_reach[0] = g_reach[1] = 40.0f; g_resp[0] = g_resp[1] = 250.0f; g_returnMs = 150.0f;
     g_deadzone = 0.0f; g_flickVeto = 10.0f; g_blankMs = 250; g_catchVeto = 1;
     g_settleMs = 60; g_settleEps = 0.06f;
     g_frame = 0; g_axisX = 1; g_axisY = 0; g_liftCm = 6.0f; g_liftAxis = 2;
-    g_twistDeg = 5.0f; g_twistAxis = 4; g_switchInv = 3; g_followIK = 1;
+    g_twist[0] = g_twist[1] = 5.0f; g_twistAxis = 4; g_switchInv = 3; g_followIK = 1;
     TwkMarkDirty();
 }
 
@@ -1027,13 +1052,16 @@ void FootSteer_DrawMenu(const OmpMenuApi* api) {
     api->SameLine(); api->TextDisabled("(in the air; flicks stay the catch)");
     if (on) {
         api->Indent();
-        float reach = g_reachCm, resp = g_responseMs;
-        if (api->SliderFloat("Reach (cm)", &reach, 2.0f, 80.0f, "%.0f")) FootSteer_SetReachCm(reach);
-        api->SameLine(); api->TextDisabled("(past the leg's reach the foot stops travelling and buzzes)");
-        if (api->SliderFloat("Response (ms)", &resp, 100.0f, 800.0f, "%.0f")) {
-            g_responseMs = resp; TwkMarkDirty();
+        api->TextDisabled("front = the leading foot, back = the trailing one (follows goofy and switch)");
+        for (int k = 0; k < 2; k++) {
+            float reach = g_reach[k], resp = g_resp[k];
+            if (api->SliderFloat(k ? "Back foot reach (cm)" : "Front foot reach (cm)", &reach, 2.0f, 80.0f, "%.0f"))
+                FootSteer_SetReachCm(k, reach);
+            if (k == 0) { api->SameLine(); api->TextDisabled("(past the leg's reach the foot stops travelling and buzzes)"); }
+            if (api->SliderFloat(k ? "Back foot response (ms)" : "Front foot response (ms)", &resp, 100.0f, 800.0f, "%.0f"))
+                FootSteer_SetResponseMs(k, resp);
+            if (k == 0) { api->SameLine(); api->TextDisabled("(lower = quicker, and closer to a flick)"); }
         }
-        api->SameLine(); api->TextDisabled("(lower = quicker, and closer to a flick)");
         float veto = g_flickVeto;
         if (api->SliderFloat("Flick veto (units/s)", &veto, 2.0f, 40.0f, "%.1f")) {
             g_flickVeto = veto; TwkMarkDirty();
@@ -1047,9 +1075,13 @@ void FootSteer_DrawMenu(const OmpMenuApi* api) {
         if (api->SliderFloat("Stick X drives axis", &axx, 0.0f, 5.0f, "%.0f")) FootSteer_SetAxisX(axx);
         if (api->SliderFloat("Stick Y drives axis", &axy, 0.0f, 5.0f, "%.0f")) FootSteer_SetAxisY(axy);
         api->TextDisabled("axis 0/1/2 = +X/+Y/+Z, 3/4/5 = the same negated");
-        float tw = g_twistDeg, ta = (float)g_twistAxis;
-        if (api->SliderFloat("Foot twist (deg)", &tw, 0.0f, 20.0f, "%.0f")) FootSteer_SetTwistDeg(tw);
-        api->SameLine(); api->TextDisabled("(push up = toe forward, pull back = toe back)");
+        float ta = (float)g_twistAxis;
+        for (int k = 0; k < 2; k++) {
+            float tw = g_twist[k];
+            if (api->SliderFloat(k ? "Back foot twist (deg)" : "Front foot twist (deg)", &tw, 0.0f, 20.0f, "%.0f"))
+                FootSteer_SetTwistDeg(k, tw);
+            if (k == 0) { api->SameLine(); api->TextDisabled("(push up = toe forward, pull back = toe back)"); }
+        }
         if (api->SliderFloat("Twist about axis", &ta, 0.0f, 5.0f, "%.0f")) FootSteer_SetTwistAxis(ta);
         bool fik = g_followIK != 0;
         if (api->Checkbox("Fade with the game's foot IK", &fik)) { g_followIK = fik ? 1 : 0; TwkMarkDirty(); }

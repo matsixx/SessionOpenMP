@@ -66,6 +66,11 @@ struct ChatTuning {
     float shadowAlpha   = 0.75f;    // the dark rim under closed-box text: the nameplates' outlineAlpha
     int   maxShownIdle  = 6;        // lines drawn when closed
     int   maxShownOpen  = 12;       // ...and when it is open, where there is no fade to thin them out
+    // Where the game-drawn box sits (mp_prefs.h says what the numbers mean), and whether the talk is
+    // hidden. Published every frame from the prefs, or from the F1 sliders while they are moving.
+    float posXPct       = 2.0f;
+    float posYPct       = 14.0f;
+    bool  hidden        = false;
 };
 ChatTuning& Chat_Tuning();
 
@@ -155,6 +160,12 @@ int  Chat_Presence();
 // Is the game drawing it? While true Chat_Draw does nothing and Chat_HasVisible is false, so the two
 // surfaces can never both be up. Set once a frame by the caller that decides, exactly like the names.
 void Chat_SetGameDrawn(bool on);
+
+// PLACING THE BOX from the F1 menu. The sliders call this every frame they are held (render thread):
+// for a moment afterwards the box is drawn OPEN at that spot -- there has to be something on screen to
+// place -- and Chat_Preview reports the spot to the game thread's publish. Shows even when hidden.
+void Chat_PreviewBox(int xPct, int yPct);
+bool Chat_Preview(int* xPct, int* yPct);
 
 // The chat's own tunables live above; the LOOK (palette + font) is shared with every other surface
 // this mod draws -- see theme.h.

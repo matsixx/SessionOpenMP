@@ -41,6 +41,10 @@ static int      g_bubblePanel    = 1;
 static int      g_bubbleBorder   = 0;   // off: the panel alone reads cleaner over the world
 static int      g_bubbleBlurPct  = MPBUBBLE_BLUR_DEFAULT;
 static int      g_bubblePanelPct = MPBUBBLE_PANEL_DEFAULT;
+static int      g_f1PopOut       = 0;
+static int      g_chatPosX       = MPCHAT_POSX_DEFAULT;
+static int      g_chatPosY       = MPCHAT_POSY_DEFAULT;
+static int      g_chatHidden     = 0;
 static int      g_chatTextSize = MPCHAT_TEXT_DEFAULT;
 static int      g_chatSmallSize = MPCHAT_SMALL_DEFAULT;
 static int      g_chatWidth    = MPCHAT_WIDTH_DEFAULT;
@@ -100,6 +104,13 @@ static void saveAll() {
     fprintf(f, "BubbleBorder=%d\n", g_bubbleBorder);
     fprintf(f, "BubbleBlurPct=%d\n", g_bubbleBlurPct);
     fprintf(f, "BubblePanelPct=%d\n", g_bubblePanelPct);
+    fprintf(f, "# Where the chat box sits, 0..100 across and up the room the open box leaves;\n");
+    fprintf(f, "# and whether the talk is hidden (F2).\n");
+    fprintf(f, "ChatPosX=%d\n", g_chatPosX);
+    fprintf(f, "ChatPosY=%d\n", g_chatPosY);
+    fprintf(f, "ChatHidden=%d\n", g_chatHidden);
+    fprintf(f, "# The F1 menu in its own window (for a second monitor): 0 off, 1 on.\n");
+    fprintf(f, "F1PopOut=%d\n", g_f1PopOut);
     fprintf(f, "# The chat box: text and header size, how wide it is, how many lines the open box\n");
     fprintf(f, "# holds, how long a line lingers with the box closed, and the panel behind it.\n");
     fprintf(f, "ChatTextSize=%d\n", g_chatTextSize);
@@ -264,6 +275,10 @@ int  MpPrefs_BubblePanel()    { return g_bubblePanel; }
 int  MpPrefs_BubbleBorder()   { return g_bubbleBorder; }
 int  MpPrefs_BubbleBlurPct()  { return g_bubbleBlurPct; }
 int  MpPrefs_BubblePanelPct() { return g_bubblePanelPct; }
+int  MpPrefs_F1PopOut()       { return g_f1PopOut; }
+int  MpPrefs_ChatPosX()       { return g_chatPosX; }
+int  MpPrefs_ChatPosY()       { return g_chatPosY; }
+int  MpPrefs_ChatHidden()     { return g_chatHidden; }
 int  MpPrefs_ChatTextSize() { return g_chatTextSize; }
 int  MpPrefs_ChatSmallSize() { return g_chatSmallSize; }
 int  MpPrefs_ChatWidth()    { return g_chatWidth; }
@@ -320,6 +335,10 @@ OMP_CHAT_SETTER(MpPrefs_SetBubbleBorder, g_bubbleBorder, 0, 1)
 OMP_CHAT_SETTER(MpPrefs_SetBubbleBlurPct, g_bubbleBlurPct, 0, 100)
 OMP_CHAT_SETTER(MpPrefs_SetNameTextSize,  g_nameTextSize,  MPNAME_TEXT_MIN, MPNAME_TEXT_MAX)
 OMP_CHAT_SETTER(MpPrefs_SetBubblePanelPct, g_bubblePanelPct, 0, 100)
+OMP_CHAT_SETTER(MpPrefs_SetF1PopOut,       g_f1PopOut,       0, 1)
+OMP_CHAT_SETTER(MpPrefs_SetChatPosX,       g_chatPosX,       0, 100)
+OMP_CHAT_SETTER(MpPrefs_SetChatPosY,       g_chatPosY,       0, 100)
+OMP_CHAT_SETTER(MpPrefs_SetChatHidden,     g_chatHidden,     0, 1)
 #undef OMP_CHAT_SETTER
 
 void MpPrefs_Init(const char* dir, void (*logf)(const char*)) {
@@ -354,6 +373,10 @@ void MpPrefs_Init(const char* dir, void (*logf)(const char*)) {
             else if (!_stricmp(key, "BubbleBorder")) g_bubbleBorder = clampI(atoi(val), 0, 1);
             else if (!_stricmp(key, "BubbleBlurPct")) g_bubbleBlurPct = clampI(atoi(val), 0, 100);
             else if (!_stricmp(key, "BubblePanelPct")) g_bubblePanelPct = clampI(atoi(val), 0, 100);
+            else if (!_stricmp(key, "F1PopOut"))  g_f1PopOut = clampI(atoi(val), 0, 1);
+            else if (!_stricmp(key, "ChatPosX"))  g_chatPosX = clampI(atoi(val), 0, 100);
+            else if (!_stricmp(key, "ChatPosY"))  g_chatPosY = clampI(atoi(val), 0, 100);
+            else if (!_stricmp(key, "ChatHidden")) g_chatHidden = clampI(atoi(val), 0, 1);
             else if (!_stricmp(key, "ChatTextSize")) g_chatTextSize = clampI(atoi(val), MPCHAT_TEXT_MIN, MPCHAT_TEXT_MAX);
             else if (!_stricmp(key, "ChatSmallSize")) g_chatSmallSize = clampI(atoi(val), MPCHAT_SMALL_MIN, MPCHAT_SMALL_MAX);
             else if (!_stricmp(key, "ChatWidth"))    g_chatWidth    = clampI(atoi(val), MPCHAT_WIDTH_MIN, MPCHAT_WIDTH_MAX);

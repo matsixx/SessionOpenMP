@@ -27,6 +27,9 @@ void        Emote_StopButton(bool down);
 void        Emote_NextVariant();
 float       Emote_StopRing();
 bool        Emote_Active();
+bool        Emote_AimView(float* weight, int* side);   // a throw is up: how far over the shoulder (0..1), +1 right / -1 left
+bool        Emote_ThrowHeld();                         // LT is holding a throw up (armed, not yet thrown): Y must not mount
+bool        Emote_BlocksMount();                       // an emote is up or asked for: Y must not get on the board (542)
 bool        Emote_WantsStick();          // the right stick is an emote's just now (the board tap): the camera does not get it
 void        Emote_Stick(float rx, float ry);    // ...and this is where it goes, every input tick
 void        Emote_Trigger(float rt);            // the right trigger, 0..1, whenever the pad reports it (always fed)

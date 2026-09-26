@@ -276,6 +276,8 @@ static bool          g_injNoCrankSaid = false;
 static volatile long      g_padAllow = 0;         // written by the pump, read by the pad hook
 static volatile long      g_padSw    = 0;         // pump: switch stance -- the stick roles swap
 static volatile long      g_padGrind = 0;         // pump: grinding/liptrick -- total hands-off
+static volatile long      g_padAir = 0;           // pump: airborne -- total hands-off once it holds (515)
+static volatile long      g_handsOffCuts = 0;     // hook: gestures the air/grind rule cut short (pump logs)
 static volatile long      g_padModeDbg = 0;       // hook: bit0 = nollie family, bit1 = switch --
                                                   // published so the log can finally SHOW which
                                                   // family the machine was in at any moment
@@ -653,12 +655,21 @@ void PopProbe_PumpFrame() {
         }
         g_padAllow = allow;
         g_padGrind = grinding ? 1 : 0;            // grinds/liptricks: total hands-off (see hook)
+        g_padAir   = grounded ? 0 : 1;            // mid-air: the same (515)
         g_padCrank = crank ? 1 : 0;               // the pop machine's "game is cranked" signal
         // Log every input-mode transition -- the one state the log never showed, and the prime
         // suspect whenever a gesture reads on the wrong stick (mode decides which physical stick
         // the machine treats as crouch vs crank).
         // The quick-shove gate's visibility: every block shows up here, so the field log proves
         // whether the gate fired (count climbs) or the shove came from something else (silent).
+        {
+            static long saidCuts = 0;
+            const long c = g_handsOffCuts;
+            if (c != saidCuts) {
+                TwkLog("[pop] mid-air/grind hands-off cut a gesture short (%s, %ld so far)", grinding ? "grinding" : "in the air", c);
+                saidCuts = c;
+            }
+        }
         {
             static long saidBlocked = 0; static double saidAt3 = 0.0;
             const long b = g_quickBlocked;
@@ -713,7 +724,7 @@ void PopProbe_PumpFrame() {
                 if (home || settled) guardUntil = 0.0; else popGuard = true;
             }
             const bool danger = g_padActive || g_padArmed || popGuard;
-            g_forbidManual = (SchemeOn() && g_manualGate && physLive && danger) ? 1 : 0;
+            g_forbidManual = (SchemeOn() && g_manualGate && physLive && danger && !grinding) ? 1 : 0;   // never in a grind (515)
         }
         // The definitive field signal: log every flip of the skater's manual bits. If a manual
         // still starts with forbid=1 on this line, the funnel assumption is wrong -- an entry
@@ -1348,6 +1359,25 @@ static void PadMachine(PadState* st) {
     // grind is an instant exit pop -- the log showed INJECTING at rail entry followed 36 ms
     // later by a grindRatio=1.0 jump.
     const bool foreign = (now < foreignUntil) || g_padGrind != 0;
+    // MID-AIR AND GRINDS ARE THE GAME'S (515). "Pop control should not affect the game in any way while
+    // mid-air or in a grind": a 180 into a nosegrind would not land as one. The trick window stays open
+    // until the game drops its crank flag (up to 500 ms), and all the while it put the frozen crank on
+    // the pop stick whenever the thumb eased off -- past takeoff, the game read that with the grind
+    // orient (the nosegrind's one stick became two). Airborne (a bump of under 40 ms is not a jump;
+    // with a pop armed it IS one at once) or grinding: every stick passes raw, the whole machine resets,
+    // and the quick-shove gate goes cold -- nothing it held survives into the air or the next gesture.
+    {
+        static long long airSince = 0;
+        if (g_padAir) { if (!airSince) airSince = now; } else airSince = 0;
+        const bool air = airSince && (g_padArmed || (now - airSince) > freq / 25);
+        if (air || g_padGrind) {
+            if (g_padActive || g_padArmed || releasedAt || graceUntil) InterlockedIncrement(&g_handsOffCuts);
+            g_padActive = 0; g_padArmed = 0; synthAt = 0; graceUntil = 0; releasedAt = 0; downSince = 0;
+            lsFreed = lsMoved = false; bandMasked = false; downStillAt = 0; fastPolls = 0;
+            synRx = 0; synRy = -32767; g_padHotUntil = 0; foreignUntil = 0;
+            return;                                // the sticks go out exactly as they came in
+        }
+    }
     // Mode resolution (see the block comment above PadCommon). The mode may only change while the
     // machine is fully idle -- mid-crouch, mid-window, mid-grace, and through the release mask the
     // established mapping stands. Selection is by commitment: the candidate whose crouch stick is

@@ -2584,6 +2584,13 @@ bool CatchTweaks_LeftTrigger(float* out) {
         return true;
     } __except (EXCEPTION_EXECUTE_HANDLER) { g_piKeyValue = nullptr; return false; }
 }
+const char* CatchTweaks_TriggerWhy() {
+    if (!g_piKeyValue) return "GetKeyValue not found in this build, or it faulted";
+    if (!g_fnameCtor) return "the FName constructor not found";
+    if (!g_playerInput) return g_piRefused ? "the player input was refused (not in the object table when first seen)" : "no player input seen yet";
+    if (!SitUI_Alive(&g_playerInputRef)) return "the player input it had is gone (a level change) and no key has come through the new one";
+    return "the axis value was out of range";
+}
 static bool hkInputKey(void* self, void* key, int ev, float amt, bool pad) {
     if (self != g_playerInput && self != g_piRefused) {       // a new one (a level change): watched, or -- once -- refused
         g_playerInput = self; SitUI_Track(&g_playerInputRef, self);

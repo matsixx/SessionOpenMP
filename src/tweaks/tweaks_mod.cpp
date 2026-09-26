@@ -47,8 +47,11 @@
 #include "cloth_sim.h"
 #include "pitch_range.h"
 #include "foot_place.h"
+#include "board_stance.h"
 #include "foot_steer.h"
 #include "grind_pop.h"
+#include "grind_rock.h"
+#include "grind_lean.h"
 #include "camera_height.h"
 #include "cam_fp.h"
 #include "sit.h"
@@ -65,7 +68,7 @@
 #include "ue4ss_abi.h"
 #include "ui/menu_ext.h"
 
-#define TWEAKS_VERSION "3.19.387"
+#define TWEAKS_VERSION "3.19.543"
 #define TWK_WIDEN(x) STR(x)   // STR() prepends L before the macro expands; expand first
 
 // ------------------------------------------------------------------ log (own file, fresh per launch)
@@ -104,7 +107,10 @@ static void saveSettings() {
     PitchRange_SaveConfig(buf, sizeof(buf));
     FootPlace_SaveConfig(buf, sizeof(buf));
     FootSteer_SaveConfig(buf, sizeof(buf));
+    Stance_SaveConfig(buf, sizeof(buf));
     GrindPop_SaveConfig(buf, sizeof(buf));
+    GrindRock_SaveConfig(buf, sizeof(buf));
+    GrindLean_SaveConfig(buf, sizeof(buf));
     PopProbe_SaveConfig(buf, sizeof(buf));
     BodyFeel_SaveConfig(buf, sizeof(buf));
     CameraHeight_SaveConfig(buf, sizeof(buf));
@@ -148,7 +154,10 @@ static void readConfig(const char* dir) {
     PitchRange_ReadConfig(buf);
     FootPlace_ReadConfig(buf);
     FootSteer_ReadConfig(buf);
+    Stance_ReadConfig(buf);
     GrindPop_ReadConfig(buf);
+    GrindRock_ReadConfig(buf);
+    GrindLean_ReadConfig(buf);
     PopProbe_ReadConfig(buf);
     BodyFeel_ReadConfig(buf);
     CameraHeight_ReadConfig(buf);
@@ -184,7 +193,10 @@ static void resetAllDefaults() {
     PitchRange_ResetDefaults();
     FootPlace_ResetDefaults();
     FootSteer_ResetDefaults();
+    Stance_ResetDefaults();
     GrindPop_ResetDefaults();
+    GrindRock_ResetDefaults();
+    GrindLean_ResetDefaults();
     PopProbe_ResetDefaults();
     BodyFeel_ResetDefaults();
     CameraHeight_ResetDefaults();
@@ -227,8 +239,8 @@ static void drawSection(const OmpMenuApi* api, void*) {
     static DrawFn const kBoard[]  = { FlipSpeed_DrawMenu, ScoopSpeed_DrawMenu, PitchRange_DrawMenu };
     static DrawFn const kCatch[]  = { CatchTweaks_DrawMenu, CatchLevel_DrawMenu, CatchSound_DrawMenu,
                                       RunOut_DrawMenu };
-    static DrawFn const kGrind[]  = { GrindPop_DrawMenu };
-    static DrawFn const kFeet[]   = { FootPlace_DrawMenu, FootSteer_DrawMenu };
+    static DrawFn const kGrind[]  = { GrindPop_DrawMenu, GrindRock_DrawMenu, GrindLean_DrawMenu };
+    static DrawFn const kFeet[]   = { FootPlace_DrawMenu, FootSteer_DrawMenu, Stance_DrawMenu };
     static DrawFn const kCamera[] = { CameraHeight_DrawMenu };
     static DrawFn const kCloth[]  = { ClothMerge_DrawMenu, ClothSim_DrawMenu };
     static DrawFn const kSit[]    = { Sit_DrawMenu, Radial_DrawMenu };
@@ -279,6 +291,15 @@ static const char* const kTwkGPitch   = "TwkGrindPitch";
 static const char* const kTwkGPitchAmt = "TwkGrindPitchAmt";
 static const char* const kTwkGSwing   = "TwkGrindSwing";
 static const char* const kTwkGSwingAmt = "TwkGrindSwingAmt";
+static const char* const kTwkGRock    = "TwkGrindRock";
+static const char* const kTwkGRockDeg = "TwkGrindRockDeg";
+static const char* const kTwkGRockCrv = "TwkGrindRockCurve";
+static const char* const kTwkGRockSway = "TwkGrindRockSway";
+static const char* const kTwkGLean     = "TwkGrindLean";
+static const char* const kTwkGLeanAmt  = "TwkGrindLeanAmt";
+static const char* const kTwkGLeanRoll = "TwkGrindLeanRoll";
+static const char* const kTwkGLeanGive = "TwkGrindLeanGive";
+static const char* const kTwkGLeanFric = "TwkGrindLeanFric";
 static const char* const kTwkPitch    = "TwkPitchRange";
 static const char* const kTwkPitchAmt = "TwkPitchSpread";
 static const char* const kTwkClickCat = "TwkCatchClickToCatch";
@@ -291,15 +312,40 @@ static const char* const kTwkCamFollow    = "TwkCamFollow";
 static const char* const kTwkCamPitchDrop = "TwkCamPitchDrop";
 static const char* const kTwkCamPitch  = "TwkCamPitch";
 static const char* const kTwkCamFp     = "TwkCamFirstPerson";
+static const char* const kTwkCamAim      = "TwkCamAim";
+static const char* const kTwkCamAimIn    = "TwkCamAimIn";
+static const char* const kTwkCamAimSide  = "TwkCamAimSide";
+static const char* const kTwkCamAimUp    = "TwkCamAimUp";
+static const char* const kTwkCamAimZoom  = "TwkCamAimZoom";
+static const char* const kTwkCamFootDist = "TwkCamFootDist";
+static const char* const kTwkCamFootUp   = "TwkCamFootUp";
+static const char* const kTwkCamFootSide = "TwkCamFootSide";
+static const char* const kTwkCamFootFov  = "TwkCamFootFov";
+static const char* const kTwkCamFootTilt = "TwkCamFootTilt";
+static const char* const kTwkCamSitDist  = "TwkCamSitDist";
+static const char* const kTwkCamSitUp    = "TwkCamSitUp";
+static const char* const kTwkCamSitSide  = "TwkCamSitSide";
+static const char* const kTwkCamSitFov   = "TwkCamSitFov";
+static const char* const kTwkCamSitTilt  = "TwkCamSitTilt";
+static const char* const kTwkSitFp       = "TwkSitFp";
+static const char* const kTwkSitFpFov    = "TwkSitFpFov";
+static const char* const kTwkSitLookSpd  = "TwkSitLookSpd";
+static const char* const kTwkSitLookInv  = "TwkSitLookInv";
+static const char* const kTwkSitLookYaw  = "TwkSitLookYaw";
+static const char* const kTwkSitLookUp   = "TwkSitLookUp";
+static const char* const kTwkSitLookDown = "TwkSitLookDown";
 static const char* const kTwkFlip     = "TwkFlipSpeed";
 static const char* const kTwkFlipMin  = "TwkFlipVelMin";
 static const char* const kTwkFlipMax  = "TwkFlipVelMax";
 static const char* const kTwkSteer    = "TwkFootSteer";
-static const char* const kTwkSteerCm  = "TwkFootSteerReach";
-static const char* const kTwkSteerMs  = "TwkFootSteerResponse";
+static const char* const kTwkSteerCmF = "TwkFootSteerReachFront";
+static const char* const kTwkSteerCmB = "TwkFootSteerReachBack";
+static const char* const kTwkSteerMsF = "TwkFootSteerResponseFront";
+static const char* const kTwkSteerMsB = "TwkFootSteerResponseBack";
 static const char* const kTwkSteerAxX = "TwkFootSteerAxisX";
 static const char* const kTwkSteerAxY = "TwkFootSteerAxisY";
-static const char* const kTwkSteerTw  = "TwkFootSteerTwistDeg";
+static const char* const kTwkSteerTwF = "TwkFootSteerTwistFront";
+static const char* const kTwkSteerTwB = "TwkFootSteerTwistBack";
 static const char* const kTwkSteerTwA = "TwkFootSteerTwistAxis";
 static const char* const kTwkBone     = "TwkBoneScalePct";
 static const char* const kTwkBoneX    = "TwkBoneAddX";
@@ -338,6 +384,7 @@ static const char* const kTwkSitMaxLedge = "TwkSitMaxLedge";
 static const char* const kTwkSitReach    = "TwkSitReach";
 static const char* const kTwkSitLean     = "TwkSitLean";
 static const char* const kTwkHeadLook    = "TwkHeadLook";
+static const char* const kTwkSitKnock    = "TwkSitBoardKnockdown";
 static const char* const kTwkRadial      = "TwkRadial";
 static const char* const kTwkRadialLeft  = "TwkRadialLeft";
 // "Style settings"
@@ -371,8 +418,42 @@ static void pageSelect(const char* key, void*) {
 
 // A toggle or slider CHANGED. `iv` is the option index, `fv` the slider's value in the units the
 // page registered.
+// Camera > Sitting (537), its own chain: pageValue/pageGet's else-if chains are at MSVC's nesting limit (C1061).
+static bool pageValueSitCam(const char* key, int iv, float fv) {
+    if      (!strcmp(key, kTwkCamSitDist))  CameraHeight_SetSitDist(fv);
+    else if (!strcmp(key, kTwkCamSitUp))    CameraHeight_SetSitUp(fv);
+    else if (!strcmp(key, kTwkCamSitSide))  CameraHeight_SetSitSide(fv);
+    else if (!strcmp(key, kTwkCamSitFov))   CameraHeight_SetSitFov(fv);
+    else if (!strcmp(key, kTwkCamSitTilt))  CameraHeight_SetSitTilt(fv);
+    else if (!strcmp(key, kTwkSitFp))       Sit_SetFpEnabled(iv != 0);
+    else if (!strcmp(key, kTwkSitFpFov))    Sit_SetFpFov(fv);
+    else if (!strcmp(key, kTwkSitLookSpd))  Sit_SetLookSpeed(fv);
+    else if (!strcmp(key, kTwkSitLookInv))  Sit_SetLookInvertY(iv != 0);
+    else if (!strcmp(key, kTwkSitLookYaw))  Sit_SetLookYawDeg(fv);
+    else if (!strcmp(key, kTwkSitLookUp))   Sit_SetLookUpDeg(fv);
+    else if (!strcmp(key, kTwkSitLookDown)) Sit_SetLookDownDeg(fv);
+    else return false;
+    return true;
+}
+static int pageGetSitCam(const char* key, int* oi, float* of) {
+    if      (!strcmp(key, kTwkCamSitDist))  *of = CameraHeight_SitDist();
+    else if (!strcmp(key, kTwkCamSitUp))    *of = CameraHeight_SitUp();
+    else if (!strcmp(key, kTwkCamSitSide))  *of = CameraHeight_SitSide();
+    else if (!strcmp(key, kTwkCamSitFov))   *of = CameraHeight_SitFov();
+    else if (!strcmp(key, kTwkCamSitTilt))  *of = CameraHeight_SitTilt();
+    else if (!strcmp(key, kTwkSitFp))       *oi = Sit_FpEnabled() ? 1 : 0;
+    else if (!strcmp(key, kTwkSitFpFov))    *of = Sit_FpFov();
+    else if (!strcmp(key, kTwkSitLookSpd))  *of = Sit_LookSpeed();
+    else if (!strcmp(key, kTwkSitLookInv))  *oi = Sit_LookInvertY() ? 1 : 0;
+    else if (!strcmp(key, kTwkSitLookYaw))  *of = Sit_LookYawDeg();
+    else if (!strcmp(key, kTwkSitLookUp))   *of = Sit_LookUpDeg();
+    else if (!strcmp(key, kTwkSitLookDown)) *of = Sit_LookDownDeg();
+    else return 0;
+    return 1;
+}
 static void pageValue(const char* key, int iv, float fv, void*) {
     if (!key) return;
+    if (pageValueSitCam(key, iv, fv)) return;
     if      (!strcmp(key, kTwkScoop))  ScoopSpeed_SetEnabled(iv != 0);
     else if (!strcmp(key, kTwkCatch))  CatchTweaks_SetEnabled(iv != 0);
     else if (!strcmp(key, kTwkRunOut)) RunOut_SetEnabled(iv != 0);
@@ -392,17 +473,29 @@ static void pageValue(const char* key, int iv, float fv, void*) {
     else if (!strcmp(key, kTwkGPitchAmt)) GrindPop_SetPitchScale(fv);
     else if (!strcmp(key, kTwkGSwing))    GrindPop_SetSwingEnabled(iv != 0);
     else if (!strcmp(key, kTwkGSwingAmt)) GrindPop_SetSwingBlend(fv);
+    else if (!strcmp(key, kTwkGRock))     GrindRock_SetEnabled(iv != 0);
+    else if (!strcmp(key, kTwkGRockDeg))  GrindRock_SetMaxDeg(fv);
+    else if (!strcmp(key, kTwkGRockCrv))  GrindRock_SetSoftness(fv);
+    else if (!strcmp(key, kTwkGRockSway)) GrindRock_SetSwayDeg(fv);
+    else if (!strcmp(key, kTwkGLean))     GrindLean_SetEnabled(iv != 0);
+    else if (!strcmp(key, kTwkGLeanAmt))  GrindLean_SetStrength(fv);
+    else if (!strcmp(key, kTwkGLeanRoll)) GrindLean_SetRollPct(fv);
+    else if (!strcmp(key, kTwkGLeanGive)) GrindLean_SetTruckGive(fv);
+    else if (!strcmp(key, kTwkGLeanFric)) GrindLean_SetFriction(fv);
     else if (!strcmp(key, kTwkPitch))     PitchRange_SetEnabled(iv != 0);
     else if (!strcmp(key, kTwkPitchAmt))  PitchRange_SetMaxAngleDeg(fv);
     else if (!strcmp(key, kTwkFlip))      FlipSpeed_SetEnabled(iv != 0);
     else if (!strcmp(key, kTwkFlipMin))   FlipSpeed_SetVelMin(fv);
     else if (!strcmp(key, kTwkFlipMax))   FlipSpeed_SetVelMax(fv);
     else if (!strcmp(key, kTwkSteer))     FootSteer_SetEnabled(iv != 0);
-    else if (!strcmp(key, kTwkSteerCm))   FootSteer_SetReachCm(fv);
-    else if (!strcmp(key, kTwkSteerMs))   FootSteer_SetResponseMs(fv);
+    else if (!strcmp(key, kTwkSteerCmF))  FootSteer_SetReachCm(0, fv);
+    else if (!strcmp(key, kTwkSteerCmB))  FootSteer_SetReachCm(1, fv);
+    else if (!strcmp(key, kTwkSteerMsF))  FootSteer_SetResponseMs(0, fv);
+    else if (!strcmp(key, kTwkSteerMsB))  FootSteer_SetResponseMs(1, fv);
     else if (!strcmp(key, kTwkSteerAxX))  FootSteer_SetAxisX(fv);
     else if (!strcmp(key, kTwkSteerAxY))  FootSteer_SetAxisY(fv);
-    else if (!strcmp(key, kTwkSteerTw))   FootSteer_SetTwistDeg(fv);
+    else if (!strcmp(key, kTwkSteerTwF))  FootSteer_SetTwistDeg(0, fv);
+    else if (!strcmp(key, kTwkSteerTwB))  FootSteer_SetTwistDeg(1, fv);
     else if (!strcmp(key, kTwkSteerTwA))  FootSteer_SetTwistAxis(fv);
     else if (!strcmp(key, kTwkBone))      CatchTweaks_SetBoneScalePct(fv);
     else if (!strcmp(key, kTwkBoneX))     CatchTweaks_SetBoneAdd(0, fv);
@@ -417,6 +510,16 @@ static void pageValue(const char* key, int iv, float fv, void*) {
     else if (!strcmp(key, kTwkCamPitchDrop)) CameraHeight_SetPitchOnDropEnabled(iv != 0);
     else if (!strcmp(key, kTwkCamPitch))  CameraHeight_SetPitchDeg(fv);
     else if (!strcmp(key, kTwkCamFp))     CamFp_SetEnabled(iv != 0);
+    else if (!strcmp(key, kTwkCamAim))      CameraHeight_SetAimOn(iv != 0);
+    else if (!strcmp(key, kTwkCamAimIn))    CameraHeight_SetAimIn(fv);
+    else if (!strcmp(key, kTwkCamAimSide))  CameraHeight_SetAimSide(fv);
+    else if (!strcmp(key, kTwkCamAimUp))    CameraHeight_SetAimUp(fv);
+    else if (!strcmp(key, kTwkCamAimZoom))  CameraHeight_SetAimZoom(fv);
+    else if (!strcmp(key, kTwkCamFootDist)) CameraHeight_SetFootDist(fv);
+    else if (!strcmp(key, kTwkCamFootUp))   CameraHeight_SetFootUp(fv);
+    else if (!strcmp(key, kTwkCamFootSide)) CameraHeight_SetFootSide(fv);
+    else if (!strcmp(key, kTwkCamFootFov))  CameraHeight_SetFootFov(fv);
+    else if (!strcmp(key, kTwkCamFootTilt)) CameraHeight_SetFootTilt(fv);
     else if (!strcmp(key, kTwkBodyFeel))  BodyFeel_SetEnabled(iv != 0);
     else if (!strcmp(key, kTwkBodyAmt))   BodyFeel_SetAmountPct(fv);
     else if (!strcmp(key, kTwkBrace))     BodyFeel_SetBraceEnabled(iv != 0);
@@ -445,6 +548,7 @@ static void pageValue(const char* key, int iv, float fv, void*) {
     else if (!strcmp(key, kTwkSitReach))    Sit_SetReachCm(fv);
     else if (!strcmp(key, kTwkSitLean))     Sit_SetLeanDeg(fv);
     else if (!strcmp(key, kTwkHeadLook))    Sit_SetHeadLook(iv != 0);
+    else if (!strcmp(key, kTwkSitKnock))    Sit_SetBoardKnockdown(iv != 0);
     else if (!strcmp(key, kTwkRadial))      Radial_SetEnabled(iv != 0);
     else if (!strcmp(key, kTwkRadialLeft))  Radial_SetLeftStick(iv != 0);
     else if (!strcmp(key, kTwkArmLoose))   BodyFeel_SetArmLoosePct(fv);
@@ -470,6 +574,7 @@ static void pageValue(const char* key, int iv, float fv, void*) {
 // ...and what it is set to RIGHT NOW, so a row opens showing the truth instead of a default.
 static int pageGet(const char* key, int* oi, float* of, void*) {
     if (!key) return 0;
+    if (pageGetSitCam(key, oi, of)) return 1;
     if      (!strcmp(key, kTwkScoop))  { *oi = ScoopSpeed_Enabled()  ? 1 : 0; return 1; }
     else if (!strcmp(key, kTwkCatch))  { *oi = CatchTweaks_Enabled() ? 1 : 0; return 1; }
     else if (!strcmp(key, kTwkRunOut)) { *oi = RunOut_Enabled()      ? 1 : 0; return 1; }
@@ -489,17 +594,29 @@ static int pageGet(const char* key, int* oi, float* of, void*) {
     else if (!strcmp(key, kTwkGPitchAmt)) { *of = GrindPop_PitchScale();           return 1; }
     else if (!strcmp(key, kTwkGSwing))    { *oi = GrindPop_SwingEnabled() ? 1 : 0; return 1; }
     else if (!strcmp(key, kTwkGSwingAmt)) { *of = GrindPop_SwingBlend();           return 1; }
+    else if (!strcmp(key, kTwkGRock))     { *oi = GrindRock_Enabled() ? 1 : 0;     return 1; }
+    else if (!strcmp(key, kTwkGRockDeg))  { *of = GrindRock_MaxDeg();              return 1; }
+    else if (!strcmp(key, kTwkGRockCrv))  { *of = GrindRock_Softness();            return 1; }
+    else if (!strcmp(key, kTwkGRockSway)) { *of = GrindRock_SwayDeg();             return 1; }
+    else if (!strcmp(key, kTwkGLean))     { *oi = GrindLean_Enabled() ? 1 : 0;     return 1; }
+    else if (!strcmp(key, kTwkGLeanAmt))  { *of = GrindLean_Strength();            return 1; }
+    else if (!strcmp(key, kTwkGLeanRoll)) { *of = GrindLean_RollPct();             return 1; }
+    else if (!strcmp(key, kTwkGLeanGive)) { *of = GrindLean_TruckGive();           return 1; }
+    else if (!strcmp(key, kTwkGLeanFric)) { *of = GrindLean_Friction();            return 1; }
     else if (!strcmp(key, kTwkPitch))     { *oi = PitchRange_Enabled() ? 1 : 0;    return 1; }
     else if (!strcmp(key, kTwkPitchAmt))  { *of = PitchRange_MaxAngleDeg();        return 1; }
     else if (!strcmp(key, kTwkFlip))      { *oi = FlipSpeed_Enabled() ? 1 : 0;     return 1; }
     else if (!strcmp(key, kTwkFlipMin))   { *of = FlipSpeed_VelMin();              return 1; }
     else if (!strcmp(key, kTwkFlipMax))   { *of = FlipSpeed_VelMax();              return 1; }
     else if (!strcmp(key, kTwkSteer))     { *oi = FootSteer_Enabled() ? 1 : 0;     return 1; }
-    else if (!strcmp(key, kTwkSteerCm))   { *of = FootSteer_ReachCm();             return 1; }
-    else if (!strcmp(key, kTwkSteerMs))   { *of = FootSteer_ResponseMs();          return 1; }
+    else if (!strcmp(key, kTwkSteerCmF))  { *of = FootSteer_ReachCm(0);            return 1; }
+    else if (!strcmp(key, kTwkSteerCmB))  { *of = FootSteer_ReachCm(1);            return 1; }
+    else if (!strcmp(key, kTwkSteerMsF))  { *of = FootSteer_ResponseMs(0);         return 1; }
+    else if (!strcmp(key, kTwkSteerMsB))  { *of = FootSteer_ResponseMs(1);         return 1; }
     else if (!strcmp(key, kTwkSteerAxX))  { *of = FootSteer_AxisX();              return 1; }
     else if (!strcmp(key, kTwkSteerAxY))  { *of = FootSteer_AxisY();              return 1; }
-    else if (!strcmp(key, kTwkSteerTw))   { *of = FootSteer_TwistDeg();           return 1; }
+    else if (!strcmp(key, kTwkSteerTwF))  { *of = FootSteer_TwistDeg(0);          return 1; }
+    else if (!strcmp(key, kTwkSteerTwB))  { *of = FootSteer_TwistDeg(1);          return 1; }
     else if (!strcmp(key, kTwkSteerTwA))  { *of = FootSteer_TwistAxis();          return 1; }
     else if (!strcmp(key, kTwkCloth))     { *oi = ClothSim_Enabled() ? 1 : 0;    return 1; }
     else if (!strcmp(key, kTwkClothMove)) { *of = ClothSim_TravelCm();            return 1; }
@@ -510,6 +627,16 @@ static int pageGet(const char* key, int* oi, float* of, void*) {
     else if (!strcmp(key, kTwkCamPitchDrop)) { *oi = CameraHeight_PitchOnDropEnabled() ? 1 : 0; return 1; }
     else if (!strcmp(key, kTwkCamPitch))  { *of = CameraHeight_PitchDeg();            return 1; }
     else if (!strcmp(key, kTwkCamFp))     { *oi = CamFp_Enabled() ? 1 : 0;            return 1; }
+    else if (!strcmp(key, kTwkCamAim))      { *oi = CameraHeight_AimOn() ? 1 : 0;       return 1; }
+    else if (!strcmp(key, kTwkCamAimIn))    { *of = CameraHeight_AimIn();               return 1; }
+    else if (!strcmp(key, kTwkCamAimSide))  { *of = CameraHeight_AimSide();             return 1; }
+    else if (!strcmp(key, kTwkCamAimUp))    { *of = CameraHeight_AimUp();               return 1; }
+    else if (!strcmp(key, kTwkCamAimZoom))  { *of = CameraHeight_AimZoom();             return 1; }
+    else if (!strcmp(key, kTwkCamFootDist)) { *of = CameraHeight_FootDist();            return 1; }
+    else if (!strcmp(key, kTwkCamFootUp))   { *of = CameraHeight_FootUp();              return 1; }
+    else if (!strcmp(key, kTwkCamFootSide)) { *of = CameraHeight_FootSide();            return 1; }
+    else if (!strcmp(key, kTwkCamFootFov))  { *of = CameraHeight_FootFov();             return 1; }
+    else if (!strcmp(key, kTwkCamFootTilt)) { *of = CameraHeight_FootTilt();            return 1; }
     else if (!strcmp(key, kTwkBone))      { *of = CatchTweaks_BoneScalePct();          return 1; }
     else if (!strcmp(key, kTwkBoneX))     { *of = CatchTweaks_BoneAdd(0);              return 1; }
     else if (!strcmp(key, kTwkBoneY))     { *of = CatchTweaks_BoneAdd(1);              return 1; }
@@ -542,6 +669,7 @@ static int pageGet(const char* key, int* oi, float* of, void*) {
     else if (!strcmp(key, kTwkSitReach))    { *of = Sit_ReachCm();                      return 1; }
     else if (!strcmp(key, kTwkSitLean))     { *of = Sit_LeanDeg();                      return 1; }
     else if (!strcmp(key, kTwkHeadLook))    { *oi = Sit_HeadLook() ? 1 : 0;             return 1; }
+    else if (!strcmp(key, kTwkSitKnock))    { *oi = Sit_BoardKnockdown() ? 1 : 0;       return 1; }
     else if (!strcmp(key, kTwkRadial))      { *oi = Radial_Enabled() ? 1 : 0;           return 1; }
     else if (!strcmp(key, kTwkRadialLeft))  { *oi = Radial_LeftStick() ? 1 : 0;          return 1; }
     else if (!strcmp(key, kTwkArmLoose))   { *of = BodyFeel_ArmLoosePct();    return 1; }
@@ -639,18 +767,41 @@ static const OmpPageItem2 kTwkGrindItems[] = {
     { OMP_ITEM_TOGGLE, kTwkGSwing,    "Pop swing out of grinds",   "The board drops its tail before popping out of a grind" },
     { OMP_ITEM_SLIDER, kTwkGSwingAmt, "  Swing amount (%)",   "100 = the trick's full pop swing",
       nullptr, nullptr, 0.0f, 100.0f, 10.0f },
+    { OMP_ITEM_TOGGLE, kTwkGRock,     "Boardslide rocking",  "On a boardslide, ease off one stick and that end of the board rises" },
+    { OMP_ITEM_SLIDER, kTwkGRockDeg,  "  Tilt strength",     "How far easing a stick tips the board (4 = about 25 degrees at half a stick)",
+      nullptr, nullptr, 0.0f, 35.0f, 1.0f },
+    { OMP_ITEM_SLIDER, kTwkGRockCrv,  "  Softness",          "0 = linear. Higher = a slight ease barely tips the board and the lean builds toward a full release",
+      nullptr, nullptr, 0.0f, 20.0f, 1.0f },
+    { OMP_ITEM_SLIDER, kTwkGRockSway, "  Natural rock (deg)", "The board teeters as a boardslide starts, then sways as you balance; 0 = none",
+      nullptr, nullptr, 0.0f, 10.0f, 1.0f },
+    { OMP_ITEM_TOGGLE, kTwkGLean,     "Grind lean", "Push the held stick a little to the side to lean your weight; on two-stick grinds push both sticks the same way" },
+    { OMP_ITEM_SLIDER, kTwkGLeanAmt,  "  Lean strength (%)",  "100 = as far as the game leans you when carving",
+      nullptr, nullptr, 0.0f, 200.0f, 10.0f },
+    { OMP_ITEM_SLIDER, kTwkGLeanRoll, "  Board roll (%)",     "Extra roll at a full push, past your trucks' own max (looser trucks roll further); 0 = body only",
+      nullptr, nullptr, 0.0f, 400.0f, 10.0f },
+    { OMP_ITEM_SLIDER, kTwkGLeanGive, "  Truck give (%)",     "The grinding truck loosens as you lean so the deck rolls over it (wheel bite); your tightness returns after",
+      nullptr, nullptr, 0.0f, 100.0f, 5.0f },
+    { OMP_ITEM_SLIDER, kTwkGLeanFric, "  Grind friction (%)", "Ledges: lean into it to dig in and slow down, away to ride light. Rails: leaning either way slows you",
+      nullptr, nullptr, 0.0f, 200.0f, 10.0f },
 };
 static const OmpPageItem2 kTwkFeetItems[] = {
     { OMP_ITEM_TOGGLE, kTwkSteer,    "Mid-trick foot control", "The sticks move your feet in the air; fast flicks are still the catch" },
-    { OMP_ITEM_SLIDER, kTwkSteerCm,  "  Reach (cm)",          "How far a fully pushed stick moves that foot. Past the leg's reach the foot stops travelling and buzzes",
+    // Per foot: front = the leading foot, back = the trailing one, following goofy and switch.
+    { OMP_ITEM_SLIDER, kTwkSteerCmF, "  Front foot reach (cm)", "How far a fully pushed stick moves the leading foot. Past the leg's reach the foot stops travelling and buzzes",
       nullptr, nullptr, 2.0f, 80.0f, 2.0f },
-    // Lower is quicker AND closer to a flick, so this slider is the discriminator: it is what decides
-    // whether a catch flick can drag the foot before the veto catches it.
-    { OMP_ITEM_SLIDER, kTwkSteerMs,  "  Response (ms)",       "Stick to full reach; lower is quicker but closer to a flick",
+    { OMP_ITEM_SLIDER, kTwkSteerCmB, "  Back foot reach (cm)",  "How far a fully pushed stick moves the trailing foot. Past the leg's reach the foot stops travelling and buzzes",
+      nullptr, nullptr, 2.0f, 80.0f, 2.0f },
+    // Lower is quicker AND closer to a flick, so these sliders are the discriminator: they decide
+    // whether a catch flick can drag that foot before the veto catches it.
+    { OMP_ITEM_SLIDER, kTwkSteerMsF, "  Front foot response (ms)", "Stick to full reach for the leading foot; lower is quicker but closer to a flick",
+      nullptr, nullptr, 100.0f, 800.0f, 25.0f },
+    { OMP_ITEM_SLIDER, kTwkSteerMsB, "  Back foot response (ms)",  "Stick to full reach for the trailing foot; lower is quicker but closer to a flick",
       nullptr, nullptr, 100.0f, 800.0f, 25.0f },
     // The three axis-mapping sliders stay in F1 and the ini only: they are dialled in once and then
     // never touched, and the page has no room for rows nobody adjusts.
-    { OMP_ITEM_SLIDER, kTwkSteerTw,  "  Foot twist (deg)",    "Push up and the toe swings forward, pull back and it swings back; 0 = move only",
+    { OMP_ITEM_SLIDER, kTwkSteerTwF, "  Front foot twist (deg)", "Push up and the leading toe swings forward, pull back and it swings back; 0 = move only",
+      nullptr, nullptr, 0.0f, 20.0f, 1.0f },
+    { OMP_ITEM_SLIDER, kTwkSteerTwB, "  Back foot twist (deg)",  "Push up and the trailing toe swings forward, pull back and it swings back; 0 = move only",
       nullptr, nullptr, 0.0f, 20.0f, 1.0f },
     { OMP_ITEM_SLIDER, kTwkBone,     "Boned ollie (%)",      "The game's own bone: 100 is stock, 0 removes it, higher shoves the board further",
       nullptr, nullptr, 0.0f, 300.0f, 10.0f },
@@ -827,6 +978,8 @@ static const OmpPageItem2 kTwkSitItems[] = {
     { OMP_ITEM_SLIDER, kTwkSitLean,     "  Torso lean (deg)",
       "Extra lean while seated: positive leans forward, negative back",
       nullptr, nullptr, -25.0f, 25.0f, 1.0f },
+    { OMP_ITEM_TOGGLE, kTwkSitKnock,    "Thrown boards knock you over",
+      "Someone else's board hitting you bails you. Off: you still hear it and it bounces off you, but you stay on your feet" },
     { OMP_ITEM_TOGGLE, kTwkHeadLook,    "Head follows the camera",
       "Off the board, the head turns to look where the camera looks -- as far as a neck goes, then it holds, then it comes back" },
     { OMP_ITEM_TOGGLE, kTwkRadial,      "Radial menu",
@@ -859,7 +1012,17 @@ static const OmpPageItem2 kTwkPopItems[] = {
       "exactly",
       nullptr, nullptr, 0.0f, 400.0f, 10.0f },
 };
+// The Camera page (524): first person, then ON BOARD (the riding camera) and OFF BOARD (walking around,
+// which the game gives no settings for) as their own pages.
 static const OmpPageItem2 kTwkCameraItems[] = {
+    { OMP_ITEM_TOGGLE, kTwkCamFp, "First person",
+      "See through your skater's eyes. Switches back to third person when you bail" },
+    { OMP_ITEM_PAGE, "On board",  "On board",  "The riding camera: height follow, the drop pitch, the pitch while you ride" },
+    { OMP_ITEM_PAGE, "Off board", "Off board", "The walking camera, and the over-the-shoulder view while you aim a board throw" },
+    // Titled "Sitting camera": "Sitting" is already the sit page's title, and pages are claimed by title (537).
+    { OMP_ITEM_PAGE, "Sitting camera", "Sitting", "The camera while you sit: where it sits, and the first-person view (A)" },
+};
+static const OmpPageItem2 kTwkCamOnBoardItems[] = {
     { OMP_ITEM_TOGGLE, kTwkCamFollow, "Camera always follows height",
       "The camera tracks your height on every air, not just onto obstacles higher than you" },
     // Named for what the GAME does, so ON is stock -- the module disables drop detection when this
@@ -869,8 +1032,57 @@ static const OmpPageItem2 kTwkCameraItems[] = {
     { OMP_ITEM_SLIDER, kTwkCamPitch, "Pitch on the board (deg)",
       "Tilts the camera while you are riding: positive looks up, negative looks down. 0 is the stock camera, and so is walking around",
       nullptr, nullptr, -30.0f, 30.0f, 1.0f },
-    { OMP_ITEM_TOGGLE, kTwkCamFp, "First person",
-      "See through your skater's eyes. Switches back to third person when you bail" },
+};
+static const OmpPageItem2 kTwkCamOffBoardItems[] = {
+    { OMP_ITEM_SLIDER, kTwkCamFootDist, "Distance (%)",
+      "How far back the walking camera sits: 100 is the game's own, lower is closer, higher is further",
+      nullptr, nullptr, 50.0f, 200.0f, 5.0f },
+    { OMP_ITEM_SLIDER, kTwkCamFootUp, "Height (cm)",
+      "Moves the walking camera straight up (or down)", nullptr, nullptr, -60.0f, 120.0f, 5.0f },
+    { OMP_ITEM_SLIDER, kTwkCamFootSide, "Side (cm)",
+      "Moves the walking camera to the right (or left)", nullptr, nullptr, -80.0f, 80.0f, 5.0f },
+    { OMP_ITEM_SLIDER, kTwkCamFootFov, "Field of view (deg)",
+      "Added to the game's own field of view while walking", nullptr, nullptr, -20.0f, 30.0f, 1.0f },
+    { OMP_ITEM_SLIDER, kTwkCamFootTilt, "Tilt (deg)",
+      "Tilts the walking camera: positive looks up", nullptr, nullptr, -20.0f, 20.0f, 1.0f },
+    { OMP_ITEM_TOGGLE, kTwkCamAim, "Throw aim over the shoulder",
+      "Holding LT to throw the board puts the camera over your shoulder" },
+    { OMP_ITEM_SLIDER, kTwkCamAimIn, "  Aim: in toward you (%)",
+      "How far the aim view comes in toward you", nullptr, nullptr, 0.0f, 70.0f, 1.0f },
+    { OMP_ITEM_SLIDER, kTwkCamAimSide, "  Aim: over the shoulder (cm)",
+      "How far to the side, away from the throwing arm", nullptr, nullptr, 0.0f, 90.0f, 1.0f },
+    { OMP_ITEM_SLIDER, kTwkCamAimUp, "  Aim: raise straight up (cm)",
+      "How far the aim view rises, straight up", nullptr, nullptr, 0.0f, 80.0f, 1.0f },
+    { OMP_ITEM_SLIDER, kTwkCamAimZoom, "  Aim: zoom (deg)",
+      "How much the aim view narrows the field of view", nullptr, nullptr, 0.0f, 20.0f, 1.0f },
+};
+// Camera > Sitting (537): the seated camera on top of the walking one, then the seated first person.
+static const OmpPageItem2 kTwkCamSitItems[] = {
+    { OMP_ITEM_SLIDER, kTwkCamSitDist, "Distance (%)",
+      "How far back the camera sits while you are seated: 100 is the walking camera's, lower is closer",
+      nullptr, nullptr, 30.0f, 200.0f, 5.0f },
+    { OMP_ITEM_SLIDER, kTwkCamSitUp, "Height (cm)",
+      "Moves the seated camera straight up (or down) from the walking camera", nullptr, nullptr, -80.0f, 120.0f, 5.0f },
+    { OMP_ITEM_SLIDER, kTwkCamSitSide, "Side (cm)",
+      "Moves the seated camera to the right (or left) of the walking camera", nullptr, nullptr, -80.0f, 80.0f, 5.0f },
+    { OMP_ITEM_SLIDER, kTwkCamSitFov, "Field of view (deg)",
+      "Added to the walking camera's field of view while seated", nullptr, nullptr, -20.0f, 30.0f, 1.0f },
+    { OMP_ITEM_SLIDER, kTwkCamSitTilt, "Tilt (deg)",
+      "Tilts the seated camera: positive looks up", nullptr, nullptr, -20.0f, 20.0f, 1.0f },
+    { OMP_ITEM_TOGGLE, kTwkSitFp, "First person (A)",
+      "While seated, A puts the camera at your eyes; A again goes back" },
+    { OMP_ITEM_SLIDER, kTwkSitFpFov, "  First person: field of view (deg)",
+      "The field of view at the eyes. 0 keeps the game's own", nullptr, nullptr, 0.0f, 120.0f, 5.0f },
+    { OMP_ITEM_SLIDER, kTwkSitLookSpd, "  First person: look speed",
+      "How fast the stick turns your head (degrees a second at full stick)", nullptr, nullptr, 40.0f, 400.0f, 10.0f },
+    { OMP_ITEM_TOGGLE, kTwkSitLookInv, "  First person: invert up/down",
+      "Pushing the stick up looks down" },
+    { OMP_ITEM_SLIDER, kTwkSitLookYaw, "  First person: look left/right (deg)",
+      "How far the head turns either way", nullptr, nullptr, 20.0f, 160.0f, 5.0f },
+    { OMP_ITEM_SLIDER, kTwkSitLookUp, "  First person: look up (deg)",
+      "How far the head tips up", nullptr, nullptr, 5.0f, 80.0f, 5.0f },
+    { OMP_ITEM_SLIDER, kTwkSitLookDown, "  First person: look down (deg)",
+      "How far the head tips down", nullptr, nullptr, 5.0f, 85.0f, 5.0f },
 };
 // Every page must stay inside the host's cap AND inside the engine's visible window -- the host
 // truncates the TAIL, so an over-long page loses its Back row, not the row just added.
@@ -880,6 +1092,9 @@ static_assert(sizeof(kTwkRootItems)  / sizeof(kTwkRootItems[0])  <= 13 &&
               sizeof(kTwkGrindItems) / sizeof(kTwkGrindItems[0]) <= 13 &&
               sizeof(kTwkFeetItems)  / sizeof(kTwkFeetItems[0])  <= 13 &&
               sizeof(kTwkCameraItems) / sizeof(kTwkCameraItems[0]) <= 13 &&
+              sizeof(kTwkCamOnBoardItems)  / sizeof(kTwkCamOnBoardItems[0])  <= 13 &&
+              sizeof(kTwkCamOffBoardItems) / sizeof(kTwkCamOffBoardItems[0]) <= 13 &&
+              sizeof(kTwkCamSitItems) / sizeof(kTwkCamSitItems[0]) <= 13 &&
               sizeof(kTwkClothItems)  / sizeof(kTwkClothItems[0])  <= 13 &&
               sizeof(kTwkPopItems)    / sizeof(kTwkPopItems[0])    <= 13 &&
               sizeof(kTwkPhysItems)   / sizeof(kTwkPhysItems[0])   <= 13 &&
@@ -926,7 +1141,7 @@ static bool tryRegisterMenu() {
                          (int)(sizeof(kTwkRootItems) / sizeof(kTwkRootItems[0])),
                          &pageSelect, &pageValue, &pageGet, nullptr, nullptr)) {
                     g_pageRegistered = true;
-                    TwkLog("[tweaks] registered the pause-menu page (the front page + 11 category pages)");
+                    TwkLog("[tweaks] registered the pause-menu page (the front page + 14 category pages)");
                 }
                 #define TWK_SUBPAGE(title, arr)                     regp(title, arr, (int)(sizeof(arr) / sizeof(arr[0])),                          &pageSelect, &pageValue, &pageGet, nullptr, nullptr)
                 TWK_SUBPAGE("Pop control",    kTwkPopItems);
@@ -935,6 +1150,9 @@ static bool tryRegisterMenu() {
                 TWK_SUBPAGE("Grinds",         kTwkGrindItems);
                 TWK_SUBPAGE("Feet",           kTwkFeetItems);
                 TWK_SUBPAGE("Camera",         kTwkCameraItems);
+                TWK_SUBPAGE("On board",       kTwkCamOnBoardItems);   // reached through Camera's rows (524)
+                TWK_SUBPAGE("Off board",      kTwkCamOffBoardItems);
+                TWK_SUBPAGE("Sitting camera", kTwkCamSitItems);       // Camera > Sitting (537)
                 TWK_SUBPAGE("Clothing",       kTwkClothItems);
                 TWK_SUBPAGE("Physical animation", kTwkPhysItems);
                 TWK_SUBPAGE("Style settings",     kTwkPhys2Items);
@@ -958,6 +1176,7 @@ void Tweaks_PumpFrame() {
     FootPlace_PumpFrame();
     FootSteer_PumpFrame();           // liveness only: it applies from inside foot_place's hook
     GrindPop_PumpFrame();            // grind-exit pop records: names resolved and logged out here
+    GrindRock_PumpFrame();           // a boardslide tilt left behind when the grind ends eases out
     PopProbe_PumpFrame();            // AFTER grind_pop: its drain feeds PopProbe_OnJump first
     BodyFeel_PumpFrame();            // breathes the physical-animation stiffness (after pop_probe: reads its crouch depth)
     Upscale_PumpFrame();             // render-scale console variables + the FSR health line
@@ -1021,6 +1240,8 @@ public:
         FootPlace_Install();
         FootSteer_Install();
         GrindPop_Install();
+        GrindRock_Install();
+        GrindLean_Install();
         CameraHeight_Install();
         Upscale_Install();
         Sit_Install();

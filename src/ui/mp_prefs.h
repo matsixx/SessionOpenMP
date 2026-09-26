@@ -88,6 +88,19 @@ int  MpPrefs_BubblePanel();   void MpPrefs_SetBubblePanel(int on);
 int  MpPrefs_BubbleBorder();  void MpPrefs_SetBubbleBorder(int on);
 int  MpPrefs_BubbleBlurPct(); void MpPrefs_SetBubbleBlurPct(int v);
 
+// ---- WHERE THE CHAT BOX SITS, and whether it shows at all. Position is two percentages of the room
+// the OPEN box leaves on screen: 0 = flush left / bottom, 100 = flush right / top, so the whole box is
+// on screen at every value. The defaults put it in the bottom-left corner it has always used.
+// Hidden hides the talk (F2 toggles it); ENTER still opens the box to type.
+enum { MPCHAT_POSX_DEFAULT = 2, MPCHAT_POSY_DEFAULT = 14 };
+int  MpPrefs_ChatPosX();       void MpPrefs_SetChatPosX(int pct);
+int  MpPrefs_ChatPosY();       void MpPrefs_SetChatPosY(int pct);
+int  MpPrefs_ChatHidden();     void MpPrefs_SetChatHidden(int on);
+
+// ---- THE F1 MENU IN ITS OWN WINDOW, for a second monitor. OFF by default, and off the menu is
+// exactly what it always was: drawn over the game, taking the mouse and keys while it is up.
+int  MpPrefs_F1PopOut();       void MpPrefs_SetF1PopOut(int on);
+
 // ---- THE CHAT BOX's look. Stored here for the same reason the nameplate settings are: they are the
 // player's, they have to survive a restart, and the game-thread publish copies them into the live
 // tuning every frame so there is exactly one source of truth and no apply step.

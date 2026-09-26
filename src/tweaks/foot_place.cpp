@@ -57,6 +57,7 @@
 #include "catch_tweaks.h"     // CatchTweaks_Skater() -- the live skater, without a hook of our own
 #include "catch_level.h"      // CatchLevel_PostPhysAssert() -- the post-physics level re-assert
 #include "body_feel.h"       // BodyFeel_PostPhysApply() -- per-body blend-weight scaling
+#include "board_stance.h"    // Stance_AddOffset() -- the rider's own stance, same socket write
 #include "proxy_body_feel.h" // ProxyBodyFeel_PostPhysApply() -- the same write on a remote player's proxy
 #include <cmath>
 #include "MinHook.h"
@@ -338,6 +339,9 @@ static void hkUpdateFootAnchors(void* self, double dt, void* a, void* b) {
     if (mine) BodyFeel_PostPhysApply();     // per-body physics-blend scaling (same surviving write point)
     if (!mine && self) ProxyBodyFeel_PostPhysApply(twkP(self, AN_SKATER));   // a remote player's proxy: its own rig's write
     if (mine) CatchTweaks_PostPhysHold();   // the scoop-foot hold (same surviving write point)
+    // The stance's own rotation comes back out before the original reads the sockets (it slerps from
+    // their previous value; see Stance_PreAnchors).
+    if (mine && self) { __try { Stance_PreAnchors(self); } __except (EXCEPTION_EXECUTE_HANDLER) {} }
     unsigned char savedAA = 0;
     bool suppressed = false;
     if (mine && g_ok && g_on && self && SuppressWanted(self)) {
@@ -380,6 +384,7 @@ static void hkUpdateFootAnchors(void* self, double dt, void* a, void* b) {
         float dL[3] = { 0.0f, 0.0f, 0.0f };
         float dR[3] = { 0.0f, 0.0f, 0.0f };
         FootSteer_AddOffset(self, realDt, dL, dR);      // false = nothing of its own to add
+        Stance_AddOffset(self, SuppressWanted(self), realDt, dL, dR);   // the rolling idle's stance
         // ---- the sole lift (FootFixSoleLiftMm): both feet along the deck's normal, riding only --
         // the same states the suppression covers. Per foot, weighted by the game's own IK alpha the
         // way foot_steer is: a zeroed socket plus a delta is not an offset.

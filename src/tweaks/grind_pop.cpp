@@ -296,6 +296,7 @@ struct Rec {
 static const int kRecs = 16;
 static Rec  g_recs[kRecs];
 static volatile LONG g_wr = 0;
+static volatile ULONGLONG g_lastJumpMs = 0;   // our skater's last JumpForTrick (any pop), for grind_rock
 
 // ------------------------------------------------------------------ hook
 // Measured arity: `(this /*rcx*/, float /*xmm1*/, float /*xmm2*/, float /*xmm3*/)` returning bool.
@@ -333,6 +334,8 @@ static bool grindPopIsOurs(void* p) {
 
 static char hkJumpForTrick(void* mc, double a2, double a3, double a4) {
     Rec* r = nullptr;
+    __try { if (mc && grindPopIsOurs(mc)) g_lastJumpMs = GetTickCount64(); }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
     if (g_ok && g_on && mc && grindPopIsOurs(mc)) {
         __try {
             const LONG i = InterlockedIncrement(&g_wr) - 1;
@@ -675,6 +678,7 @@ void GrindPop_Install() {
 }
 
 bool GrindPop_Enabled() { return g_on != 0; }
+unsigned long long GrindPop_LastJumpMs() { return g_lastJumpMs; }
 void GrindPop_SetEnabled(bool on) { g_on = on ? 1 : 0; TwkMarkDirty(); }
 bool  GrindPop_PitchEnabled() { return g_pitchFix != 0; }
 void  GrindPop_SetPitchEnabled(bool on) { g_pitchFix = on ? 1 : 0; TwkMarkDirty(); }

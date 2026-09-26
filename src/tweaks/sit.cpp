@@ -54,8 +54,10 @@
 #include "radial.h"         // Radial_Open: the radial menu borrows the prompt bar
 #include "grind_pop.h"      // GrindPop_FNameToString
 #include "scoop_speed.h"    // ScoopSpeed_StickRaw: the right stick, for the look
-#include "camera_height.h"  // CameraHeight_ViewForward: where the camera looks, for the head that follows it
+#include "camera_height.h"
 #include "emote.h"          // Emote_OnFlip / Emote_Watchdog: gestures ride this module's pose seam
+#include "board_stance.h"   // Stance_OnFlip: the nollie/fakie toe joints ride the same seam
+#include "catch_sound.h"    // CatchSound_FindSound / _SpawnAttached: the head knock of a board that hits you
 #include <psapi.h>          // the SessionOpenMP bridge is found by export name
 #include "MinHook.h"
 
@@ -75,7 +77,8 @@ static int   g_promptLog = 0;      // SitPromptLog: 1/s line proving the pump st
 static int   g_capMove   = 1;      // SitMoveCapsule: the collision follows you to the seat
 static volatile LONGLONG g_pumpMs = 0;   // when the sit pump last ran: the watchdog's whole input
 static uint64_t g_modeWatchUntil = 0;    // ...and until when a stolen movement mode is watched for
-static int   g_boardRest = 1;      // SitBoardRest: set the board down beside you and let it settle
+static int   g_boardRest = 1;      // SitBoardRest: set the board down beside you and let it settle (only with SitKeepBoard off)
+static int   g_keepBoard = 1;      // SitKeepBoard: the board stays yours while you sit -- emote.cpp lays it beside you
 static float g_boardOut  = 46.0f;  // SitBoardOutCm: how far out from the hip it lands
 static float g_boardDrop = 9.0f;   // SitBoardDropCm: how far above the surface it is let go
 static float g_boardAhead = 62.0f; // SitBoardAheadCm: how far in front of you it is set down
@@ -116,6 +119,17 @@ static int   g_bailOnHit   = 1;     // SitBailOnHit: another skater running into
 static float g_hitRadius   = 75.0f; // SitHitRadiusCm: how close their capsule has to get
 static float g_hitRise     = 130.0f;// SitHitRiseCm: ...and how far above or below you it may be
 static float g_hitSpeed    = 140.0f;// SitHitSpeedCm: how fast they must be going for it to count as a hit
+static int   g_seatColl    = 1;     // SitSeatCollision: the seated body is what gets hit, not the standing capsule
+static int   g_boardHits   = 1;     // SitBoardHits: someone else's thrown board that hits you knocks you over
+static float g_boardHitSpeed = 400.0f; // SitBoardHitSpeedCm: how fast it must be going to count (cm/s)
+static float g_boardHitVol = 100.0f;   // SitBoardHitVolumePct: the head knock it makes
+static float g_boardKnock  = 35.0f;    // SitBoardKnockPct: how much of the board's speed the body is sent off with
+static int   g_boardKnockdown = 1;     // SitBoardKnockdown: ...and it knocks you over. Off, the head knock still
+                                       // plays and the board still bounces off you (that is its owner's physics);
+                                       // you just stay on your feet
+static int   g_boardTrips  = 1;        // SitBoardTrips: SPRINTING into a board lying about trips you over it
+static int   g_boardPush   = 1;        // SitBoardPush: other players walking into YOUR loose board push it
+static float g_boardPushPct = 115.0f;  // SitBoardPushPct: ...to this much of their speed into it
 
 // ------------------------------------------------------------------ layouts (PDB, both builds)
 enum {
@@ -150,6 +164,15 @@ enum {
     RM_MODE       = 0x2a8,   // AReplayManager::_currentReplayMode (EReplayMode); 2 = playback
     SK_BOARD      = 0x568,   // ASkaterCharacterBase::_skateboard
     SK_CAN_BAIL   = 0x649,   // ASkaterCharacterBase::_canBail -- the game's own bail veto
+    SK_BITS       = 0x710,   // ASkaterCharacterBase bitfield: 0x02 = _isRagDoll (the host's bail sync reads the same bit)
+    PRIM_COLL     = 0x2e8,   // UPrimitiveComponent::BodyInstance (+0x2c8) .CollisionEnabled (+0x20): 0 none, 1 query, 2 physics, 3 both
+    MESH_ANIM     = 0x6b0,   // USkeletalMeshComponent::AnimScriptInstance (a proxy's: is it on its board)
+    SK_MOVECOMP   = 0x550,   // ASkaterCharacterBase::_movementComponent (USkaterMovementComponent)
+    SK_MOVE_RATIO = 0x62c,   // ..._onFootAnimParams (+0x628) .MoveSpeedRatio: what the on-foot walk cycle plays at
+    SK_SPRINT     = 0x630,   // ..._onFootAnimParams.SprintSpeedMultiplier: 1 walking, ramped up by Sprint()
+    SK_SPRINT_MAX = 0xa08,   // _advancedSettings (+0x998) .MaxSprintSpeedMultiplier
+    SMC_WALK_MULT = 0xb04,   // USkaterMovementComponent::MaxWalkSpeedMultiplier -- Sprint() caps at this x the above
+    SMC_WALK3D    = 0xcf8,   // ..._walking3DVelocity
     DROP_MGR_MODE = 0x490,   // AObjectDropperManager::_currentMode (EObjectDropperModes u8; 0 = closed)
     SC_ATTACH_PARENT = 0xc0, // USceneComponent::AttachParent
     SC_ATTACH_SOCKET = 0xc8, // ...AttachSocketName
@@ -272,6 +295,12 @@ static const char* SIG_SET_PHYS_VELOCITY =
     "?? ?? 41 B1 01 44 0F B6 C3 48 8B D7 48 8B C8 E8 ?? ?? ?? ?? 48 8B 5C 24 30 48 83 C4 20 5F C3";
 typedef void (*SetVelocityFn)(void* prim, const float* vec3, bool addToCurrent, uint64_t boneName);
 static SetVelocityFn g_setAngVel = nullptr, g_setLinVel = nullptr;
+// UPrimitiveComponent::SetCollisionEnabled(this, ECollisionEnabled::Type) -- Epic 0x2ed7660 / Steam 0x2e9a140,
+// sigmade: unique in both. (The byte alone would not rebuild the physics filter data; this does.)
+static const char* SIG_SET_COLLISION =
+    "48 89 5C 24 08 48 89 74 24 10 57 48 83 EC 20 48 8B D9 8B F2 48 81 C1 C8 02 00 00 E8 ?? ?? ?? ?? 3B C6 ?? ?? 41 B0 01 48 8D 8B C8 02 00 00";
+typedef void (*SetCollisionFn)(void* prim, int type);
+static SetCollisionFn g_setColl = nullptr;
 typedef void (*PlaceInHandFn)(void* moveComp, void* a, void* b, void* c);
 static PlaceInHandFn g_origPlaceInHand = nullptr;
 static void*         g_placeAt = nullptr;
@@ -354,6 +383,8 @@ static bool  g_dumped = false;
 // progress rather than one number for the whole skeleton.
 enum { PART_LEGS = 0, PART_PELVIS, PART_SPINE, PART_HEAD, PART_ARMS, PART_N };
 static int   g_group[MAX_BONES];
+static int   g_boardRoot[4], g_nBoardRoot = 0, g_bFlip = -1;   // the board rig: its top bones, and the flipper the board hangs from
+static uint64_t g_boneFN[MAX_BONES];   // each bone's FName: what a physics body is asked for by
 static uint8_t g_underHead[MAX_BONES]; // the head and everything hanging off it: hidden from inside
 static uint8_t g_underNeck[MAX_BONES]; // the neck and everything hanging off it, head included: turned with the neck
 
@@ -379,18 +410,32 @@ static bool ResolveRig(void* meshComp) {
     void* skel = twkP(meshComp, SKM_MESH);
     if (!skel) return false;
     if (skel == g_bonesFor) return g_rigOk;
+    // NAMES NOT READABLE YET ARE NOT A VERDICT (526): right after a level loads the bone names can come back
+    // unresolved ("bone0, bone1, ..."), and that failure was CACHED for the skeleton -- "LEGS UNRESOLVED,
+    // sitting off" for the whole session ("pressing B does nothing"). board_stance hit the same race (497).
+    // Such a read is dropped and tried again a second later.
+    static ULONGLONG s_retryAt = 0;
+    if (GetTickCount64() < s_retryAt) return false;
     g_bonesFor = skel; g_rigOk = false; g_nBones = 0;
     const uint8_t* rs = (const uint8_t*)skel + SM_REFSKEL;
     const uint8_t* info = *(const uint8_t* const*)(rs + RS_FINAL_INFO);
     const int n = *(const int*)(rs + RS_FINAL_INFO + 8);
     if (!info || n <= 0 || n > MAX_BONES) { TwkLog("[sit] rig: %d bones -- unusable", n); return false; }
+    int unnamed = 0;
     for (int i = 0; i < n; i++) {
         char nb[96];
-        if (!GrindPop_FNameToString(info + i * 12, nb, sizeof(nb))) snprintf(nb, sizeof(nb), "bone%d", i);
+        if (!GrindPop_FNameToString(info + i * 12, nb, sizeof(nb))) { snprintf(nb, sizeof(nb), "bone%d", i); unnamed++; }
         for (char* c = nb; *c; c++) if (*c >= 'A' && *c <= 'Z') *c = (char)(*c - 'A' + 'a');
         snprintf(g_bones[i].name, sizeof(g_bones[i].name), "%s", nb);
         g_bones[i].parent = *(const int*)(info + i * 12 + 8);
         if (g_bones[i].parent >= i) g_bones[i].parent = -1;    // parents precede children; anything else is not a tree we can walk
+        g_boneFN[i] = *(const uint64_t*)(info + i * 12);
+    }
+    if (unnamed * 2 > n) {
+        g_bonesFor = nullptr; g_nBones = 0; s_retryAt = GetTickCount64() + 1000;
+        static int s_n = 0;
+        if (s_n < 20) { s_n++; TwkLog("[sit] rig: %d of %d bone names not readable yet -- trying again in a second", unnamed, n); }
+        return false;
     }
     g_nBones = n;
     g_pelvis = AnyNamed("pelvis");
@@ -419,6 +464,14 @@ static bool ResolveRig(void* meshComp) {
             for (int i = 0; i < g_nBones && g_nHandKids[sd] < 6; i++)
                 if (g_bones[i].parent == g_hand[sd]) g_handKids[sd][g_nHandKids[sd]++] = i;
     }
+    // The board rig: every "skateskel" bone whose parent is not one (it hangs off the root, not a hand).
+    g_nBoardRoot = 0;
+    for (int i = 0; i < n && g_nBoardRoot < 4; i++) {
+        if (!strstr(g_bones[i].name, "skateskel")) continue;
+        const int pa = g_bones[i].parent;
+        if (pa < 0 || !strstr(g_bones[pa].name, "skateskel")) g_boardRoot[g_nBoardRoot++] = i;
+    }
+    g_bFlip = AnyNamed("skateskel_flipper");
     // which part each bone moves with: the named ones by name, everything else with its parent (the
     // table is parents-first, so one pass does it)
     for (int i = 0; i < n; i++) {
@@ -512,7 +565,7 @@ static V3    g_eyeW = { 0.0f, 0.0f, 0.0f };       // the eyes, world, each pump 
 enum { WATCH_FREE = 0, WATCH_AUTO = 1, WATCH_PEER = 2 };   // WATCH_PEER + k = the k-th player in the list
 static int   g_watch = WATCH_FREE;
 static int   g_watchPeerIdx = -1;    // a specific player, by the peer number (stable), not list position
-struct Peer { void* actor; int idx; char name[40]; V3 pos; float speed; float stillS; bool fresh; };
+struct Peer { void* actor; int idx; char name[40]; V3 pos; float speed; float stillS; bool fresh; float deckZ; bool deckOk; };
 static Peer  g_peers[16]; static int g_nPeers = 0;
 static void* g_curWatch = nullptr;   // whom the auto attention is on
 static float g_dwell = 0.0f, g_attnClock = 0.0f, g_outOfReachS = 0.0f;
@@ -578,6 +631,16 @@ static float g_blendEff = 450.0f;    // this sit's blend time: longer for a bigg
 static int   g_style = 0, g_prevStyle = 0;   // which way of sitting, and the one being blended out of
 static float g_styleBlend = 1.0f;
 static float g_groundDz = 0.0f;      // ground height relative to the seat plane (<= 0)
+// THE KEPT BOARD (SitKeepBoard). Seated, the board stays in hand as far as the game knows (its movement mode
+// stays "on foot", PlaceInHand keeps hanging it off the flipper bone), and the pose puts it somewhere: here it
+// rides the hand that carries it, by exactly that hand's change, so the carry grip is kept; emote.cpp then lays
+// it down on a spot of the seat (Sit_BoardSpot) as the hands settle, and picks it back up as you stand.
+static bool  g_boardKept = false;    // this sit keeps the board
+static int   g_carrySide = -2;       // the hand it rides in: 0 left, 1 right, -2 not yet seen
+static bool  BoardResting();           // below, with the board's own state
+static float g_spanLo = 0.0f, g_spanHi = 0.0f;   // the seated body, lowest and highest point, WORLD z (WhoHitUs)
+static void  CapsuleQueryOnly(void* sk, bool on);   // with the other players' bodies, below
+static bool  g_spanOk = false;
 // A floor sit used to assume the floor is flat, so on a slope or a kerb the feet hung in the air or sank
 // into it. The body does not move while seated, so ONE patch of ground sampled at sit time is enough for
 // every foot to find the surface actually under it -- and for every style, since the patch covers the
@@ -1268,6 +1331,36 @@ static void ApplyPose(void* mesh) {
         g_Lt[i].p = lerp(g_L[i].p, g_Lt[i].p, a);
     }
     for (int i = 0; i < n; i++) CompOf(i, g_Lt, g_Ct);
+    if (g_boardKept && !BoardResting() && g_nBoardRoot) {
+        if (g_carrySide == -2) {           // the hand nearer the board, as the carry animation has it
+            const int b = g_bFlip >= 0 ? g_bFlip : g_boardRoot[0];
+            g_carrySide = (g_hand[0] >= 0 && g_hand[1] >= 0)
+                ? (len(sub(g_C[b].p, g_C[g_hand[0]].p)) < len(sub(g_C[b].p, g_C[g_hand[1]].p)) ? 0 : 1) : -1;
+            TwkLog("[sit] the board stays with you: in the %s hand", g_carrySide == 0 ? "left" : g_carrySide == 1 ? "right" : "(no hand found)");
+        }
+        if (g_carrySide >= 0) {
+            const int h = g_hand[g_carrySide];
+            const Q4 d = qmul(g_Ct[h].q, qconj(g_C[h].q));
+            for (int k = 0; k < g_nBoardRoot; k++) {
+                const int b = g_boardRoot[k];
+                SetComp(b, qmul(d, g_C[b].q), add(g_Ct[h].p, qrot(d, sub(g_C[b].p, g_C[h].p))));
+            }
+        }
+    }
+    {   // how high the seated body reaches, and how low: what someone going OVER you has to clear
+        Q4 mq; V3 mp, ms; ReadC2W(mesh, &mq, &mp, &ms);
+        auto wz = [&](int b) { return add(mp, qrot(mq, mulv(g_Ct[b].p, ms))).z; };
+        const int top = g_head >= 0 ? g_head : g_neck;
+        if (top >= 0 && g_pelvis >= 0) {
+            float lo = wz(g_pelvis) - 14.0f, hi = wz(top) + 16.0f;
+            for (int sd = 0; sd < 2; sd++) {
+                if (g_foot[sd] >= 0) lo = fminf(lo, wz(g_foot[sd]) - 9.0f);
+                if (g_calf[sd] >= 0) lo = fminf(lo, wz(g_calf[sd]) - 9.0f);
+                if (g_hand[sd] >= 0) hi = fmaxf(hi, wz(g_hand[sd]) + 6.0f);
+            }
+            g_spanLo = lo; g_spanHi = hi; g_spanOk = true;
+        }
+    }
     // With the camera inside the head, the head is not drawn: its scale (and its children's) goes to
     // zero in the published pose, which collapses the skin to a point. The co-op held pose carries
     // rotation and position only, so other players keep seeing your head.
@@ -1419,6 +1512,7 @@ static void __fastcall hkFlip(void* mesh) {
     // Gestures ride the same seam (one DLL cannot hook an address twice), AFTER the seat's own pose so
     // an emote sits on top of it. It guards itself: its own mesh, its own pump's heartbeat, the editors.
     if (mesh) Emote_OnFlip(mesh);
+    if (mesh) Stance_OnFlip(mesh);      // nollie/fakie toe joints (board_stance.cpp)
     g_origFlip(mesh);
 }
 
@@ -1457,6 +1551,75 @@ static int   g_boardWatch = 0;
 static unsigned g_rand = 0;
 static float Rand01() { g_rand = g_rand * 1664525u + 1013904223u; return (float)((g_rand >> 8) & 0xFFFF) / 65535.0f; }
 static float RandRange(float a, float b) { return a + (b - a) * Rand01(); }
+
+// Where the kept board lies, per way of sitting: flat, wheels down, beside you where no hand or leg goes (the
+// styles' own targets say where those are). side 0 = the carrying hand's side, -1 left, +1 right; `out` is how
+// far out from the middle its centre is, `fx` how far forward, `yaw` its nose off forward, toward the side.
+struct BoardSpotDef { int side; float fx, out, yaw; };
+static const BoardSpotDef kBoardSpot[2][STYLE_COUNT] = {
+    { { 0,  8.0f, 44.0f, 0.0f },      // ledge, legs down: hands on the thighs, either side is free
+      { 0, 22.0f, 54.0f, 0.0f },      // leaning back: forward of the hands planted behind and wide
+      { 0, 10.0f, 44.0f, 0.0f },      // slouched: elbows on the knees
+      {-1, 16.0f, 58.0f, 0.0f } },    // one leg folded: that leg lies to the right, the left hand is beside you
+    { { 1, 12.0f, 50.0f, 6.0f },      // floor, one knee up: the left hand is propped behind, the left leg out
+      { 0, 62.0f,  0.0f, 90.0f },     // cross-legged: across in front of the shins, nose to the carrying side
+      { 0, 28.0f, 56.0f, 0.0f },      // leaning back: forward of the hands planted wide
+      { 0,  6.0f, 48.0f, 0.0f } },    // knees hugged
+};
+static float g_spotUz[STYLE_COUNT][2];   // ledge: the surface there, vs the seat plane ([0] left, [1] right)
+static bool  g_spotHit[STYLE_COUNT][2];
+static float g_spotJit[3] = { 0.0f, 0.0f, 0.0f };   // this sit's own: forward, out, yaw -- set down, not placed
+// One style's spot on one side, in the seat frame. false = nothing to lay it on there.
+static bool SpotFor(int style, int sideSign, float* fx, float* ry, float* uz, float* yaw) {
+    const BoardSpotDef& d = kBoardSpot[g_mode == M_LEDGE ? 0 : 1][style & (STYLE_COUNT - 1)];
+    *fx = d.fx + g_spotJit[0];
+    *ry = sideSign * (d.out > 0.0f ? d.out + g_spotJit[1] : 0.0f);
+    *yaw = sideSign * d.yaw + g_spotJit[2];
+    if (g_mode == M_LEDGE) {
+        const int k = sideSign > 0 ? 1 : 0;
+        if (!g_spotHit[style & (STYLE_COUNT - 1)][k]) return false;
+        *uz = g_spotUz[style & (STYLE_COUNT - 1)][k];
+        return true;
+    }
+    // the floor: the highest ground under its length and width, so no wheel goes into it
+    const float yr = *yaw * 0.0174532925f, ca = cosf(yr), sa = sinf(yr);
+    float h = -1e9f;
+    const float along[5] = { 0.0f, 30.0f, -30.0f, 0.0f, 0.0f }, across[5] = { 0.0f, 0.0f, 0.0f, 8.0f, -8.0f };
+    for (int i = 0; i < 5; i++) {
+        const float px = *fx + along[i] * ca - across[i] * sa, py = *ry + along[i] * sa + across[i] * ca;
+        h = fmaxf(h, GroundAt(px, py));
+    }
+    *uz = h;
+    return true;
+}
+// The style's spot, on its preferred side, else the other; false = no spot on either.
+static bool SpotForStyle(int style, float* fx, float* ry, float* uz, float* yaw) {
+    const BoardSpotDef& d = kBoardSpot[g_mode == M_LEDGE ? 0 : 1][style & (STYLE_COUNT - 1)];
+    const int want = d.side != 0 ? d.side : (g_carrySide == 0 ? -1 : 1);
+    if (SpotFor(style, want, fx, ry, uz, yaw)) return true;
+    return d.out > 0.0f && SpotFor(style, -want, fx, ry, uz, yaw);
+}
+static bool BoardResting() { return g_boardResting; }
+bool Sit_BoardKept() { return g_sitting && g_boardKept && !g_boardResting && g_carrySide >= 0; }
+bool Sit_BoardSpot(SitBoardSpot* out) {
+    if (!out || !g_mesh || g_anyA <= 0.0f || !g_boardKept || g_boardResting || g_carrySide < 0) return false;
+    float fx, ry, uz, yaw;
+    if (!SpotForStyle(g_style, &fx, &ry, &uz, &yaw)) return false;
+    if (g_styleBlend < 1.0f && g_prevStyle != g_style) {       // a change of style carries it across as the body goes
+        float fx0, ry0, uz0, yaw0;
+        if (SpotForStyle(g_prevStyle, &fx0, &ry0, &uz0, &yaw0)) {
+            const float t = g_styleBlend * g_styleBlend * (3.0f - 2.0f * g_styleBlend);
+            fx = fx0 + (fx - fx0) * t; ry = ry0 + (ry - ry0) * t; uz = uz0 + (uz - uz0) * t; yaw = yaw0 + (yaw - yaw0) * t;
+        }
+    }
+    const V3* v[4] = { &g_os, &g_f, &g_r, &g_u };
+    float* o[4] = { out->os, out->f, out->r, out->u };
+    for (int k = 0; k < 4; k++) { o[k][0] = v[k]->x; o[k][1] = v[k]->y; o[k][2] = v[k]->z; }
+    out->fx = fx; out->ry = ry; out->uz = uz; out->yawDeg = yaw;
+    out->arms = g_partA[PART_ARMS];
+    out->carry = g_carrySide;
+    return true;
+}
 
 static void RestBoard(void* skater, const V3& seatPoint, const V3& facing, bool ledge, float groundDz) {
     // Already out -- thrown -- and still where it landed: the seat takes it over as it lies. Capturing it
@@ -1590,6 +1753,7 @@ bool Sit_BoardInHand(void* skater) {
     return mv && twkB(mv, BM_MODE) == BM_ON_FOOT;
 }
 bool Sit_BoardOut() { return g_boardResting && g_boardThrown; }
+bool Sit_MountPending() { return GetTickCount64() < g_mountUntilMs; }
 // WHERE THE DECK IS -- not the actor's root: that is not one of the seven bodies a loose board is made of, and it
 // stays where the board was let go of (the field: thrown at 15 m/s, flew, and "1 m away" by the log a second on).
 bool Sit_BoardWhere(float outW[3]) {
@@ -1631,13 +1795,26 @@ static bool LetGoOfBoard(void* skater) {
     } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; g_boardResting = false; g_boardThrown = false; g_boardMoveComp = nullptr; return false; }
 }
 bool Sit_BoardThrow(void* skater, const float vel[3], const float spinRad[3]) {
-    if (!g_detach || !g_attach || !skater || g_boardResting || g_sitting) return false;
+    if (!g_detach || !g_attach || !skater || g_boardResting || (g_sitting && !g_boardKept)) return false;
     if (!g_ragOn && !g_boardSim && !g_setSim) return false;
     if (!Sit_BoardInHand(skater) || !LetGoOfBoard(skater)) return false;
     const int parts = BoardVelocity(vel, spinRad);
     TwkLog("[sit] board THROWN: %.0f cm/s (%.0f %.0f %.0f), spin %.1f rad/s -- given to %d of its 7 bodies%s", sqrtf(vel[0] * vel[0] + vel[1] * vel[1] + vel[2] * vel[2]),
            vel[0], vel[1], vel[2], sqrtf(spinRad[0] * spinRad[0] + spinRad[1] * spinRad[1] + spinRad[2] * spinRad[2]), parts,
            g_setLinVel ? "" : " (NO velocity call in this build: it just drops)");
+    {   // WHERE it left the hand: from your eyes, and over what is under it (a board stuck at the release is one of the two)
+        float bw[3];
+        if (Sit_BoardWhere(bw)) {
+            const V3 b = v3(bw[0], bw[1], bw[2]);
+            float under = -1.0f;
+            void* world = nullptr;
+            __try { world = g_getWorld ? g_getWorld(skater) : nullptr; } __except (EXCEPTION_EXECUTE_HANDLER) { world = nullptr; }
+            V3 hit;
+            if (world && Trace(world, b, sub(b, v3(0.0f, 0.0f, 400.0f)), &hit, nullptr)) under = b.z - hit.z;
+            TwkLog("[sit] ...let go %s: the deck %.0f cm from your eyes (%.0f cm above them), %.0f cm over the ground",
+                   g_sitting ? "SEATED" : "standing", len(sub(b, g_eyeW)), b.z - g_eyeW.z, under);
+        }
+    }
     return true;
 }
 
@@ -1720,6 +1897,7 @@ static void StandUp(const char* why) {
     g_capMoved = false; g_capReassert = 0;
     g_fp = 0;                       // the camera comes back with the body
     if (g_realMove) g_avel = -0.6f / ((g_blendEff > 50.0f ? g_blendEff : 50.0f) * 0.001f);   // the push off: up is brisker than down
+    CapsuleQueryOnly(nullptr, false);
     ReleaseBoard();
     void* move = g_skater ? twkP(g_skater, CH_MOVE) : nullptr;
     if (move && g_setMode) { __try { g_setMode(move, g_savedMode, g_savedCustom); } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; } }
@@ -1847,6 +2025,23 @@ static void TrySit(void* sk) {
             TwkLog("[sit] ground: %d of %d samples, %.0f..%.0f cm about the seat; nothing in the legs' way | %.1f ms",
                    found, GRID_NF * GRID_NR, lo, hi, ms);
     }
+    for (int st = 0; st < STYLE_COUNT; st++) { g_spotHit[st][0] = g_spotHit[st][1] = false; }
+    if (seat.kind == M_LEDGE && g_keepBoard) {   // where the kept board would lie on the ledge: is there ledge there?
+        const V3 fwdW = norm(v3(seat.facing.x, seat.facing.y, 0.0f));
+        const V3 rightW = norm(cross(v3(0.0f, 0.0f, 1.0f), fwdW));
+        int ok = 0;
+        for (int st = 0; st < STYLE_COUNT; st++) for (int k = 0; k < 2; k++) {
+            const BoardSpotDef& d = kBoardSpot[0][st];
+            const float sg = k ? 1.0f : -1.0f;
+            const V3 c = add(add(seat.point, mul(fwdW, d.fx)), mul(rightW, sg * d.out));
+            V3 hit;
+            if (Trace(world, add(c, v3(0.0f, 0.0f, 30.0f)), add(c, v3(0.0f, 0.0f, -40.0f)), &hit, nullptr)) {
+                const float dz = hit.z - seat.point.z;
+                if (dz > -8.0f && dz < 14.0f) { g_spotUz[st][k] = dz; g_spotHit[st][k] = true; ok++; }
+            }
+        }
+        TwkLog("[sit] the board's spots on the ledge: %d of %d have ledge under them", ok, STYLE_COUNT * 2);
+    }
     g_seatW = seat.point; g_faceW = norm(v3(seat.facing.x, seat.facing.y, 0.0f));
     g_fcur = norm(qinv(mq, fwd));
     g_groundDz = seat.groundDz;
@@ -1887,8 +2082,13 @@ static void TrySit(void* sk) {
         } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; g_capMoved = false; }
     }
     g_rand ^= (unsigned)GetTickCount64() ^ (unsigned)(seat.point.x * 7.0f) ^ ((unsigned)(seat.point.y * 13.0f) << 8);
-    RestBoard(sk, seat.point, seat.facing, seat.kind == M_LEDGE, seat.groundDz);
+    g_boardKept = false; g_carrySide = -2;
+    if (g_keepBoard && Sit_BoardInHand(sk)) {      // kept: it stays in hand, and the pose lays it down (emote.cpp)
+        g_boardKept = true;
+        g_spotJit[0] = RandRange(-4.0f, 4.0f); g_spotJit[1] = RandRange(-3.0f, 3.0f); g_spotJit[2] = RandRange(-9.0f, 9.0f);
+    } else if (!g_keepBoard) RestBoard(sk, seat.point, seat.facing, seat.kind == M_LEDGE, seat.groundDz);
     g_mode = seat.kind; g_mesh = mesh; g_skater = sk; g_sitting = 1;
+    CapsuleQueryOnly(sk, true);
     if (g_debug) g_dumpFrames = 1;
     snprintf(g_last, sizeof(g_last), "sitting %s, %s (ledge %.0f cm)", how, StyleName(), seat.height);
     TwkLog("[sit] sitting %s: seat (%.0f %.0f %.0f) height %.0f cm, ground %.0f cm below the seat, thigh %.0f cm, ankle %.0f cm, "
@@ -1979,6 +2179,15 @@ static void RefreshPeers(float dt) {
         } __except (EXCEPTION_EXECUTE_HANDLER) { continue; }
         if (!(fabsf(pos.x) < 1e7f && fabsf(pos.y) < 1e7f && fabsf(pos.z) < 1e7f)) continue;
         Peer pr; pr.actor = a; pr.idx = idx; pr.pos = pos; pr.speed = 0.0f; pr.stillS = 0.0f; pr.fresh = true;
+        pr.deckOk = false; pr.deckZ = 0.0f;
+        __try {                                   // their board, when it is under or near them: their lowest point
+            void* bd = twkP(a, SK_BOARD);
+            void* deck = bd ? twkP(bd, BD_FLIPPER) : nullptr;
+            if (deck) {
+                const float* dw = (const float*)((const uint8_t*)deck + SC_C2W);
+                if (len(v3(dw[4] - pos.x, dw[5] - pos.y, dw[6] - pos.z)) < 200.0f) { pr.deckZ = dw[6]; pr.deckOk = true; }
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) {}
         strncpy_s(pr.name, sizeof(pr.name), nm, _TRUNCATE);
         for (int k = 0; k < g_nPeers; k++) if (g_peers[k].actor == a) {   // carry the motion history
             const float v = dt > 1e-4f ? len(sub(pos, g_peers[k].pos)) / dt : g_peers[k].speed;
@@ -2060,31 +2269,39 @@ static void CycleWatch(int dir) {
 // fight the ragdoll for it -- then let the GAME bail us: its own Bail means the ragdoll, the sound and
 // the score-run reset all behave exactly as they do for any other bail, and the co-op lane carries it
 // to everyone else for free (a real local bail is already replicated).
-static void BailFromHit(const Peer* by) {
-    void* sk = g_skater;
-    char lb[48];
-    TwkLog("[sit] %s skated into us -- bailing", by ? PeerLabel(by, lb, sizeof(lb)) : "someone");
+// The game's own bail (the small overload), seated or not: a seat stands down first, since its pose would
+// fight the ragdoll for the skeleton. `reasonChars` must outlive the call (a static array).
+static bool     g_footDown = false;           // knocked over ON FOOT: the walk cycle must not go on under the ragdoll
+static uint64_t g_footDownMs = 0, g_footUpMs = 0;
+static void KnockOver(void* sk, wchar_t* reasonChars, int reasonLen) {
     StandUp("knocked over");
     if (!g_bail || !sk) return;
+    if (OnFoot(sk)) { g_footDown = true; g_footDownMs = GetTickCount64(); g_footUpMs = 0; }
     __try {
         if (!twkP(sk, SK_BOARD)) return;        // the location fallback derefs the board link
-        static wchar_t reasonChars[] = L"Knocked over while sitting";
-        const struct { const wchar_t* d; int n; int max; } reason =
-            { reasonChars, (int)(sizeof(reasonChars) / 2), (int)(sizeof(reasonChars) / 2) };
+        const struct { const wchar_t* d; int n; int max; } reason = { reasonChars, reasonLen, reasonLen };
         const uint8_t was = twkB(sk, SK_CAN_BAIL);
         *((uint8_t*)sk + SK_CAN_BAIL) = 1;      // lifted for exactly this call, as the host does
         g_bail(sk, &reason, true, true);        // (reason, 1, 1): the in-game pattern, the last 1 = ragdoll
         *((uint8_t*)sk + SK_CAN_BAIL) = was;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        g_faults++; g_bailOnHit = 0;
+        g_faults++; g_bailOnHit = 0; g_boardHits = 0;
         TwkLog("[sit] fault bailing -- knock-overs off for this run");
     }
+}
+static void BailFromHit(const Peer* by) {
+    char lb[48];
+    TwkLog("[sit] %s skated into us -- bailing", by ? PeerLabel(by, lb, sizeof(lb)) : "someone");
+    static wchar_t reasonChars[] = L"Knocked over while sitting";
+    KnockOver(g_skater, reasonChars, (int)(sizeof(reasonChars) / 2));
 }
 // Anyone close enough, and moving fast enough, to have run into us. Their capsule against ours: the
 // actor roots within a capsule's width horizontally and a body's height vertically. Someone standing
 // next to you is not a hit, which is what the speed is for.
+static const Peer* WhoHitUsByShape(bool* have);   // with the other players' bodies, below
 static const Peer* WhoHitUs() {
     if (!g_bailOnHit || !g_skater) return nullptr;
+    { bool have = false; const Peer* p = WhoHitUsByShape(&have); if (have) return p; }
     V3 me;
     __try {
         void* root = twkP(g_skater, ACT_ROOT);
@@ -2095,13 +2312,417 @@ static const Peer* WhoHitUs() {
         const Peer& pr = g_peers[i];
         if (pr.speed < g_hitSpeed) continue;
         const V3 d = sub(pr.pos, me);
-        if (fabsf(d.z) > g_hitRise) continue;
+        if (g_spanOk) {                          // their body, board to head, against ours as it sits: clearing us is no hit
+            float lo = pr.pos.z - 95.0f;
+            const float hi = pr.pos.z + 90.0f;
+            if (pr.deckOk) lo = fminf(lo, pr.deckZ - 8.0f);
+            if (lo > g_spanHi || hi < g_spanLo) continue;
+        } else if (fabsf(d.z) > g_hitRise) continue;
         if (len(v3(d.x, d.y, 0.0f)) > g_hitRadius) continue;
         return &pr;
     }
     return nullptr;
 }
 
+
+// ------------------------------------------------------------------ other players' bodies and boards
+// SEATED COLLISION. The capsule is a standing body's: sitting leaves it standing at the seat, and that is
+// what a skater going over you, or your own thrown board, ran into. So while a body sits, its capsule gets
+// out of the way and the body's own physics shapes -- which follow the seated pose -- are what is hit.
+//   Yours: QUERY ONLY while you sit (TrySit / StandUp): no physics contact (your thrown board), overlaps
+//   kept (the game's trigger volumes still know where you are).
+//   Theirs, on this machine: a proxy whose HEAD is low over its capsule's bottom is sitting (or down); its
+//   capsule is OFF until it rises. Read off the proxy's own skeleton: no wire field, any build of theirs.
+// THROWN BOARDS. Every other player's board whose owner is not near it, moving fast, is tested against
+// your body's bones (as capsules) this frame and half a frame back (it covers 25 cm a frame at 15 m/s).
+// A hit: the bail's own head knock (SCU_Impact_Head) as loud as it was hard, the game's own bail -- which
+// already travels to everyone -- and, once the ragdoll is up, a push the way the board was going.
+struct PxPhys {
+    void* actor; void* cap; SitObjRef capRef; uint8_t capWas; bool capOff, seated;
+    V3 nose, tail, deck; bool boardOk; uint64_t coolUntil;
+    V3 head; bool headOk;                              // their head, world: the top of the body a run-in tests
+    V3 root, vel; bool rootOk; bool riding;            // their body's motion (smoothed), and whether they are on their board
+    V3 bvel;                                           // their board's, smoothed: a stamped board jitters frame to frame
+};
+static PxPhys   g_pxp[16]; static int g_pxpN = 0;
+static void*    g_capColl = nullptr;           // YOUR capsule while it is query-only, and what it was
+static SitObjRef g_capCollRef = { nullptr, 0, 0, nullptr };
+static uint8_t  g_capCollWas = 3;
+static void*    g_meshColl = nullptr;          // ...and your body's shapes (the mesh), the same way
+static SitObjRef g_meshCollRef = { nullptr, 0, 0, nullptr };
+static uint8_t  g_meshCollWas = 3;
+// your body as capsules, this pump (the board hits and the seated run-in both test against it)
+static V3    g_meA[11], g_meB[11]; static float g_meR[11]; static int g_meBone[11]; static int g_meN = 0;
+static void*    g_headCue = nullptr;
+static SitObjRef g_headCueRef = { nullptr, 0, 0, nullptr };
+static int      g_knockLeft = 0;               // frames the push waits for the ragdoll
+static float    g_knockVel[3] = { 0, 0, 0 };
+static uint64_t g_knockBone = 0;
+static int      g_boardHitsN = 0;
+static void*    g_tripCue = nullptr;          // a trip is a body hitting the ground, not a board to the head
+static SitObjRef g_tripCueRef = { nullptr, 0, 0, nullptr };
+static V3       g_myDeckPrev = { 0, 0, 0 }, g_myDeckVel = { 0, 0, 0 }; static bool g_myDeckOk = false;
+static int      g_pushSaid = 0;
+
+static float SegDist(V3 p1, V3 q1, V3 p2, V3 q2) {       // closest distance between two segments
+    const V3 d1 = sub(q1, p1), d2 = sub(q2, p2), r = sub(p1, p2);
+    const float a = dot(d1, d1), e = dot(d2, d2), f = dot(d2, r);
+    float s = 0.0f, t = 0.0f;
+    if (a <= 1e-6f && e <= 1e-6f) return len(r);
+    if (a <= 1e-6f) t = clampf(f / e, 0.0f, 1.0f);
+    else {
+        const float c = dot(d1, r);
+        if (e <= 1e-6f) s = clampf(-c / a, 0.0f, 1.0f);
+        else {
+            const float b = dot(d1, d2), den = a * e - b * b;
+            s = den > 1e-6f ? clampf((b * f - c * e) / den, 0.0f, 1.0f) : 0.0f;
+            t = (b * s + f) / e;
+            if (t < 0.0f) { t = 0.0f; s = clampf(-c / a, 0.0f, 1.0f); }
+            else if (t > 1.0f) { t = 1.0f; s = clampf((b - c) / a, 0.0f, 1.0f); }
+        }
+    }
+    return len(sub(add(p1, mul(d1, s)), add(p2, mul(d2, t))));
+}
+static void CapsuleQueryOnly(void* sk, bool on) {           // yours, while seated
+    if (!on) {
+        __try {
+            if (g_capColl && SitUI_Alive(&g_capCollRef) && g_setColl) g_setColl(g_capColl, g_capCollWas);
+            if (g_meshColl && SitUI_Alive(&g_meshCollRef) && g_setColl) g_setColl(g_meshColl, g_meshCollWas);
+        } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; }
+        g_capColl = nullptr; g_meshColl = nullptr;
+        return;
+    }
+    g_capColl = nullptr; g_meshColl = nullptr;
+    if (!g_seatColl || !g_setColl || !sk) return;
+    // The capsule, and your body's own shapes: seated, the throwing arm lets go right beside your head, and a
+    // board that touches you there has nowhere to go. Nothing needs either to push anything while you sit (the
+    // run-in and the board hits are both measured, not collided); the bail stands you up, which puts them back
+    // before the ragdoll needs them. Only what HAD physics is changed, and exactly that is put back.
+    void* cap = twkP(sk, CH_CAPSULE);
+    void* mesh = twkP(sk, CH_MESH);
+    int capWas = -1, meshWas = -1;
+    __try {
+        if (cap) {
+            capWas = twkB(cap, PRIM_COLL);
+            if (capWas == 2 || capWas == 3) { g_setColl(cap, 1); g_capColl = cap; g_capCollWas = (uint8_t)capWas; SitUI_Track(&g_capCollRef, cap); }
+        }
+        if (mesh) {
+            meshWas = twkB(mesh, PRIM_COLL);
+            if (meshWas == 2 || meshWas == 3) { g_setColl(mesh, 1); g_meshColl = mesh; g_meshCollWas = (uint8_t)meshWas; SitUI_Track(&g_meshCollRef, mesh); }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; }
+    TwkLog("[sit] seated collision: capsule was %d%s, body was %d%s", capWas, g_capColl ? " -> query-only" : " (left)",
+           meshWas, g_meshColl ? " -> query-only" : " (left)");
+}
+static bool BoneWorld(const uint8_t* data, int b, Q4 mq, V3 mp, V3 ms, V3* out) {
+    if (b < 0) return false;
+    const float* t = (const float*)(data + b * 48);
+    *out = add(mp, qrot(mq, mulv(v3(t[4], t[5], t[6]), ms)));
+    return true;
+}
+// `trip`: YOU ran into a board lying about (sprinting), rather than it flying into you -- the body's own thud,
+// and the push is your own run carried on over it.
+static void HitByBoard(void* sk, const char* who, V3 vel, float rel, int bone, bool trip) {
+    const float str = clampf((rel - 300.0f) / 1200.0f, 0.0f, 1.0f);
+    if (!g_headCue || !SitUI_Alive(&g_headCueRef)) {
+        g_headCue = CatchSound_FindSound("SCU_Impact_Head");
+        if (!g_headCue) g_headCue = CatchSound_FindSound("SCU_Impact_Body");
+        if (g_headCue) SitUI_Track(&g_headCueRef, g_headCue);
+    }
+    if (trip && (!g_tripCue || !SitUI_Alive(&g_tripCueRef))) {
+        g_tripCue = CatchSound_FindSound("SCU_Impact_Body");
+        if (g_tripCue) SitUI_Track(&g_tripCueRef, g_tripCue);
+    }
+    void* cue = (trip && g_tripCue) ? g_tripCue : g_headCue;
+    void* root = twkP(sk, ACT_ROOT);
+    const float vol = g_boardHitVol * 0.01f * (0.3f + 0.7f * str);
+    bool played = false;
+    if (cue && root) { __try { played = CatchSound_SpawnAttached(cue, root, vol, 1.03f - 0.08f * str + 0.04f * (Rand01() - 0.5f)) != nullptr; } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; } }
+    const bool down = (twkB(sk, SK_BITS) & 0x02) != 0;
+    if (g_boardHitsN < 60) {
+        g_boardHitsN++;
+        if (trip) TwkLog("[sit] you tripped over %s's board (sprinting, %.0f cm/s, your %s) -- %s, thud %s at %.0f%%", who, rel,
+                         bone >= 0 ? g_bones[bone].name : "?", down ? "already down" : "over you go", played ? "played" : "NOT played", vol * 100.0f);
+        else TwkLog("[sit] %s's board hit you on the %s at %.0f cm/s -- %s, head knock %s at %.0f%%", who, bone >= 0 ? g_bones[bone].name : "?", rel,
+                    down ? "already down" : g_boardKnockdown ? "knocked over" : "stayed up (knock-over is off)",
+                    played ? "played" : (g_headCue ? "NOT played" : "not loaded here"), vol * 100.0f);
+    }
+    if (down) return;
+    if (!trip && !g_boardKnockdown) return;          // the sound, not the fall
+    static wchar_t reasonChars[] = L"Hit by a board";
+    static wchar_t tripChars[] = L"Tripped over a board";
+    if (trip) KnockOver(sk, tripChars, (int)(sizeof(tripChars) / 2));
+    else      KnockOver(sk, reasonChars, (int)(sizeof(reasonChars) / 2));
+    const float sp = len(vel), k = fminf(sp, 1500.0f) * g_boardKnock * 0.01f / (sp > 1.0f ? sp : 1.0f);
+    g_knockVel[0] = vel.x * k; g_knockVel[1] = vel.y * k; g_knockVel[2] = vel.z * k + 60.0f * str;
+    g_knockBone = bone >= 0 ? g_boneFN[bone] : 0; g_knockLeft = 30;
+}
+// Sprinting, by the game's own measure: Sprint() ramps _onFootAnimParams.SprintSpeedMultiplier from 1 toward
+// MaxWalkSpeedMultiplier x MaxSprintSpeedMultiplier while the button is held. Half way up that ramp is a sprint.
+static bool Sprinting(void* sk, float speed) {
+    const float mult = twkF(sk, SK_SPRINT);
+    void* smc = twkP(sk, SK_MOVECOMP);
+    const float cap = smc ? twkF(smc, SMC_WALK_MULT) * twkF(sk, SK_SPRINT_MAX) : 0.0f;
+    if (cap > 1.05f && cap < 10.0f && mult > 0.5f && mult < 10.0f) return mult >= 1.0f + 0.5f * (cap - 1.0f) && speed > 200.0f;
+    return speed > 450.0f;                       // the fields did not read as a ramp: by speed alone
+}
+// Add a velocity to every one of a loose board's seven bodies (deck, trucks, wheels).
+static void BoardAddVelocity(void* board, const float dv[3]) {
+    static const int kParts[7] = { BD_FLIPPER, BD_TRUCK_B, BD_TRUCK_F, BD_WHEEL_BL, BD_WHEEL_BL + 8, BD_WHEEL_BL + 16, BD_WHEEL_BL + 24 };
+    for (int i = 0; i < 7; i++) { void* part = twkP(board, kParts[i]); if (part) g_setLinVel(part, dv, true, 0); }
+}
+static void PumpPeerPhysics(void* sk, float dt) {
+    // ---- knocked over on foot: the walk cycle stops under the ragdoll. The bail mode keeps the speed you were
+    //      walking at, so the bones with no body (the toes) went on walking and the footsteps went on sounding.
+    if (g_footDown) {
+        const uint64_t now = GetTickCount64();
+        __try {
+            const bool rag = sk && (twkB(sk, SK_BITS) & 0x02) != 0;
+            if (rag || now - g_footDownMs < 400) {
+                g_footUpMs = 0;
+                void* move = twkP(sk, CH_MOVE);
+                if (move) { float* v = (float*)((uint8_t*)move + MOVE_VEL); v[0] = v[1] = v[2] = 0.0f; }
+                void* smc = twkP(sk, SK_MOVECOMP);
+                if (smc) { float* v = (float*)((uint8_t*)smc + SMC_WALK3D); v[0] = v[1] = v[2] = 0.0f; }
+                *(float*)((uint8_t*)sk + SK_MOVE_RATIO) = 0.0f;
+            } else if (!g_footUpMs) g_footUpMs = now;
+            if ((g_footUpMs && now - g_footUpMs > 300) || now - g_footDownMs > 10000) g_footDown = false;
+        } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; g_footDown = false; }
+    }
+    // the push waits for the ragdoll the bail brings up
+    if (g_knockLeft > 0) {
+        g_knockLeft--;
+        void* mesh = sk ? twkP(sk, CH_MESH) : nullptr;
+        __try {
+            if (mesh && g_setLinVel && (twkB(sk, SK_BITS) & 0x02)) {
+                if (g_knockBone) g_setLinVel(mesh, g_knockVel, true, g_knockBone);
+                if (g_pelvis >= 0) { const float h[3] = { g_knockVel[0] * 0.7f, g_knockVel[1] * 0.7f, g_knockVel[2] * 0.7f }; g_setLinVel(mesh, h, true, g_boneFN[g_pelvis]); }
+                g_knockLeft = 0;
+            }
+        } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; g_knockLeft = 0; }
+    }
+    if (!BindBridge()) return;
+    void* acts[16]; int n = 0;
+    __try { n = g_proxyList(acts, 16); } __except (EXCEPTION_EXECUTE_HANDLER) { n = 0; }
+    // your body as capsules, for the boards
+    V3 segA[11], segB[11]; float segR[11]; int segBone[11]; int nSeg = 0; V3 myVel = v3(0, 0, 0);
+    if ((g_boardHits || g_sitting) && sk && !(twkB(sk, SK_BITS) & 0x02)) {
+        __try {
+            void* mesh = twkP(sk, CH_MESH);
+            if (mesh && ResolveRig(mesh)) {
+                Q4 mq; V3 mp, ms; ReadC2W(mesh, &mq, &mp, &ms);
+                const int ridx = *(const int*)((const uint8_t*)mesh + SKM_READ);
+                const uint8_t* arr = (const uint8_t*)mesh + SKM_CST + (ridx == 1 ? 0x10 : 0);
+                const uint8_t* data = *(const uint8_t* const*)arr;
+                if (data && *(const int*)(arr + 8) == g_nBones) {
+                    auto seg = [&](int a, int b, float r, int bone) {
+                        V3 pa, pb;
+                        if (nSeg < 11 && BoneWorld(data, a, mq, mp, ms, &pa) && BoneWorld(data, b, mq, mp, ms, &pb)) {
+                            segA[nSeg] = pa; segB[nSeg] = pb; segR[nSeg] = r; segBone[nSeg] = bone; nSeg++;
+                        }
+                    };
+                    const int top = g_nSpine ? g_spine[g_nSpine - 1] : g_pelvis;
+                    const int hd = g_head >= 0 ? g_head : g_neck;
+                    seg(g_pelvis, top, 17.0f, top);
+                    seg(top, hd, 12.0f, hd);
+                    if (hd >= 0 && g_neck >= 0 && hd != g_neck) {       // the skull, up past the head bone
+                        V3 h, nk;
+                        if (BoneWorld(data, hd, mq, mp, ms, &h) && BoneWorld(data, g_neck, mq, mp, ms, &nk) && nSeg < 11) {
+                            segA[nSeg] = h; segB[nSeg] = add(h, mul(norm(sub(h, nk)), 14.0f)); segR[nSeg] = 12.0f; segBone[nSeg] = hd; nSeg++;
+                        }
+                    }
+                    for (int sd = 0; sd < 2; sd++) {
+                        seg(g_thigh[sd], g_calf[sd], 10.0f, g_thigh[sd]);
+                        seg(g_calf[sd], g_foot[sd], 8.0f, g_calf[sd]);
+                        seg(g_uarm[sd], g_larm[sd], 7.0f, g_uarm[sd]);
+                    }
+                }
+            }
+            void* move = twkP(sk, CH_MOVE);
+            if (move) { const float* v = (const float*)((const uint8_t*)move + MOVE_VEL); if (fabsf(v[0]) < 1e5f) myVel = v3(v[0], v[1], v[2]); }
+        } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; nSeg = 0; }
+    }
+    for (int k = 0; k < nSeg; k++) { g_meA[k] = segA[k]; g_meB[k] = segB[k]; g_meR[k] = segR[k]; g_meBone[k] = segBone[k]; }
+    g_meN = nSeg;
+    const bool boardHitsOn = g_boardHits != 0;
+    const uint64_t nowMs = GetTickCount64();
+    PxPhys next[16]; int m = 0;
+    for (int i = 0; i < n && m < 16; i++) {
+        void* a = acts[i];
+        if (!a) continue;
+        PxPhys st; memset(&st, 0, sizeof(st)); st.actor = a;
+        for (int k = 0; k < g_pxpN; k++) if (g_pxp[k].actor == a) { st = g_pxp[k]; break; }
+        char nm[40] = "";
+        __try {
+            if (g_proxyName && !g_proxyName(a, nm, sizeof(nm))) { next[m++] = st; continue; }   // away: left as it is
+            void* root = twkP(a, ACT_ROOT);
+            void* cap  = twkP(a, CH_CAPSULE);
+            void* mesh = twkP(a, CH_MESH);
+            if (!root || !cap || !mesh) { next[m++] = st; continue; }
+            Q4 rq; V3 rp; ReadC2W(root, &rq, &rp, nullptr);
+            // 1) are they sitting (or down): the head against the capsule's bottom
+            const PxRig* rig = PxRigFor(mesh);
+            void* anim = twkP(mesh, MESH_ANIM);
+            const bool riding = anim && twkB(anim, AN_ON_BOARD) != 0;     // a crouched rider's head is low too: not a seat
+            st.riding = riding;
+            if (st.rootOk && dt > 1e-4f) {
+                const V3 iv = mul(sub(rp, st.root), 1.0f / dt);
+                if (len(iv) < 5000.0f) st.vel = lerp(st.vel, iv, fminf(1.0f, dt / 0.08f));
+            }
+            st.root = rp; st.rootOk = true;
+            st.headOk = false;
+            if (riding) st.seated = false;
+            if (rig) {
+                Q4 mq; V3 mp, ms; ReadC2W(mesh, &mq, &mp, &ms);
+                const int ridx = *(const int*)((const uint8_t*)mesh + SKM_READ);
+                const uint8_t* arr = (const uint8_t*)mesh + SKM_CST + (ridx == 1 ? 0x10 : 0);
+                const uint8_t* data = *(const uint8_t* const*)arr;
+                V3 hp;
+                if (data && *(const int*)(arr + 8) == rig->n && BoneWorld(data, rig->head, mq, mp, ms, &hp)) {
+                    const float rel = hp.z - (rp.z - twkF(cap, CAP_HALF));
+                    if (!riding) st.seated = st.seated ? rel < 135.0f : rel < 120.0f;
+                    st.head = hp; st.headOk = true;
+                }
+            }
+            if (st.seated && g_seatColl && g_setColl && !st.capOff) {
+                const uint8_t was = twkB(cap, PRIM_COLL);
+                if (was != 0) {
+                    g_setColl(cap, 0);
+                    st.cap = cap; st.capWas = was; st.capOff = true; SitUI_Track(&st.capRef, cap);
+                    static int s_n = 0;
+                    if (s_n++ < 40) TwkLog("[sit] %s is sitting (or down): their capsule is off, their body is what gets hit", nm[0] ? nm : "a player");
+                }
+            } else if (st.capOff && (!st.seated || !g_seatColl)) {
+                if (SitUI_Alive(&st.capRef) && g_setColl) g_setColl(st.cap, st.capWas);
+                st.capOff = false;
+                static int s_n = 0;
+                if (s_n++ < 40) TwkLog("[sit] %s is up again: their capsule is back", nm[0] ? nm : "a player");
+            }
+            // 2) their board: thrown (or loose), fast, and at us?
+            void* bd = twkP(a, SK_BOARD);
+            void* tf = bd ? twkP(bd, BD_TRUCK_F) : nullptr;
+            void* tb = bd ? twkP(bd, BD_TRUCK_B) : nullptr;
+            if (tf && tb) {
+                const float* fw = (const float*)((const uint8_t*)tf + SC_C2W);
+                const float* bw = (const float*)((const uint8_t*)tb + SC_C2W);
+                const V3 F = v3(fw[4], fw[5], fw[6]), B = v3(bw[4], bw[5], bw[6]);
+                V3 ax = sub(F, B); const float wb = len(ax);
+                if (wb > 5.0f && wb < 200.0f) {
+                    ax = mul(ax, 1.0f / wb);
+                    const V3 mid = mul(add(F, B), 0.5f);
+                    const V3 nose = add(mid, mul(ax, 0.97f * wb)), tail = sub(mid, mul(ax, 0.97f * wb));
+                    if (st.boardOk && dt > 1e-4f) {                       // smoothed: a stamped board jitters frame to frame
+                        const V3 iv = mul(sub(mid, st.deck), 1.0f / dt);
+                        if (len(iv) < 8000.0f) st.bvel = lerp(st.bvel, iv, fminf(1.0f, dt / 0.06f));
+                    }
+                    if ((boardHitsOn || g_boardTrips) && st.boardOk && dt > 1e-4f && nSeg && nowMs >= st.coolUntil && len(sub(mid, rp)) > 120.0f) {
+                        const float sp = len(st.bvel), mySp = len(v3(myVel.x, myVel.y, 0.0f));
+                        // FLYING at you: fast on its own. Otherwise it is lying about, and only a SPRINT into it trips you.
+                        const bool flying = boardHitsOn && sp >= g_boardHitSpeed;
+                        const bool trip = !flying && g_boardTrips && Sprinting(sk, mySp);
+                        if (flying || trip) {
+                            const V3 n2 = mul(add(nose, st.nose), 0.5f), t2 = mul(add(tail, st.tail), 0.5f);
+                            int hit = -1;
+                            for (int k = 0; k < nSeg && hit < 0; k++) {
+                                if (trip && segR[k] > 11.0f) continue;         // a trip is the legs', not the head's
+                                const float lim = segR[k] + 7.0f;
+                                if (SegDist(segA[k], segB[k], tail, nose) < lim || SegDist(segA[k], segB[k], t2, n2) < lim) hit = k;
+                            }
+                            if (hit >= 0) {
+                                st.coolUntil = nowMs + 1500;
+                                if (flying) HitByBoard(sk, nm[0] ? nm : "a player", st.bvel, len(sub(st.bvel, myVel)), segBone[hit], false);
+                                else        HitByBoard(sk, nm[0] ? nm : "a player", myVel, mySp, segBone[hit], true);
+                            }
+                        }
+                    }
+                    st.nose = nose; st.tail = tail; st.deck = mid; st.boardOk = true;
+                } else st.boardOk = false;
+            } else st.boardOk = false;
+        } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; }
+        next[m++] = st;
+    }
+    // ---- YOUR LOOSE BOARD, PUSHED. Rolling after a bail, or thrown: it is simulated on THIS machine and nowhere
+    //      else, so a player walking into it on their screen only fights their copy of it. Here their body --
+    //      feet to head, as it is on this machine -- walking into it moves it, as fast as they walk into it, and
+    //      where it goes reaches everyone the way it always does.
+    if (g_boardPush && g_setLinVel && sk) {
+        __try {
+            void* bd = twkP(sk, SK_BOARD);
+            void* bm = bd ? twkP(bd, BD_MOVECOMP) : nullptr;
+            const int mode = bm ? twkB(bm, BM_MODE) : -1;
+            const bool loose = bd && (mode == 8 || (g_boardResting && g_board == bd));
+            void* tf = loose ? twkP(bd, BD_TRUCK_F) : nullptr;
+            void* tb = loose ? twkP(bd, BD_TRUCK_B) : nullptr;
+            if (tf && tb) {
+                const float* fw = (const float*)((const uint8_t*)tf + SC_C2W);
+                const float* bw = (const float*)((const uint8_t*)tb + SC_C2W);
+                const V3 F = v3(fw[4], fw[5], fw[6]), B = v3(bw[4], bw[5], bw[6]);
+                V3 ax = sub(F, B); const float wb = len(ax);
+                const V3 mid = mul(add(F, B), 0.5f);
+                if (g_myDeckOk && dt > 1e-4f) g_myDeckVel = lerp(g_myDeckVel, mul(sub(mid, g_myDeckPrev), 1.0f / dt), fminf(1.0f, dt / 0.06f));
+                g_myDeckPrev = mid; g_myDeckOk = true;
+                if (wb > 5.0f && wb < 200.0f) {
+                    ax = mul(ax, 1.0f / wb);
+                    const V3 nose = add(mid, mul(ax, 0.97f * wb)), tail = sub(mid, mul(ax, 0.97f * wb));
+                    for (int j = 0; j < m; j++) {
+                        const PxPhys& o = next[j];
+                        if (!o.rootOk || o.riding) continue;           // a rider's own board does the pushing, and already can
+                        const V3 feet = v3(o.root.x, o.root.y, o.root.z - 85.0f);
+                        const V3 top = o.headOk ? o.head : v3(o.root.x, o.root.y, o.root.z + 70.0f);
+                        const float reach = 22.0f + 9.0f;
+                        const float d = SegDist(feet, top, tail, nose);
+                        if (d >= reach) continue;
+                        V3 n = sub(mid, v3(o.root.x, o.root.y, mid.z));   // out from their body, along the ground
+                        n.z = 0.0f;
+                        if (len(n) < 1e-3f) continue;
+                        n = norm(n);
+                        const float into = dot(v3(o.vel.x, o.vel.y, 0.0f), n);
+                        const float want = fmaxf(into, 0.0f) * g_boardPushPct * 0.01f + (reach - d) * 6.0f;   // their pace, plus getting out of them
+                        const float have = dot(g_myDeckVel, n);
+                        if (want <= have) continue;
+                        const float add = fminf(want - have, 900.0f);
+                        const float dv[3] = { n.x * add, n.y * add, 0.0f };
+                        BoardAddVelocity(bd, dv);
+                        if (g_pushSaid < 20 && into > 60.0f) { g_pushSaid++; TwkLog("[sit] a player walked into your loose board at %.0f cm/s: pushed on %.0f cm/s", into, add); }
+                    }
+                }
+            } else g_myDeckOk = false;
+        } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; g_myDeckOk = false; }
+    }
+    for (int k = 0; k < g_pxpN; k++) {                        // gone from the list: their capsule back if it still exists
+        bool still = false;
+        for (int j = 0; j < m; j++) if (next[j].actor == g_pxp[k].actor) { still = true; break; }
+        if (!still && g_pxp[k].capOff) {
+            __try { if (SitUI_Alive(&g_pxp[k].capRef) && g_setColl) g_setColl(g_pxp[k].cap, g_pxp[k].capWas); } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; }
+        }
+    }
+    for (int k = 0; k < m; k++) g_pxp[k] = next[k];
+    g_pxpN = m;
+}
+
+// THE RUN-IN, BY SHAPE (WhoHitUs asks this first): their board (when it is theirs to ride, near them) and their
+// body (feet to head) against your seated body as capsules. Going OVER you -- board and feet higher than anything
+// of yours below them -- touches nothing, and so is nothing. `have` = your body was to hand (else the old test).
+static const Peer* WhoHitUsByShape(bool* have) {
+    *have = g_meN > 0;
+    if (!*have) return nullptr;
+    for (int i = 0; i < g_nPeers; i++) {
+        const Peer& pr = g_peers[i];
+        if (pr.speed < g_hitSpeed) continue;
+        const PxPhys* st = nullptr;
+        for (int k = 0; k < g_pxpN; k++) if (g_pxp[k].actor == pr.actor) { st = &g_pxp[k]; break; }
+        const bool board = st && st->boardOk && len(sub(st->deck, pr.pos)) < 200.0f;
+        float lo = pr.pos.z - 85.0f;
+        if (board) lo = fminf(lo, st->deck.z + 8.0f);
+        const V3 feet = v3(pr.pos.x, pr.pos.y, lo + 10.0f);
+        const V3 top = (st && st->headOk) ? st->head : v3(pr.pos.x, pr.pos.y, pr.pos.z + 75.0f);
+        for (int k = 0; k < g_meN; k++) {
+            if (board && SegDist(g_meA[k], g_meB[k], st->tail, st->nose) < g_meR[k] + 6.0f) return &pr;
+            if (SegDist(g_meA[k], g_meB[k], feet, top) < g_meR[k] + 16.0f) return &pr;
+        }
+    }
+    return nullptr;
+}
 
 // The first-person view, for the camera module: the eyes in the world off the mesh's FINISHED pose
 // (the read buffer -- what is on screen), the look as a world rotation, the dolly weight, the FOV.
@@ -2170,6 +2791,7 @@ void Sit_PumpFrame() {
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; }
     }
+    if (!InReplay() && !InPropEditor()) PumpPeerPhysics(sk, dt);   // seated players' capsules, thrown boards at you
     if (onFoot && sk && g_headLook && !InReplay()) {
         void* mesh = twkP(sk, CH_MESH);
         if (mesh && mesh != g_walkSeen) {
@@ -2544,13 +3166,27 @@ bool Sit_OnInputKey(const void* key, int ev) {
         // into a state the seat cannot follow (skating while sitting, stuck). On foot, a Y is the
         // game's own mount request, and a sit must not start under the mount animation -- the same
         // stuck state from the other side -- so it holds the sit key off for the length of one.
-        if (g_sitting) return true;
+        // A THROWN board still comes back on Y from a seat (and that press does nothing else either).
+        if (g_sitting) {
+            if (kind == 5 && ev == 0 && Sit_BoardOut()) Sit_BoardBack("the mount key, seated");
+            return true;
+        }
         // A board that was THROWN stays where it landed until it is asked for: Y puts it back in the hand, and
         // that press does nothing else -- the way the game's own Y does when getting on is blocked. The next
         // Y gets on it as it always has. (The release, and any repeats, of that press are swallowed with it.)
         if (kind == 5) {
             if (ev == 0) {
+                // Not while a throw is held up on LT: Y would get on the board in the middle of the aim. Swallowed
+                // with its release; let go of LT (or throw) and Y mounts as always.
+                if (Emote_ThrowHeld()) { g_swallowMount = 1; return true; }
                 if (Sit_BoardOut()) { Sit_BoardBack("the mount key"); g_swallowMount = 1; return true; }
+                // Not under any other emote either (542): a dance, a wave, the board tap. The thrown board above still
+                // comes back; put the emote away (B) or let it end and Y gets on as always.
+                if (Emote_BlocksMount()) {
+                    static int s_nb = 0;
+                    if (s_nb++ < 20) TwkLog("[sit] Y held off: an emote is up (put it away first)");
+                    g_swallowMount = 1; return true;
+                }
                 g_swallowMount = 0;                                     // a fresh press with no board out is always the game's
             } else if (g_swallowMount) { if (ev == 1) g_swallowMount = 0; return true; }
         }
@@ -2598,6 +3234,7 @@ void Sit_ReadConfig(const char* buf) {
     g_promptLog = TwkIniInt(buf, "SitPromptLog", 0) ? 1 : 0;
     g_capMove   = TwkIniInt(buf, "SitMoveCapsule", 1) ? 1 : 0;
     g_boardRest = TwkIniInt(buf, "SitBoardRest", 1) ? 1 : 0;
+    g_keepBoard = TwkIniInt(buf, "SitKeepBoard", 1) ? 1 : 0;
     g_boardOut  = (float)TwkIniInt(buf, "SitBoardOutCm", 46);
     g_boardDrop = (float)TwkIniInt(buf, "SitBoardDropCm", 9);
     g_boardAhead = (float)TwkIniInt(buf, "SitBoardAheadCm", 62);
@@ -2631,6 +3268,15 @@ void Sit_ReadConfig(const char* buf) {
     g_hitRadius   = (float)TwkIniInt(buf, "SitHitRadiusCm", 75);
     g_hitRise     = (float)TwkIniInt(buf, "SitHitRiseCm", 130);
     g_hitSpeed    = (float)TwkIniInt(buf, "SitHitSpeedCm", 140);
+    g_seatColl    = TwkIniInt(buf, "SitSeatCollision", 1) ? 1 : 0;
+    g_boardHits   = TwkIniInt(buf, "SitBoardHits", 1) ? 1 : 0;
+    g_boardHitSpeed = (float)TwkIniInt(buf, "SitBoardHitSpeedCm", 400);
+    g_boardHitVol = (float)TwkIniInt(buf, "SitBoardHitVolumePct", 100);
+    g_boardKnock  = (float)TwkIniInt(buf, "SitBoardKnockPct", 35);
+    g_boardKnockdown = TwkIniInt(buf, "SitBoardKnockdown", 1) ? 1 : 0;
+    g_boardTrips  = TwkIniInt(buf, "SitBoardTrips", 1) ? 1 : 0;
+    g_boardPush   = TwkIniInt(buf, "SitBoardPush", 1) ? 1 : 0;
+    g_boardPushPct = (float)TwkIniInt(buf, "SitBoardPushPct", 115);
     SitUI_ReadConfig(buf);
     g_keyFName = 0; g_fpKeyFName = 0; g_dpadL = 0; g_dpadR = 0; g_keyTop = 0; g_keyLeft = 0; g_notKeyN = 0;
     g_maxLedge = clampf(g_maxLedge, 30.0f, 200.0f); g_reach = clampf(g_reach, 40.0f, 200.0f); g_lean = clampf(g_lean, -25.0f, 25.0f);
@@ -2654,6 +3300,7 @@ void Sit_SaveConfig(char* buf, size_t cap) {
     TwkIniSetInt(buf, cap, "SitPromptLog",     g_promptLog);
     TwkIniSetInt(buf, cap, "SitMoveCapsule",   g_capMove);
     TwkIniSetInt(buf, cap, "SitBoardRest",     g_boardRest);
+    TwkIniSetInt(buf, cap, "SitKeepBoard",     g_keepBoard);
     TwkIniSetInt(buf, cap, "SitBoardOutCm",    (int)g_boardOut);
     TwkIniSetInt(buf, cap, "SitBoardDropCm",   (int)g_boardDrop);
     TwkIniSetInt(buf, cap, "SitBoardAheadCm",  (int)g_boardAhead);
@@ -2687,6 +3334,15 @@ void Sit_SaveConfig(char* buf, size_t cap) {
     TwkIniSetInt(buf, cap, "SitHitRadiusCm",   (int)g_hitRadius);
     TwkIniSetInt(buf, cap, "SitHitRiseCm",     (int)g_hitRise);
     TwkIniSetInt(buf, cap, "SitHitSpeedCm",    (int)g_hitSpeed);
+    TwkIniSetInt(buf, cap, "SitSeatCollision", g_seatColl);
+    TwkIniSetInt(buf, cap, "SitBoardHits",     g_boardHits);
+    TwkIniSetInt(buf, cap, "SitBoardHitSpeedCm",   (int)g_boardHitSpeed);
+    TwkIniSetInt(buf, cap, "SitBoardHitVolumePct", (int)g_boardHitVol);
+    TwkIniSetInt(buf, cap, "SitBoardKnockPct",     (int)g_boardKnock);
+    TwkIniSetInt(buf, cap, "SitBoardKnockdown",    g_boardKnockdown);
+    TwkIniSetInt(buf, cap, "SitBoardTrips",        g_boardTrips);
+    TwkIniSetInt(buf, cap, "SitBoardPush",         g_boardPush);
+    TwkIniSetInt(buf, cap, "SitBoardPushPct",      (int)g_boardPushPct);
     SitUI_SaveConfig(buf, cap);
 }
 void Sit_ResetDefaults() { g_on = 1; g_floor = 1; g_maxLedge = 120.0f; g_reach = 110.0f; g_lean = 0.0f; }
@@ -2700,6 +3356,23 @@ float Sit_ReachCm()             { return g_reach; }
 void  Sit_SetReachCm(float v)   { g_reach = clampf(v, 40.0f, 200.0f); TwkMarkDirty(); }
 float Sit_LeanDeg()             { return g_lean; }
 bool  Sit_HeadLook()            { return g_headLook != 0; }
+bool  Sit_BoardKnockdown()      { return g_boardKnockdown != 0; }
+void  Sit_SetBoardKnockdown(bool o) { g_boardKnockdown = o ? 1 : 0; TwkMarkDirty(); }
+// The seated first person (537: Camera > Sitting in the pause menu).
+bool  Sit_FpEnabled()           { return g_fpOn != 0; }
+void  Sit_SetFpEnabled(bool o)  { g_fpOn = o ? 1 : 0; TwkMarkDirty(); }
+float Sit_FpFov()               { return g_fpFov; }
+void  Sit_SetFpFov(float v)     { g_fpFov = (v < 1.0f) ? 0.0f : clampf(floorf(v + 0.5f), 60.0f, 120.0f); TwkMarkDirty(); }
+float Sit_LookSpeed()           { return g_lookSpeed; }
+void  Sit_SetLookSpeed(float v) { g_lookSpeed = clampf(floorf(v + 0.5f), 40.0f, 400.0f); TwkMarkDirty(); }
+bool  Sit_LookInvertY()         { return (g_lookInvert & 2) != 0; }
+void  Sit_SetLookInvertY(bool o){ g_lookInvert = o ? (g_lookInvert | 2) : (g_lookInvert & ~2); TwkMarkDirty(); }
+float Sit_LookYawDeg()          { return g_lookYawMax; }
+void  Sit_SetLookYawDeg(float v){ g_lookYawMax = clampf(floorf(v + 0.5f), 20.0f, 160.0f); TwkMarkDirty(); }
+float Sit_LookUpDeg()           { return g_lookUpMax; }
+void  Sit_SetLookUpDeg(float v) { g_lookUpMax = clampf(floorf(v + 0.5f), 5.0f, 80.0f); TwkMarkDirty(); }
+float Sit_LookDownDeg()         { return g_lookDownMax; }
+void  Sit_SetLookDownDeg(float v){ g_lookDownMax = clampf(floorf(v + 0.5f), 5.0f, 85.0f); TwkMarkDirty(); }
 void  Sit_SetHeadLook(bool o)   { g_headLook = o ? 1 : 0; TwkMarkDirty(); }
 void  Sit_SetLeanDeg(float v)   { g_lean = clampf(v, -25.0f, 25.0f); TwkMarkDirty(); }
 
@@ -2708,6 +3381,25 @@ void Sit_DrawMenu(const OmpMenuApi* api) {
     if (api->Checkbox("Sit down (B while off the board)", &on)) Sit_SetEnabled(on);
     api->SameLine(); api->TextDisabled(g_ok ? "(press again to stand)" : "(unavailable this build -- see the log)");
     if (api->Checkbox("Sit on the ground when there is no ledge", &fl)) Sit_SetFloorEnabled(fl);
+    bool kb = g_keepBoard != 0;
+    if (api->Checkbox("Keep the board while seated", &kb)) { g_keepBoard = kb ? 1 : 0; TwkMarkDirty(); }
+    api->SameLine(); api->TextDisabled("(laid beside you; RB taps it, LT + RT throws it. Off: set down and left to settle)");
+    bool sc = g_seatColl != 0, bh = g_boardHits != 0;
+    if (api->Checkbox("Seated collision fits the body", &sc)) { g_seatColl = sc ? 1 : 0; TwkMarkDirty(); }
+    api->SameLine(); api->TextDisabled("(yours and other players': a trick over someone sitting clears them)");
+    if (api->Checkbox("Thrown boards hit you", &bh)) { g_boardHits = bh ? 1 : 0; TwkMarkDirty(); }
+    api->SameLine(); api->TextDisabled("(someone else's board hitting you: the head-knock sound, as hard as it hit)");
+    if (g_boardHits) {
+        bool kd = g_boardKnockdown != 0;
+        api->Indent();
+        if (api->Checkbox("...and knock you over", &kd)) Sit_SetBoardKnockdown(kd);
+        api->SameLine(); api->TextDisabled("(off: you hear it and it bounces off you, but you stay on your feet)");
+        api->Unindent();
+    }
+    bool tr = g_boardTrips != 0, pu = g_boardPush != 0;
+    if (api->Checkbox("Sprinting into a board trips you", &tr)) { g_boardTrips = tr ? 1 : 0; TwkMarkDirty(); }
+    if (api->Checkbox("Walking into a loose board pushes it", &pu)) { g_boardPush = pu ? 1 : 0; TwkMarkDirty(); }
+    api->SameLine(); api->TextDisabled("(each player's game pushes its OWN board, so everyone sees it move)");
     float v = g_maxLedge;
     if (api->SliderFloat("Tallest ledge (cm)", &v, 30.0f, 200.0f, "%.0f")) Sit_SetMaxLedgeCm(v);
     v = g_reach;
@@ -2747,6 +3439,8 @@ void Sit_Install() {
     g_ragOff = (RagDollFn)TwkScanExe(SIG_RAGDOLL_OFF);
     g_setAngVel = (SetVelocityFn)TwkScanExeNth(SIG_SET_PHYS_VELOCITY, 0);     // the twins, by order: see the signature's note
     g_setLinVel = (SetVelocityFn)TwkScanExeNth(SIG_SET_PHYS_VELOCITY, 1);
+    g_setColl   = (SetCollisionFn)TwkScanExe(SIG_SET_COLLISION);
+    if (!g_setColl) TwkLog("[sit] SetCollisionEnabled NOT FOUND -- seated bodies keep the standing capsule");
     if (!g_flipAt || !g_trace || !g_setMode || !g_getWorld) {
         TwkLog("[sit] %s%s%s%s-- sitting unavailable (game updated?)",
                g_flipAt ? "" : "FlipEditableSpaceBases sig NOT FOUND ", g_trace ? "" : "LineTraceSingleByChannel sig NOT FOUND ",

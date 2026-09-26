@@ -22,6 +22,8 @@ void GrindPop_DrawMenu(const OmpMenuApi* api);   // RENDER THREAD (menu_ext cont
 void GrindPop_PumpFrame();                       // GAME THREAD: drains the record ring and logs
 void GrindPop_ResetDefaults();
 bool GrindPop_Enabled();
+// GetTickCount64 of our skater's last JumpForTrick (the pop, on flat or out of a grind); 0 = none yet.
+unsigned long long GrindPop_LastJumpMs();
 void GrindPop_SetEnabled(bool on);
 // Pause-menu accessors (GAME THREAD, like every other module's).
 bool  GrindPop_PitchEnabled();     void GrindPop_SetPitchEnabled(bool on);

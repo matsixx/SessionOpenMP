@@ -5,6 +5,7 @@
 #include <stddef.h>
 
 void Radio_ReadConfig(const char* iniText);
+void* Radio_LoadAsset(const char* path);   // an asset by its full path: found if loaded, loaded if not
 void Radio_PumpFrame();
 void Radio_SaveConfig(char* iniText, size_t cap);      // your own radio's volume, as the wheel last left it
 

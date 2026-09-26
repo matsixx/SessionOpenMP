@@ -35,6 +35,7 @@
 #include <cstdarg>
 #include <cstring>
 #include "imgui.h"
+#include "imgui_internal.h"   // GImGui->Viewports: every pop-out window, including ones about to be retired
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx11.h"
 #include "imgui_impl_dx12.h"
@@ -51,6 +52,7 @@
 #include "theme.h"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
+void ImGui_ImplDX12_OmpWaitViewports();   // imgui_impl_dx12_omp.cpp
 
 typedef HRESULT(WINAPI* pfn_Present)(IDXGISwapChain*, UINT, UINT);
 typedef HRESULT(WINAPI* pfn_ResizeBuffers)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
@@ -60,6 +62,75 @@ static pfn_ResizeBuffers o_ResizeBuffers = nullptr;
 static pfn_ECL           o_ECL = nullptr;
 
 static std::atomic<bool> g_visible{false};
+// THE POP-OUT: the F1 menu in an OS window of its own, for a second monitor (ImGui's multi-viewport
+// feature, setting MpPrefs_F1PopOut, off by default). g_f1Popped is published by the frame: the F1
+// window is living in its own window RIGHT NOW. While it is, the menu does not own the game -- no
+// input is taken from the game window, no cursor is drawn over it, and Enter still opens the chat,
+// because the point of a menu on the other screen is to keep playing.
+static std::atomic<bool> g_f1Popped{false};
+static std::atomic<bool> g_vpCloseReq{false};   // Alt+F4 / taskbar close on the pop-out: close the MENU
+// A mouse button went down on the menu while it was in the game's window and has not come up yet.
+// Set/cleared by the window hook (game thread); see there.
+static std::atomic<bool> g_menuMouseHeld{false};
+// The menu has just moved out of the game into its own window (a drag or the checkbox): give that
+// window the focus once the mouse is let go (render thread only). Until then the cursor stays
+// unlocked -- putting the game's lock back first would yank the cursor to the game's screen.
+// g_f1ViewportId = which window.
+static bool    g_popHandoff = false;
+static std::atomic<bool> g_backToGame{false};   // the menu was closed from its own window: the game is being put in front
+static ImGuiID g_f1ViewportId = 0;
+
+// THE GAME'S CURSOR LOCK. While it has the mouse, Session clips the cursor to its own screen
+// (logged: LOCKED to (0,0)-(2560,1440) on a desktop reaching -3840), so a menu dragged toward another
+// monitor stopped dead at the edge. WITH THE POP-OUT SETTING ON, while the in-game menu owns the
+// mouse, the lock is held off: the game's ClipCursor calls are recorded instead of applied, and the
+// last one goes back when the menu lets go. The rest of the time this hook only passes calls through.
+typedef BOOL(WINAPI* pfn_ClipCursor)(const RECT*);
+static pfn_ClipCursor o_ClipCursor = nullptr;
+static std::mutex g_clipMx;                          // held around every ClipCursor, ours and the game's
+static bool g_clipKnown = false, g_clipNull = true;  // the game's last request
+static RECT g_clipRect = {};
+static bool g_clipFree = false;
+static int  g_clipHeldCalls = 0;                     // game lock requests held off in the current stretch
+static BOOL callClip(const RECT* r) { return o_ClipCursor ? o_ClipCursor(r) : ClipCursor(r); }
+static BOOL WINAPI hkClipCursor(const RECT* r) {
+    std::lock_guard<std::mutex> lk(g_clipMx);
+    g_clipKnown = true; g_clipNull = (r == nullptr); if (r) g_clipRect = *r;
+    if (r && g_clipFree) { g_clipHeldCalls++; return TRUE; }
+    return callClip(r);
+}
+static void clipHoldOff(bool on, bool restore) {
+    std::lock_guard<std::mutex> lk(g_clipMx);
+    if (on == g_clipFree) return;
+    if (on) {
+        if (!g_clipKnown) {                      // locked before the hook went in: read what is there
+            RECT c;
+            if (GetClipCursor(&c)) {
+                const LONG vx = GetSystemMetrics(SM_XVIRTUALSCREEN), vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+                g_clipNull = c.left <= vx && c.top <= vy &&
+                             c.right >= vx + GetSystemMetrics(SM_CXVIRTUALSCREEN) &&
+                             c.bottom >= vy + GetSystemMetrics(SM_CYVIRTUALSCREEN);
+                g_clipRect = c; g_clipKnown = true;
+            }
+        }
+        g_clipFree = true;
+        g_clipHeldCalls = 0;
+        callClip(nullptr);
+        OvLog("[overlay] cursor lock: off (the menu has the mouse)");
+    } else {
+        g_clipFree = false;
+        const bool put = restore && g_clipKnown;
+        if (put) callClip(g_clipNull ? nullptr : &g_clipRect);
+        char b[200];
+        snprintf(b, sizeof(b), "[overlay] cursor lock: %s (game asked %d time(s) meanwhile; its last ask: %s)",
+                 put ? "given back to the game" : "left off (the game is not in front)",
+                 g_clipHeldCalls, !g_clipKnown ? "none seen" : g_clipNull ? "unlock" : "lock");
+        OvLog(b);
+    }
+}
+static bool g_vpAvail = false;                   // both backends installed their multi-window support
+static bool g_vpLive  = false;                   // a pop-out OS window exists (render thread only)
+static bool g_vpNoOtherMonitor = false;          // popping out, but the game is on the only monitor
 // ---- the JOIN-CODE PROMPT. A second, much smaller overlay mode: the pause menu can show a code but
 // it cannot take one -- Session's editable-text widgets need style assets that are not available, and
 // its own name entry is welded into the customization container. So the code is typed into an ImGui
@@ -99,7 +170,7 @@ static UINT g_bbCount = 0, g_rtvSize = 0;
 static ID3D12CommandQueue* g_qCand[4] = {};
 static volatile LONG g_nQCand = 0;
 
-bool Overlay_Visible() { return g_visible.load() || g_promptKind.load() != PK_NONE; }
+bool Overlay_Visible() { return (g_visible.load() && !g_f1Popped.load()) || g_promptKind.load() != PK_NONE; }
 void Overlay_PromptCode(bool open) { g_promptKind = open ? PK_CODE : PK_NONE; }
 void Overlay_PromptName(bool open) { g_promptKind = open ? PK_NAME : PK_NONE; }
 bool Overlay_PromptOpen() { return g_promptKind.load() != PK_NONE; }
@@ -187,6 +258,71 @@ static void imguiFeed(HWND h, UINT m, WPARAM w, LPARAM l) {
     } catch (...) { }
 }
 
+// ---- THE POP-OUT'S OWN WINDOWS. ImGui creates them on the thread that calls Present -- the engine's
+// render thread, which has no message loop -- so the frame pumps them itself (vpPump). Their window
+// procedure is ImGui's, wrapped for three reasons:
+//  * THE LOCK. ImGui's handler feeds input just as the game window's hook does, but from this thread,
+//    and the game thread's key releases can land at the same moment.
+//  * WM_CLOSE. Alt+F4 would reach DefWindowProc and DESTROY the window out from under ImGui, which
+//    would then present into a dead window. It closes the menu instead.
+//  * NO MODAL LOOPS. There is no caption and no system menu, but Alt still asks DefWindowProc for the
+//    menu loop -- and a modal loop here would stop the render thread, the game, until it ended.
+// The windows have NO OWNER (ConfigViewportsNoDefaultParent): owned by the game window they would be
+// tied to the game thread, and one thread blocking on the other is how a hook hangs a game.
+static WNDPROC g_vpOrigProc = nullptr;
+static void (*g_vpOrigCreate)(ImGuiViewport*) = nullptr;
+static void (*g_vpOrigDestroy)(ImGuiViewport*) = nullptr;
+static LRESULT CALLBACK vpWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (m == WM_CLOSE) { g_vpCloseReq = true; return 0; }
+    if (m == WM_SYSCOMMAND) {
+        const UINT c = (UINT)(w & 0xFFF0);
+        if (c == SC_KEYMENU || c == SC_MOVE || c == SC_SIZE) return 0;
+    }
+    if (!g_vpOrigProc) return DefWindowProcW(h, m, w, l);
+    try {
+        std::lock_guard<std::recursive_mutex> lk(g_imguiInputMx);
+        return CallWindowProcW(g_vpOrigProc, h, m, w, l);
+    } catch (...) { return DefWindowProcW(h, m, w, l); }
+}
+static void vpCreate(ImGuiViewport* vp) {
+    g_vpOrigCreate(vp);
+    if (HWND h = (HWND)vp->PlatformHandle) {
+        WNDPROC prev = (WNDPROC)SetWindowLongPtrW(h, GWLP_WNDPROC, (LONG_PTR)&vpWndProc);
+        if (prev && prev != &vpWndProc) g_vpOrigProc = prev;
+    }
+}
+static void vpDestroy(ImGuiViewport* vp) {
+    // ImGui hands a mouse capture the dying window held over to the MAIN window -- the game's, on
+    // another thread. Released here instead: nothing of ours takes the game window's mouse.
+    if (vp != ImGui::GetMainViewport())
+        if (HWND h = (HWND)vp->PlatformHandle) if (GetCapture() == h) ReleaseCapture();
+    g_vpOrigDestroy(vp);
+}
+// Messages for the pop-out windows, pumped at the top of each frame, outside the input lock (the
+// procedure takes it per message). Filtered BY WINDOW: whatever else this thread owns is the
+// engine's business, and a thread message (WM_QUIT) is never touched.
+static void vpPump() {
+    if (!g_vpAvail || !GImGui) return;
+    HWND hw[16]; int n = 0;
+    for (int i = 1; i < GImGui->Viewports.Size && n < 16; i++) {
+        ImGuiViewportP* vp = GImGui->Viewports[i];
+        if (vp->PlatformWindowCreated && vp->PlatformHandle) hw[n++] = (HWND)vp->PlatformHandle;
+    }
+    for (int i = 0; i < n; i++) {
+        MSG msg; int guard = 0;
+        while (guard++ < 256 && PeekMessageW(&msg, hw[i], 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+}
+static bool vpAnyLive() {
+    if (!g_vpAvail || !GImGui) return false;
+    for (int i = 1; i < GImGui->Viewports.Size; i++)
+        if (GImGui->Viewports[i]->PlatformWindowCreated) return true;
+    return false;
+}
+
 // A FROZEN SCREEN LOOKS LIKE A STUCK CURSOR while a menu is open, so the two are told apart here: a
 // long gap between the game thread's messages, or between frames, is logged with whether F1 was up.
 // Measured on FRAMES, not messages: a stalled game thread stalls Present too, while a quiet
@@ -214,9 +350,24 @@ static LRESULT CALLBACK hkWndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
     // Chat is in this list for the same reason the code prompt is: while it is OPEN the player is
     // typing, and a WASD that reaches the game would send them rolling down the street mid-sentence.
-    const bool capturing = g_visible.load() || Overlay_PromptOpen() || Chat_IsOpen();
+    // A POPPED-OUT menu takes nothing here: it has a window of its own, and the game keeps playing.
+    // EXCEPT A DRAG THAT STARTED HERE. Dragging the menu off the game's screen pops it out the moment
+    // it crosses the edge -- but the game window still holds the mouse capture from the press, so the
+    // rest of the drag keeps arriving HERE. Cut off at the pop, the menu froze right at the edge
+    // (field-reported). So a press on the in-game menu is fed through to its release.
+    const bool menuOwns = g_visible.load() && !g_f1Popped.load();
+    const bool dragging = g_visible.load() && g_menuMouseHeld.load();
+    const bool capturing = menuOwns || dragging || Overlay_PromptOpen() || Chat_IsOpen();
+    if (m == WM_CAPTURECHANGED) g_menuMouseHeld = false;
     if (capturing) {
+        if (menuOwns && (m == WM_LBUTTONDOWN || m == WM_RBUTTONDOWN || m == WM_MBUTTONDOWN ||
+                         m == WM_LBUTTONDBLCLK || m == WM_RBUTTONDBLCLK || m == WM_MBUTTONDBLCLK))
+            g_menuMouseHeld = true;
         imguiFeed(h, m, w, l);
+        // The last button up ends it (wParam carries the buttons STILL down).
+        if ((m == WM_LBUTTONUP || m == WM_RBUTTONUP || m == WM_MBUTTONUP) &&
+            !(w & (MK_LBUTTON | MK_RBUTTON | MK_MBUTTON)))
+            g_menuMouseHeld = false;
         // THE TYPING, WHEN THE GAME IS DRAWING THE BOX. The keys are already being swallowed here --
         // they have to be, or a WASD typed mid-sentence rolls you down the street -- so this is the
         // one place they exist at all. Chat decides whether it wants them (they are a no-op unless
@@ -413,7 +564,11 @@ static void buildPrompt() {
     const ImGuiIO& io = ImGui::GetIO();
     const float sc = io.FontGlobalScale > 0.01f ? io.FontGlobalScale : 1.0f;
 
-    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f),
+    // Positions are relative to the GAME's window: with the pop-out on, ImGui works in desktop
+    // coordinates and the game's corner is not (0,0). The prompt stays on the game's screen.
+    const ImVec2 org = ImGui::GetMainViewport()->Pos;
+    ImGui::SetNextWindowViewport(ImGui::GetMainViewport()->ID);
+    ImGui::SetNextWindowPos(ImVec2(org.x + io.DisplaySize.x * 0.5f, org.y + io.DisplaySize.y * 0.5f),
                             ImGuiCond_Always, ImVec2(0.5f, 0.5f));
     ImGui::SetNextWindowSize(ImVec2(400 * sc, 0), ImGuiCond_Always);
 
@@ -466,15 +621,52 @@ static void buildPrompt() {
 }
 
 static void buildUI() {
-    if (!g_visible.load()) return;      // the prompt can request a frame without opening the panel
+    // g_f1Popped is LEFT as it was: the window reopens where it closed, so it is the right guess for
+    // the first frame of the next open (every reader also checks g_visible).
+    static bool wasInGame = false;
+    if (!g_visible.load()) { g_menuMouseHeld = false; wasInGame = false; g_popHandoff = false; return; }   // the prompt can request a frame without opening the panel
     MpUiState st;
     { std::lock_guard<std::mutex> lk(g_uiMx); st = g_uiState; }
 
-    ImGui::SetNextWindowPos(ImVec2(60, 60), ImGuiCond_FirstUseEver);
+    // WHERE IT OPENS. Placed only when the pop-out setting changes (and the first time): popping out
+    // puts it on a monitor the game is NOT on, popping back in returns it to the corner it always
+    // opened in. Any other time it stays wherever it was dragged. With the pop-out off the main
+    // viewport sits at (0,0), so this is the old (60,60) exactly.
+    {
+        static int placedFor = -1;
+        const int pop = (g_vpAvail && MpPrefs_F1PopOut()) ? 1 : 0;
+        if (placedFor != pop) {
+            placedFor = pop;
+            const ImGuiViewport* mv = ImGui::GetMainViewport();
+            ImVec2 at(mv->Pos.x + 60.0f, mv->Pos.y + 60.0f);
+            g_vpNoOtherMonitor = false;
+            if (pop) {
+                const ImVec2 c(mv->Pos.x + mv->Size.x * 0.5f, mv->Pos.y + mv->Size.y * 0.5f);
+                bool found = false;
+                for (const ImGuiPlatformMonitor& m : ImGui::GetPlatformIO().Monitors) {
+                    const bool hasGame = c.x >= m.MainPos.x && c.x < m.MainPos.x + m.MainSize.x &&
+                                         c.y >= m.MainPos.y && c.y < m.MainPos.y + m.MainSize.y;
+                    if (hasGame) continue;
+                    at = ImVec2(m.WorkPos.x + 60.0f, m.WorkPos.y + 60.0f);
+                    found = true;
+                    break;
+                }
+                g_vpNoOtherMonitor = !found;
+            }
+            ImGui::SetNextWindowPos(at, ImGuiCond_Always);
+        }
+    }
     ImGui::SetNextWindowSize(ImVec2(560, 470), ImGuiCond_FirstUseEver);
     // Same look as the chat box and the pause menu (theme.h), so the mod's surfaces read as one.
     Theme_Push(true);
     const bool panelOpen = ImGui::Begin("SessionOpenMP  (F1 closes)");
+    {
+        const bool popped = (ImGui::GetWindowViewport() != ImGui::GetMainViewport());
+        g_f1Popped = popped;
+        g_f1ViewportId = ImGui::GetWindowViewport()->ID;
+        if (popped && wasInGame) g_popHandoff = true;    // it just LEFT the game -- not a reopen
+        wasInGame = !popped;
+    }
     if (panelOpen) {
         // ---- status: everything needed to tell "it is working" from "it is not", without the log.
         const char* bk = (st.backend == 2) ? "shared memory (this PC)"
@@ -562,6 +754,22 @@ static void buildUI() {
             ImGui::TextDisabled("Applies to new connections -- it does not re-route a session already up.");
         }
 
+        // ---- THIS MENU IN ITS OWN WINDOW, for a second monitor (see g_f1Popped).
+        {
+            bool pop = MpPrefs_F1PopOut() != 0;
+            if (!g_vpAvail) ImGui::BeginDisabled();
+            if (ImGui::Checkbox("Pop this menu out onto another monitor", &pop)) MpPrefs_SetF1PopOut(pop ? 1 : 0);
+            if (!g_vpAvail) ImGui::EndDisabled();
+            if (!g_vpAvail)
+                ImGui::TextDisabled("Not available with this graphics setup.");
+            else if (pop && g_vpNoOtherMonitor)
+                ImGui::TextDisabled("Only one monitor found -- drag this window off the game to pop it out.");
+            else if (pop)
+                ImGui::TextDisabled("While it is out the game keeps your mouse and keys; click the menu to use it.");
+            else
+                ImGui::TextDisabled("Its own window, so it can sit on the other screen while you play.");
+        }
+
         // ---- PLAYER NAMES. The same three settings as the pause menu's "Player names" page: one
         // setting, two surfaces, one store (mp_prefs.h). Collapsed by default so it does not push the
         // connect buttons down the panel -- this is a preference, not something you come here to do.
@@ -622,6 +830,47 @@ static void buildUI() {
         // and a slider dragged across its range would otherwise write it once per frame.
         if (ImGui::BeginTabItem("Chat")) {
         ImGui::Spacing();
+        // ---- WHERE THE BOX SITS, and whether the talk shows at all. The sliders commit on release
+        // like every other one here (each commit rewrites the prefs file), but while one is held the
+        // box is drawn OPEN at the value under the thumb (Chat_PreviewBox), so it can be seen moving.
+        {
+            ImGui::TextUnformatted("Where it sits");
+            ImGui::Spacing();
+            bool hid = MpPrefs_ChatHidden() != 0;
+            if (ImGui::Checkbox("Hide the chat  (F2)", &hid)) MpPrefs_SetChatHidden(hid ? 1 : 0);
+            ImGui::TextDisabled("Nothing anyone says shows up. ENTER still opens the box to type, and "
+                                "F2 brings it back.");
+            ImGui::Spacing();
+            static int  pos[2]  = {};
+            static bool held[2] = {};
+            static const char* const lbl[2]  = { "Across", "Up" };
+            static const char* const hint[2] = {
+                "0 is the left edge of the screen, 100 the right.",
+                "0 is the bottom, 100 the top. The whole box stays on screen at any setting." };
+            int  (*const get[2])()    = { &MpPrefs_ChatPosX,    &MpPrefs_ChatPosY };
+            void (*const set[2])(int) = { &MpPrefs_SetChatPosX, &MpPrefs_SetChatPosY };
+            bool moving = false;
+            for (int i = 0; i < 2; i++) {
+                if (!held[i]) pos[i] = get[i]();
+                ImGui::SetNextItemWidth(220.0f);
+                ImGui::SliderInt(lbl[i], &pos[i], 0, 100, "%d%%");
+                held[i] = ImGui::IsItemActive();
+                moving |= held[i];
+                if (ImGui::IsItemDeactivatedAfterEdit()) set[i](pos[i]);
+                ImGui::TextDisabled("%s", hint[i]);
+                ImGui::Spacing();
+            }
+            if (ImGui::Button("Back to the corner")) {
+                MpPrefs_SetChatPosX(MPCHAT_POSX_DEFAULT); MpPrefs_SetChatPosY(MPCHAT_POSY_DEFAULT);
+                pos[0] = MPCHAT_POSX_DEFAULT; pos[1] = MPCHAT_POSY_DEFAULT;
+                moving = true;
+            }
+            ImGui::SameLine();
+            ImGui::TextDisabled("The box shows while you move it.");
+            if (moving) Chat_PreviewBox(pos[0], pos[1]);
+            ImGui::Spacing();
+            ImGui::Separator();
+        }
         {
             // `heading`, when set, prints a section title above the row. The tab covers two things
             // that are the same subject and not the same object -- the box you open with ENTER, and
@@ -718,7 +967,7 @@ static void buildUI() {
             }
             ImGui::Separator();
             ImGui::TextDisabled("ENTER opens the box, ESC closes it, UP recalls your last line,");
-            ImGui::TextDisabled("and the wheel scrolls back through what was said.");
+            ImGui::TextDisabled("the wheel scrolls back through what was said, and F2 hides it all.");
             if (!omp::ui::GameHud_Enabled())
                 ImGui::TextDisabled("The overlay is drawing the chat, so these do not apply to it.");
         }
@@ -916,7 +1165,40 @@ static void buildUI() {
 // condition under which the WndProc takes the mouse: we draw a cursor when, and only when, we have
 // taken the one the game would have drawn.
 static void frameCursorPolicy() {
-    ImGui::GetIO().MouseDrawCursor = g_visible.load() || Overlay_PromptOpen() || Chat_IsOpen();
+    ImGui::GetIO().MouseDrawCursor = (g_visible.load() && (!g_f1Popped.load() || g_menuMouseHeld.load()))
+                                     || Overlay_PromptOpen() || Chat_IsOpen();
+}
+
+// The pop-out setting, applied where it can be: between frames, on this thread. The flag is the whole
+// switch -- off, ImGui runs its single-window path exactly as before the pop-out existed.
+static void popOutPolicy() {
+    ImGuiIO& io = ImGui::GetIO();
+    if (g_vpAvail && MpPrefs_F1PopOut()) io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
+    else                                 io.ConfigFlags &= ~ImGuiConfigFlags_ViewportsEnable;
+    if (g_vpCloseReq.exchange(false)) {
+        g_visible = false;
+        SetForegroundWindow(g_gameHwnd);   // Alt+F4 in the pop-out: back to the game, as F1 does
+        g_backToGame = true;
+    }
+    vpPump();
+}
+// After the game's window is drawn: create/move/draw the pop-out windows. UpdatePlatformWindows runs
+// every frame -- it is also ImGui's end-of-frame bookkeeping for the feature, and returns at once
+// with the flag off.
+static void popOutRender() {
+    ImGui::UpdatePlatformWindows();
+    if (ImGui::GetIO().ConfigFlags & ImGuiConfigFlags_ViewportsEnable) ImGui::RenderPlatformWindowsDefault();
+    g_vpLive = vpAnyLive();
+    // THE HANDOFF. The menu was dragged (or ticked) out of the game: its window takes the focus as soon
+    // as the button is up -- not during the drag, which the game window's mouse capture is carrying.
+    // From then on the lock follows the focus (see the cursor-lock block in hkPresent).
+    if (g_popHandoff && !g_menuMouseHeld.load() && !(GetAsyncKeyState(VK_LBUTTON) & 0x8000) &&
+        !(GetAsyncKeyState(VK_RBUTTON) & 0x8000) && !(GetAsyncKeyState(VK_MBUTTON) & 0x8000)) {
+        g_popHandoff = false;
+        ImGuiViewport* vp = ImGui::FindViewportByID(g_f1ViewportId);
+        if (vp && vp != ImGui::GetMainViewport() && vp->PlatformHandle && ImGui::GetPlatformIO().Platform_SetWindowFocus)
+            ImGui::GetPlatformIO().Platform_SetWindowFocus(vp);
+    }
 }
 
 // ------------------------------------------------------------------ D3D11 render
@@ -933,6 +1215,7 @@ static void renderD3D11(IDXGISwapChain* sc) {
     // device objects going with it so the new texture is uploaded.
     if (Theme_ConsumePendingFont()) ImGui_ImplDX11_InvalidateDeviceObjects();
     frameCursorPolicy();
+    popOutPolicy();
     ImGui_ImplDX11_NewFrame();
     { std::lock_guard<std::recursive_mutex> lk(g_imguiInputMx); ImGui_ImplWin32_NewFrame(); ImGui::NewFrame(); }
     buildUI();
@@ -942,6 +1225,7 @@ static void renderD3D11(IDXGISwapChain* sc) {
     ImGui::Render();
     g_ctx11->OMSetRenderTargets(1, &g_rtv11, nullptr);
     ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+    popOutRender();
 }
 
 // ------------------------------------------------------------------ D3D12 render
@@ -967,8 +1251,11 @@ static void renderD3D12(IDXGISwapChain* sc) {
     // The game's own typeface arrives from the game thread; swapping it means rebuilding the
     // atlas, which may only happen BETWEEN frames -- hence here, and hence the backend's
     // device objects going with it so the new texture is uploaded.
-    if (Theme_ConsumePendingFont()) ImGui_ImplDX12_InvalidateDeviceObjects();
+    // (A pop-out frame can still be on the GPU -- its window does not wait for one -- so it is waited
+    // for before the font texture it reads is thrown away.)
+    if (Theme_ConsumePendingFont()) { ImGui_ImplDX12_OmpWaitViewports(); ImGui_ImplDX12_InvalidateDeviceObjects(); }
     frameCursorPolicy();
+    popOutPolicy();
     ImGui_ImplDX12_NewFrame();
     { std::lock_guard<std::recursive_mutex> lk(g_imguiInputMx); ImGui_ImplWin32_NewFrame(); ImGui::NewFrame(); }
     buildUI();
@@ -994,6 +1281,7 @@ static void renderD3D12(IDXGISwapChain* sc) {
     g_list12->ResourceBarrier(1, &b);
     g_list12->Close();
     g_queue12->ExecuteCommandLists(1, (ID3D12CommandList* const*)&g_list12);
+    popOutRender();
 }
 
 // ------------------------------------------------------------------ bind & hooks
@@ -1006,8 +1294,25 @@ static void bindCommon(HWND hwnd) {
                                   // Re-decided every frame -- see frameCursorPolicy().
     ImGui::StyleColorsDark();
     ImGui::GetStyle().ScaleAllSizes(1.3f); io.FontGlobalScale = 1.3f;
+    // THE POP-OUT'S PLUMBING is installed whatever the setting: the backends register their window
+    // handlers only if the flag is up during their Init. vpFinishInit then drops the flag, and each
+    // frame raises it again only if the setting is on.
+    io.ConfigFlags |= ImGuiConfigFlags_ViewportsEnable;
+    io.ConfigViewportsNoDefaultParent = true;   // no owner window: see vpWndProc
     ImGui_ImplWin32_Init(hwnd);
     g_origWndProc = (WNDPROC)SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)hkWndProc);
+}
+static void vpFinishInit() {
+    ImGuiIO& io = ImGui::GetIO();
+    ImGuiPlatformIO& pio = ImGui::GetPlatformIO();
+    g_vpAvail = (io.BackendFlags & ImGuiBackendFlags_PlatformHasViewports) &&
+                (io.BackendFlags & ImGuiBackendFlags_RendererHasViewports) &&
+                pio.Platform_CreateWindow && pio.Platform_DestroyWindow;
+    if (g_vpAvail) {
+        g_vpOrigCreate  = pio.Platform_CreateWindow;  pio.Platform_CreateWindow  = vpCreate;
+        g_vpOrigDestroy = pio.Platform_DestroyWindow; pio.Platform_DestroyWindow = vpDestroy;
+    }
+    io.ConfigFlags &= ~ImGuiConfigFlags_ViewportsEnable;
 }
 static void initFromSwapchain(IDXGISwapChain* sc) {
     DXGI_SWAP_CHAIN_DESC d; if (FAILED(sc->GetDesc(&d)) || !d.OutputWindow) return;
@@ -1028,6 +1333,7 @@ static void initFromSwapchain(IDXGISwapChain* sc) {
         g_dev11 = d11; g_dev11->GetImmediateContext(&g_ctx11);
         bindCommon(d.OutputWindow);
         ImGui_ImplDX11_Init(g_dev11, g_ctx11);
+        vpFinishInit();
         g_isD3D12 = false; g_init = true;
         ovlogf("[overlay] ready (D3D11) - press F1 for the menu");
         return;
@@ -1059,6 +1365,7 @@ static void initFromSwapchain(IDXGISwapChain* sc) {
     ImGui_ImplDX12_Init(g_dev12, (int)(d.BufferCount ? d.BufferCount : 3), d.BufferDesc.Format, g_srvHeap,
                         g_srvHeap->GetCPUDescriptorHandleForHeapStart(),
                         g_srvHeap->GetGPUDescriptorHandleForHeapStart());
+    vpFinishInit();
     g_isD3D12 = true; g_init = true;
     ovlogf("[overlay] ready (D3D12, %u buffers) - press F1 for the menu", d.BufferCount);
 }
@@ -1070,13 +1377,65 @@ static HRESULT WINAPI hkPresent(IDXGISwapChain* sc, UINT sync, UINT flags) {
             DXGI_SWAP_CHAIN_DESC d;
             if (SUCCEEDED(sc->GetDesc(&d)) && d.OutputWindow == g_gameHwnd) {
                 static bool f1Held = false;
-                bool now = (GetAsyncKeyState(VK_F1) & 0x8000) && GetForegroundWindow() == g_gameHwnd;
-                if (now && !f1Held) g_visible = !g_visible.load();
+                // F1 works from the pop-out too, when that is the window you are in.
+                const HWND fg = GetForegroundWindow();
+                const bool ours = fg == g_gameHwnd ||
+                                  (fg && g_vpAvail && ImGui::FindViewportByPlatformHandle((void*)fg));
+                bool now = (GetAsyncKeyState(VK_F1) & 0x8000) && ours;
+                if (now && !f1Held) {
+                    g_visible = !g_visible.load();
+                    // Closed from its own window: back to the game, which takes its lock back as it
+                    // comes to the front. (Our process is in front, so it may hand the focus over.)
+                    if (!g_visible.load() && fg != g_gameHwnd && g_vpAvail && fg &&
+                        ImGui::FindViewportByPlatformHandle((void*)fg)) {
+                        SetForegroundWindow(g_gameHwnd);
+                        g_backToGame = true;
+                    }
+                    // Diagnostic for the pop-out: a cursor LOCKED to the game's screen cannot drag
+                    // the menu to another one. Said once per open, only with the setting on.
+                    if (g_visible.load() && g_vpAvail && MpPrefs_F1PopOut()) {
+                        RECT c = {}, v = { GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN), 0, 0 };
+                        v.right  = v.left + GetSystemMetrics(SM_CXVIRTUALSCREEN);
+                        v.bottom = v.top  + GetSystemMetrics(SM_CYVIRTUALSCREEN);
+                        if (GetClipCursor(&c)) {
+                            const bool locked = c.left > v.left || c.top > v.top || c.right < v.right || c.bottom < v.bottom;
+                            ovlogf("[overlay] F1 opened (pop-out on): cursor %s (%ld,%ld)-(%ld,%ld), desktop (%ld,%ld)-(%ld,%ld)",
+                                   locked ? "LOCKED to" : "free,", c.left, c.top, c.right, c.bottom,
+                                   v.left, v.top, v.right, v.bottom);
+                        }
+                    }
+                }
                 f1Held = now;
+                // A lost button-up must not leave the game window's input with the menu for good.
+                if (g_menuMouseHeld.load() && !(GetAsyncKeyState(VK_LBUTTON) & 0x8000) &&
+                    !(GetAsyncKeyState(VK_RBUTTON) & 0x8000) && !(GetAsyncKeyState(VK_MBUTTON) & 0x8000))
+                    g_menuMouseHeld = false;
+                // THE CURSOR LOCK (see hkClipCursor), pop-out setting on. It FOLLOWS THE FOCUS: off while
+                // the menu has the mouse -- the menu is up in the game, a drag that started there is
+                // still going, the menu is being handed its own window, or its window is the one in
+                // front -- and given back only when the GAME is in front. Relying on the game to drop
+                // its lock on losing focus did not hold: it does not, and a menu clicked into after a
+                // click on the game dragged into the old wall at the screen edge.
+                {
+                    static bool menuHadMouse = false;
+                    const ImGuiViewport* fgVp = fg ? ImGui::FindViewportByPlatformHandle((void*)fg) : nullptr;
+                    const bool popFront = fgVp && fgVp != ImGui::GetMainViewport();
+                    const bool menuHasMouse = g_vpAvail && MpPrefs_F1PopOut() && g_visible.load() &&
+                                              (!g_f1Popped.load() || g_menuMouseHeld.load() || g_popHandoff || popFront);
+                    if (menuHasMouse) g_backToGame = false;
+                    if (menuHasMouse != menuHadMouse) {
+                        menuHadMouse = menuHasMouse;
+                        clipHoldOff(menuHasMouse, fg == g_gameHwnd || g_backToGame.load());
+                        if (!menuHasMouse) g_backToGame = false;
+                    }
+                }
                 { static uint64_t lastFrameMs = 0;
                   if (g_visible.load()) noteGap("drawing frames", lastFrameMs); else lastFrameMs = 0; }
+                // g_vpLive: a pop-out window still exists. ImGui retires one two frames after the menu
+                // stops using it, so frames keep running until it has -- stop early and the window
+                // would stay on the other screen, frozen on its last picture.
                 if (g_visible.load() || Overlay_PromptOpen() || Chat_HasVisible()
-                    || Nameplates_HasVisible()) {
+                    || Nameplates_HasVisible() || g_vpLive) {
                     if (g_isD3D12) renderD3D12(sc); else renderD3D11(sc);
                 } else {
                     // NO FRAME, SO NOTHING MAY PILE UP. Since 1.2.4 the game draws the names and the
@@ -1103,8 +1462,14 @@ static HRESULT WINAPI hkPresent(IDXGISwapChain* sc, UINT sync, UINT flags) {
 }
 
 static HRESULT WINAPI hkResizeBuffers(IDXGISwapChain* sc, UINT n, UINT w, UINT h, DXGI_FORMAT f, UINT fl) {
-    if (g_rtv11) { g_rtv11->Release(); g_rtv11 = nullptr; }   // both recreated lazily
-    releaseBB12();
+    // Every swapchain in the process resizes through this one hook -- the pop-out's included, from
+    // inside our own frame -- and only the GAME's owns the buffers held here.
+    DXGI_SWAP_CHAIN_DESC d;
+    const bool game = !g_gameHwnd || FAILED(sc->GetDesc(&d)) || d.OutputWindow == g_gameHwnd;
+    if (game) {
+        if (g_rtv11) { g_rtv11->Release(); g_rtv11 = nullptr; }   // both recreated lazily
+        releaseBB12();
+    }
     return o_ResizeBuffers(sc, n, w, h, f, fl);
 }
 
@@ -1116,6 +1481,17 @@ static DWORD WINAPI ovlThread(LPVOID) {
 
     MH_STATUS ms = MH_Initialize();   // dllmain's EOS tick hook may already have init'd it
     if (ms != MH_OK && ms != MH_ERROR_ALREADY_INITIALIZED) { ovlogf("[overlay] MinHook init failed (%d)", ms); return 0; }
+
+    // The game's cursor lock, for the pop-out (see hkClipCursor). A failure costs only that: the
+    // lock is then lifted by a plain ClipCursor call and the game may put it straight back.
+    {
+        LPVOID target = nullptr;
+        if (MH_CreateHookApiEx(L"user32", "ClipCursor", (LPVOID)&hkClipCursor, (LPVOID*)&o_ClipCursor, &target) != MH_OK ||
+            !target || MH_EnableHook(target) != MH_OK) {
+            o_ClipCursor = nullptr;
+            OvLog("[overlay] ClipCursor hook failed -- the pop-out may not be draggable off the game's screen");
+        }
+    }
 
     // D3D12 queue capture first, so the game's queue is known by the time Present binds.
     if (GetModuleHandleA("d3d12.dll")) {

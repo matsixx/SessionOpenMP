@@ -434,6 +434,19 @@ static void MpPump() {
     bool host  = keyEdge(VK_F8, &f8);
     bool join  = keyEdge(VK_F9, &f9);
     bool leave = keyEdge(VK_F6, &f6);
+    // F2 HIDES THE CHAT, and brings it back. Only while this game (or its popped-out menu) is the
+    // window in front: F2 pressed in another program is that program's.
+    {
+        static bool f2 = false;
+        if (keyEdge(VK_F2, &f2)) {
+            DWORD pid = 0;
+            GetWindowThreadProcessId(GetForegroundWindow(), &pid);
+            if (pid == GetCurrentProcessId()) {
+                MpPrefs_SetChatHidden(MpPrefs_ChatHidden() ? 0 : 1);
+                logLine(MpPrefs_ChatHidden() ? "[chat] hidden (F2)" : "[chat] shown (F2)");
+            }
+        }
+    }
 
     // ---- CHAT. Enter opens the box; from that moment the box owns the keyboard (its WndProc gate
     // lives in overlay.cpp) and closes itself on Enter or Escape.
@@ -970,6 +983,12 @@ static void publishNameplates() {
         C.width        = (float)MpPrefs_ChatWidth();
         C.maxShownOpen = MpPrefs_ChatLines();
         C.fadeAfterSec = (float)MpPrefs_ChatHoldSec();
+        // Where it sits: the F1 sliders' live values while they are being moved, the saved ones after.
+        int pvx = 0, pvy = 0;
+        const bool pv = Chat_Preview(&pvx, &pvy);
+        C.posXPct      = (float)(pv ? pvx : MpPrefs_ChatPosX());
+        C.posYPct      = (float)(pv ? pvy : MpPrefs_ChatPosY());
+        C.hidden       = MpPrefs_ChatHidden() != 0;
         omp::ui::GameHud_SetChatLook(MpPrefs_ChatTextSize(), MpPrefs_ChatSmallSize(),
                                      MpPrefs_ChatPanelPct(), MpPrefs_ChatBlurPct());
         omp::ui::GameHud_SetBubbleLook(MpPrefs_BubblePanel() != 0, MpPrefs_BubbleBorder() != 0,

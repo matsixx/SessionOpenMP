@@ -1307,7 +1307,11 @@ void GameHud_Chat(bool menuUp) {
 
     ChatLineView lines[kChatLines];
     const int n = Chat_Lines(lines, kChatLines);
-    const bool open = Chat_IsOpen();
+    // Being placed from F1 (Chat_PreviewBox): drawn OPEN, so there is a box to see where it goes.
+    const bool open = Chat_IsOpen() || Chat_Preview(nullptr, nullptr);
+    // F2 / "Hide the chat": the talk goes. The box still opens to type -- then it is the one thing
+    // the player is looking at.
+    if (C.hidden && !open) { hideRects(); return; }
     // Nothing to say and nobody typing: the panel goes with the words. Hidden HERE rather than only
     // on the open-to-closed edge, because the last line can expire in the same frame the box shuts.
     if (n <= 0 && !open) { hideRects(); return; }
@@ -1318,10 +1322,33 @@ void GameHud_Chat(bool menuUp) {
     const int   tiny   = (int)(kChatSmall + 0.5f);
     const float lineS  = kChatSize * kLineFactor;
     const float lineH  = px(lineS);
-    // Left normally; right while the pause menu is up, where the menu's own rows are not.
-    const float x      = menuUp ? ((float)g_vw - px(C.marginX) - px(C.width)) : px(C.marginX);
+    // WHERE IT SITS: the player's two percentages (F1 > Chat), each across the room the OPEN box
+    // leaves on screen -- 0 flush with the left / bottom edge, 100 with the right / top -- so the whole
+    // box is on screen at every value, whatever its size. Measured from the OPEN box even while it is
+    // closed, so the lines sit exactly where the box will open around them. The height is the same
+    // arithmetic as the vertical layout below; `openRows` gets the same clamps as `histSlots`.
+    int openRows = C.maxShownOpen > 0 ? C.maxShownOpen : 8;
+    if (openRows > kSlotsChat - 8) openRows = kSlotsChat - 8;
+    if (openRows > kSlotsChatName) openRows = kSlotsChatName;
+    const float openTop = 2.0f * px(kChatSmall * kLineFactor) + 5.0f * px(kRuleGap)
+                        + (float)(openRows + 1) * lineH + px(kBoxPadY);   // base -> panel top
+    const float boxW = px(C.width + kBoxPadX * 2.0f), boxH = openTop + px(kBoxPadY);
+    const float roomX = (float)g_vw > boxW ? (float)g_vw - boxW : 0.0f;
+    const float roomY = (float)g_vh > boxH ? (float)g_vh - boxH : 0.0f;
+    const float fx = C.posXPct < 0.0f ? 0.0f : C.posXPct > 100.0f ? 1.0f : C.posXPct / 100.0f;
+    const float fy = C.posYPct < 0.0f ? 0.0f : C.posYPct > 100.0f ? 1.0f : C.posYPct / 100.0f;
+    const float panelLeft = roomX * fx;
+    float x = panelLeft + px(kBoxPadX);
     // The bottom edge of the LOWEST row, and the one number everything else here is measured from.
-    const float yBase  = (float)g_vh - px(C.marginY) - (menuUp ? px(kPauseLiftY) : 0.0f);
+    float yBase = (float)g_vh - roomY * fy - px(kBoxPadY);
+    if (menuUp) {
+        // Out from under the pause menu's rows, which are on the LEFT: a box on the left half moves
+        // to the mirror-image spot on the right, and it lifts clear of the menu's footer -- but never
+        // off the top. The default corner lands exactly where it always went.
+        if (panelLeft + boxW * 0.5f < (float)g_vw * 0.5f) x = (float)g_vw - panelLeft - boxW + px(kBoxPadX);
+        yBase -= px(kPauseLiftY);
+        if (yBase < openTop) yBase = openTop;
+    }
 
     // ---- everything that was said, as visual lines, oldest first
     // `nameLen` is how much of the row is the speaker's name, and only on the row the name is ON --

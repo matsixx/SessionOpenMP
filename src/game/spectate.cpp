@@ -27,6 +27,7 @@ void* Target() { return g_target; }
 // audio::SetLocalParts). "Me" has to be an actual actor -- see SetLookTarget.
 static void* g_localSkater = nullptr;
 void SetLocalSkater(void* pawn) { g_localSkater = pawn; }
+void* LocalSkater() { return g_localSkater; }
 
 #ifdef _WIN32
 // An object's CLASS name. The registered recorders are a mix of types, and reading one type's fields

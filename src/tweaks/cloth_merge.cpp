@@ -1750,6 +1750,13 @@ static bool RootObject(void* obj, const char* what) {
     return ok;
 }
 
+// Rooting for others (539: the clap's sound must stay loaded on every client, or a peer's clap resolves to nothing).
+bool ClothMerge_RootObject(void* obj, const char* what) {
+    static bool s_tried = false;
+    if (!g_objObjects && !s_tried) { s_tried = true; ResolveObjectArray(); }
+    return RootObject(obj, what);
+}
+
 // Print the fields the ENGINE reads off a garment mesh when a component adopts it. Logged both when we
 // build a copy and every time one is re-worn, so comparing the two lines names whatever goes bad between
 // maps -- ComputeMinLOD and UpdateMasterBoneMap both die reading -1 off a copy that was perfect on the

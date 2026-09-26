@@ -116,7 +116,9 @@ void Nameplates_Draw() {
     const ThemePalette& T = Theme();
     // BACKGROUND, not foreground: it still draws over the game (everything ImGui draws does), but it
     // draws UNDER our own windows, so the chat box and the F1 panel are never covered by a name.
-    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+    ImDrawList* dl = ImGui::GetBackgroundDrawList(ImGui::GetMainViewport());
+    // The game window's corner: (0,0) unless the F1 pop-out has ImGui in desktop coordinates.
+    const ImVec2 org = ImGui::GetMainViewport()->Pos;
     ImFont* font = ImGui::GetFont();
     if (!font) return;
     const float baseSize = ImGui::GetFontSize();
@@ -164,8 +166,8 @@ void Nameplates_Draw() {
         const float size = snap(baseSize * scale);
         if (size < 1.0f) continue;
 
-        const float cx  = snap(it.x * disp.x);          // the head, in whole pixels
-        const float hy  = snap(it.y * disp.y);
+        const float cx  = snap(org.x + it.x * disp.x);  // the head, in whole pixels
+        const float hy  = snap(org.y + it.y * disp.y);
         const float rim = (size >= 18.0f) ? 2.0f : 1.0f;
 
         // ---- the name

@@ -41,6 +41,11 @@ struct Release { const char* version; const char* notes; };
 // instead of anything else (field 2026-09-20, at 1600). `show` measures and trims, but keep the source
 // short enough that trimming never has to happen: budget ~300 characters a release, three releases.
 static const Release kReleases[] = {
+    { "1.2.11",
+      "- Pop the F1 menu out onto a second monitor (F1 -> You).\n"
+      "- Move the chat box anywhere on screen (F1 -> Chat). F2 hides the chat.\n"
+      "- Walking into someone's loose board moves it smoothly.\n"
+      "- SessionTweaks: thrown boards can hit you without knocking you over." },
     { "1.2.10",
       "- Fixes 1.2.9: online play could not reach Epic Online Services.\n"
       "- Everything else from 1.2.9 is here too." },

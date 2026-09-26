@@ -49,6 +49,8 @@
 #include "sit.h"           // Sit_FirstPersonView -- the seated first-person view this module writes
 #include "cam_fp.h"        // CamFp_View -- first person while skating, the other view this module writes
 #include "foot_place.h"    // FootPlace_AnimInstance -- riding, or walking around
+#include "emote.h"         // Emote_AimView -- a throw held up: the over-the-shoulder aim this module writes
+#include "catch_tweaks.h"  // CatchTweaks_Skater -- how far the camera is from you, for the aim's dolly
 #include "MinHook.h"
 
 // ------------------------------------------------------------------ measured offsets (PDB-confirmed)
@@ -70,6 +72,8 @@ enum {
     // USceneComponent
     COMP_REL_ROT          = 0x128,  // RelativeRotation (FRotator) -- read once for the stock check
     AN_ON_BOARD           = 0x300,  // USkaterAnimInstance::IsOnBoard -- riding, not walking
+    AN_THROWING_DOWN      = 0x302,  // USkaterAnimInstance::IsThrowingDown
+    SK_THROWDOWN          = 0xa28,  // ASkaterCharacterBase::_isDoingThrowdown: set by DoBoardThrowdown, cleared on board
     COMP_WORLD_QUAT       = 0x1c0,  // ComponentToWorld.Rotation (FQuat)
     COMP_WORLD_POS        = 0x1d0,  // ComponentToWorld.Translation
     COMP_REL_LOC          = 0x11c,  // RelativeLocation (FVector)
@@ -107,6 +111,30 @@ static int g_follow      = 0; // CameraFollowHeight    -- no air classifies as "
 static int g_pitchOnDrop = 1; // CameraPitchBeforeDrop -- 1 = stock pitch kept, 0 = we disable it
 static int g_dropDebug = 0;   // CameraDropDebug  -- the game's own drop visualiser, for field rounds
 static float g_pitchDeg = 0;  // CameraPitchDeg   -- extra camera pitch, degrees; positive looks UP
+static int   g_aimOn    = 1;    // CameraAimShoulder  -- holding LT to throw puts the camera over your shoulder
+static float g_aimDolly = 50.0f;// CameraAimDollyPct  -- ...this much of the way in toward you
+static float g_aimSide  = 45.0f;// CameraAimSideCm    -- ...and over to the side, away from the throwing arm
+static float g_aimUp    = 65.0f;// CameraAimRaiseCm -- ...and up (the old CameraAimUpCm 6 is not read: too low, and a saved 6 would keep it there)
+static float g_aimZoom  = 6.0f; // CameraAimZoomDeg   -- ...narrowed by this much
+// THE ON-FOOT CAMERA (524). The game lets you set the riding camera but not the walking one. All at the stock
+// values = the game's own camera, untouched.
+static float g_footDist = 100.0f; // CameraFootDistPct  -- how far back, % of the game's own distance (100 = stock)
+static float g_footUp   = 0.0f;   // CameraFootRaiseCm  -- straight up (world) or down
+static float g_footSide = 0.0f;   // CameraFootSideCm   -- to the right (+) or left
+static float g_footFov  = 0.0f;   // CameraFootFovDeg   -- added to the game's field of view
+static float g_footTilt = 0.0f;   // CameraFootTiltDeg  -- + looks up
+// SEATED (537): on top of the walking camera while the sit pose is held -- all at stock = the walking camera.
+static float g_sitDist = 100.0f;  // CameraSitDistPct   -- % of the walking camera's distance
+static float g_sitUp   = 0.0f;    // CameraSitRaiseCm   -- straight up (world) or down, added
+static float g_sitSide = 0.0f;    // CameraSitSideCm    -- to the right (+) or left, added
+static float g_sitFov  = 0.0f;    // CameraSitFovDeg    -- added to the field of view
+static float g_sitTilt = 0.0f;    // CameraSitTiltDeg   -- + looks up, added
+static bool SitCamOn() {
+    return g_sitDist != 100.0f || g_sitUp != 0.0f || g_sitSide != 0.0f || g_sitFov != 0.0f || g_sitTilt != 0.0f;
+}
+static bool FootCamOn() {
+    return g_footDist != 100.0f || g_footUp != 0.0f || g_footSide != 0.0f || g_footFov != 0.0f || g_footTilt != 0.0f;
+}
 static int   g_pitchBlendMs = 400;  // CameraPitchBlendMs -- how long the pitch takes to arrive when you
                                     //   get on the board, and to leave when you step off
 
@@ -240,6 +268,18 @@ static bool OnBoard() {
         return a && twkB(a, AN_ON_BOARD) > 0;
     } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
 }
+// THE CAMERA'S "ON THE BOARD" starts with the throwdown (525). The game's own camera heads for its riding
+// view as soon as you press Y; the animation says "on board" only once the throwdown is over. Keyed on the
+// latter, the walking camera stayed on through the game's move and only then faded out, and the riding pitch
+// only then faded in ("a weird zoom in first then smoothly moves back to my on board position").
+static bool CamOnBoard() {
+    if (OnBoard()) return true;
+    __try {
+        void* a = FootPlace_AnimInstance();
+        void* sk = CatchTweaks_Skater();
+        return (a && twkB(a, AN_THROWING_DOWN) != 0) || (sk && twkB(sk, SK_THROWDOWN) != 0);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+}
 
 // The pitch lever, applied AFTER the game's Tick so the actor rotation it composes from is this
 // frame's. The write is ABSOLUTE every frame -- actor rotation (game-owned, never ours) times the
@@ -288,7 +328,7 @@ static void applyPitch(void* cam, float dt) {
     // _defaultTransitionCurve on the camera data) and it does not need to be decoded to be used: the
     // compose below starts from the ACTOR, which is exactly what that machinery moves, so the game's
     // own transition runs underneath this one and the two cannot fight. Nothing we write is an input.
-    const float tgt = (g_pitchDeg != 0.0f && OnBoard()) ? 1.0f : 0.0f;
+    const float tgt = (g_pitchDeg != 0.0f && CamOnBoard()) ? 1.0f : 0.0f;
     if (dt > 0.0f && dt < 0.5f) {
         const float step = dt / ((g_pitchBlendMs > 30 ? (float)g_pitchBlendMs : 30.0f) * 0.001f);
         if (g_pitchW < tgt) { g_pitchW += step; if (g_pitchW > tgt) g_pitchW = tgt; }
@@ -399,7 +439,26 @@ static bool applyFirstPerson(void* cam, float dt) {
     const bool skate = CamFp_View(actorQ, dt, eyeK, lookK, &wK, &fovK) && wK > 0.0f;
     float eyeS[3], lookS[4], wS = 0.0f, fovS = 0.0f;
     const bool seat = Sit_FirstPersonView(eyeS, lookS, &wS, &fovS) && wS > 0.0f;
-    if (!skate && !seat) {
+    float wA = 0.0f; int sideA = 1;
+    const bool aim = g_aimOn && Emote_AimView(&wA, &sideA) && wA > 0.0005f;
+    // Off the board: the on-foot camera, eased in and out over 0.4 s so getting on or off never jumps.
+    // Seated (537): the sitting camera's own settings ease in on top of the walking camera's, 0.5 s either way.
+    static float s_footW = 0.0f, s_sitW = 0.0f;
+    const bool seated = Sit_PoseHeld();
+    {
+        const float step = (dt > 0.0f && dt < 0.25f ? dt : 1.0f / 60.0f) / 0.4f;
+        const float want = ((FootCamOn() || (SitCamOn() && (seated || s_sitW > 0.0f))) && !CamOnBoard()) ? 1.0f : 0.0f;
+        s_footW += (want - s_footW > step) ? step : ((want - s_footW < -step) ? -step : want - s_footW);
+        const float wantS = seated ? 1.0f : 0.0f, stepS = step * 0.8f;
+        s_sitW += (wantS - s_sitW > stepS) ? stepS : ((wantS - s_sitW < -stepS) ? -stepS : wantS - s_sitW);
+    }
+    const float wF = s_footW * s_footW * (3.0f - 2.0f * s_footW);
+    const bool foot = wF > 0.0005f;
+    const float wSt = s_sitW * s_sitW * (3.0f - 2.0f * s_sitW);
+    const float fDist = g_footDist * (1.0f + (g_sitDist * 0.01f - 1.0f) * wSt);
+    const float fUp = g_footUp + g_sitUp * wSt, fSide = g_footSide + g_sitSide * wSt;
+    const float fFov = g_footFov + g_sitFov * wSt, fTilt = g_footTilt + g_sitTilt * wSt;
+    if (!skate && !seat && !aim && !foot) {
         if (g_fpWrote) {   // one restoring write: back under the actor, on the relative it had when we began
             float relQ[4]; quatFromRotator(g_fpStockRelRot, relQ);
             float off[3];  quatRotate(actorQ, g_fpStockRelLoc, off);
@@ -416,14 +475,90 @@ static bool applyFirstPerson(void* cam, float dt) {
         for (int i = 0; i < 3; i++) { g_fpStockRelLoc[i] = twkF(comp, COMP_REL_LOC + 4 * i); g_fpStockRelRot[i] = twkF(comp, COMP_REL_ROT + 4 * i); }
         g_fpStockFov = twkF(comp, CAMC_FOV);
         TwkLog("[camh] first person: camera to the eyes (%s; stock relative (%.1f %.1f %.1f) / (%.1f %.1f %.1f), fov %.1f)",
-               seat ? "seated" : "skating", g_fpStockRelLoc[0], g_fpStockRelLoc[1], g_fpStockRelLoc[2],
+               seat ? "seated" : skate ? "skating" : aim ? "over the shoulder, aiming a throw" : "your on-foot camera", g_fpStockRelLoc[0], g_fpStockRelLoc[1], g_fpStockRelLoc[2],
                g_fpStockRelRot[0], g_fpStockRelRot[1], g_fpStockRelRot[2], g_fpStockFov);
     }
     // the game's own view this frame, off the actor
     float relQ[4]; quatFromRotator(g_fpStockRelRot, relQ);
     float off[3];  quatRotate(actorQ, g_fpStockRelLoc, off);
-    const float gameP[3] = { actorP[0] + off[0], actorP[1] + off[1], actorP[2] + off[2] };
+    float gameP[3] = { actorP[0] + off[0], actorP[1] + off[1], actorP[2] + off[2] };
     float gameQ[4]; quatMul(actorQ, relQ, gameQ);
+    // THE ON-FOOT CAMERA (524): the game's own walking view, moved back or in, up or down (world), to the side,
+    // and tilted -- then everything else (the throw's aim, the seat) works from it. The game's view is clear
+    // of walls; ours is traced from it and stops just short of anything in between.
+    if (foot) {
+        const float X[3] = { 1.0f, 0.0f, 0.0f }, Y[3] = { 0.0f, 1.0f, 0.0f };
+        float fx[3], ry[3];
+        quatRotate(gameQ, X, fx); quatRotate(gameQ, Y, ry);
+        float d = 300.0f;
+        void* sk = CatchTweaks_Skater();
+        void* sroot = sk ? twkP(sk, ACTOR_ROOT) : nullptr;
+        if (sroot) {
+            const float dx = twkF(sroot, COMP_WORLD_POS) - gameP[0], dy = twkF(sroot, COMP_WORLD_POS + 4) - gameP[1],
+                        dz = twkF(sroot, COMP_WORLD_POS + 8) + 40.0f - gameP[2];
+            d = sqrtf(dx * dx + dy * dy + dz * dz);
+            if (!(d > 60.0f)) d = 60.0f; else if (d > 900.0f) d = 900.0f;
+        }
+        const float in = d * (1.0f - fDist * 0.01f) * wF;           // + = toward you
+        float want[3];
+        for (int i = 0; i < 3; i++) want[i] = gameP[i] + fx[i] * in + ry[i] * fSide * wF;
+        want[2] += fUp * wF;
+        // TRACED FROM THE BODY, LIKE A BOOM (536). "when angling the camera up (looking up) it sorta glitches a bit
+        // and flickers to a different position for a small second. This doesnt happen when looking down." Looking up
+        // swings the game's camera down to the floor, its own probe (simple collision) holding it just clear; the
+        // trace started THERE, against complex geometry, and could hit within its first cm -- keeping 0 of the move
+        // dropped the view onto the game's own spot for a frame. Now traced from the body (the point the distance is
+        // measured from: always open air) to where the camera wants to be; a hit pulls it in at once, and it eases
+        // back out when the way clears.
+        static float s_reach = 1.0f;
+        float from[3] = { gameP[0], gameP[1], gameP[2] };
+        if (sroot) { from[0] = twkF(sroot, COMP_WORLD_POS); from[1] = twkF(sroot, COMP_WORLD_POS + 4); from[2] = twkF(sroot, COMP_WORLD_POS + 8) + 40.0f; }
+        const float mv[3] = { want[0] - from[0], want[1] - from[1], want[2] - from[2] };
+        const float ml = sqrtf(mv[0] * mv[0] + mv[1] * mv[1] + mv[2] * mv[2]);
+        float frac = 1.0f;
+        if (sk && ml > 1.0f) {
+            float hit[3];
+            if (Sit_TraceSurface(sk, from, want, hit, nullptr)) {
+                const float hl = sqrtf((hit[0] - from[0]) * (hit[0] - from[0]) + (hit[1] - from[1]) * (hit[1] - from[1]) +
+                                       (hit[2] - from[2]) * (hit[2] - from[2]));
+                frac = fmaxf(0.0f, hl - 12.0f) / ml;
+            }
+        }
+        const float easeOut = (dt > 0.0f && dt < 0.25f ? dt : 1.0f / 60.0f) / 0.25f;
+        s_reach = frac < s_reach ? frac : fminf(frac, s_reach + easeOut);
+        if (s_reach < 0.999f) for (int i = 0; i < 3; i++) want[i] = from[i] + mv[i] * s_reach;
+        for (int i = 0; i < 3; i++) gameP[i] = want[i];
+        if (fTilt != 0.0f) {
+            // About the camera's own right axis; the sign is taken from which way the forward actually goes.
+            const float a = fTilt * wF * 0.0174532925f * 0.5f;
+            float qt[4] = { ry[0] * sinf(a), ry[1] * sinf(a), ry[2] * sinf(a), cosf(a) };
+            float f2[3]; quatRotate(qt, fx, f2);
+            if ((f2[2] > fx[2]) != (fTilt > 0.0f)) { qt[0] = -qt[0]; qt[1] = -qt[1]; qt[2] = -qt[2]; }
+            float q2[4]; quatMul(qt, gameQ, q2);
+            for (int i = 0; i < 4; i++) gameQ[i] = q2[i];
+        }
+    }
+    // OVER THE SHOULDER while a throw is held up: the game's own view, its direction untouched (the throw goes
+    // where the camera looks), brought in toward you and over to the side away from the throwing arm.
+    if (aim) {
+        const float X[3] = { 1.0f, 0.0f, 0.0f }, Y[3] = { 0.0f, 1.0f, 0.0f }, Z[3] = { 0.0f, 0.0f, 1.0f };
+        float fx[3], ry[3], uz[3];
+        quatRotate(gameQ, X, fx); quatRotate(gameQ, Y, ry); quatRotate(gameQ, Z, uz);
+        float d = 300.0f;
+        void* sk = CatchTweaks_Skater();
+        void* sroot = sk ? twkP(sk, ACTOR_ROOT) : nullptr;
+        if (sroot) {
+            const float dx = twkF(sroot, COMP_WORLD_POS) - gameP[0], dy = twkF(sroot, COMP_WORLD_POS + 4) - gameP[1],
+                        dz = twkF(sroot, COMP_WORLD_POS + 8) + 40.0f - gameP[2];
+            d = sqrtf(dx * dx + dy * dy + dz * dz);
+            if (!(d > 60.0f)) d = 60.0f; else if (d > 900.0f) d = 900.0f;
+        }
+        const float in = g_aimDolly * 0.01f * d * wA, side = (float)sideA * g_aimSide * wA, up = g_aimUp * wA;
+        // Raised STRAIGHT UP in the world, not along the camera's own (pitched) up axis: the view's direction
+        // is untouched, the camera just sits higher.
+        for (int i = 0; i < 3; i++) gameP[i] += fx[i] * in + ry[i] * side;
+        gameP[2] += up;
+    }
     // game -> skating -> seated
     float p1[3], q1[4];
     if (skate) blendView(gameP, gameQ, eyeK, lookK, wK, p1, q1);
@@ -434,7 +569,12 @@ static bool applyFirstPerson(void* cam, float dt) {
     g_setWorldLocRot(comp, loc, q, false, nullptr, 0);
     const float fovWant = (seat && fovS > 0.0f) ? fovS : ((skate && fovK > 0.0f) ? fovK : 0.0f);
     const float fovW    = (seat && fovS > 0.0f) ? wS   : wK;
-    if (g_fpStockFov > 0.0f) wrF(comp, CAMC_FOV, fovWant > 0.0f ? g_fpStockFov + (fovWant - g_fpStockFov) * fovW : g_fpStockFov);
+    if (g_fpStockFov > 0.0f) {
+        const float baseFov = g_fpStockFov + (foot ? fFov * wF : 0.0f);   // the on-foot camera's own (524)
+        if (fovWant > 0.0f)  wrF(comp, CAMC_FOV, baseFov + (fovWant - baseFov) * fovW);
+        else if (aim)        wrF(comp, CAMC_FOV, baseFov - g_aimZoom * wA);
+        else                 wrF(comp, CAMC_FOV, baseFov);
+    }
     g_fpWrote = 1;
     return true;
 }
@@ -526,6 +666,21 @@ void CameraHeight_ReadConfig(const char* iniText) {
     g_dropDebug   = TwkIniInt(iniText, "CameraDropDebug",       0);
     g_pitchDeg  = (float)TwkIniInt(iniText, "CameraPitchDeg", 0);
     g_pitchBlendMs = TwkIniInt(iniText, "CameraPitchBlendMs", 400);
+    g_aimOn    = TwkIniInt(iniText, "CameraAimShoulder", 1) ? 1 : 0;
+    g_aimDolly = (float)TwkIniInt(iniText, "CameraAimDollyPct", 50);
+    g_aimSide  = (float)TwkIniInt(iniText, "CameraAimSideCm", 45);
+    g_aimUp    = (float)TwkIniInt(iniText, "CameraAimRaiseCm", 65);
+    g_aimZoom  = (float)TwkIniInt(iniText, "CameraAimZoomDeg", 6);
+    g_footDist = (float)TwkIniInt(iniText, "CameraFootDistPct", 100);
+    g_footUp   = (float)TwkIniInt(iniText, "CameraFootRaiseCm", 0);
+    g_footSide = (float)TwkIniInt(iniText, "CameraFootSideCm", 0);
+    g_footFov  = (float)TwkIniInt(iniText, "CameraFootFovDeg", 0);
+    g_footTilt = (float)TwkIniInt(iniText, "CameraFootTiltDeg", 0);
+    g_sitDist  = (float)TwkIniInt(iniText, "CameraSitDistPct", 100);
+    g_sitUp    = (float)TwkIniInt(iniText, "CameraSitRaiseCm", 0);
+    g_sitSide  = (float)TwkIniInt(iniText, "CameraSitSideCm", 0);
+    g_sitFov   = (float)TwkIniInt(iniText, "CameraSitFovDeg", 0);
+    g_sitTilt  = (float)TwkIniInt(iniText, "CameraSitTiltDeg", 0);
     if (g_pitchDeg < -30.0f) g_pitchDeg = -30.0f;
     if (g_pitchDeg >  30.0f) g_pitchDeg =  30.0f;
     CamFp_ReadConfig(iniText);
@@ -536,10 +691,28 @@ void CameraHeight_SaveConfig(char* iniText, size_t cap) {
     TwkIniSetInt(iniText, cap, "CameraDropDebug",       g_dropDebug);
     TwkIniSetInt(iniText, cap, "CameraPitchDeg",   (int)g_pitchDeg);
     TwkIniSetInt(iniText, cap, "CameraPitchBlendMs", g_pitchBlendMs);
+    TwkIniSetInt(iniText, cap, "CameraAimShoulder", g_aimOn);
+    TwkIniSetInt(iniText, cap, "CameraAimDollyPct", (int)g_aimDolly);
+    TwkIniSetInt(iniText, cap, "CameraAimSideCm",   (int)g_aimSide);
+    TwkIniSetInt(iniText, cap, "CameraAimRaiseCm",  (int)g_aimUp);
+    TwkIniSetInt(iniText, cap, "CameraAimZoomDeg",  (int)g_aimZoom);
+    TwkIniSetInt(iniText, cap, "CameraFootDistPct", (int)g_footDist);
+    TwkIniSetInt(iniText, cap, "CameraFootRaiseCm", (int)g_footUp);
+    TwkIniSetInt(iniText, cap, "CameraFootSideCm",  (int)g_footSide);
+    TwkIniSetInt(iniText, cap, "CameraFootFovDeg",  (int)g_footFov);
+    TwkIniSetInt(iniText, cap, "CameraFootTiltDeg", (int)g_footTilt);
+    TwkIniSetInt(iniText, cap, "CameraSitDistPct",  (int)g_sitDist);
+    TwkIniSetInt(iniText, cap, "CameraSitRaiseCm",  (int)g_sitUp);
+    TwkIniSetInt(iniText, cap, "CameraSitSideCm",   (int)g_sitSide);
+    TwkIniSetInt(iniText, cap, "CameraSitFovDeg",   (int)g_sitFov);
+    TwkIniSetInt(iniText, cap, "CameraSitTiltDeg",  (int)g_sitTilt);
     CamFp_SaveConfig(iniText, cap);
 }
 void CameraHeight_ResetDefaults() {
     g_follow = 0; g_pitchOnDrop = 1; g_dropDebug = 0; g_pitchDeg = 0;
+    g_aimOn = 1; g_aimDolly = 50.0f; g_aimSide = 45.0f; g_aimUp = 65.0f; g_aimZoom = 6.0f;   // the user's tuning (3.19.523)
+    g_footDist = 100.0f; g_footUp = 0.0f; g_footSide = 0.0f; g_footFov = 0.0f; g_footTilt = 0.0f;
+    g_sitDist = 100.0f; g_sitUp = 0.0f; g_sitSide = 0.0f; g_sitFov = 0.0f; g_sitTilt = 0.0f;
     CamFp_ResetDefaults();
     TwkMarkDirty();
 }
@@ -551,6 +724,37 @@ bool CameraHeight_FollowEnabled()            { return g_follow != 0; }
 void CameraHeight_SetFollowEnabled(bool on)  { g_follow = on ? 1 : 0; TwkMarkDirty(); }
 bool CameraHeight_PitchOnDropEnabled()       { return g_pitchOnDrop != 0; }
 void CameraHeight_SetPitchOnDropEnabled(bool on) { g_pitchOnDrop = on ? 1 : 0; TwkMarkDirty(); }
+static float CamClampI(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : floorf(v + 0.5f)); }
+bool  CameraHeight_AimOn()              { return g_aimOn != 0; }
+void  CameraHeight_SetAimOn(bool on)    { g_aimOn = on ? 1 : 0; TwkMarkDirty(); }
+float CameraHeight_AimIn()              { return g_aimDolly; }
+void  CameraHeight_SetAimIn(float v)    { g_aimDolly = CamClampI(v, 0.0f, 70.0f); TwkMarkDirty(); }
+float CameraHeight_AimSide()            { return g_aimSide; }
+void  CameraHeight_SetAimSide(float v)  { g_aimSide = CamClampI(v, 0.0f, 90.0f); TwkMarkDirty(); }
+float CameraHeight_AimUp()              { return g_aimUp; }
+void  CameraHeight_SetAimUp(float v)    { g_aimUp = CamClampI(v, 0.0f, 80.0f); TwkMarkDirty(); }
+float CameraHeight_AimZoom()            { return g_aimZoom; }
+void  CameraHeight_SetAimZoom(float v)  { g_aimZoom = CamClampI(v, 0.0f, 20.0f); TwkMarkDirty(); }
+float CameraHeight_FootDist()           { return g_footDist; }
+void  CameraHeight_SetFootDist(float v) { g_footDist = CamClampI(v, 50.0f, 200.0f); TwkMarkDirty(); }
+float CameraHeight_FootUp()             { return g_footUp; }
+void  CameraHeight_SetFootUp(float v)   { g_footUp = CamClampI(v, -60.0f, 120.0f); TwkMarkDirty(); }
+float CameraHeight_FootSide()           { return g_footSide; }
+void  CameraHeight_SetFootSide(float v) { g_footSide = CamClampI(v, -80.0f, 80.0f); TwkMarkDirty(); }
+float CameraHeight_FootFov()            { return g_footFov; }
+void  CameraHeight_SetFootFov(float v)  { g_footFov = CamClampI(v, -20.0f, 30.0f); TwkMarkDirty(); }
+float CameraHeight_FootTilt()           { return g_footTilt; }
+void  CameraHeight_SetFootTilt(float v) { g_footTilt = CamClampI(v, -20.0f, 20.0f); TwkMarkDirty(); }
+float CameraHeight_SitDist()            { return g_sitDist; }
+void  CameraHeight_SetSitDist(float v)  { g_sitDist = CamClampI(v, 30.0f, 200.0f); TwkMarkDirty(); }
+float CameraHeight_SitUp()              { return g_sitUp; }
+void  CameraHeight_SetSitUp(float v)    { g_sitUp = CamClampI(v, -80.0f, 120.0f); TwkMarkDirty(); }
+float CameraHeight_SitSide()            { return g_sitSide; }
+void  CameraHeight_SetSitSide(float v)  { g_sitSide = CamClampI(v, -80.0f, 80.0f); TwkMarkDirty(); }
+float CameraHeight_SitFov()             { return g_sitFov; }
+void  CameraHeight_SetSitFov(float v)   { g_sitFov = CamClampI(v, -20.0f, 30.0f); TwkMarkDirty(); }
+float CameraHeight_SitTilt()            { return g_sitTilt; }
+void  CameraHeight_SetSitTilt(float v)  { g_sitTilt = CamClampI(v, -20.0f, 20.0f); TwkMarkDirty(); }
 float CameraHeight_PitchDeg()           { return g_pitchDeg; }
 void CameraHeight_SetPitchDeg(float d)  {
     if (d < -30.0f) d = -30.0f;
@@ -561,6 +765,7 @@ void CameraHeight_SetPitchDeg(float d)  {
 
 void CameraHeight_DrawMenu(const OmpMenuApi* api) {
     bool f = g_follow != 0, p = g_pitchOnDrop != 0, dbg = g_dropDebug != 0;
+    api->Text("On board");
     if (api->Checkbox("Camera always follows height", &f)) CameraHeight_SetFollowEnabled(f);
     api->SameLine(); api->TextDisabled("(every air, not just onto higher obstacles)");
     if (api->Checkbox("Pitch camera before drop", &p)) CameraHeight_SetPitchOnDropEnabled(p);
@@ -568,6 +773,51 @@ void CameraHeight_DrawMenu(const OmpMenuApi* api) {
     float pd = g_pitchDeg;
     if (api->SliderFloat("Pitch on the board (deg, + looks up)", &pd, -30.0f, 30.0f, "%.0f")) CameraHeight_SetPitchDeg(pd);
     if (api->Checkbox("Draw the game's drop-detection debug", &dbg)) { g_dropDebug = dbg ? 1 : 0; TwkMarkDirty(); }
+    api->Separator();
+    api->Text("Off board");
+    api->SameLine(); api->TextDisabled("(walking around; all at stock = the game's own camera)");
+    {
+        float v = g_footDist;
+        if (api->SliderFloat("Distance (%)##foot", &v, 50.0f, 200.0f, "%.0f")) CameraHeight_SetFootDist(v);
+        api->SameLine(); api->TextDisabled("(100 = stock; lower is closer)");
+        v = g_footUp;
+        if (api->SliderFloat("Height (cm)##foot", &v, -60.0f, 120.0f, "%.0f")) CameraHeight_SetFootUp(v);
+        v = g_footSide;
+        if (api->SliderFloat("Side (cm)##foot", &v, -80.0f, 80.0f, "%.0f")) CameraHeight_SetFootSide(v);
+        api->SameLine(); api->TextDisabled("(+ = to the right)");
+        v = g_footFov;
+        if (api->SliderFloat("Field of view (deg)##foot", &v, -20.0f, 30.0f, "%.0f")) CameraHeight_SetFootFov(v);
+        v = g_footTilt;
+        if (api->SliderFloat("Tilt (deg)##foot", &v, -20.0f, 20.0f, "%.0f")) CameraHeight_SetFootTilt(v);
+        api->SameLine(); api->TextDisabled("(+ looks up)");
+    }
+    api->Text("Sitting");
+    api->SameLine(); api->TextDisabled("(on top of the walking camera while seated; all at stock = the walking camera)");
+    {
+        float v = g_sitDist;
+        if (api->SliderFloat("Distance (%)##sit", &v, 30.0f, 200.0f, "%.0f")) CameraHeight_SetSitDist(v);
+        api->SameLine(); api->TextDisabled("(of the walking camera's)");
+        v = g_sitUp;
+        if (api->SliderFloat("Height (cm)##sit", &v, -80.0f, 120.0f, "%.0f")) CameraHeight_SetSitUp(v);
+        v = g_sitSide;
+        if (api->SliderFloat("Side (cm)##sit", &v, -80.0f, 80.0f, "%.0f")) CameraHeight_SetSitSide(v);
+        v = g_sitFov;
+        if (api->SliderFloat("Field of view (deg)##sit", &v, -20.0f, 30.0f, "%.0f")) CameraHeight_SetSitFov(v);
+        v = g_sitTilt;
+        if (api->SliderFloat("Tilt (deg)##sit", &v, -20.0f, 20.0f, "%.0f")) CameraHeight_SetSitTilt(v);
+    }
+    bool am = g_aimOn != 0;
+    if (api->Checkbox("Over-the-shoulder aim (holding LT to throw the board)", &am)) { g_aimOn = am ? 1 : 0; TwkMarkDirty(); }
+    if (am) {
+        float v = g_aimDolly;
+        if (api->SliderFloat("Aim: in toward you (%)", &v, 0.0f, 70.0f, "%.0f")) { g_aimDolly = floorf(v + 0.5f); TwkMarkDirty(); }
+        v = g_aimSide;
+        if (api->SliderFloat("Aim: over the shoulder (cm)", &v, 0.0f, 90.0f, "%.0f")) { g_aimSide = floorf(v + 0.5f); TwkMarkDirty(); }
+        v = g_aimUp;
+        if (api->SliderFloat("Aim: raise straight up (cm)", &v, 0.0f, 80.0f, "%.0f")) { g_aimUp = floorf(v + 0.5f); TwkMarkDirty(); }
+        v = g_aimZoom;
+        if (api->SliderFloat("Aim: zoom (deg)", &v, 0.0f, 20.0f, "%.0f")) { g_aimZoom = floorf(v + 0.5f); TwkMarkDirty(); }
+    }
     if (g_data) {
         char b[160];
         snprintf(b, sizeof(b), "stock: flatAirMax %.0f/%.0f, dropDetect %d",

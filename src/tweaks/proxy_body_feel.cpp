@@ -89,6 +89,16 @@ struct Cfg {
     float torsoLoose = 0.60f, torsoHold = 0.50f, torsoDamp = 1.20f, torsoInertia = 0.60f;
     float headLoose = 0.50f, headHold = 0.45f, headDamp = 1.30f, headInertia = 0.40f;
 };
+// Member by member (537): a memcmp saw the PADDING, and `c = Cfg{}` below copies an uninitialised temporary's
+// padding right over a memset -- "owner changed their settings" every second with the same numbers, and every
+// false change re-stamped all 21 drives on that proxy.
+static bool CfgSame(const Cfg& a, const Cfg& b) {
+    return a.on == b.on && a.amount == b.amount && a.armK == b.armK && a.armLoose == b.armLoose && a.armHold == b.armHold &&
+           a.armDamp == b.armDamp && a.armInertia == b.armInertia && a.spreadAccel == b.spreadAccel && a.landAccent == b.landAccent &&
+           a.torsoOn == b.torsoOn && a.torsoLoose == b.torsoLoose && a.torsoHold == b.torsoHold && a.torsoDamp == b.torsoDamp &&
+           a.torsoInertia == b.torsoInertia && a.headLoose == b.headLoose && a.headHold == b.headHold && a.headDamp == b.headDamp &&
+           a.headInertia == b.headInertia;
+}
 static void CfgFromWire(const int16_t* v, int n, Cfg& c) {
     c = Cfg{};
     auto has = [&](int i) { return i < n; };
@@ -719,13 +729,10 @@ void ProxyBodyFeel_PumpFrame() {
             continue;
         }
         if (!r) { r = RigAlloc(sk); if (!r) continue; }
-        // Zeroed FIRST: Cfg carries padding (after each bool), the compare below is a memcmp, and
-        // neither `Cfg{}` nor the assignment inside CfgFromWire writes padding. Stack garbage there
-        // read as "the owner changed their settings" on most passes -- 1,354 such lines in one
-        // 35-minute session -- and every one re-stamped all 21 drives on that proxy. The rig side is
-        // clean: rigs live in a zeroed static array and only ever receive member-wise copies.
+        // Compared member by member (CfgSame): Cfg carries padding, and a memcmp read its garbage as "the
+        // owner changed their settings" on most passes, re-stamping all 21 drives on that proxy each time.
         Cfg c; memset(&c, 0, sizeof(c)); CfgFromWire(v, n, c);
-        if (memcmp(&c, &r->cfg, sizeof(Cfg)) != 0) {
+        if (!CfgSame(c, r->cfg)) {
             const bool first = !r->armed;
             r->cfg = c;
             r->paSoft = false;                 // the next apply re-stamps every drive with the new hold/damp

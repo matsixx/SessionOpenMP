@@ -40,12 +40,23 @@ bool Sit_BoardInHand(void* skater);             // on foot, carried: the board's
 bool Sit_BoardThrow(void* skater, const float velW[3], const float spinRadW[3]);
 void Sit_BoardKick(const float velW[3], const float spinRadW[3]);   // the same velocity again, a frame on
 bool Sit_BoardOut();                            // thrown, and not back yet
+bool Sit_MountPending();                        // Y was pressed on foot within a mount's length: getting on the board
 bool Sit_BoardWhere(float outW[3]);
 void Sit_BoardBack(const char* why);
 // What is under a point and what it is made of (EPhysicalSurface; 0 = default). The skater and the board are ignored.
 bool Sit_AttachKeepWorld(void* comp, void* parent, unsigned long long socketFName);      // props: GAME THREAD
 void Sit_DetachKeepWorld(void* comp);
 bool Sit_TraceSurface(void* skater, const float aW[3], const float bW[3], float hitW[3], int* surface);
+// THE KEPT BOARD (SitKeepBoard): seated, the board stays in hand and emote.cpp lays it down beside you.
+struct SitBoardSpot {
+    float os[3], f[3], r[3], u[3];   // the seat frame, the mesh's component space, this frame (origin on the seat plane)
+    float fx, ry, uz;                // where the middle of the board's footprint goes, in that frame (cm)
+    float yawDeg;                    // its nose, off the seat's forward toward its right
+    float arms;                      // how far the hands are into the seat: 0 standing .. 1 seated
+    int   carry;                     // the hand it rides in: 0 left, 1 right
+};
+bool Sit_BoardKept();                        // seated, the board kept and in hand: the tap and the throw may run
+bool Sit_BoardSpot(SitBoardSpot* out);       // INSIDE the pose hook, after the seat's pose; false = leave it where it is
 // GAME THREAD, for the camera module: the seated first-person view -- the eyes (world), the look (world
 // FQuat), the dolly weight 0..1 and the wanted FOV (0 = the game's). False = the camera is the game's.
 bool Sit_FirstPersonView(float eye[3], float look[4], float* weight, float* fov);
@@ -56,3 +67,12 @@ float Sit_MaxLedgeCm();     void Sit_SetMaxLedgeCm(float v);
 float Sit_ReachCm();        void Sit_SetReachCm(float v);
 float Sit_LeanDeg();        void Sit_SetLeanDeg(float v);
 bool  Sit_HeadLook();       void Sit_SetHeadLook(bool on);   // off the board, the head looks where the camera looks
+bool  Sit_BoardKnockdown(); void Sit_SetBoardKnockdown(bool on);   // someone's thrown board knocks you over (off: sound only)
+// The seated first person (537): the view key's eyes-view, its field of view (0 = the game's) and the look.
+bool  Sit_FpEnabled();      void Sit_SetFpEnabled(bool on);
+float Sit_FpFov();          void Sit_SetFpFov(float deg);
+float Sit_LookSpeed();      void Sit_SetLookSpeed(float dps);
+bool  Sit_LookInvertY();    void Sit_SetLookInvertY(bool on);
+float Sit_LookYawDeg();     void Sit_SetLookYawDeg(float deg);
+float Sit_LookUpDeg();      void Sit_SetLookUpDeg(float deg);
+float Sit_LookDownDeg();    void Sit_SetLookDownDeg(float deg);

@@ -33,6 +33,23 @@ bool CameraHeight_FollowEnabled();      void CameraHeight_SetFollowEnabled(bool 
 // you. The stored sense is the LABEL's sense, not the mod's -- see the polarity note in the .cpp.
 bool CameraHeight_PitchOnDropEnabled(); void CameraHeight_SetPitchOnDropEnabled(bool on);
 float CameraHeight_PitchDeg();          void CameraHeight_SetPitchDeg(float deg);
+// Off board (524): the throw's over-the-shoulder aim and the on-foot camera.
+bool  CameraHeight_AimOn();     void CameraHeight_SetAimOn(bool on);
+float CameraHeight_AimIn();     void CameraHeight_SetAimIn(float pct);
+float CameraHeight_AimSide();   void CameraHeight_SetAimSide(float cm);
+float CameraHeight_AimUp();     void CameraHeight_SetAimUp(float cm);
+float CameraHeight_AimZoom();   void CameraHeight_SetAimZoom(float deg);
+float CameraHeight_FootDist();  void CameraHeight_SetFootDist(float pct);
+float CameraHeight_FootUp();    void CameraHeight_SetFootUp(float cm);
+float CameraHeight_FootSide();  void CameraHeight_SetFootSide(float cm);
+float CameraHeight_FootFov();   void CameraHeight_SetFootFov(float deg);
+float CameraHeight_FootTilt();  void CameraHeight_SetFootTilt(float deg);
+// The seated camera (537): on top of the walking camera while the sit pose is held.
+float CameraHeight_SitDist();   void CameraHeight_SetSitDist(float pct);
+float CameraHeight_SitUp();     void CameraHeight_SetSitUp(float cm);
+float CameraHeight_SitSide();   void CameraHeight_SetSitSide(float cm);
+float CameraHeight_SitFov();    void CameraHeight_SetSitFov(float deg);
+float CameraHeight_SitTilt();   void CameraHeight_SetSitTilt(float deg);
 // GAME THREAD: which way the camera is looking this frame (the component's forward after everything
 // that moves it), for the head that looks where the camera looks. False = no fresh camera.
 bool  CameraHeight_ViewForward(float out[3]);

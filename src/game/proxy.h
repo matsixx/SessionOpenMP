@@ -55,6 +55,15 @@ struct ProxyTuning {
     float driveMaxAngRad  = 25.0f;        // rad/s clamp
     float quietStopMs     = 1500.0f;      // stream silent this long -> stop simulating (no zombie boards)
     bool  vetoBail        = true;         // a proxy must not DECIDE to bail; the owner transports it
+    // YOUR BODY ON A LOOSE BOARD: the chase eases to a gentle pull while your own on-foot body touches a
+    // peer's loose (bailed / thrown / set-down) board, so your push moves it here at once instead of the
+    // chase yanking it back every frame; it eases back onto the owner's version when you step off. The
+    // owner's game makes the same push to the real board (SessionTweaks pushes its own loose board off your
+    // walking proxy), so the two stay close. A RIDDEN board is never softened.
+    bool  touchSoften     = true;
+    float touchPullRate   = 4.0f;         // 1/s: the gentle pull toward the owner's board while you touch it
+    float touchInRate     = 20.0f;        // 1/s: how fast the softening comes on at contact...
+    float touchOutRate    = 3.0f;         // ...and goes off after it (the ease back onto the owner's version)
     bool  looseBoardSim   = true;         // off board, a SIMULATING board is driven like a bailed one
                                           // instead of stamped -- see the carry note in Apply
     bool  carryBoard      = true;         // off board: stamp the transported pose. PlaceInHand runs on
@@ -219,7 +228,7 @@ public:
     void* OwnBoard() const;               // board ONLY if `board+0x4d8` links back to us
 
 private:
-    bool  VelocityDrive(const repl::State& s, uint64_t nowUs);
+    bool  VelocityDrive(const repl::State& s, uint64_t nowUs, bool loose = false);
     void  StampBoard(const repl::State& s);
     void  StopBoardSim();
     // The peer's ACTUAL sounds, captured at their end and re-issued here. Loops are diffed against
@@ -251,6 +260,7 @@ private:
     uint64_t   cvLingerMs_ = 0;           // release: rate stays pinned through the blend-out
     void*      world_ = nullptr;
     uint64_t   bornMs_ = 0, lastTryMs_ = 0, lastDriveUs_ = 0;
+    float      touchW_ = 0.f;             // how softened the board chase is: your body on their loose board
     int        tries_ = 0;
     bool       refreshed_ = false, repOff_ = false, boardRepOff_ = false, tickOff_ = false;
     void*      tagsClearedBoard_ = nullptr;   // the board whose replay tags were cleared (see clearReplayTags)

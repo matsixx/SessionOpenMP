@@ -43,6 +43,7 @@ void* CatchTweaks_LocalInputHandler();   // the local skater's InputHandler, nul
 // yet, or this build lacks the call): the caller falls back to the trigger's press.
 bool  CatchTweaks_RightTrigger(float* out);
 bool  CatchTweaks_LeftTrigger(float* out);        // held = arm a board throw (emote.cpp)
+const char* CatchTweaks_TriggerWhy();             // why the triggers cannot be read right now (for the log)
 bool  CatchTweaks_MakeName(const char* s, bool add, unsigned long long* out);      // an FName (8 B) from a string
 // The highest skater world-Z (cm) seen in the last ~1.5 s, sampled per frame from the
 // CanCatchOrient hook -- run_out computes the drop height of the air that is ending as
