@@ -42,9 +42,11 @@ struct Release { const char* version; const char* notes; };
 // short enough that trimming never has to happen: budget ~300 characters a release, three releases.
 static const Release kReleases[] = {
     { "1.3.2",
-      "- SessionTweaks: flick and scoop speed are read straight from the controller,\n"
+      "- SessionTweaks: flicks, scoops and pop control read the controller directly,\n"
       "  so they no longer change with your frame rate or a busy lobby.\n"
-      "- SessionTweaks: another skater's catch can no longer cancel yours.\n"
+      "- SessionTweaks: boardslide rocking uses the whole stick.\n"
+      "- SessionTweaks: another skater's catch can't cancel yours, and a held\n"
+      "  crouch no longer pops a heelflip.\n"
       "- Direct (non-Epic) connections no longer drop a player as they join." },
     { "1.3.1",
       "- Fixed other skaters' grinds sometimes showing the wrong animation\n"

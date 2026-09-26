@@ -69,7 +69,7 @@
 #include "ue4ss_abi.h"
 #include "ui/menu_ext.h"
 
-#define TWEAKS_VERSION "3.19.546"
+#define TWEAKS_VERSION "3.19.549"
 #define TWK_WIDEN(x) STR(x)   // STR() prepends L before the macro expands; expand first
 
 // ------------------------------------------------------------------ log (own file, fresh per launch)
@@ -772,8 +772,8 @@ static const OmpPageItem2 kTwkGrindItems[] = {
     { OMP_ITEM_SLIDER, kTwkGSwingAmt, "  Swing amount (%)",   "100 = the trick's full pop swing",
       nullptr, nullptr, 0.0f, 100.0f, 10.0f },
     { OMP_ITEM_TOGGLE, kTwkGRock,     "Boardslide rocking",  "On a boardslide, ease off one stick and that end of the board rises" },
-    { OMP_ITEM_SLIDER, kTwkGRockDeg,  "  Tilt strength",     "How far easing a stick tips the board (4 = about 25 degrees at half a stick)",
-      nullptr, nullptr, 0.0f, 35.0f, 1.0f },
+    { OMP_ITEM_SLIDER, kTwkGRockDeg,  "  Tilt strength",     "How far easing a stick tips the board at a full ease (4 = 45 degrees, the most)",
+      nullptr, nullptr, 0.0f, 4.0f, 1.0f },
     { OMP_ITEM_SLIDER, kTwkGRockCrv,  "  Softness",          "0 = linear. Higher = a slight ease barely tips the board and the lean builds toward a full release",
       nullptr, nullptr, 0.0f, 20.0f, 1.0f },
     { OMP_ITEM_SLIDER, kTwkGRockSway, "  Natural rock (deg)", "The board teeters as a boardslide starts, then sways as you balance; 0 = none",

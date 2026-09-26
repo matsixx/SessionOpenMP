@@ -487,7 +487,7 @@ void FlipSpeed_DrawMenu(const OmpMenuApi* api) {
     api->TextDisabled(b);
     bool pad = PadSampler_Enabled();
     if (api->Checkbox("Time flicks from the controller itself (1000 Hz)", &pad)) PadSampler_SetEnabled(pad);
-    api->SameLine(); api->TextDisabled("(flips and scoops; independent of frame rate and of the game thread)");
+    api->SameLine(); api->TextDisabled("(flips, scoops, pop control and the catch foot; independent of frame rate)");
     PadSampler_DrawStatus(api);
     api->TextDisabled("Stock maps most flicks to one speed (a flat spot in the game's curve) and "
                       "reads the stick on a single frame, so frame rate changes the result.");

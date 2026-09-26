@@ -196,10 +196,19 @@ static float LeftFootEnd(void* skater) {
 // on GetLocalAnimatorBoardQuat adds it and puts the game's own value back straight after -- so the
 // game's pitch state never carries it, and the visible lean follows kLegacyGain x the stick lean on the
 // game's own smoothing: the stacked feel the strength knob was tuned on (0.0056 s), at any framerate.
-// The knob's numbers are that loop's, not degrees.
+// (549: the lean is set in degrees now -- see THE WHOLE STICK.)
 static const float kLegacyGain = 35.7f;          // 1 / (0.0056 s x 5): the loop's gain the rider tuned against
 static const float kMaxVisibleDeg = 45.0f;       // a fully released stick asked for ~140 deg; the log never passed 27
-static float    s_tilt = 0.0f;       // the stick lean, eased (strength units)
+// THE WHOLE STICK, NOT A THIRD OF IT (549). "the boardslide rocking feels very sensitive. There also feels like a
+// deadzone where if you let go of pressure too much on one foot, it just gives up. I need really good control".
+// The lean asked for kLegacyGain x tilt x t^curve = 143 x t^3 deg at the user's tilt 4 / softness 20 and was cut
+// at 45: nothing below ~30% of the stick difference, all of it by ~68%, the rest of the travel dead -- 0..45 deg
+// in about a third of the stick. Now the lean is in DEGREES: full (tilt x kDegPerTilt, most 45) at kFullEase of
+// difference -- one stick eased to about a quarter held, short of the release the game reads as a pop -- on the
+// same curve, so every bit of the travel between is the rock.
+static const float kDegPerTilt = 11.25f;         // tilt strength 4 = 45 deg at a full ease
+static const float kFullEase   = 0.75f;          // the stick difference that is the full lean
+static float    s_tilt = 0.0f;       // the stick lean, eased (deg)
 static float    s_lean = 0.0f;       // the visible lean it makes (deg)
 static float    s_apply = 0.0f;      // what the board's read gets on top of the game's pitch (deg)
 static uint64_t s_lastMs = 0;
@@ -259,7 +268,7 @@ static void Rock(void* comp, float dt) {
     // Back on a grind after a pop is a new grind however short the air (hops along a rail: 0.15 s).
     if (now - s_lastMs > 150 || (s_popped && now - s_lastMs > 40)) {
         s_lastDef = nullptr; s_grindT = 0.0f; RollRock();
-        s_lean = s_apply; s_tilt = s_apply / kLegacyGain;
+        s_lean = s_apply; s_tilt = s_apply;
         s_grindStartMs = now; s_popped = false; s_popFade = 1.0f;
     }
     s_lastMs = now;
@@ -285,7 +294,7 @@ static void Rock(void* comp, float dt) {
             rMag = sqrtf(rx * rx + ry * ry); if (rMag > 1.0f) rMag = 1.0f;
             // > 0: the left stick is the eased one. Two held sticks never read exactly equal.
             const float d = rMag - lMag, dz = 0.06f;
-            float t = (fabsf(d) - dz) / (1.0f - dz);
+            float t = (fabsf(d) - dz) / (kFullEase - dz);
             if (t < 0.0f) t = 0.0f; if (t > 1.0f) t = 1.0f;
             lean01 = t;
             // Over the WHOLE stick: the boardslide holds with a stick fully let go (measured: L 0.00
@@ -299,12 +308,24 @@ static void Rock(void* comp, float dt) {
             // which a 180 shove leaves set and a 360 clears ("after a pop shove-it the weight
             // distribution becomes opposite ... a 360 shove into a boardslide was fine").
             reversed = (*((const uint8_t*)comp + MC_FLAGS_7E9) & 0x80) != 0;
-            target = t * g_maxDeg * side * (reversed ? -1.0f : 1.0f);
+            const float maxLean = fminf(kMaxVisibleDeg, g_maxDeg * kDegPerTilt);
+            target = t * maxLean * side * (reversed ? -1.0f : 1.0f);
         }
     }
+    // A POP THAT DID NOT LEAVE THE RAIL (549): the pop hands the board to the game for the rest of the grind, and a
+    // real one leaves it ~0.2 s later (507 log). Still on it kPopVoidMs after, it was not one -- rock again, and say so
+    // (the lead for "if you let go of pressure too much on one foot, it just gives up").
+    static const unsigned long long kPopVoidMs = 350;
+    static unsigned long long s_popSeenMs = 0;
     const unsigned long long pop = GrindPop_LastJumpMs();
-    if (!s_popped && pop > s_grindStartMs) {
-        s_popped = true;
+    if (s_popped && now > s_popSeenMs + kPopVoidMs) {
+        s_popped = false; s_popFade = 1.0f;
+        static int s_nv = 0;
+        if (s_nv++ < 60) TwkLog("[rock] a pop registered %.2f s ago but you are still on the rail -- rocking again (sticks L %.2f R %.2f)",
+                                (double)(now - s_popSeenMs) / 1000.0, lMag, rMag);
+    }
+    if (!s_popped && pop > s_grindStartMs && pop != s_popSeenMs) {
+        s_popped = true; s_popSeenMs = pop;
         s_popHold = s_lean * g_popDip;
         static int s_n = 0;
         if (two && s_n < 100) {
@@ -323,12 +344,12 @@ static void Rock(void* comp, float dt) {
         s_popFade -= s_popFade * kq;
     } else {
         const float k = (g_easeMs <= 0.0f) ? 1.0f : (1.0f - expf(-dt * 1000.0f / g_easeMs));
-        s_tilt += (target - s_tilt) * k;
+        s_tilt += (target - s_tilt) * k;         // degrees (549)
         // The visible lean, on the game's own smoothing (GrindOrientSmoothing, 5 in the logs).
         void* db = twkP(comp, MC_GRINDS_DB);
         float S = db ? twkF(db, GDB_ORIENT_SMOOTHING) : 0.0f;
         if (!(S > 0.1f && S < 100.0f)) S = 5.0f;
-        float want = kLegacyGain * s_tilt;
+        float want = s_tilt;
         if (want > kMaxVisibleDeg) want = kMaxVisibleDeg; else if (want < -kMaxVisibleDeg) want = -kMaxVisibleDeg;
         s_lean += (want - s_lean) * (1.0f - expf(-S * dt));
     }
@@ -465,8 +486,8 @@ void GrindRock_DrawMenu(const OmpMenuApi* api) {
     if (!on) return;
     api->Indent();
     float d = g_maxDeg, e = g_easeMs;
-    if (api->SliderFloat("Tilt strength", &d, 0.0f, 35.0f, "%.0f")) GrindRock_SetMaxDeg(d);
-    api->SameLine(); api->TextDisabled("(how far easing a stick tips the board; 4 = ~25 deg at half a stick)");
+    if (api->SliderFloat("Tilt strength", &d, 0.0f, 4.0f, "%.1f")) GrindRock_SetMaxDeg(d);   // x 11.25 deg at a full ease, 4 = 45 (549)
+    api->SameLine(); api->TextDisabled("(how far easing a stick tips the board at a full ease; 4 = 45 deg, the most)");
     float c = GrindRock_Softness();
     if (api->SliderFloat("Softness", &c, 0.0f, 20.0f, "%.0f")) GrindRock_SetSoftness(c);
     api->SameLine(); api->TextDisabled("(0 = linear; higher = a slight ease barely tips it)");

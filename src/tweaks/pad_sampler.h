@@ -70,4 +70,15 @@ struct PadSweep {
 };
 bool PadSampler_Sweep(bool rightStick, float minMag, float freshSec, float sustainFrac, PadSweep* out);
 
+// Where one stick was at time t (PadSampler_Now's clock): the report HELD at t -- a resting stick
+// sends nothing, so the last report at or before t is its position then. Stick units. Safe from any
+// thread. False = no pad, or t is older than the samples reach.
+bool PadSampler_StickAt(bool rightStick, double t, float* x, float* y);
+
+// When one stick last went OUT past radius `mag` (a report at or beyond it, the one before inside),
+// no earlier than `since`: interpolated between those two reports, never from further back than one
+// report interval. reportT = the report that crossed -- two sticks that crossed on the SAME report
+// cannot be ordered. GAME THREAD. False = no such crossing in the samples.
+bool PadSampler_OutwardCrossing(bool rightStick, float mag, double since, double* t, double* reportT);
+
 void PadSampler_DrawStatus(const OmpMenuApi* api);   // RENDER THREAD

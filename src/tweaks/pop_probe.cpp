@@ -18,6 +18,7 @@
 #include "foot_place.h"      // FootPlace_AnimInstance / FootPlace_SettingUpTrick (asset-gated crank)
 #include "catch_tweaks.h"    // CatchTweaks_Skater -- the root the handler scan starts from
 #include "flip_speed.h"      // FlipSpeed_Stance -- the pad gate's switch/fakie answer
+#include "pad_sampler.h"     // the controller's own clock, for the machine's stick-speed tests
 #include "MinHook.h"      // the pad-level hook (injection mode 3)
 #include <cmath>
 #include <cstring>
@@ -121,6 +122,17 @@ static int g_maskMs  = 180;   // PopProbeReleaseMaskMs -- LS stays hidden this l
 static int g_depthPop = 1;        // PopProbeDepthPop
 static int g_windowMs = 200;      // PopProbeTrickWindowMs
 static int g_graceMs  = 60;       // PopProbeGraceMs -- how long a flick-ended crouch waits for RS
+static int g_speedRefHz = 90;     // PopProbeSpeedRefHz -- the frame rate the machine's stick-speed
+                                  // tests were tuned at; with the controller sampler live they
+                                  // behave at every frame rate as they did at this one
+// THE HELD CROUCH STICK AFTER THE POP. A crouch stick still held where it crouched when the pop window
+// closes (or the skater leaves the ground) was hidden from the game all crouch long; handing it back
+// in one read shows the game a full flick that never happened -- a held pocket popped heelflips.
+// It stays hidden until it moves at flick speed (a real flick: shown at once), comes back near the
+// centre, a grind starts, or the machine takes it again -- and at most PopProbeHeldHideMs, after
+// which it FADES in over PopProbeHeldFadeMs rather than jumping. 0 = off.
+static int g_heldHideMs = 250;    // PopProbeHeldHideMs
+static int g_heldFadeMs = 150;    // PopProbeHeldFadeMs
 static int g_manualGate   = 1;    // PopProbeManualGate -- the game-side manual gate (see its block)
 static int g_landSettleMs = 250;  // PopProbeLandSettleMs -- how long after a pop's touchdown the
                                   // manual gate stays closed (recovering thumbs come home well
@@ -184,6 +196,12 @@ void PopProbe_ReadConfig(const char* buf) {
     }
     g_graceMs = TwkIniInt(buf, "PopProbeGraceMs", 60);
     if (g_graceMs < 0) g_graceMs = 0; else if (g_graceMs > 150) g_graceMs = 150;
+    g_speedRefHz = TwkIniInt(buf, "PopProbeSpeedRefHz", 90);
+    if (g_speedRefHz < 30) g_speedRefHz = 30; else if (g_speedRefHz > 360) g_speedRefHz = 360;
+    g_heldHideMs = TwkIniInt(buf, "PopProbeHeldHideMs", 250);
+    if (g_heldHideMs < 0) g_heldHideMs = 0; else if (g_heldHideMs > 1000) g_heldHideMs = 1000;
+    g_heldFadeMs = TwkIniInt(buf, "PopProbeHeldFadeMs", 150);
+    if (g_heldFadeMs < 0) g_heldFadeMs = 0; else if (g_heldFadeMs > 1000) g_heldFadeMs = 1000;
     g_manualGate   = TwkIniInt(buf, "PopProbeManualGate", 1);
     g_landSettleMs = TwkIniInt(buf, "PopProbeLandSettleMs", 250);
     if (g_landSettleMs < 0) g_landSettleMs = 0; else if (g_landSettleMs > 1000) g_landSettleMs = 1000;
@@ -198,9 +216,11 @@ void PopProbe_ReadConfig(const char* buf) {
     g_stances = TwkIniInt(buf, "PopProbeStances", 1);
     if (SchemeOn() && g_inject != 0)
         TwkLog("[pop] config: pop control scheme ON | trick window %d ms, crouch gate %d%%, "
-               "crouch visual %d-%d ms smoothed %d ms%s%s", g_windowMs,
+               "crouch visual %d-%d ms smoothed %d ms, stick speed as at %d fps, held crouch hidden "
+               "%d ms + fade %d ms%s%s", g_windowMs,
                (int)(-(int)g_lsEngage * 100 / 32767), g_crankVisMin, g_crankVisTime,
-               g_crankVisSmoothMs, g_crankVis ? "" : " (crouch visual OFF)",
+               g_crankVisSmoothMs, g_speedRefHz, g_heldHideMs, g_heldFadeMs,
+               g_crankVis ? "" : " (crouch visual OFF)",
                g_log ? " [diagnostics on]" : "");
     else
         TwkLog("[pop] config: pop control scheme off%s", g_log ? " [diagnostics on]" : "");
@@ -220,6 +240,9 @@ void PopProbe_SaveConfig(char* buf, size_t cap) {
     TwkIniSetInt(buf, cap, "PopProbeTrickWindowMs", g_windowMs);
     TwkIniSetInt(buf, cap, "PopProbeCrouchGatePct", (int)(-(int)g_lsEngage * 100 / 32767));
     TwkIniSetInt(buf, cap, "PopProbeGraceMs", g_graceMs);
+    TwkIniSetInt(buf, cap, "PopProbeSpeedRefHz", g_speedRefHz);
+    TwkIniSetInt(buf, cap, "PopProbeHeldHideMs", g_heldHideMs);
+    TwkIniSetInt(buf, cap, "PopProbeHeldFadeMs", g_heldFadeMs);
     TwkIniSetInt(buf, cap, "PopProbeManualGate", g_manualGate);
     TwkIniSetInt(buf, cap, "PopProbeLandSettleMs", g_landSettleMs);
     TwkIniSetInt(buf, cap, "PopProbeCrankVis", g_crankVis);
@@ -232,6 +255,7 @@ void PopProbe_ResetDefaults() {
     g_on = 1; g_scan = 0; g_log = 0; g_force = -1;
     g_inject = 0;                     // the scheme is OPT-IN: reset leaves it off
     g_dwellMs = 110; g_maskMs = 180; g_graceMs = 60; g_depthPop = 1; g_windowMs = 200;
+    g_speedRefHz = 90; g_heldHideMs = 250; g_heldFadeMs = 150;
     g_lsEngage = (short)(-(36 * 32767) / 100);
     g_lsRelease = (short)(-(21 * 32767) / 100);
     g_manualGate = 1; g_landSettleMs = 250; g_stances = 1;
@@ -278,6 +302,8 @@ static volatile long      g_padSw    = 0;         // pump: switch stance -- the 
 static volatile long      g_padGrind = 0;         // pump: grinding/liptrick -- total hands-off
 static volatile long      g_padAir = 0;           // pump: airborne -- total hands-off once it holds (515)
 static volatile long      g_handsOffCuts = 0;     // hook: gestures the air/grind rule cut short (pump logs)
+static volatile long      g_heldEnds = 0;         // hook: held-crouch hides finished (pump logs)...
+static volatile long      g_heldLastMs = 0, g_heldLastWhy = 0;   // ...the last one's length and ending
 static volatile long      g_padModeDbg = 0;       // hook: bit0 = nollie family, bit1 = switch --
                                                   // published so the log can finally SHOW which
                                                   // family the machine was in at any moment
@@ -668,6 +694,18 @@ void PopProbe_PumpFrame() {
             if (c != saidCuts) {
                 TwkLog("[pop] mid-air/grind hands-off cut a gesture short (%s, %ld so far)", grinding ? "grinding" : "in the air", c);
                 saidCuts = c;
+            }
+        }
+        {
+            static long saidHeld = 0;
+            const long h = g_heldEnds;
+            if (h != saidHeld) {
+                static const char* kWhy[] = { "?", "flicked -- shown at once", "back at the centre",
+                                              "a grind started", "crouched again", "faded in" };
+                const long w = g_heldLastWhy;
+                TwkLog("[pop] held crouch stick kept hidden after the pop for %ld ms, then %s (%ld so far)",
+                       (long)g_heldLastMs, kWhy[(w >= 1 && w <= 5) ? w : 0], h);
+                saidHeld = h;
             }
         }
         {
@@ -1252,7 +1290,8 @@ static volatile long    g_padCalls[kPadTargets] = {};
 static volatile long    g_padUserSeen = -1;       // last connected user index a poll returned
 // The pop trigger is its own, deliberately deeper than a stray touch but early in a real press.
 static const short kPadPopTrigger = (short)(-0.50f * 32767);
-// A FLICK moves this much per poll (~120 Hz; a full-range flick sweeps 65k units in ~10 polls).
+// A FLICK moves this much per read -- per 1/PopProbeSpeedRefHz on the controller's clock while the
+// sampler is live (see STICK SPEED in the machine), per game read otherwise.
 // Used twice: upward = unmask the trick flick the moment it is IN FLIGHT even while still deep
 // (position-only unmasking truncated the gesture and made tricks inconsistent -- field report);
 // any direction = the stick is not SITTING, so the crouch dwell does not accumulate (which is what
@@ -1335,9 +1374,80 @@ static void PadMachine(PadState* st) {
     g_physStamp = now;
     // Per-PHYSICAL-stick deltas, continuous across mode flips.
     static short pvLy = 0, pvLx = 0, pvRy = 0, pvRx = 0;
-    const int dPhLy = (int)phLy - (int)pvLy, dPhLx = (int)phLx - (int)pvLx;
-    const int dPhRy = (int)phRy - (int)pvRy, dPhRx = (int)phRx - (int)pvRx;
+    int dPhLy = (int)phLy - (int)pvLy, dPhLx = (int)phLx - (int)pvLx;
+    int dPhRy = (int)phRy - (int)pvRy, dPhRx = (int)phRx - (int)pvRx;
     pvLy = phLy; pvLx = phLx; pvRy = phRy; pvRx = phRx;
+    // STICK SPEED ON THE CONTROLLER'S CLOCK. Every speed test below compares one read's movement with
+    // kFlickPerPoll, and a read is a FRAME: the same thumb crossed it more easily at a low frame rate
+    // than a high one, and a hitch moved it. With the controller sampler live, the movement is the
+    // stick's travel over one reference interval (1 / PopProbeSpeedRefHz, the rate the thresholds were
+    // tuned at) ending now on the controller's own clock -- what a read at exactly that rate would
+    // see -- and "N fast reads in a row" becomes N consecutive fast intervals. -1 = no sampler: the
+    // per-read deltas and counters stand.
+    int fastIvL = -1, fastIvR = -1;
+    {
+        const double tNow = PadSampler_Now(), iv = 1.0 / (double)g_speedRefHz;
+        float x[2][5], y[2][5];
+        bool ok = PadSampler_Live();
+        for (int s = 0; s < 2 && ok; ++s)
+            for (int k = 0; k < 5 && ok; ++k)
+                ok = PadSampler_StickAt(s == 1, tNow - k * iv, &x[s][k], &y[s][k]);
+        if (ok) {
+            dPhLx = (int)((x[0][0] - x[0][1]) * 32767.0f); dPhLy = (int)((y[0][0] - y[0][1]) * 32767.0f);
+            dPhRx = (int)((x[1][0] - x[1][1]) * 32767.0f); dPhRy = (int)((y[1][0] - y[1][1]) * 32767.0f);
+            int* fast[2] = { &fastIvL, &fastIvR };
+            for (int s = 0; s < 2; ++s) {
+                *fast[s] = 0;
+                for (int k = 0; k < 4; ++k) {
+                    const int m = abs((int)((x[s][k] - x[s][k + 1]) * 32767.0f)) +
+                                  abs((int)((y[s][k] - y[s][k + 1]) * 32767.0f));
+                    if (m <= kFlickPerPoll) break;
+                    ++*fast[s];
+                }
+            }
+        }
+    }
+    // THE HELD CROUCH STICK AFTER THE POP (see g_heldHideMs): which physical stick, and since when
+    // (0 = not hiding). lastCrouchRS = the previous read's crouch stick, for the air gate, which
+    // runs before this read's mode is resolved.
+    static long long heldFrom = 0;
+    static bool heldRS = false, lastCrouchRS = false;
+    auto heldArm = [&](bool rs) {
+        if (g_heldHideMs <= 0 || heldFrom) return;
+        const float x = rs ? phRx : phLx, y = rs ? phRy : phLy;
+        if (x * x + y * y < (0.35f * 32767.0f) * (0.35f * 32767.0f)) return;   // not held out
+        heldFrom = now; heldRS = rs;
+    };
+    // On the OUTGOING pad, after everything else has written it: the held stick goes out at `scale`
+    // of what it would have been -- 0 while hidden, rising through the fade.
+    auto heldApply = [&]() {
+        if (!heldFrom) return;
+        const float x = heldRS ? phRx : phLx, y = heldRS ? phRy : phLy;
+        const int mv = abs(heldRS ? dPhRx : dPhLx) + abs(heldRS ? dPhRy : dPhLy);
+        const long long el = now - heldFrom;
+        const long long hideT = freq * g_heldHideMs / 1000, fadeT = freq * g_heldFadeMs / 1000;
+        int why = 0;
+        if (mv > kFlickPerPoll)                                      why = 1;
+        else if (x * x + y * y < (0.25f * 32767.0f) * (0.25f * 32767.0f)) why = 2;
+        else if (g_padGrind)                                         why = 3;
+        else if (g_padActive || g_padArmed)                          why = 4;
+        else if (el >= hideT + fadeT)                                why = 5;
+        if (why) {
+            g_heldLastMs = (long)(el * 1000 / freq); g_heldLastWhy = why;
+            InterlockedIncrement(&g_heldEnds);
+            heldFrom = 0;
+            return;
+        }
+        const float scale = (el <= hideT || fadeT <= 0) ? 0.0f : (float)(el - hideT) / (float)fadeT;
+        short& ox = heldRS ? st->Gamepad.sThumbRX : st->Gamepad.sThumbLX;
+        short& oy = heldRS ? st->Gamepad.sThumbRY : st->Gamepad.sThumbLY;
+        ox = (short)((float)ox * scale); oy = (short)((float)oy * scale);
+    };
+    if (heldFrom && (g_padActive || g_padArmed)) {     // the machine has the stick again
+        g_heldLastMs = (long)((now - heldFrom) * 1000 / freq); g_heldLastWhy = 4;
+        InterlockedIncrement(&g_heldEnds);
+        heldFrom = 0;
+    }
     // A FOREIGN CRANK: the game is cranked by a gesture we did not synthesize = the player is
     // running a stock trick (vanilla RS-down crank into a 360-shove scoop, a vanilla tre...).
     // The machine keeps its hands off EVERYTHING while it runs and for a short tail after: the
@@ -1372,9 +1482,11 @@ static void PadMachine(PadState* st) {
         const bool air = airSince && (g_padArmed || (now - airSince) > freq / 25);
         if (air || g_padGrind) {
             if (g_padActive || g_padArmed || releasedAt || graceUntil) InterlockedIncrement(&g_handsOffCuts);
+            if (!g_padGrind && (g_padActive || (g_padArmed && !lsMoved))) heldArm(lastCrouchRS);
             g_padActive = 0; g_padArmed = 0; synthAt = 0; graceUntil = 0; releasedAt = 0; downSince = 0;
             lsFreed = lsMoved = false; bandMasked = false; downStillAt = 0; fastPolls = 0;
             synRx = 0; synRy = -32767; g_padHotUntil = 0; foreignUntil = 0;
+            heldApply();                           // the one exception: a crouch stick still held
             return;                                // the sticks go out exactly as they came in
         }
     }
@@ -1406,6 +1518,7 @@ static void PadMachine(PadState* st) {
     }
     g_padModeDbg = (mode ? 1 : 0) | (swL ? 2 : 0);
     const bool cIsRS = (mode == 0) ? swL : !swL;   // which physical stick crouches (and tricks)
+    lastCrouchRS = cIsRS;
     const int  yFlip = (mode == 0) ? 1 : -1;       // -1: mode "down" is physical up
     // The machine's working axes, in mode space. Names kept from the regular-ollie original so
     // the proven logic below reads unchanged: ly/lx = the crouch/trick stick, ryPhys/rxPhys = the
@@ -1451,6 +1564,8 @@ static void PadMachine(PadState* st) {
         if (crankDropped || capped || (timedOut && synthAt && (now - synthAt) > freq / 12)) {
             g_padArmed = 0; synthAt = 0;           // window over; the air gate takes it from here
             releasedAt = 0; downSince = 0;
+            if (!lsMoved) heldArm(cIsRS);          // this read goes out raw: a held crouch would show
+            heldApply();
         } else if (timedOut && !rsBusy) {
             // No trick gesture arrived: synthesize the plain pop -- the trick stick full
             // ANTI-crouch (up for ollies, down for nollies via the emit) for ~80 ms while the
@@ -1488,6 +1603,7 @@ static void PadMachine(PadState* st) {
     // gesture speed; a hovering thumb and its noise spikes never make three in a row.
     static int rsFast = 0;
     if (rsMove > kFlickPerPoll) { if (rsFast < 100) rsFast++; } else rsFast = 0;
+    if (fastIvL >= 0) rsFast = cIsRS ? fastIvL : fastIvR;       // the crank stick, on the pad's clock
     const bool rsPressed = (ryPhys < kPadPopTrigger) ||
                            (ryPhys < -8192 && dry < -kFlickPerPoll);
 
@@ -1595,6 +1711,7 @@ static void PadMachine(PadState* st) {
         // is now hysteretic: once on, it holds until the stick leaves the down half or shows
         // SUSTAINED fast motion -- three consecutive fast polls is a gesture, noise never is.
         if (moving > kFlickPerPoll) { if (fastPolls < 100) fastPolls++; } else fastPolls = 0;
+        if (fastIvL >= 0) fastPolls = cIsRS ? fastIvR : fastIvL;  // the crouch stick, on the pad's clock
         if (ly >= -1500 || !inCone) { downStillAt = 0; bandMasked = false; }   // sideways = not ours
         else if (fastPolls >= 3)    { downStillAt = 0; bandMasked = false; }   // a real gesture
         else if (!downStillAt)      downStillAt = now;
@@ -1643,6 +1760,7 @@ static void PadMachine(PadState* st) {
         }
         }
         PadEmit(st, cIsRS, yFlip, tLx, tLy, kRx, kRy);
+        heldApply();
     }}
 
 static unsigned long PadCommon(int idx, unsigned long user, PadState* st) {

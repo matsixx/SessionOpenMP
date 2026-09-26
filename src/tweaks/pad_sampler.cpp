@@ -184,9 +184,11 @@ static DWORD WINAPI SamplerMain(void*) {
     return 0;
 }
 
+static double g_startedAt = 0.0;
 void PadSampler_Start() {
     if (g_thread) return;
     g_run = true;
+    g_startedAt = QpcSec();
     g_thread = CreateThread(nullptr, 0, SamplerMain, nullptr, 0, nullptr);
     TwkLog("[pad] controller sampler %s (%d reads/s requested%s)", g_thread ? "started" : "FAILED to start",
            g_hz, g_hz ? "" : " -- off: flick timing follows the frame rate");
@@ -298,6 +300,44 @@ bool PadSampler_Flick(bool right, float windowSec, PadFlick* out) {
     return true;
 }
 
+// ------------------------------------------------------------------ positions and crossings
+bool PadSampler_StickAt(bool right, double t, float* x, float* y) {
+    if (!x || !y || !PadSampler_Live()) return false;
+    const uint64_t w = g_w.load(std::memory_order_acquire);
+    const uint64_t lo = (w > kRing - kSafety) ? w - (kRing - kSafety) : 0;
+    // Callers ask about the last few tens of ms: a bounded walk back from the newest report.
+    for (uint64_t i = w, steps = 0; i > lo && steps < 1024; --i, ++steps) {
+        const Sample& s = g_ring[(i - 1) & kMask];
+        if (s.t <= t) {
+            *x = right ? s.rx : s.lx;
+            *y = right ? s.ry : s.ly;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool PadSampler_OutwardCrossing(bool right, float mag, double since, double* t, double* reportT) {
+    if (!t || !PadSampler_Live()) return false;
+    const int n = Snapshot(since, g_snap, 4096);
+    if (n < 2) return false;
+    const double repSec = (double)g_reportUs.load(std::memory_order_relaxed) * 1e-6;
+    for (int j = n - 1; j >= 1; --j) {
+        const float x1 = right ? g_snap[j].rx : g_snap[j].lx,         y1 = right ? g_snap[j].ry : g_snap[j].ly;
+        const float x0 = right ? g_snap[j - 1].rx : g_snap[j - 1].lx, y0 = right ? g_snap[j - 1].ry : g_snap[j - 1].ly;
+        const float m1 = sqrtf(x1 * x1 + y1 * y1), m0 = sqrtf(x0 * x0 + y0 * y0);
+        if (m1 < mag || m0 >= mag) continue;
+        float f = (m1 > m0) ? (mag - m0) / (m1 - m0) : 1.0f;
+        if (f < 0.0f) f = 0.0f; else if (f > 1.0f) f = 1.0f;
+        double base = g_snap[j - 1].t;
+        if (g_snap[j].t - base > repSec) base = g_snap[j].t - repSec;   // see Crossing
+        *t = base + (g_snap[j].t - base) * (double)f;
+        if (reportT) *reportT = g_snap[j].t;
+        return true;
+    }
+    return false;
+}
+
 // ------------------------------------------------------------------ the scoop
 bool PadSampler_Sweep(bool right, float minMag, float freshSec, float sustainFrac, PadSweep* out) {
     if (!out) return false;
@@ -376,6 +416,9 @@ void PadSampler_PumpFrame() {
     static int lastState = -2;
     const double now = QpcSec();
     if (now - lastLog < 10.0) return;
+    // Nothing to report before the thread exists (Start logs its own line), nor in the moments before
+    // its first read: "no controller answering" is only true once it has had the chance to ask.
+    if (g_hz > 0 && (!g_thread || now - g_startedAt < 3.0)) return;
     const int state = g_hz <= 0 ? 0 : (PadSampler_Live() ? 2 : 1);
     if (state == lastState && now - lastLog < 300.0) return;
     lastLog = now; lastState = state;

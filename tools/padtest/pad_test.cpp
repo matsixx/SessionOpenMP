@@ -83,6 +83,31 @@ static void feed(const Traj& tr, double rep, double phase, double tEnd, std::mt1
         }
     }
 }
+// Both sticks, the same policy (no rest noise).
+static void feed2(const Traj& trL, const Traj& trR, double rep, double phase, double tEnd) {
+    float rep4[4] = { 0, 0, 0, 0 }, last4[4] = { 1e9f, 1e9f, 1e9f, 1e9f };
+    double nextRep = phase, lastPush = -1;
+    for (double t = 0.0; t <= tEnd + 1e-9; t += 0.001) {
+        while (nextRep <= t) {
+            trL.at(nextRep, &rep4[0], &rep4[1]); trR.at(nextRep, &rep4[2], &rep4[3]);
+            nextRep += rep;
+        }
+        bool changed = false;
+        for (int k = 0; k < 4; ++k) if (rep4[k] != last4[k]) changed = true;
+        if (changed || t - lastPush >= 0.020) {
+            PadSampler_TestPush(t, rep4[0], rep4[1], rep4[2], rep4[3]);
+            for (int k = 0; k < 4; ++k) last4[k] = rep4[k];
+            lastPush = t;
+        }
+    }
+}
+// A straight sweep at constant speed (stick units / s) along Y, from `from` downward.
+struct Sweep : Traj {
+    double t0; float speed, from;
+    void at(double t, float* x, float* y) const override {
+        *x = 0.f; *y = from - (t > t0 ? (float)(t - t0) * speed : 0.f);
+    }
+};
 static bool measure(const Traj& tr, double rep, double phase, double queryAt, std::mt19937& rng,
                     PadFlick* out, float restNoise = 0.01f) {
     PadSampler_TestReset(rep);
@@ -193,6 +218,68 @@ int main() {
         printf("   scoop 90 deg / 150 ms: sustained %.0f deg/s (min %.0f max %.0f), 600 exact\n", m, lo, hi);
         check(v.size() == 100 && fabs(m - 600.0) / 600.0 < 0.08 && (hi - lo) / m < 0.10,
               "scoop's sustained rate is the true rate (within 8%), whatever the report phase");
+    }
+    // ---- 7. the pop scheme's speed test (pop_probe's machine): travel over one reference interval
+    // (1/90 s) ending at the game's read, taken from StickAt, against the threshold of 2500/32767 per
+    // interval. It must give the same answer at any frame rate; the per-read delta it replaces does not.
+    {
+        const double iv = 1.0 / 90.0, thr = 2500.0 / 32767.0;
+        const float speeds[2] = { 5.5f, 10.0f };          // below / above thr / iv = 6.9 units/s
+        const double fps[3] = { 60.0, 90.0, 144.0 };
+        bool padSame = true;
+        for (int si = 0; si < 2; ++si) {
+            Sweep sw; sw.t0 = 0.300; sw.speed = speeds[si]; sw.from = 0.95f;
+            Flick still; still.t0 = 9.0; still.dur = 0.01; still.fx = still.fy = still.tx = still.ty = 0.f;
+            char line[160]; int w = snprintf(line, sizeof(line), "   sweep %.1f/s:", speeds[si]);
+            for (int fi = 0; fi < 3; ++fi) {
+                int padFast = 0, readFast = 0, reads = 0;
+                for (int k = 0; k < 20; ++k) {
+                    const double phase = ph01(rng) * 0.004;
+                    PadSampler_TestReset(0.004);
+                    feed2(sw, still, 0.004, phase, 0.420);
+                    const double tRead = 0.330 + ph01(rng) * 0.070;   // mid-sweep, any phase
+                    PadSampler_TestSetNow(tRead);
+                    float x0, y0, x1, y1, xp, yp;
+                    if (!PadSampler_StickAt(false, tRead, &x0, &y0) || !PadSampler_StickAt(false, tRead - iv, &x1, &y1) ||
+                        !PadSampler_StickAt(false, tRead - 1.0 / fps[fi], &xp, &yp)) continue;
+                    ++reads;
+                    if (fabs(y0 - y1) > thr) ++padFast;
+                    if (fabs(y0 - yp) > thr) ++readFast;
+                }
+                const bool want = (si == 1);
+                if (reads == 0 || (want ? padFast != reads : padFast != 0)) padSame = false;
+                w += snprintf(line + w, sizeof(line) - w, "  %3.0f fps: pad %s, per-read %s", fps[fi],
+                              padFast == reads ? "fast" : padFast == 0 ? "slow" : "MIXED",
+                              readFast == reads ? "fast" : readFast == 0 ? "slow" : "MIXED");
+            }
+            printf("%s\n", line);
+        }
+        check(padSame, "pop speed test on the pad clock: same answer at 60, 90 and 144 fps");
+    }
+    // ---- 8. the catch foot: which stick left the deadzone later, when both did inside one frame
+    {
+        int right = 0, same = 0, n = 0;
+        for (int k = 0; k < 100; ++k) {
+            Flick fl; fl.t0 = 0.300; fl.dur = 0.020; fl.fx = 0; fl.fy = 0; fl.tx = 0; fl.ty = 1;
+            Flick fr = fl; fr.t0 = 0.306;                      // R leaves 6 ms after L
+            PadSampler_TestReset(0.004);
+            feed2(fl, fr, 0.004, ph01(rng) * 0.004, 0.340);
+            PadSampler_TestSetNow(0.340);
+            double tL, tR, rL, rR;
+            if (!PadSampler_OutwardCrossing(false, 0.2f, 0.240, &tL, &rL) ||
+                !PadSampler_OutwardCrossing(true, 0.2f, 0.240, &tR, &rR)) continue;
+            ++n;
+            if (rL != rR && tR > tL) ++right;
+            // and the same flick on both sticks: one report, no order
+            PadSampler_TestReset(0.004);
+            feed2(fl, fl, 0.004, ph01(rng) * 0.004, 0.340);
+            PadSampler_TestSetNow(0.340);
+            if (PadSampler_OutwardCrossing(false, 0.2f, 0.240, &tL, &rL) &&
+                PadSampler_OutwardCrossing(true, 0.2f, 0.240, &tR, &rR) && rL == rR) ++same;
+        }
+        printf("   catch order: R-after-L named in %d of %d, simultaneous left unordered in %d of 100\n", right, n, same);
+        check(n == 100 && right == 100, "a stick leaving 6 ms after the other is always named the later one");
+        check(same == 100, "two sticks leaving on the same report are never ordered");
     }
     printf("%s (%d failed)\n", g_fails ? "PAD TEST FAIL" : "PAD TEST PASS", g_fails);
     return g_fails ? 1 : 0;

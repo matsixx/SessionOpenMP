@@ -52,6 +52,7 @@
 #include "sit.h"             // Sit_OnInputKey -- the sit key rides this hook
 #include "radial.h"          // Radial_OnInputKey -- and so do the radial menu's keys
 #include "sit_ui.h"          // SitUI_Track / SitUI_Alive -- is the skater we remember still that skater
+#include "pad_sampler.h"     // the controller's own clock: which stick left the deadzone first
 #include <cmath>
 
 static bool CatchIsGoofy();   // defined with the catch-orient hook, used by the flick log above it
@@ -1652,8 +1653,10 @@ static void* hkCatchDefault(void* self, double dt, void* frontStick, void* backS
     // own one-frame history, which owes nothing to argument order or stance.
     //
     // Must still run BEFORE the mask block: masking zeroes stick state the game reads afterwards.
-    // Exactly one fresh edge names a foot; two together are a deliberate two-stick gesture and name
-    // nothing, so the game's own choice stands.
+    // One fresh edge names a foot, and a newer one re-decides. Two in the SAME frame are ordered on
+    // the controller's own clock and the later names the foot -- exactly what two frames would have
+    // done, so the answer no longer depends on whether they happened to share one. Two that left on
+    // the same controller report (or with no sampler) name nothing, and the game's choice stands.
     if ((g_flickFoot || g_needFlick) && self && skater) {
         __try {
             void* mine = CatchTweaks_Skater();
@@ -1680,12 +1683,32 @@ static void* hkCatchDefault(void* self, double dt, void* frontStick, void* backS
                 }
                 if (!outL) g_deflStartL = 0;
                 if (!outR) g_deflStartR = 0;
-                if (g_flickFoot && edgeL != edgeR) {                    // exactly one of them edged
+                int flicked = (edgeL != edgeR) ? (edgeL ? 1 : 2) : 0;
+                if (g_flickFoot && edgeL && edgeR) {
+                    const double now = PadSampler_Now();
+                    double tL = 0.0, tR = 0.0, repL = 0.0, repR = 0.0;
+                    const bool okL = PadSampler_OutwardCrossing(false, dz, now - 0.10, &tL, &repL);
+                    const bool okR = PadSampler_OutwardCrossing(true,  dz, now - 0.10, &tR, &repR);
+                    if (okL && okR && repL != repR) flicked = (tL > tR) ? 1 : 2;
+                    static int s_saidBoth = 0;
+                    if (s_saidBoth < 200) {
+                        ++s_saidBoth;
+                        TwkLog("[catch] both sticks left the deadzone in one frame: L %s, R %s -> %s",
+                               okL ? "on the pad clock" : "not seen", okR ? "on the pad clock" : "not seen",
+                               !(okL && okR) ? "no order, the game decides" :
+                               repL == repR ? "same controller report, the game decides" :
+                               flicked == 1 ? "LEFT was later" : "RIGHT was later");
+                        if (okL && okR && repL != repR)
+                            TwkLog("[catch]   ... L %.1f ms ago, R %.1f ms ago", (now - tL) * 1000.0,
+                                   (now - tR) * 1000.0);
+                    }
+                }
+                if (g_flickFoot && flicked) {
                     // A fresh flick re-decides: drop any latch so the next one-footed orient latches
                     // onto the foot just flicked rather than the previous catch's.
                     // 60 frames only has to span flick -> catch-engage (measured ~15); the latch
                     // covers the catch itself, so this window no longer bounds the correction.
-                    g_flickPhys = edgeL ? 1 : 2; g_flickFresh = 60; g_flickLatch = 0;
+                    g_flickPhys = flicked; g_flickFresh = 60; g_flickLatch = 0;
                     // ---- MAPPING PROBE (no behaviour change). Closes the model that the hand-rolled
                     // stance table stands in for: which ARG the flicked stick landed on, plus every
                     // term of the game's own swap predicate. Four catches, one per stance, and the
@@ -1696,14 +1719,14 @@ static void* hkCatchDefault(void* self, double dt, void* frontStick, void* backS
                         const bool fIsR = (fabsf(fx2 - rx) < 0.01f && fabsf(fy2 - ry) < 0.01f);
                         void* sk2 = twkP(self, IAH_SKATER);
                         TwkLog("[catch] MAP: flicked=%s frontArg=%s goofy=%d switch=%d lrFoot=%d",
-                               edgeL ? "LEFT" : "RIGHT",
+                               flicked == 1 ? "LEFT" : "RIGHT",
                                fIsL ? "rawLEFT" : fIsR ? "rawRIGHT" : "NEITHER",
                                CatchIsGoofy() ? 1 : 0, CatchIsSwitch() ? 1 : 0,
                                sk2 ? (twkB(sk2, SK_STANCE_OPTS) & 1) : -1);
                     }
                     if (g_catchDiag)
                         TwkLog("[catch] flick: %s stick (L %.2f,%.2f  R %.2f,%.2f)",
-                               edgeL ? "LEFT" : "RIGHT", lx, ly, rx, ry);
+                               flicked == 1 ? "LEFT" : "RIGHT", lx, ly, rx, ry);
                 }
             }
         } __except (EXCEPTION_EXECUTE_HANDLER) { g_flickFoot = 0; }
