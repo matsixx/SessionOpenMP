@@ -71,6 +71,7 @@ add_library(omp_game STATIC src/game/game_syms.cpp src/game/proxy.cpp src/game/g
                             src/game/peer_bodies.cpp
                             src/game/teleport.cpp
                             src/game/trick_pulse.cpp
+                            src/game/grind_anim.cpp
                             src/game/pa_state.cpp
                             src/game/custom_maps.cpp
                             src/game/dropper.cpp)
@@ -196,6 +197,7 @@ if(EXISTS "${UE4SS_LIB}")
         src/game/peer_bodies.cpp
         src/game/teleport.cpp
         src/game/trick_pulse.cpp
+        src/game/grind_anim.cpp
         src/game/pa_state.cpp
         src/game/custom_maps.cpp
         src/game/spectate.cpp

@@ -110,6 +110,7 @@ namespace omp { namespace repl {
 //          one byte each (trick_pulse.h, pa_state.h)
 //   1.3 -> no bytes: announces the mod channel lane (session/modapi.h), sent only to 1.3+ peers
 //   1.4 -> the board's articulation: artOk, then truckB/truckF/wheelBL when it is set (1 or 13 bytes)
+//   1.5 -> footPosP1 + grindFace (1.3.1): the owner's stance byte and grind facing (game/grind_anim.h)
 // The cost is two bytes on a packet of several hundred. The thing it buys is that "one of you needs
 // to update or you will not see each other" stops being the answer to every future wire change.
 static const uint32_t kMagic = 0x5A504D4Fu; // "OMPZ"
@@ -321,9 +322,10 @@ static void limbRead(Rd& r, uint8_t mode, float* p, const float* body) {
 // Bytes written AFTER the audio section -- the appended fields of minor >= 1. Both the pose slice and
 // the audio sizing reserve them, or a cap that the audio fills exactly leaves no room for the
 // trailer and the whole packet fails, which is what the codec gate caught the first time.
-// minor 1: spare1 (was the grace flag); minor 2: trickSerial, paSerial; minor 4: artOk + three quats.
+// minor 1: spare1 (was the grace flag); minor 2: trickSerial, paSerial; minor 4: artOk + three quats;
+// minor 5: footPosP1, grindFace.
 // Reserved at its MAXIMUM: the articulation is 1 byte when absent and 13 when present.
-static const int kTrailBytes = 3 + 13;
+static const int kTrailBytes = 3 + 13 + 2;
 
 int Pack(const State& s, uint64_t senderUs, uint8_t* out, int cap, int* poseWrote) {
     if (poseWrote) *poseWrote = 0;
@@ -534,6 +536,8 @@ int Pack(const State& s, uint64_t senderUs, uint8_t* out, int cap, int* poseWrot
         w.u8(art);
         if (art) { w.u32(qPack(s.truckB)); w.u32(qPack(s.truckF)); w.u32(qPack(s.wheelBL)); }
     }
+    w.u8(s.footPosP1);                           // minor 5
+    w.u8(s.grindFace);                           // minor 5
     return w.ok ? w.n : 0;
 }
 
@@ -733,6 +737,12 @@ bool Unpack(const uint8_t* d, int len, State& out, uint64_t* senderUs) {
             qUnpack(r.u32(), out.truckB); qUnpack(r.u32(), out.truckF); qUnpack(r.u32(), out.wheelBL);
             out.artOk = art >= 2 ? 2 : 1;          // unit by construction of qUnpack
         }
+    }
+    if (wireMinor >= 5) {
+        // Both are VALUES the receiver writes into game state, so both are range-checked here: a stance
+        // outside EFootPositionType (0..4, sent plus one) and a facing that is not 1/2 read as unsent.
+        out.footPosP1 = r.u8(); if (out.footPosP1 > 5) out.footPosP1 = 0;
+        out.grindFace = r.u8(); if (out.grindFace > 2) out.grindFace = 0;
     }
     if (!r.ok) return false;
     // Post-decode discipline: no packet field is an index or a pointer, and poses are range-checked,

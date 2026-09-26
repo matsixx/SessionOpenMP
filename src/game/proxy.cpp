@@ -19,6 +19,7 @@
 #include "pose.h"
 #include "peer_bodies.h"       // what a peer's physical animation is actually allowed to cost
 #include "spectate.h"          // hand the replay camera back before this actor's pointer dies
+#include "grind_anim.h"        // the owner's stance + grind facing for this skater's grind pose
 #include "../replication/anim_fields.h"
 
 namespace omp { namespace game {
@@ -250,6 +251,7 @@ void Proxy::Forget() {
                                                                        // nothing to restore INTO
     DropProxyActor(actor_);               // no longer one of ours -- drop it before the pointer dies
     DropAnimSlot(this);                   // the anim instance died with the world; never post-apply to it
+    grindanim::ForgetProxy(actor_);
     { void* pm = actor_ ? safePtr(actor_, off::kSkaterMesh) : nullptr;
       if (pm) { pose::Forget(pm); PeerBodiesForget(pm); } }
     ClearState();
@@ -364,6 +366,9 @@ struct AnimSlot {
     float    wireCrankPocket = 0;
     // the wire's onBoard, for the transition-pose save edge (see AnimPostApply).
     uint8_t  onBoard = 0;
+    // the owner's stance byte plus one (0 = not sent): written onto the SKATER in the post-pass, the
+    // last write before the grind pose reads it through IsSkatingSwitch (grind_anim.h)
+    uint8_t  footPosP1 = 0;
     int8_t   lastOnBoardSaved = -1;   // -1 = no edge yet (a fresh slot must not "transition")
     // When the game last ran this instance's anim update. Stamped before any of the freshness gates
     // below, so it means "the graph is running", never "the graph is being fed".
@@ -398,6 +403,7 @@ static void StoreAnimForPostPass(Proxy* owner, void* ai, const repl::State& s, u
     }
     mine->wireCrankOn = s.crankOn; mine->wireCrankIdx = s.crankDefOff; mine->wireCrankPocket = s.crankPocket;
     mine->onBoard = (uint8_t)(s.onBoard ? 1 : 0);
+    mine->footPosP1 = s.footPosP1;
 }
 static void DropAnimSlot(Proxy* owner) {
     for (auto& s : g_animSlots) if (s.owner == owner) s = AnimSlot{};
@@ -491,6 +497,12 @@ void AnimPostApply(void* ai) {
             // proxy skater's (never set) _pendingAnimationReset over ResetSkater; write it now, before
             // this update's graph reads it, and that same copy clears it next update.
             if (s.animReset) { *((uint8_t*)ai + off::kAnimResetSkater) = 1; s.animReset = 0; }
+            // ---- the owner's STANCE on the skater (grind_anim.h), same seam: the grind pose picks its
+            // Regular or Switch animation set from skater+0x598 during this evaluation.
+            if (s.footPosP1) {
+                void* sk = *(void**)((uint8_t*)ai + off::kAnimOwnerSkater);
+                if (sk) *((uint8_t*)sk + off::kSkaterFootPosition) = (uint8_t)(s.footPosP1 - 1);
+            }
             // ---- the on/off-board TRANSITION POSE SAVE. The graph's mount/dismount transition blends
             // FROM a pose buffer (anim+0x5c0) that only gameplay code fills (ApplyToggleOnBoard/
             // DoBoardPickup -- input paths a proxy never runs), so without this a proxy's transition
@@ -1039,8 +1051,15 @@ void Proxy::Apply(const repl::State& s, uint64_t nowMs, uint64_t nowUs, void (*l
     __try {
         *(float*)((uint8_t*)actor_ + off::kSkaterGrindPitch) = s.grindPitch;
         *(float*)((uint8_t*)actor_ + off::kSkaterGrindYaw)   = s.grindYaw;
+        // ---- 4.9b the grind POSE's two local inputs (grind_anim.h). The definition above is only
+        //          half of which animation plays: the pose also reads the skater's stance byte and
+        //          asks whether the board moves the way it faces -- both of which this machine could
+        //          only guess from its own copy. The owner's values, every frame; 0 = an older peer
+        //          that does not send them, and the proxy keeps its own.
+        if (s.footPosP1) *((uint8_t*)actor_ + off::kSkaterFootPosition) = (uint8_t)(s.footPosP1 - 1);
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 #endif
+    grindanim::NoteProxy(actor_, s.grindFace);
 
     // ---- 6.5 the POSE BLOB (field table in anim_fields.h): STORE this frame's blob for the anim
     //          post-pass. Writing the instance HERE (pre-world-tick) does not survive to render: the
@@ -1886,6 +1905,7 @@ void Proxy::Destroy(void (*logf)(const char*)) {
     // ---- 2. nothing may write to it from here on
     DropProxyActor(actor_);
     DropAnimSlot(this);
+    grindanim::ForgetProxy(actor_);
     if (mesh) { pose::Forget(mesh); PeerBodiesForget(mesh); }
 
     // ---- 3. the actors themselves

@@ -34,6 +34,7 @@
 #include "game/proxy.h"
 #include "game/audio.h"
 #include "game/trick_pulse.h"
+#include "game/grind_anim.h"
 #include "game/pa_state.h"
 #include "game/custom_maps.h"
 #include "game/pose.h"
@@ -1262,6 +1263,7 @@ static void GameThreadFrame() {
     // a session exists. Idempotent, so the repeated call costs a bool test.
     game::audio::Install(&logLine);
     game::trick::Install(&logLine);          // the flick seam: a serial per trick for the wire
+    game::grindanim::Install(&logLine);      // the grind pose: a peer's own stance + facing, not our guess
     game::pa::Install(&logLine);             // the body-physics lifecycle, for the wire
 
     // pawn validity: re-checked every run, so a level change or possession swap cannot leave a freed
@@ -1360,6 +1362,20 @@ static void GameThreadFrame() {
             snprintf(m, sizeof(m), "[mod] peers=%d proxies=%d pubHz=%.0f published=%u received=%u applied=%u pawn=%p%s",
                      st.peers, st.proxiesAlive, st.publishHz, st.published, st.received, st.appliedFrames, g_ownPawn, refusedTxt);
             logLine(m);
+            // THE GRIND POSE FIX (grind_anim.h), said only once it has had something to do: how often a
+            // peer's grind pose got the owner's facing, and how often that DIFFERED from this machine's
+            // own test -- each of those was a wrong (mirrored) grind animation before 1.3.1.
+            {
+                static uint32_t lastOv = 0;
+                const uint32_t ov = game::grindanim::Overrides(), dis = game::grindanim::Disagreed();
+                if (ov != lastOv) {
+                    lastOv = ov;
+                    char g[128];
+                    snprintf(g, sizeof(g), "[grindanim] peer grind poses given the owner's facing: %u, of which %u "
+                                           "this machine would have mirrored", ov, dis);
+                    logLine(g);
+                }
+            }
             // Audio, both directions on one line. SEND: what the funnel captured, how much of it was
             // ours, how many loops are live. RECV: what was played for peers and what could not be
             // (a cue this install does not have is named once, separately).

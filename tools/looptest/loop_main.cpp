@@ -1933,6 +1933,20 @@ static bool wireVersionCheck() {
       printf("  minor-4 articulation round-trips; minor 3 ignores it; 1 B when absent  %s\n", all ? "PASS" : "FAIL");
       if (!all) ok = false; }
 
+    // THE FOURTH: minor 5's grind-pose inputs, the owner's stance byte (+1) and grind facing. Both are
+    // VALUES the receiver writes into game state, so out-of-range ones must arrive as "not sent".
+    { State g = s; g.footPosP1 = 5; g.grindFace = 2;                        // Switch, not facing
+      uint8_t gp[2048]; const int gn = Pack(g, 1234567, gp, sizeof(gp));
+      State rt{}; const bool round = gn > 0 && Unpack(gp, gn, rt, nullptr) && rt.footPosP1 == 5 && rt.grindFace == 2;
+      uint8_t old[2048]; memcpy(old, gp, (size_t)gn); old[5] = 4;         // a minor-4 reader: never read
+      State ro{}; const bool older = Unpack(old, gn, ro, nullptr) && ro.footPosP1 == 0 && ro.grindFace == 0;
+      State bad = s; bad.footPosP1 = 9; bad.grindFace = 7;                  // a hostile or corrupt sender
+      uint8_t bp[2048]; const int bn = Pack(bad, 1234567, bp, sizeof(bp));
+      State rb{}; const bool clamped = bn > 0 && Unpack(bp, bn, rb, nullptr) && rb.footPosP1 == 0 && rb.grindFace == 0;
+      const bool all = round && older && clamped;
+      printf("  minor-5 grind-pose bytes round-trip; minor 4 ignores them; bad values read unsent  %s\n", all ? "PASS" : "FAIL");
+      if (!all) ok = false; }
+
     return ok;
 }
 

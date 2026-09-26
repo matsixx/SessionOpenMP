@@ -41,6 +41,10 @@ struct Release { const char* version; const char* notes; };
 // instead of anything else (field 2026-09-20, at 1600). `show` measures and trims, but keep the source
 // short enough that trimming never has to happen: budget ~300 characters a release, three releases.
 static const Release kReleases[] = {
+    { "1.3.1",
+      "- Fixed other skaters' grinds sometimes showing the wrong animation\n"
+      "  (a tailslide showing as a noseslide or noseblunt).\n"
+      "- SessionTweaks: getting on your board during a board tap works again." },
     { "1.3.0",
       "- Pop the F1 menu out onto a second monitor (F1 -> You).\n"
       "- Move the chat box anywhere on screen (F1 -> Chat). F2 hides the chat.\n"

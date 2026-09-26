@@ -228,6 +228,14 @@ struct State {
     // Bit 0 valid, bit 1 enabled, bits 2-7 a change count. 0 = the sender did not say (a minor-1
     // packet), and the receiver keeps its own judgement.
     uint8_t    paSerial = 0;
+    // ---- APPENDED, minor 5 (1.3.1): THE GRIND POSE'S TWO LOCAL INPUTS (game/grind_anim.h). The game
+    // picks a grind's animation from the definition (grindName) AND from the drawing machine's skater:
+    // its `_footPosition` (Regular vs Switch anim set) and whether its board moves the way it faces
+    // (if not, the definition's MIRROR -- a tailslide becomes a nose trick). A proxy guessed both; the
+    // owner now says. footPosP1 = skater+0x598 plus one (0 = not sent); grindFace = the owner's
+    // IsFacingMoveDirection as their own grind pose asked it: 1 facing, 2 not, 0 = not asked lately.
+    uint8_t    footPosP1 = 0;
+    uint8_t    grindFace = 0;
 
     // ==== THE POSE LANE ==============================================================================
     // Component-space bone transforms, sent when the receiver's own anim graph cannot produce the
@@ -289,7 +297,9 @@ constexpr uint8_t kWireMajor = 1;
 //      is only ever sent to peers at 1.3 or later -- an older build reports it as a version mismatch.
 // 1.4: the board's articulation: one flag byte (artOk), then -- only when it is non-zero -- three
 //      smallest-three quats (truckB, truckF, wheelBL). 1 or 13 bytes.
-constexpr uint8_t kWireMinor = 4;
+// 1.5: footPosP1 + grindFace (1.3.1) -- the owner's stance byte and grind facing, so a peer's grind
+//      plays the animation they are actually in (game/grind_anim.h). 2 bytes.
+constexpr uint8_t kWireMinor = 5;
 
 // What a snapshot that would not parse actually was. Lets the reject path say who needs to update
 // instead of leaving a peer silently invisible.

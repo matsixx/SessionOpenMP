@@ -324,6 +324,12 @@ static const SigEntry kSigs[] = {
     // HOOKED (pa_state.cpp), never called: the owner's body-physics lifecycle, counted for the wire.
     { "BcastPaDisable",        "48 89 5C 24 10 57 48 83 EC 20 48 83 B9 40 05 00 00 00 48 8B F9 ?? ?? 48 8B 01 48 89 74 24 30 FF 90 ?? ?? ?? ?? 48 8B B0 80 01 00 00", false },
     { "BcastPaEnable",         "40 55 53 48 8D 6C 24 B1 48 81 EC C8 00 00 00 48 8B 05 ?? ?? ?? ?? 48 33 C4 48 89 45 27 48 8B 01 48 8B D9 FF 90 ?? ?? ?? ??", false },
+    // USkaterAnimInstance::GetGrindBlendSpace                              Epic 0xf58450 / Steam 0xf18260
+    // USkaterMovementComponent::IsFacingMoveDirection(const FVector&)      Epic 0xff7ed0 / Steam 0xfb7d00
+    // HOOKED (grind_anim.cpp), never called: the grind pose's choice of mirror + stance, answered with
+    // the OWNER's facing for a proxy (the proxy board's velocity is the drive's, not theirs).
+    { "GrindBlendSpace",       "48 89 6C 24 20 57 41 54 41 56 48 83 EC 20 4C 8D B1 08 06 00 00 48 8B E9 49 8B 0E E8 ?? ?? ?? ??", false },
+    { "IsFacingMoveDir",       "48 89 5C 24 08 57 48 83 EC 40 48 8B 81 28 0B 00 00 48 8B FA 48 8B D9 48 85 C0 0F 84 ?? ?? ?? ??", false },
     // UTransitMapWidget::SetOpenTransitMap                              Epic 0x1192890 / Steam 0x1153070
     // HOOKED (custom_maps.cpp), never called: the Select Map screen opening, where the custom maps
     // are added to its data. Optional: without it they simply do not appear.
@@ -1294,6 +1300,8 @@ const Syms& Resolve(void (*logf)(const char*)) {
     g_syms.SetTrick           =                     take("SetTrick");             // hooked, never called
     g_syms.BcastPaDisable     =                     take("BcastPaDisable");       // hooked, never called
     g_syms.BcastPaEnable      =                     take("BcastPaEnable");        // hooked, never called
+    g_syms.GrindBlendSpace    =                     take("GrindBlendSpace");      // hooked, never called
+    g_syms.IsFacingMoveDir    =                     take("IsFacingMoveDir");      // hooked, never called
     g_syms.TransitOpenMap     =                     take("TransitOpenMap");       // hooked, never called
     g_syms.CompDestroy        = (CompDestroyFn)     take("CompDestroy");
     g_syms.WidgetCreate       = (WidgetCreateFn)    take("WidgetCreate");

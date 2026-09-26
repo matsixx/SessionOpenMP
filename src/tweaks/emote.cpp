@@ -2156,7 +2156,6 @@ void Emote_TapButton(bool down) {
         if (g_id != EM_NONE || g_req != EM_NONE) return;
         if (!g_on || !sk || Twk_IsProxy(sk) || !OnFoot(sk) || Sit_EditorOpen() || (Sit_PoseHeld() && !Sit_BoardKept())) return;
         if (Emote_Carrying() || Radial_Open() || Radial_Busy() || !Sit_BoardInHand(sk)) return;
-        if (Mounting(sk)) return;                              // not in the middle of getting on (542)
         g_req = EM_TAP;
         g_tapBeganHere = true;
         TwkLog("[emote] board tap (RB)");
@@ -2579,10 +2578,12 @@ static void PumpAim(float dt) {
     const float rate = want ? 1.0f / 0.22f : 1.0f / 0.45f;
     g_aimW += clampf((want ? 1.0f : 0.0f) - g_aimW, -dt * rate, dt * rate);
 }
-// An emote is up (or asked for): Y must not get on the board under it (542). The carry is the radio's, not an
-// emote to the player, and keeps its own rules; one already blending out lets Y through.
+// An emote is up (or asked for): Y must not get on the board under it (542). The carry (the radio's) and the
+// board tap (543: "board tap is an action/state not a damn emote") are not emotes to the player and keep their
+// own rules; one already blending out lets Y through.
+static bool NotAnEmote(int id) { return id == EM_CARRY || id == EM_TAP; }
 bool Emote_BlocksMount() {
-    return (g_req != EM_NONE && g_req != EM_CARRY) || (g_id != EM_NONE && g_id != EM_CARRY && !g_ending);
+    return (g_req != EM_NONE && !NotAnEmote(g_req)) || (g_id != EM_NONE && !NotAnEmote(g_id) && !g_ending);
 }
 bool Emote_ThrowHeld() {
     return g_armed || g_req == EM_RAGE || (g_id == EM_RAGE && !g_ending && !g_thrown);
@@ -2671,7 +2672,7 @@ void Emote_PumpFrame() {
         else if (!SitUI_Alive(&g_meshRef) || twkP(sk, CH_MESH) != g_mesh) Drop("the body changed");
         else if (Sit_EditorOpen())                 Drop("an editor opened");
     }
-    if (g_req != EM_NONE && g_req != EM_CARRY && g_id == EM_NONE && Mounting(sk)) {
+    if (g_req != EM_NONE && g_req != EM_CARRY && g_req != EM_TAP && g_id == EM_NONE && Mounting(sk)) {
         TwkLog("[emote] %s: dropped -- getting on the board", kDefs[g_req].name);
         g_req = EM_NONE;
     }

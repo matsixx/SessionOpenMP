@@ -21,6 +21,7 @@
 #include "game_syms.h"
 #include "pose.h"
 #include "trick_pulse.h"
+#include "grind_anim.h"
 #include "pa_state.h"
 #include "../replication/anim_fields.h"
 #include <cstring>
@@ -298,6 +299,13 @@ bool GatherOwnState(void* pawn, repl::State& out) {
             float gr;
             if (rd((uint8_t*)pawn + off::kSkaterGrindPitch, &gr, 4)) out.grindPitch = gr;
             if (rd((uint8_t*)pawn + off::kSkaterGrindYaw,   &gr, 4)) out.grindYaw   = gr;
+            // ...and the grind POSE's two local inputs (grind_anim.h): the stance byte the pose reads
+            // through IsSkatingSwitch, and the game's own facing answer as this machine's grind pose
+            // last asked it. The receiver's copy of the board cannot answer that for us.
+            omp::game::grindanim::NoteOwnPawn(pawn);
+            uint8_t fp = 0;
+            if (rd((uint8_t*)pawn + off::kSkaterFootPosition, &fp, 1) && fp <= 4) out.footPosP1 = (uint8_t)(fp + 1);
+            out.grindFace = omp::game::grindanim::OwnFacing();
         }
 
         // ---- the crank: bit 0 of +0x580, pocket ratio, and the crank def's INDEX in the shared tricks

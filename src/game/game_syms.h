@@ -532,6 +532,8 @@ struct Syms {
     void*                SetTrick = nullptr;           // the flick seam trick_pulse.cpp hooks
     void*                BcastPaDisable = nullptr;     // the body-physics lifecycle pa_state.cpp hooks
     void*                BcastPaEnable  = nullptr;
+    void*                GrindBlendSpace = nullptr;       // USkaterAnimInstance::GetGrindBlendSpace -- grind_anim.cpp hooks
+    void*                IsFacingMoveDir = nullptr;       // USkaterMovementComponent::IsFacingMoveDirection -- ditto
     void*                TransitOpenMap = nullptr;        // UTransitMapWidget::SetOpenTransitMap -- custom_maps.cpp hooks it
     CompDestroyFn        CompDestroy    = nullptr;        // UActorComponent::DestroyComponent -- audio.cpp, a stopped loop
     WidgetCreateFn       WidgetCreate       = nullptr;   // the game's own panels, with our words in them
@@ -794,6 +796,11 @@ namespace off {
     constexpr int kRefSkelFinalBonePose = 0x30;  // TArray<FTransform>, parent-relative bind pose (PDB)
     constexpr int kMeshBoneInfoStride   = 12;    // FMeshBoneInfo { FName Name; int32 ParentIndex; }
     constexpr int kSkaterMoveComp     = 0x550;   // -> USkaterMovementComponent
+    constexpr int kSkaterFootPosition = 0x598;   // ASkaterCharacterBase::_footPosition, EFootPositionType
+                                                 // None 0 / Regular 1 / Fakie 2 / Nollie 3 / Switch 4.
+                                                 // IsSkatingSwitch = 2 or 4; the grind pose reads it
+    constexpr int kMoveCompSkater     = 0xb28;   // USkaterMovementComponent::_skater (IsFacingMoveDirection's first read)
+    constexpr int kAnimOwnerSkater    = 0x608;   // USkaterAnimInstance -> its ASkaterCharacterBase (GetGrindBlendSpace's first read)
     // THE MARKER RETURN, which is how the game itself puts a skater somewhere. ASkaterCharacter::Tick
     // calls UpdatePendingGotoMarker every frame; it early-outs unless bit 0 of +0xb30 is set, and
     // otherwise does the WHOLE job -- skater and board placed, rotations, velocity and state reset.
