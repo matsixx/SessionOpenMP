@@ -1184,9 +1184,10 @@ int main(int argc, char** argv) {
         Check(g_mkWait < 0.0f, "marker: skating away is not a return");
         // a jump back onto it is
         At(305.0f, 203.0f, 50.0f); PumpMarker(sk, 0.016f);
-        Check(g_mkWait > 0.0f, "marker: a jump that lands on the marker puts the board back up", Fmt("(wait %.2f)", g_mkWait));
-        PumpMarker(sk, 1.0f);
-        Check(g_mkWait <= 0.0f, "marker: ...after the wait, not into the graph reset a return leaves");
+        Check(g_req == EM_TAP || (g_mkWait == 0.0f && g_mkTry > 0.0f), "marker: a jump that lands on the marker puts the board back up at once",
+              Fmt("(req %d, wait %.2f, try %.2f)", g_req, g_mkWait, g_mkTry));
+        Check(g_req != EM_TAP || g_tapSnap, "marker: ...straight into the pose, not blended up to it");
+        g_req = EM_NONE; g_tapSnap = false; g_tapBtn = false;
         // a jump somewhere else (the co-op host putting you beside a peer) is not
         Reset(); At(100.0f, 200.0f, 50.0f); SetMarker(100.0f, 200.0f, 50.0f); g_id = EM_TAP;
         PumpMarker(sk, 0.016f); g_id = EM_NONE;

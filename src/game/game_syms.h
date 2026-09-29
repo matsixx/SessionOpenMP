@@ -26,6 +26,8 @@ namespace omp { namespace game {
 // ---- the functions the overlay CALLS (resolved by byte sig; provenance in game_syms.cpp) ------------
 using SpawnActorFn      = void* (*)(void* world, void* cls, const void* loc, const void* rot, void* params);
 using GetWorldFn        = void* (*)(void* actor);
+using WorldAudioDevFn   = void* (*)(void* world);          // UWorld::GetAudioDeviceRaw -> FAudioDevice*
+using AudioMaxChFn      = int   (*)(void* audioDevice);    // FAudioDevice::GetMaxChannels (effective)
 using GetGameInstFn     = void* (*)(void* actor);   // AActor::GetGameInstance -- cosmetics live there
 // ACharacterCustomization::GetCustomizationItem(const FName&) -- the game's OWN name -> item
 // definition lookup: it scans the global item catalog and returns NULL for an item this install does
@@ -535,6 +537,9 @@ struct Syms {
     void*                GrindBlendSpace = nullptr;       // USkaterAnimInstance::GetGrindBlendSpace -- grind_anim.cpp hooks
     void*                IsFacingMoveDir = nullptr;       // USkaterMovementComponent::IsFacingMoveDirection -- ditto
     void*                TransitOpenMap = nullptr;        // UTransitMapWidget::SetOpenTransitMap -- custom_maps.cpp hooks it
+    void**               TransitInstance = nullptr;       // &ATransitManager::_instance (decoded, two sites agree)
+    WorldAudioDevFn      WorldAudioDevice = nullptr;      // UWorld::GetAudioDeviceRaw (voice-budget sample)
+    AudioMaxChFn         AudioGetMaxChannels = nullptr;   // FAudioDevice::GetMaxChannels (the effective limit)
     CompDestroyFn        CompDestroy    = nullptr;        // UActorComponent::DestroyComponent -- audio.cpp, a stopped loop
     WidgetCreateFn       WidgetCreate       = nullptr;   // the game's own panels, with our words in them
     WidgetAddViewFn      WidgetAddToViewport= nullptr;
@@ -775,10 +780,24 @@ namespace off {
     constexpr int kReplayCamActiveType= 0x878;   // _activeCameraType (EReplayCameraType, uint8)
     constexpr int kReplayCamOrbit     = 1;       // RCT_Orbit
     constexpr int kSoundConcMaxCount  = 0x00;    // FSoundConcurrencySettings::MaxCount
+    constexpr int kSoundConcToOwner   = 0x04;    // FSoundConcurrencySettings::bLimitToOwner
+    constexpr int kSoundConcRetrigger = 0x0c;    // FSoundConcurrencySettings::RetriggerTime (float)
+    constexpr int kSoundConcVolScale  = 0x10;    // FSoundConcurrencySettings::VolumeScale (float)
+    constexpr int kConcurrencySettings= 0x28;    // USoundConcurrency::Concurrency (FSoundConcurrencySettings)
+    // FAudioDevice, for the voice-budget sample (read-only; the arrays belong to the audio thread, so only
+    // their Num at +8 is read, as a statistic).
+    constexpr int kAudDevMaxSources   = 0x90;    // FAudioDevice::MaxSources
+    constexpr int kAudDevMaxChannels  = 0x94;    // FAudioDevice::MaxChannels
+    constexpr int kAudDevSources      = 0x140;   // FAudioDevice::Sources (TArray<FSoundSource*>)
+    constexpr int kAudDevFreeSources  = 0x150;   // FAudioDevice::FreeSources
+    constexpr int kAudDevActiveSounds = 0x438;   // FAudioDevice::ActiveSounds (TArray<FActiveSound*>)
     // USoundBase::Duration. UE stamps INDEFINITELY_LOOPING_DURATION (1e6 seconds) on a sound that
     // never ends, which is the cue's own answer to "do you loop?" -- and the only answer available
     // at spawn time that does not depend on how the caller happened to spawn it.
     constexpr int kSoundBaseDuration  = 0x108;   // USoundBase::Duration (float)
+    // USoundBase::Priority. Copied into a sound when it STARTS (UAudioComponent::PlayInternal, PlaySound2D,
+    // FAudioDevice::PlaySoundAtLocation, the Slate device -- all game thread) and never read again.
+    constexpr int kSoundBasePriority  = 0x114;   // USoundBase::Priority (float)
 
     constexpr int kActorTagsData      = 0x170;
     constexpr int kActorTagsNum       = 0x178;

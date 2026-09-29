@@ -386,6 +386,7 @@ static LONGLONG g_clickForceUntil = 0;
 static int      g_clickForceState = 0;      // 1 = left foot, 2 = right
 static long     g_clickSetterSeen = 0;      // did the game call the setter this frame
 static LONGLONG      g_clickQpc   = 0;
+static volatile long g_clickLastWhich = 0;   // the stick of the last click (1 left, 2 right), with g_clickQpc
 static long          g_uiClickCatches = 0;
 // A SELF-LIMITING PROBE, live while the option is on and spent after this many lines. Which half
 // of the feature is failing is not guessable from outside: either the presses never reach the hook
@@ -851,6 +852,14 @@ static float  g_pxRing[kZRing], g_pyRing[kZRing];
 static double g_zRingT[kZRing];
 static int    g_zHead = 0;
 static double g_zLastPush = -1000.0;
+// When the LOCAL skater's CanCatchOrient last ran. The InAirHandler stops while a replay is scrubbed,
+// so this going stale is how "we are in replay playback" is told without touching positions.
+static double g_localCatchT = 0.0;
+double CatchTweaks_LocalCatchAgeSec() { return g_localCatchT > 0.0 ? DsNow() - g_localCatchT : 1e9; }
+// Every catch that engaged on the local skater (TraceFeetCatch's edge) -- lets catch_sound notice a
+// catch its own watch missed and say why.
+static volatile LONG g_engageCount = 0;
+long CatchTweaks_EngageCount() { return g_engageCount; }
 float CatchTweaks_RecentMaxZ() {
     const double cutoff = DsNow() - 1.5;
     float best = -999999.0f;
@@ -1298,17 +1307,22 @@ static bool hkCanCatchOrient(void* self, void* b, void* c, void* d) {
     }
     // Position sampling for run_out, under its OWN guard. Sharing the widen gate's __try would let
     // a sampler fault run that handler, which switches the whole window fix off.
+    // OURS ONLY: this runs on every skater's InAirHandler, and a peer's positions in the ring made
+    // the apex, the travel velocity and the catch sound's live test other people's. And a position
+    // is refused only for the read-failure sentinel -- a map can put the skater kilometres out on any
+    // axis (the old "> -1 km" test threw every sample away on such a map, and the catch sound with it).
     if (self && g_samplerOK) {
         __try {
             void* skaterS = twkP(self, IAH_SKATER);
-            if (skaterS) {
+            if (skaterS && !Twk_IsProxy(skaterS)) {
                 const double now = DsNow();
+                g_localCatchT = now;
                 if (now - g_zLastPush >= 0.008) {
                     void* root = twkP(skaterS, 0x130);             // AActor::RootComponent
                     const float px = root ? twkF(root, 0x1d0) : -999999.0f;
                     const float py = root ? twkF(root, 0x1d4) : 0.0f;
                     const float z  = root ? twkF(root, 0x1d8) : 0.0f;
-                    if (px > -100000.0f) {
+                    if (px != -999999.0f && z != -999999.0f && isfinite(px) && isfinite(z)) {
                         static bool s_live = false;
                         if (!s_live) { s_live = true; TwkLog("[catch] position sampler live (z=%.0f cm)", z); }
                         g_zRing[g_zHead]  = z;
@@ -2578,6 +2592,32 @@ bool CatchTweaks_MakeName(const char* s, bool add, unsigned long long* out) {
     *out = nm;
     return nm != 0;
 }
+// A FAULT IN GetKeyValue IS THE PLAYER INPUT'S, NOT THE FUNCTION'S. The reads run fine for the whole
+// session around one; nulling the function on it (as this did) took both triggers -- the throw -- away
+// until a restart, since a map change brings a new input but never the function back. So a fault drops
+// the INPUT (the next key through the hook re-acquires it) and is logged with where it happened; the
+// function is given up only after a long unbroken run of them.
+static int   g_piFaults = 0, g_piFaultRun = 0;
+static DWORD g_piFaultCode = 0;
+static void* g_piFaultAt = nullptr;
+static int PiFaultFilter(EXCEPTION_POINTERS* p) {
+    if (p && p->ExceptionRecord) { g_piFaultCode = p->ExceptionRecord->ExceptionCode;
+                                   g_piFaultAt = p->ExceptionRecord->ExceptionAddress; }
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+static void PiFaulted(const char* which) {
+    g_piFaults++; g_piFaultRun++;
+    if (g_piFaults <= 20 || g_piFaults % 100 == 0)
+        TwkLog("[catch] the %s trigger read faulted (0x%08lx at exe+0x%llx, player input %p) -- dropping that input, "
+               "the next key re-acquires it (%d in a row, %d this session)", which, g_piFaultCode,
+               (unsigned long long)((const uint8_t*)g_piFaultAt - (const uint8_t*)GetModuleHandleW(nullptr)),
+               g_playerInput, g_piFaultRun, g_piFaults);
+    g_playerInput = nullptr;
+    if (g_piFaultRun >= 50) {
+        g_piKeyValue = nullptr;
+        TwkLog("[catch] %d trigger reads in a row faulted -- giving up on GetKeyValue for this session", g_piFaultRun);
+    }
+}
 bool CatchTweaks_RightTrigger(float* out) {
     if (out) *out = 0.0f;
     PiLook();
@@ -2591,10 +2631,11 @@ bool CatchTweaks_RightTrigger(float* out) {
         }
         uint64_t fkey[3] = { g_fnRTAxis, 0, 0 };
         const float v = g_piKeyValue(g_playerInput, fkey);
+        g_piFaultRun = 0;
         if (!(v >= -0.01f && v <= 1.5f)) return false;
         if (out) *out = v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v;
         return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) { g_piKeyValue = nullptr; return false; }
+    } __except (PiFaultFilter(GetExceptionInformation())) { PiFaulted("right"); return false; }
 }
 // The LEFT trigger, the same way and for the same reason -- a throw is armed by holding it (emote.cpp).
 // Its own cached FName: these are FOUND, never added, so a build where the name does not exist simply
@@ -2613,13 +2654,15 @@ bool CatchTweaks_LeftTrigger(float* out) {
         }
         uint64_t fkey[3] = { g_fnLTAxis, 0, 0 };
         const float v = g_piKeyValue(g_playerInput, fkey);
+        g_piFaultRun = 0;
         if (!(v >= -0.01f && v <= 1.5f)) return false;
         if (out) *out = v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v;
         return true;
-    } __except (EXCEPTION_EXECUTE_HANDLER) { g_piKeyValue = nullptr; return false; }
+    } __except (PiFaultFilter(GetExceptionInformation())) { PiFaulted("left"); return false; }
 }
 const char* CatchTweaks_TriggerWhy() {
-    if (!g_piKeyValue) return "GetKeyValue not found in this build, or it faulted";
+    if (!g_piKeyValue) return g_piFaults ? "GetKeyValue faulted on every read for a long run -- given up this session"
+                                         : "GetKeyValue not found in this build";
     if (!g_fnameCtor) return "the FName constructor not found";
     if (!g_playerInput) return g_piRefused ? "the player input was refused (not in the object table when first seen)" : "no player input seen yet";
     if (!SitUI_Alive(&g_playerInputRef)) return "the player input it had is gone (a level change) and no key has come through the new one";
@@ -2669,7 +2712,7 @@ static bool hkInputKey(void* self, void* key, int ev, float amt, bool pad) {
                 swallow = 1;
                 if (ev == 0) {
                     LARGE_INTEGER t; QueryPerformanceCounter(&t);
-                    g_clickArmed = which; g_clickQpc = t.QuadPart;
+                    g_clickArmed = which; g_clickLastWhich = which; g_clickQpc = t.QuadPart;
                     // The fresh-flick veto admits a catch only after a stick EDGE. This press IS
                     // that edge -- without the stamp the veto would throw the catch away as a
                     // held-over flick for the first two seconds of every trick.
@@ -2786,6 +2829,19 @@ void  CatchTweaks_SetBoneAdd(int axis, float v) {
     g_boneAdd[axis] = a; TwkMarkDirty();
 }
 float CatchTweaks_ManualTolDeg() { return (float)g_manualFlipTol; }
+void CatchTweaks_Params(CatchTweaksParams* o) {
+    if (!o) return;
+    o->manualTolDeg = (float)g_manualFlipTol; o->overBailDeg = (float)g_overBailDeg;
+    o->snapMs = (float)g_snapMs; o->snapMaxDeg = (float)g_snapMaxDeg; o->snapMaxBoost = (float)g_snapMaxBoost;
+    o->overMs = (float)g_overMs; o->minSpinDeg = (float)g_minSpinDeg; o->descendDeg = (float)g_descendDeg;
+    o->footDescends = g_footDescend != 0; o->holdPose = g_holdPose != 0; o->clickToCatch = g_clickCatch != 0;
+}
+bool CatchTweaks_LastClick(int* which, long long* qpc) {
+    if (!g_clickQpc) return false;
+    if (which) *which = (int)g_clickLastWhich;   // 1 = left stick, 2 = right
+    if (qpc) *qpc = g_clickQpc;
+    return true;
+}
 float CatchTweaks_OverBailDeg()  { return (float)g_overBailDeg; }
 // A shove has been stopped where it was caught (over- or under-rotated) and the catch is still live.
 // foot_place holds the feet's sockets against per-frame flip-flops for its duration.
@@ -3012,6 +3068,7 @@ static void TraceFeetCatch(void* skater, void* comp, float ang) {
     static int   heldFrames = 0, heldRejected = 0, heldAlready = 0;
 
     if (state != 0 && !inCatch) {
+        InterlockedIncrement(&g_engageCount);
         inCatch = true; sawL = sawR = false; peakL = peakR = 0.0f; frames = 0; quiet = 0;
         attL = attR = -1;
         // The engage LATENCY names the pop-time-catch bug directly: ~230 ms is the pop itself

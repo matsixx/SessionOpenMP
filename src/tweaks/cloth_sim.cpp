@@ -89,6 +89,8 @@ enum {
     SMC_MASTERPOSE   = 0x488,   // USkinnedMeshComponent::MasterPoseComponent (weak ptr)
     ACTOR_STRIDE     = 0x1f0,   // sizeof(FClothingActorNv)
     ACTOR_CURLOD     = 0x60,    // FClothingActorNv::CurrentLodIndex -- -1 == actor is asleep
+    ACTOR_SKINIDX    = 0x148,   // CurrentSkinnedPositionIndex -- flipped at the END of each step (Simulate)
+    ACTOR_SKINPOS    = 0x150,   // SkinnedPhysicsMeshPositions[2] -- the step's targets, sim space
     ACTOR_LODDATA    = 0x130,   // FClothingActorNv::LodData
     ACTOR_SKINNORM   = 0x170,   // SkinnedPhysicsMeshNormals -- the ANIMATED reference (ours)
     ACTOR_CURNORM    = 0x180,   // CurrentNormals -- what the solver computed and the renderer uses
@@ -275,6 +277,14 @@ static const int g_lag   = 1;     // SETTLED ON -- the garment sits slightly beh
                                   // ClothLagMaxMm = 0 turns the effect off; it needs no flag of its own.
 static float g_lagRate   = 9.0f;  // how quickly it catches up (lower = looser)
 static float g_lagMax    = 4.0f;  // cm it may ever sit behind
+static int   g_spikeIters = 12;   // ClothSpikePasses: spike-guard projection passes, F1 (563); 0 = guard off
+// SETTLE TIME (ClothSettleMs). The cloth's rest shape is the garment on a standing body, and with gravity
+// off the steady part of its offset is only that shape fighting the pose: 3.5-4.7 cm on every garment at
+// rest, and the shirt hem pushed into the seat when crouching ("doesnt seem to be staying and bending the
+// same way the mesh does without cloth"). Each particle's offset is drawn relative to its own running
+// average over this time, so a held pose settles onto the unsimulated garment and only movement shows.
+// 0 = off (the raw offset).
+static float g_settleTime = 0.35f;
 static void  LagDrive(void* comp, int slot, float dt);
 static const int g_sway  = 0;     // WITHDRAWN: hand-written bones never reached the renderer, so the
                                   // garment stood in its rest pose. See the T-pose note below.
@@ -384,6 +394,10 @@ void ClothSim_ReadConfig(const char* buf) {
     ClothSim_HemGripLower = (float)TwkIniInt(buf, "ClothHemGripPctLower", 12) / 100.0f;
     ClothSim_HemPush      = (float)TwkIniInt(buf, "ClothHemPushMm",   0) / 10.0f;
     ClothSim_HemPushBand  = (float)TwkIniInt(buf, "ClothHemPushBandPct", 30) / 100.0f;
+    g_spikeIters          = TwkIniInt(buf, "ClothSpikePasses", 12);
+    g_settleTime          = (float)TwkIniInt(buf, "ClothSettleMs", 350) / 1000.0f;
+    if (g_settleTime < 0.0f) g_settleTime = 0.0f; else if (g_settleTime > 2.0f) g_settleTime = 2.0f;
+    if (g_spikeIters < 0) g_spikeIters = 0; else if (g_spikeIters > 30) g_spikeIters = 30;
     TwkLog("[cloth] config: ClothPhysics=%d MaxVerts=%d ArmDelayMs=%d | shape: travel=%.1fcm "
            "gravity=%d%% wind=%d%% peak=%d%% hemGrip=%d%%/%d%% hemLift=%.1fmm reach=%d%%",
            g_on, g_maxVerts, g_armDelayMs, ClothSim_MaxTravel,
@@ -411,6 +425,8 @@ void ClothSim_SaveConfig(char* buf, size_t cap) {
     TwkIniSetInt(buf, cap, "ClothHemGripPctLower", (int)(ClothSim_HemGripLower * 100.0f + 0.5f));
     TwkIniSetInt(buf, cap, "ClothHemPushMm",   (int)(ClothSim_HemPush * 10.0f + 0.5f));
     TwkIniSetInt(buf, cap, "ClothHemPushBandPct", (int)(ClothSim_HemPushBand * 100.0f + 0.5f));
+    TwkIniSetInt(buf, cap, "ClothSpikePasses", g_spikeIters);
+    TwkIniSetInt(buf, cap, "ClothSettleMs",    (int)(g_settleTime * 1000.0f + 0.5f));
 }
 // Cloth is opt-in, so a reset leaves it off. It no longer has to remember to re-enable the two
 // renderers: they are not settings any more, so "reset defaults" cannot switch cloth into a state
@@ -502,6 +518,7 @@ static const uint8_t kQuadGuid[16] = { 0x51,0x55,0x41,0x44, 0x53,0x45,0x53,0x53,
 // Everything here comes from buffers confirmed CPU-readable in this build; if any of it is missing
 // the caller falls back to the test quad rather than guessing.
 float ClothSim_PinAbove  = 0.55f;   // above this fraction of garment height, welded to the body
+float ClothSim_TightShare = 0.4f;   // held when this much of a particle's weight is on a tight bone (562)
 float ClothSim_MaxTravel = 6.0f;    // cm the hem may stray from its animated position
 // Gravity as a fraction of the world's. At 0 the garment has no weight of its own: it sits exactly
 // where the animation puts it and only MOVES because the body moves, which is what stops a hoodie
@@ -831,7 +848,7 @@ static bool BuildRealMeshData(void* mesh, uint8_t* lod, uint8_t* clothLod, void*
             uint8_t*  bd   = boneDat + (size_t)u * BONEDATA_STRIDE;
             uint16_t* bIdx = (uint16_t*)(bd + 0x04);
             float*    bWt  = (float*)   (bd + 0x1c);
-            int count = 0; int domBone = -1; float domW = -1.0f;
+            int count = 0; int domBone = -1; float domW = -1.0f; float tightW = 0.0f;
             if (useSkin) {
                 const uint8_t* sw  = skinData + (size_t)(baseVert + i) * skinStride;
                 const uint8_t* wts = sw + maxInfl * (bone16 ? 2 : 1);
@@ -849,6 +866,7 @@ static bool BuildRealMeshData(void* mesh, uint8_t* lod, uint8_t* clothLod, void*
                     }
                     bIdx[count] = (uint16_t)boneRemap[skelBone];
                     bWt[count]  = (float)w / 255.0f;
+                    if (tightBone[skelBone]) tightW += (float)w / 255.0f;
                     if ((float)w > domW) { domW = (float)w; domBone = skelBone; }
                     count++;
                 }
@@ -876,6 +894,10 @@ static bool BuildRealMeshData(void* mesh, uint8_t* lod, uint8_t* clothLod, void*
                 d *= ClothSim_MaxTravel;
             }
             if (domBone >= 0 && domBone < 1024 && tightBone[domBone]) d = 0.0f;
+            // ...or when a good share of it rides a tight bone (562). The dominant-bone rule alone left an
+            // elbow's 50/50 UpperArm/Forearm ring FREE between pinned forearm particles -- the pin line ran
+            // through the fold, and the fabric pushed that ring out into spikes whenever the elbow bent.
+            if (tightW >= ClothSim_TightShare) d = 0.0f;
             maxDist[u] = d;
             invMass[u] = (d <= 0.001f) ? 0.0f : 1.0f;
             if (invMass[u] == 0.0f) nFixed++;
@@ -1611,6 +1633,244 @@ static void ReleaseGarmentForRebuild(void* mesh, int slot) {
     } __except (EXCEPTION_EXECUTE_HANDLER) {}
 }
 
+// ---- THE FABRIC'S REST SHAPE (3.19.551) --------------------------------------------------------
+// FClothingSimulationNv::CreateActor cooks the fabric -- every rest length, bend and geodesic tether --
+// from the physical mesh SKINNED TO THE POSE AT THAT MOMENT: SkinPhysicsMesh's output is what it hands
+// NvClothCookFabricFromMesh as ClothMeshDesc.points (Epic 0x326e263 -> 0x326e3f7). Our garments are
+// built with the skater already riding at the map start, so that stance was baked in as the cloth's
+// rest shape and it pulled toward it all session: the permanent hem lean (the user's diagnosis). The
+// cook now gets the garment's BIND shape in the same reference-bone space -- what it would have seen
+// with the skater in the reference pose. Particles still start where the body is.
+typedef void* (*CookFabricFn)(void* factory, void* desc, const float* gravity, void* phaseTypes, bool geodesic);
+static CookFabricFn    g_origCook  = nullptr;
+static int             g_cookBind  = 1;         // 0 = the engine's cook from the current pose (pre-551)
+static const float*    g_cookRest  = nullptr;   // set only for the length of our own recreate
+static int             g_cookRestN = 0;
+static const uint32_t* g_cookIdx   = nullptr;
+static int             g_cookIdxN  = 0;
+enum { MDESC_STRIDE = 0x00, MDESC_DATA = 0x08, MDESC_COUNT = 0x10 };   // nv::cloth::ClothMeshDesc::points
+
+static void* hkCookFabric(void* factory, void* desc, const float* gravity, void* phaseTypes, bool geodesic) {
+    uint8_t* d = (uint8_t*)desc;
+    if (!g_cookRest || !d || *(int*)(d + MDESC_COUNT) != g_cookRestN || *(int*)(d + MDESC_STRIDE) != 12) {
+        static int s_other = 0;
+        if (d && s_other < 10) { s_other++;
+            TwkLog("[quad] a fabric was cooked outside our build (%d points) -- from the pose of the moment",
+                   *(int*)(d + MDESC_COUNT)); }
+        return g_origCook(factory, desc, gravity, phaseTypes, geodesic);
+    }
+    const float* posed = *(const float**)(d + MDESC_DATA);
+    // What the engine's cook would have baked in: each triangle edge as posed vs at rest.
+    double sum = 0.0, longest = 0.0, shortest = 0.0;
+    int edges = 0;
+    if (posed && g_cookIdx)
+        for (int t = 0; t + 2 < g_cookIdxN; t += 3)
+            for (int e = 0; e < 3; e++) {
+                const uint32_t a = g_cookIdx[t + e], b = g_cookIdx[t + (e + 1) % 3];
+                if (a >= (uint32_t)g_cookRestN || b >= (uint32_t)g_cookRestN) continue;
+                const float* pa = posed + a*3;       const float* pb = posed + b*3;
+                const float* ra = g_cookRest + a*3;  const float* rb = g_cookRest + b*3;
+                const double lp = sqrt((double)(pa[0]-pb[0])*(pa[0]-pb[0]) + (double)(pa[1]-pb[1])*(pa[1]-pb[1]) +
+                                       (double)(pa[2]-pb[2])*(pa[2]-pb[2]));
+                const double lr = sqrt((double)(ra[0]-rb[0])*(ra[0]-rb[0]) + (double)(ra[1]-rb[1])*(ra[1]-rb[1]) +
+                                       (double)(ra[2]-rb[2])*(ra[2]-rb[2]));
+                if (lr < 0.01) continue;
+                const double st = lp / lr - 1.0;
+                sum += fabs(st); edges++;
+                if (st > longest) longest = st;
+                if (st < shortest) shortest = st;
+            }
+    *(const float**)(d + MDESC_DATA) = g_cookRest;
+    void* fabric = g_origCook(factory, desc, gravity, phaseTypes, geodesic);
+    *(const float**)(d + MDESC_DATA) = posed;
+    TwkLog("[quad] fabric cooked from the garment's rest shape (%d particles) -- the pose of the moment "
+           "would have baked its edges %+.1f%% .. %+.1f%% (mean %.1f%%)", g_cookRestN,
+           shortest * 100.0, longest * 100.0, edges ? sum / edges * 100.0 : 0.0);
+    return fabric;
+}
+
+// NvCloth is loaded by PhysDLLHelper::LoadPhysXModules at engine start; retried per build if not.
+static void InstallCookHook() {
+    static bool gaveUp = false;
+    if (g_origCook || !g_cookBind || gaveUp) return;
+    HMODULE m = GetModuleHandleA("NvCloth_x64.dll");
+    if (!m) { static bool said = false;
+              if (!said) { said = true; TwkLog("[quad] NvCloth not loaded yet -- the rest-shape cook waits for it"); }
+              return; }
+    void* at = (void*)GetProcAddress(m, "NvClothCookFabricFromMesh");
+    if (!at || MH_CreateHook(at, (void*)&hkCookFabric, (void**)&g_origCook) != MH_OK || MH_EnableHook(at) != MH_OK) {
+        g_origCook = nullptr; gaveUp = true;
+        TwkLog("[quad] could not hook NvClothCookFabricFromMesh (%p) -- fabrics keep the engine's cook", at);
+        return;
+    }
+    TwkLog("[quad] fabric cook hooked (%p) -- garments take their rest shape from the bind pose", at);
+}
+
+// The garment's physical mesh at rest, in the space SkinPhysicsMesh<.., true> puts it: relative to the
+// asset's reference bone at rest, scale dropped.
+static float* BuildCookRest(void* comp) {
+    void* mesh = twkP(comp, SMC_SKELMESH);
+    if (!mesh || twkI(mesh, SM_MESHCLOTH + 8) <= 0) return nullptr;
+    void** assets = (void**)twkP(mesh, SM_MESHCLOTH);
+    void* asset = assets ? assets[0] : nullptr;
+    uint8_t* lod = asset ? (uint8_t*)twkP(asset, CA_LODDATA) : nullptr;
+    if (!lod || twkI(asset, CA_LODDATA + 8) <= 0) return nullptr;
+    const float*    v  = (const float*)twkP(lod, PMD_VERTS);
+    const int       n  = twkI(lod, PMD_VERTS + 8);
+    const uint32_t* ix = (const uint32_t*)twkP(lod, PMD_INDICES);
+    const int       ni = twkI(lod, PMD_INDICES + 8);
+    uint8_t* info = (uint8_t*)twkP((uint8_t*)mesh + SM_REFSKELETON, REFSK_BONEINFO);
+    const int nInfo = twkI((uint8_t*)mesh + SM_REFSKELETON, REFSK_BONEINFO + 8);
+    uint8_t* pose = (uint8_t*)twkP((uint8_t*)mesh + SM_REFPOSE, 0);
+    const int ref = twkI(asset, CA_REFBONEIDX);
+    if (!v || n <= 0 || n > 500000 || !info || !pose || ref < 0 || ref >= nInfo) return nullptr;
+
+    int chain[64], nc = 0;
+    for (int b = ref; b >= 0 && nc < 64; ) {
+        chain[nc++] = b;
+        const int p = twkI(info + (size_t)b * BONEINFO_STRIDE, 8);
+        if (p >= b) break;
+        b = p;
+    }
+    double q[4] = { 0, 0, 0, 1 }, t[3] = { 0, 0, 0 }, s[3] = { 1, 1, 1 };
+    for (int k = nc - 1; k >= 0; k--) {             // root first: CS = local * parentCS
+        const float* x = (const float*)(pose + (size_t)chain[k] * XFORM_STRIDE);
+        double lq[4] = { x[0], x[1], x[2], x[3] };
+        const double ln = sqrt(lq[0]*lq[0] + lq[1]*lq[1] + lq[2]*lq[2] + lq[3]*lq[3]);
+        if (ln > 1e-9) for (int i = 0; i < 4; i++) lq[i] /= ln;
+        const double st[3] = { x[4]*s[0], x[5]*s[1], x[6]*s[2] };
+        const double tx = 2*(q[1]*st[2] - q[2]*st[1]), ty = 2*(q[2]*st[0] - q[0]*st[2]), tz = 2*(q[0]*st[1] - q[1]*st[0]);
+        t[0] += st[0] + q[3]*tx + (q[1]*tz - q[2]*ty);
+        t[1] += st[1] + q[3]*ty + (q[2]*tx - q[0]*tz);
+        t[2] += st[2] + q[3]*tz + (q[0]*ty - q[1]*tx);
+        const double nq[4] = { q[3]*lq[0] + q[0]*lq[3] + q[1]*lq[2] - q[2]*lq[1],
+                               q[3]*lq[1] - q[0]*lq[2] + q[1]*lq[3] + q[2]*lq[0],
+                               q[3]*lq[2] + q[0]*lq[1] - q[1]*lq[0] + q[2]*lq[3],
+                               q[3]*lq[3] - q[0]*lq[0] - q[1]*lq[1] - q[2]*lq[2] };
+        for (int i = 0; i < 4; i++) q[i] = nq[i];
+        for (int i = 0; i < 3; i++) s[i] *= x[8 + i];
+    }
+    float* rest = (float*)malloc((size_t)n * 3 * sizeof(float));
+    if (!rest) return nullptr;
+    const double c[3] = { -q[0], -q[1], -q[2] };      // conjugate: rotate back into the bone's frame
+    for (int i = 0; i < n; i++) {
+        const double dv[3] = { v[i*3+0] - t[0], v[i*3+1] - t[1], v[i*3+2] - t[2] };
+        const double tx = 2*(c[1]*dv[2] - c[2]*dv[1]), ty = 2*(c[2]*dv[0] - c[0]*dv[2]), tz = 2*(c[0]*dv[1] - c[1]*dv[0]);
+        rest[i*3+0] = (float)(dv[0] + q[3]*tx + (c[1]*tz - c[2]*ty));
+        rest[i*3+1] = (float)(dv[1] + q[3]*ty + (c[2]*tx - c[0]*tz));
+        rest[i*3+2] = (float)(dv[2] + q[3]*tz + (c[0]*ty - c[1]*tx));
+    }
+    g_cookRestN = n;
+    g_cookIdx = ix; g_cookIdxN = ix ? ni : 0;
+    return rest;
+}
+
+// Every actor we build comes through here, so every fabric we cook takes the rest shape.
+static void RecreateActors(void* comp) {
+    if (!g_recreate) return;
+    InstallCookHook();
+    float* rest = nullptr;
+    if (g_origCook && g_cookBind) {
+        __try { rest = BuildCookRest(comp); }
+        __except (EXCEPTION_EXECUTE_HANDLER) { rest = nullptr; }
+    }
+    g_cookRest = rest;
+    __try { g_recreate(comp); }
+    __finally { g_cookRest = nullptr; g_cookRestN = 0; g_cookIdx = nullptr; g_cookIdxN = 0; }
+    free(rest);
+}
+
+// 559 PROBE: "spikes coming from the right elbow" of AMXX_GEN_UB_LS, an ENGINE-DRAWN (bound) top, cloth on
+// only. The bound mapping draws each render vertex exactly ON its particle, so spikes mean particles far
+// from their neighbours. This says whether the SIMULATED shirt has them: the particle furthest from its
+// own target, and the most stretched / squashed triangle edge against the rest shape -- with heights,
+// bones and pinned/free. Spike-sized edges here = the sim; none = the drawing side.
+static int g_boundProbe = 1;
+static void ProbeParticle(void* mesh, void* asset, uint8_t* clod, int u, const float* rest, char* out, size_t cap) {
+    const uint8_t* bd = (const uint8_t*)twkP(clod, PMD_BONEDATA);
+    const int nBd = twkI(clod, PMD_BONEDATA + 8);
+    const float* im = (const float*)twkP(clod, PMD_INVMASS);
+    const int nIm = twkI(clod, PMD_INVMASS + 8);
+    const int* used = (const int*)twkP(asset, CA_USEDBONEIDX);
+    const int nUsed = twkI(asset, CA_USEDBONEIDX + 8);
+    uint8_t* info = (uint8_t*)twkP((uint8_t*)mesh + SM_REFSKELETON, REFSK_BONEINFO);
+    const int nInfo = twkI((uint8_t*)mesh + SM_REFSKELETON, REFSK_BONEINFO + 8);
+    size_t n = snprintf(out, cap, "#%d z %.0f %s:", u, rest[u*3+2], (im && u < nIm && im[u] == 0.0f) ? "pinned" : "free");
+    if (!bd || u >= nBd) return;
+    const uint8_t* e = bd + (size_t)u * BONEDATA_STRIDE;
+    const int cnt = *(const int*)e;
+    for (int k = 0; k < cnt && k < 12 && n < cap - 1; k++) {
+        const int li = ((const uint16_t*)(e + 4))[k];
+        const float w = ((const float*)(e + 0x1c))[k];
+        const int sb = (used && li < nUsed) ? used[li] : -1;
+        char bn[64] = "?";
+        if (info && sb >= 0 && sb < nInfo) CatchSound_FNameText(info + (size_t)sb * BONEINFO_STRIDE, bn, sizeof(bn));
+        n += snprintf(out + n, cap - n, " %s %.2f", strncmp(bn, "AMXX_", 5) == 0 ? bn + 5 : bn, w);
+    }
+}
+static void BoundProbe(void* comp, void* mesh, int slot) {
+    static double nextCalc[kSimSlots] = {}, nextBase[kSimSlots] = {}, nextHit[kSimSlots] = {};
+    const double now = (double)GetTickCount64() / 1000.0;
+    if (now < nextCalc[slot]) return;
+    nextCalc[slot] = now + 0.25;
+    uint8_t* mapData = (uint8_t*)twkP(comp, SMC_SIMDATA);
+    if (!mapData || twkI(comp, SMC_SIMDATA + 8) != 1) return;
+    const float* sp = (const float*)twkP(mapData + SIMDATA_POS, 0);
+    const int nSim = twkI(mapData + SIMDATA_POS, 8);
+    void* so = twkP(comp, SMC_CLOTHSIM);
+    uint8_t* acts = so ? (uint8_t*)twkP(so, NVSIM_ACTORS) : nullptr;
+    const int nA = so ? twkI(so, NVSIM_ACTORS + 8) : 0;
+    const float* tg = nullptr;
+    for (int k = 0; acts && k < nA && k < 8; k++) {
+        uint8_t* a = acts + (size_t)k * ACTOR_STRIDE;
+        if (twkI(a, ACTOR_CURLOD) < 0) continue;
+        const int sel = (twkI(a, ACTOR_SKINIDX) ^ 1) & 1;
+        if (twkI(a + ACTOR_SKINPOS + sel * 16, 8) == nSim) tg = (const float*)twkP(a + ACTOR_SKINPOS + sel * 16, 0);
+        break;
+    }
+    void** assets = (void**)twkP(mesh, SM_MESHCLOTH);
+    void* asset = (assets && twkI(mesh, SM_MESHCLOTH + 8) > 0) ? assets[0] : nullptr;
+    uint8_t* clod = asset ? (uint8_t*)twkP(asset, CA_LODDATA) : nullptr;
+    if (!sp || nSim <= 0 || !tg || !clod || twkI(clod, PMD_VERTS + 8) != nSim) return;
+    const float* rest = (const float*)twkP(clod, PMD_VERTS);
+    const uint32_t* ix = (const uint32_t*)twkP(clod, PMD_INDICES);
+    const int ni = twkI(clod, PMD_INDICES + 8);
+    if (!rest || !ix) return;
+
+    int wo = -1; float offMax = 0.0f;
+    for (int u = 0; u < nSim; u++) {
+        const float dx = sp[u*3]-tg[u*3], dy = sp[u*3+1]-tg[u*3+1], dz = sp[u*3+2]-tg[u*3+2];
+        const float d = sqrtf(dx*dx + dy*dy + dz*dz);
+        if (d > offMax) { offMax = d; wo = u; }
+    }
+    // 560: against the SKINNED POSE's edge, not the rest shape. A one-step timing gap between the
+    // published points and the targets moves both ends alike (lengths barely change), a spike does not.
+    int sa = -1, sb = -1; float grow = 0.0f, lMax = 0.0f, lPose = 0.0f; int nOver3 = 0;
+    for (int t = 0; t + 2 < ni; t += 3)
+        for (int e = 0; e < 3; e++) {
+            const uint32_t a = ix[t + e], b = ix[t + (e + 1) % 3];
+            if (a >= (uint32_t)nSim || b >= (uint32_t)nSim) continue;
+            const float px = tg[a*3]-tg[b*3], py = tg[a*3+1]-tg[b*3+1], pz = tg[a*3+2]-tg[b*3+2];
+            const float lp = sqrtf(px*px + py*py + pz*pz);
+            const float mx = sp[a*3]-sp[b*3], my = sp[a*3+1]-sp[b*3+1], mz = sp[a*3+2]-sp[b*3+2];
+            const float ls = sqrtf(mx*mx + my*my + mz*mz);
+            const float g = ls - lp;
+            if (g > 3.0f) nOver3++;
+            if (g > grow) { grow = g; sa = (int)a; sb = (int)b; lMax = ls; lPose = lp; }
+        }
+    const float rMax = grow; const float rMin = (float)nOver3;
+    const bool hit = (grow > 3.0f) && now >= nextHit[slot];
+    if (!hit && now < nextBase[slot]) return;
+    if (hit) nextHit[slot] = now + 0.5;
+    nextBase[slot] = now + 5.0;
+    char pw[200] = "", ps1[200] = "", ps2[200] = "";
+    if (wo >= 0) ProbeParticle(mesh, asset, clod, wo, rest, pw, sizeof(pw));
+    if (sa >= 0) { ProbeParticle(mesh, asset, clod, sa, rest, ps1, sizeof(ps1)); ProbeParticle(mesh, asset, clod, sb, rest, ps2, sizeof(ps2)); }
+    TwkLog("[probe] slot %d bound %s: an edge %.1f cm LONGER than the skinned pose's (%.1f cm vs %.1f) between "
+           "[%s] and [%s] | %.0f edge(s) over 3 cm | worst particle %.1f cm off its target (%s)", slot,
+           hit ? "SPIKE" : "baseline", rMax, lMax, lPose, ps1, ps2, rMin, offMax, pw);
+}
+
 static bool SetupGarment(void* comp, void* mesh, int slot, bool forceRebuild) {
     // Both of these used to return in silence, which is why a garment could simply have no cloth with
     // nothing in the log to say why. The caller retries, so these are throttled to one per garment.
@@ -1622,8 +1882,6 @@ static bool SetupGarment(void* comp, void* mesh, int slot, bool forceRebuild) {
                    slot, g_ready ? 1 : 0, (void*)g_recreate); }
         return false;
     }
-    // Put the garment back exactly as it was built before measuring or binding anything -- see Pristine.
-    PristineSyncMesh(mesh);
     char nm[64];
     if (!CatchSound_ObjName(mesh, nm, sizeof(nm))) {
         static double whineAt2 = 0.0;
@@ -1654,7 +1912,7 @@ static bool SetupGarment(void* comp, void* mesh, int slot, bool forceRebuild) {
         g_asset = prior;
         *(uint8_t*)((uint8_t*)comp + SMC_DISABLECLOTH) = 0;
         MarkMeshHasCloth(mesh);
-        if (g_recreate) g_recreate(comp);
+        RecreateActors(comp);
         if (g_recreateRender) { __try { g_recreateRender(comp); }
                                 __except (EXCEPTION_EXECUTE_HANDLER) {} }
         if (g_updClothTick)   { __try { g_updClothTick(comp); }
@@ -1662,6 +1920,13 @@ static bool SetupGarment(void* comp, void* mesh, int slot, bool forceRebuild) {
         TwkLog("[quad] '%s' already carries our cloth asset -- re-adopted (slot %d)", nm, slot);
         return true;
     }
+    // Put the garment back exactly as it was built before measuring or binding anything -- see Pristine.
+    // A FRESH build only (558). This used to run first, before the re-adopt above: the snapshot's section
+    // table has no cloth marks, so it wiped the marks and binding a re-adopt keeps, the engine then found
+    // no section using our asset and built no actor. Field report: untick a top in F1, tick it again,
+    // cloth comes back and is dropped ("actors=1" with two garments); a map change fixed it only because
+    // it clears the registry and forces this fresh path.
+    PristineSyncMesh(mesh);
     TwkLog("[quad] building a cloth asset on '%s' (slot %d)", nm, slot);
     g_buildLower = (strstr(nm, "_LB_") != nullptr) || (strstr(nm, "LB_") != nullptr);
 
@@ -1708,7 +1973,7 @@ static bool SetupGarment(void* comp, void* mesh, int slot, bool forceRebuild) {
     }
     FreeWeld();                                   // scratch: the binding was its only consumer
 
-    if (g_recreate) g_recreate(comp);             // this is what builds the simulation actors
+    RecreateActors(comp);                         // this is what builds the simulation actors
     // Ask the engine to (re)decide whether the cloth tick should be registered; without this the
     // actors exist and simply never get stepped. Must run BEFORE any unmarking below.
     if (g_updClothTick) {
@@ -1807,6 +2072,22 @@ struct DirectState {
     bool     armed;
 };
 static DirectState g_dir[kSimSlots] = {};
+// 554 PROBE: "the shirt lifts like this when doing smith grinds" (Tee_Watches ticked only). The sim cannot
+// move a particle 4+ cm off its skinned target, so the lift is suspected in the WRITE: out = inv(blend) x
+// sim, and a hem weighted ~50/50 pelvis/thigh has a near-singular blend when the thigh swings far from
+// the pelvis -- any mismatch with the GPU's matrices is then multiplied. Logs the vertex written furthest
+// from its rest spot: its blend's det, how far the sim put it off its skinned target, and how far ONE
+// frame of bone motion would move it on screen.
+static int   g_liftProbe = 0;   // off since 557: 556 confirmed (the smith lift is gone)
+// THE CLOTH AS AN OFFSET ON THE RENDER'S OWN SKINNING (556). 555 measured the solver AIMING the tee's hem
+// 20 cm from where the rendered body puts it in a smith (~1 cm skating normally, "slightly off even when
+// just skating"), with no collision at all: the cloth takes its bones from an earlier snapshot of the
+// frame than the one the body is drawn with. So each vertex is drawn at its REST position plus the
+// cloth's offset from its OWN target, un-skinned: at rest (and everywhere pinned) the garment is exactly
+// the unsimulated one; the cloth only adds its swing. 0 = the absolute sim position (pre-556).
+static int   g_offsetDrive = 1;
+static float s_prevMats[kSimSlots][512 * 12];
+static bool  s_prevOk[kSimSlots] = {};
 
 // --- small 3x4 matrix helpers (row-major, 12 floats: 3 rows of {x,y,z,w}) ---------------------
 static void XformToMat(const float* q, const float* t, const float* sc, float* m) {
@@ -1904,6 +2185,69 @@ static void DirWhy(int slot, const char* why) {
     if (slot < 0 || slot >= kSimSlots || g_dirWhy[slot]) return;
     g_dirWhy[slot] = why;
     TwkLog("[direct] slot %d not driving: %s", slot, why);
+}
+
+// THE SPIKE GUARD (561). Along every edge, the two ends' cloth offsets may differ by at most
+// g_spikeGuard x the edge's rest length (never under 0.5 cm), and a pinned point's offset is zero. A free
+// point hemmed in by pinned ones can then not stand out of the surface (the elbow spikes: an edge 4-5 cm
+// longer than the pose), while cloth that moves as a piece -- neighbours alike -- is untouched. Projected
+// like distance constraints, a few passes. 0 = off.
+static float g_spikeGuard = 0.5f;
+// g_spikeIters (the passes) is with the saved knobs up top -- F1 "Spike guard passes" (563).
+struct SpikeEdges { void* mesh; int nSim; int nE; int* e; float* rest; float* off; uint8_t* pin;
+                    float* base; LONGLONG lastQpc; bool primed; };
+static SpikeEdges s_edges[kSimSlots] = {};
+static int CmpU64(const void* a, const void* b) {
+    const uint64_t x = *(const uint64_t*)a, y = *(const uint64_t*)b;
+    return x < y ? -1 : x > y ? 1 : 0;
+}
+static SpikeEdges* SpikeEdgesFor(int slot, void* mesh, int nSim) {
+    SpikeEdges& E = s_edges[slot];
+    if (E.mesh == mesh && E.nSim == nSim && E.e) return &E;
+    free(E.e); free(E.rest); free(E.off); free(E.pin); free(E.base); memset(&E, 0, sizeof(E));
+    void** assets = (void**)twkP(mesh, SM_MESHCLOTH);
+    void* asset = (assets && twkI(mesh, SM_MESHCLOTH + 8) > 0) ? assets[0] : nullptr;
+    uint8_t* clod = asset ? (uint8_t*)twkP(asset, CA_LODDATA) : nullptr;
+    if (!clod || twkI(clod, PMD_VERTS + 8) != nSim) return nullptr;
+    const float* rv = (const float*)twkP(clod, PMD_VERTS);
+    const uint32_t* ix = (const uint32_t*)twkP(clod, PMD_INDICES);
+    const int ni = twkI(clod, PMD_INDICES + 8);
+    const float* im = (const float*)twkP(clod, PMD_INVMASS);
+    if (!rv || !ix || ni < 3 || !im || twkI(clod, PMD_INVMASS + 8) != nSim) return nullptr;
+    uint64_t* pairs = (uint64_t*)malloc((size_t)ni * sizeof(uint64_t));
+    if (!pairs) return nullptr;
+    int np = 0;
+    for (int t = 0; t + 2 < ni; t += 3)
+        for (int k = 0; k < 3; k++) {
+            uint32_t a = ix[t + k], b = ix[t + (k + 1) % 3];
+            if (a == b || a >= (uint32_t)nSim || b >= (uint32_t)nSim) continue;
+            if (a > b) { const uint32_t c = a; a = b; b = c; }
+            pairs[np++] = ((uint64_t)a << 32) | b;
+        }
+    qsort(pairs, (size_t)np, sizeof(uint64_t), CmpU64);
+    int nu = 0;
+    for (int i = 0; i < np; i++) if (i == 0 || pairs[i] != pairs[i - 1]) pairs[nu++] = pairs[i];
+    E.e = (int*)malloc((size_t)nu * 2 * sizeof(int));
+    E.rest = (float*)malloc((size_t)nu * sizeof(float));
+    E.off = (float*)malloc((size_t)nSim * 3 * sizeof(float));
+    E.pin = (uint8_t*)malloc((size_t)nSim);
+    E.base = (float*)calloc((size_t)nSim * 3, sizeof(float));
+    if (!E.e || !E.rest || !E.off || !E.pin || !E.base) {
+        free(pairs); free(E.e); free(E.rest); free(E.off); free(E.pin); free(E.base); memset(&E, 0, sizeof(E));
+        return nullptr;
+    }
+    for (int i = 0; i < nu; i++) {
+        const int a = (int)(pairs[i] >> 32), b = (int)(pairs[i] & 0xffffffffu);
+        E.e[i*2] = a; E.e[i*2+1] = b;
+        const float dx = rv[a*3]-rv[b*3], dy = rv[a*3+1]-rv[b*3+1], dz = rv[a*3+2]-rv[b*3+2];
+        E.rest[i] = sqrtf(dx*dx + dy*dy + dz*dz);
+    }
+    for (int u = 0; u < nSim; u++) E.pin[u] = (im[u] == 0.0f) ? 1 : 0;
+    free(pairs);
+    E.mesh = mesh; E.nSim = nSim; E.nE = nu;
+    TwkLog("[direct] slot %d: spike guard over %d edges (%.0f%% of rest length, at least 0.5 cm)",
+           slot, nu, g_spikeGuard * 100.0f);
+    return &E;
 }
 
 static void DirectDrive(void* comp, void* mesh, int slot) {
@@ -2147,6 +2491,103 @@ static void DirectDrive(void* comp, void* mesh, int slot) {
                "t=(%.1f %.1f %.1f) s=(%.2f %.2f %.2f) (using %d)",
                slot, b[0],b[1],b[2],b[3], b[4],b[5],b[6], b[8],b[9],b[10], ClothSim_SimXform); }
 
+    // 556: the targets of the step that produced simPos, and the rest positions they were skinned from.
+    const float* simTgt = nullptr;
+    const float* physV  = nullptr;
+    if (g_offsetDrive) {
+        const char* why = nullptr;
+        __try {
+            void* so = twkP(comp, SMC_CLOTHSIM);
+            uint8_t* acts = so ? (uint8_t*)twkP(so, NVSIM_ACTORS) : nullptr;
+            const int nA = so ? twkI(so, NVSIM_ACTORS + 8) : 0;
+            for (int k = 0; acts && k < nA && k < 8; k++) {
+                uint8_t* a = acts + (size_t)k * ACTOR_STRIDE;
+                if (twkI(a, ACTOR_CURLOD) < 0) continue;
+                const int sel = (twkI(a, ACTOR_SKINIDX) ^ 1) & 1;
+                const float* t = (const float*)twkP(a + ACTOR_SKINPOS + sel * 16, 0);
+                if (t && twkI(a + ACTOR_SKINPOS + sel * 16, 8) == nSim) simTgt = t;
+                break;
+            }
+            void** assets = (void**)twkP(mesh, SM_MESHCLOTH);
+            void* asset = (assets && twkI(mesh, SM_MESHCLOTH + 8) > 0) ? assets[0] : nullptr;
+            uint8_t* clod = asset ? (uint8_t*)twkP(asset, CA_LODDATA) : nullptr;
+            if (clod && twkI(asset, CA_LODDATA + 8) > 0 && twkI(clod, PMD_VERTS + 8) == nSim)
+                physV = (const float*)twkP(clod, PMD_VERTS);
+            if (!simTgt) why = "the cloth actor's targets are not readable";
+            else if (!physV) why = "the cloth asset's rest positions are not readable";
+        } __except (EXCEPTION_EXECUTE_HANDLER) { why = "reading the cloth actor faulted"; }
+        if (!simTgt || !physV) {
+            simTgt = nullptr; physV = nullptr;
+            static int saidOff[kSimSlots] = {};
+            if (!saidOff[slot]) { saidOff[slot] = 1;
+                TwkLog("[direct] slot %d: drawing the absolute simulation -- %s", slot, why ? why : "?"); }
+        } else {
+            static int saidOn[kSimSlots] = {};
+            if (!saidOn[slot]) { saidOn[slot] = 1;
+                TwkLog("[direct] slot %d: drawn as the unsimulated garment plus the cloth's own movement", slot); }
+        }
+    }
+
+    // 561: the offset field, guarded against spikes (see g_spikeGuard). Component space.
+    SpikeEdges* SE = nullptr;
+    if (simTgt && ((g_spikeGuard > 0.0f && g_spikeIters > 0) || g_settleTime > 0.001f)) {
+        __try { SE = SpikeEdgesFor(slot, mesh, nSim); } __except (EXCEPTION_EXECUTE_HANDLER) { SE = nullptr; }
+    }
+    if (SE) {
+        float* off = SE->off;
+        for (int u = 0; u < nSim; u++) {
+            if (SE->pin[u]) { off[u*3] = off[u*3+1] = off[u*3+2] = 0.0f; continue; }
+            const float dl[3] = { simPos[u*3+0] - simTgt[u*3+0], simPos[u*3+1] - simTgt[u*3+1],
+                                  simPos[u*3+2] - simTgt[u*3+2] };
+            if (useXf) MatXfmDir(simMat, dl, off + u*3);
+            else { off[u*3] = dl[0]; off[u*3+1] = dl[1]; off[u*3+2] = dl[2]; }
+        }
+        // Settle: draw each offset relative to its own running average (see g_settleTime).
+        {
+            LARGE_INTEGER qf, qc; QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&qc);
+            float dt = SE->lastQpc ? (float)((double)(qc.QuadPart - SE->lastQpc) / (double)qf.QuadPart) : 0.0f;
+            SE->lastQpc = qc.QuadPart;
+            if (dt < 0.0f) dt = 0.0f; else if (dt > 0.1f) dt = 0.1f;
+            if (g_settleTime > 0.001f) {
+                const float a = SE->primed ? 1.0f - expf(-dt / g_settleTime) : 1.0f;
+                for (int i = 0; i < nSim * 3; i++) {
+                    SE->base[i] += (off[i] - SE->base[i]) * a;
+                    off[i] -= SE->base[i];
+                }
+                SE->primed = true;
+            } else SE->primed = false;       // re-primes when turned back on: no catch-up swing
+        }
+        int held = 0; float worst = 0.0f;
+        const int passes = (g_spikeGuard > 0.0f) ? g_spikeIters : 0;
+        for (int it = 0; it < passes; it++)
+            for (int k = 0; k < SE->nE; k++) {
+                const int a = SE->e[k*2], b = SE->e[k*2+1];
+                const bool pa = SE->pin[a] != 0, pb = SE->pin[b] != 0;
+                if (pa && pb) continue;
+                float* oa = off + a*3; float* ob = off + b*3;
+                const float d[3] = { oa[0]-ob[0], oa[1]-ob[1], oa[2]-ob[2] };
+                const float len = sqrtf(d[0]*d[0] + d[1]*d[1] + d[2]*d[2]);
+                float lim = g_spikeGuard * SE->rest[k];
+                if (lim < 0.5f) lim = 0.5f;
+                if (len <= lim) continue;
+                if (it == 0) { held++; if (len - lim > worst) worst = len - lim; }
+                const float c = (len - lim) / len;
+                if (pa)      { for (int i = 0; i < 3; i++) ob[i] += d[i] * c; }
+                else if (pb) { for (int i = 0; i < 3; i++) oa[i] -= d[i] * c; }
+                else         { for (int i = 0; i < 3; i++) { oa[i] -= d[i] * c * 0.5f; ob[i] += d[i] * c * 0.5f; } }
+            }
+        static double sgNext[kSimSlots] = {};
+        static int sgHeld[kSimSlots] = {}; static float sgWorst[kSimSlots] = {};
+        sgHeld[slot] += held; if (worst > sgWorst[slot]) sgWorst[slot] = worst;
+        const double tn = (double)GetTickCount64() / 1000.0;
+        if (tn >= sgNext[slot]) {
+            if (sgHeld[slot] > 0)
+                TwkLog("[direct] slot %d: spike guard held %d edge(s) in the last 5 s, the worst %.1f cm past its limit",
+                       slot, sgHeld[slot], sgWorst[slot]);
+            sgNext[slot] = tn + 5.0; sgHeld[slot] = 0; sgWorst[slot] = 0.0f;
+        }
+    }
+
     // Each bone's rest->posed matrix is the same for every vertex it touches, so build them ONCE.
     // Doing it inside the vertex loop meant thousands of quaternion conversions and matrix multiplies
     // a frame for a handful of distinct answers.
@@ -2168,6 +2609,10 @@ static void DirectDrive(void* comp, void* mesh, int slot) {
     const bool   wantDev = g_debugLog && (nowD - lastDev[slot] >= 1.0);
 
     int driven = 0; float devSum = 0.0f, devMax = 0.0f;
+    // 554 probe: the vertex written furthest from its rest spot this frame
+    const bool probe = g_liftProbe && d.nBones <= 512;
+    int   pwI = -1; float pwDev = 0.0f, pwDet = 0.0f, minDet = 1e9f; int nLowDet = 0;
+    float pwOut[3] = {}, pwPt[3] = {};
     for (int i = 0; i < d.weldCount; i++) {
         const int u = d.weld[i];
         if (u < 0 || u >= nSim) continue;
@@ -2200,7 +2645,17 @@ static void DirectDrive(void* comp, void* mesh, int slot) {
         if (useXf) { float tmp[3]; MatXfmPos(simMat, pt, tmp);
                      pt[0]=tmp[0]; pt[1]=tmp[1]; pt[2]=tmp[2]; }
         float out[3];
-        MatXfmPos(inv, pt, out);
+        if (simTgt) {
+            // rest spot + the cloth's offset from its own target, un-skinned (see g_offsetDrive)
+            const float dl[3] = { simPos[u*3+0] - simTgt[u*3+0], simPos[u*3+1] - simTgt[u*3+1],
+                                  simPos[u*3+2] - simTgt[u*3+2] };
+            float dc[3] = { dl[0], dl[1], dl[2] }, lo[3];
+            if (SE) { dc[0] = SE->off[u*3]; dc[1] = SE->off[u*3+1]; dc[2] = SE->off[u*3+2]; }
+            else if (useXf) MatXfmDir(simMat, dl, dc);
+            MatXfmDir(inv, dc, lo);
+            out[0] = physV[u*3+0] + lo[0]; out[1] = physV[u*3+1] + lo[1]; out[2] = physV[u*3+2] + lo[2];
+            if (probe) MatXfmPos(blend, out, pt);      // what will be drawn, for the probe's numbers
+        } else MatXfmPos(inv, pt, out);
         // Never hand the card a broken vertex: one bad transform used to spray NaN through the mesh.
         if (!(out[0]==out[0]) || !(out[1]==out[1]) || !(out[2]==out[2])) continue;
         // A distance clamp against the plain pose was tried here (3.19.17) and REMOVED. The idea was
@@ -2222,8 +2677,106 @@ static void DirectDrive(void* comp, void* mesh, int slot) {
             const float dist = sqrtf(dx*dx + dy*dy + dz*dz);
             devSum += dist; if (dist > devMax) devMax = dist;
         }
+        if (probe) {
+            const float det = blend[0]*(blend[5]*blend[10]-blend[6]*blend[9])
+                            - blend[1]*(blend[4]*blend[10]-blend[6]*blend[8])
+                            + blend[2]*(blend[4]*blend[9]-blend[5]*blend[8]);
+            if (det < minDet) minDet = det;
+            if (det < 0.25f) nLowDet++;
+            const float* was = (const float*)(d.origPos + (size_t)(baseVert + i) * d.posStride);
+            const float dx = out[0]-was[0], dy = out[1]-was[1], dz = out[2]-was[2];
+            const float dev = sqrtf(dx*dx + dy*dy + dz*dz);
+            if (dev > pwDev) { pwDev = dev; pwI = i; pwDet = det;
+                               for (int k = 0; k < 3; k++) { pwOut[k] = out[k]; pwPt[k] = pt[k]; } }
+        }
         dst[0] = out[0]; dst[1] = out[1]; dst[2] = out[2];
         driven++;
+    }
+    if (probe) {
+        static double nextBase[kSimSlots] = {}, nextHit[kSimSlots] = {};
+        const bool hit = pwDev > 15.0f && nowD >= nextHit[slot];
+        const bool base = nowD >= nextBase[slot];
+        if (pwI >= 0 && (hit || base)) {
+            if (hit) nextHit[slot] = nowD + 0.5;
+            nextBase[slot] = nowD + 5.0;
+            // Rebuild the worst vertex's blend with this frame's and last frame's bones.
+            const uint8_t* sw  = skinData + (size_t)(baseVert + pwI) * skinStride;
+            const uint8_t* wts = sw + maxInfl * (bone16 ? 2 : 1);
+            float bNow[12] = {0}, bPrev[12] = {0}, ws = 0.0f;
+            char bones[160] = ""; size_t bl = 0;
+            uint8_t* gInfo = (uint8_t*)twkP((uint8_t*)mesh + SM_REFSKELETON, REFSK_BONEINFO);
+            const int nGInfo = twkI((uint8_t*)mesh + SM_REFSKELETON, REFSK_BONEINFO + 8);
+            for (int k = 0; k < maxInfl; k++) {
+                const int w = wts[k];
+                if (!w) continue;
+                const int sb = bone16 ? (int)((const uint16_t*)sw)[k] : (int)sw[k];
+                if (sb < 0 || sb >= boneMapNum) continue;
+                const int b = boneMap[sb];
+                if (b < 0 || b >= d.nBones || !d.boneOk[b]) continue;
+                const float fw = (float)w / 255.0f;
+                for (int e = 0; e < 12; e++) {
+                    bNow[e]  += d.boneMats[b*12 + e] * fw;
+                    bPrev[e] += (s_prevOk[slot] ? s_prevMats[slot][b*12 + e] : d.boneMats[b*12 + e]) * fw;
+                }
+                ws += fw;
+                char bn[64] = "?";
+                if (gInfo && b < nGInfo) CatchSound_FNameText(gInfo + (size_t)b * BONEINFO_STRIDE, bn, sizeof(bn));
+                if (bl < sizeof(bones) - 1)
+                    bl += snprintf(bones + bl, sizeof(bones) - bl, "%s%s %.2f", bl ? ", " : "",
+                                   strncmp(bn, "AMXX_", 5) == 0 ? bn + 5 : bn, fw);
+            }
+            if (ws > 0.001f) for (int e = 0; e < 12; e++) { bNow[e] /= ws; bPrev[e] /= ws; }
+            const float* was = (const float*)(d.origPos + (size_t)(baseVert + pwI) * d.posStride);
+            float tgt[3], viaPrev[3];
+            MatXfmPos(bNow, was, tgt);          // where the plain skinning puts it (= unticked)
+            MatXfmPos(bPrev, pwOut, viaPrev);   // what last frame's bones would draw from our write
+            const float off = sqrtf((pwPt[0]-tgt[0])*(pwPt[0]-tgt[0]) + (pwPt[1]-tgt[1])*(pwPt[1]-tgt[1]) +
+                                    (pwPt[2]-tgt[2])*(pwPt[2]-tgt[2]));
+            const float lag = sqrtf((viaPrev[0]-pwPt[0])*(viaPrev[0]-pwPt[0]) + (viaPrev[1]-pwPt[1])*(viaPrev[1]-pwPt[1]) +
+                                    (viaPrev[2]-pwPt[2])*(viaPrev[2]-pwPt[2]));
+            TwkLog("[probe] slot %d %s: vertex %d (rest z %.0f) written %.1f cm off its rest spot | blend det %.3f "
+                   "(garment min %.3f, %d under 0.25) | sim %.1f cm off its skinned spot | one frame of bone "
+                   "motion would move it %.1f cm | %s", slot, hit ? "LIFT" : "baseline", pwI, was[2], pwDev,
+                   pwDet, minDet, nLowDet, off, lag, bones);
+            // 555: the ACTOR's side of it. Its own skinned target for this particle (is the sim aiming
+            // where we think?), how far the particle sits from that target (travel caps it at 4 cm --
+            // only collision can push past it), and every collision list it holds.
+            __try {
+                void* simObj = twkP(comp, SMC_CLOTHSIM);
+                uint8_t* acts = simObj ? (uint8_t*)twkP(simObj, NVSIM_ACTORS) : nullptr;
+                const int nA = simObj ? twkI(simObj, NVSIM_ACTORS + 8) : 0;
+                uint8_t* a = nullptr;
+                for (int k = 0; acts && k < nA && k < 8; k++)
+                    if (twkI(acts + (size_t)k * ACTOR_STRIDE, ACTOR_CURLOD) >= 0) { a = acts + (size_t)k * ACTOR_STRIDE; break; }
+                if (a) {
+                    const int sel = (twkI(a, ACTOR_SKINIDX) ^ 1) & 1;       // the finished step's targets
+                    const float* sk = (const float*)twkP(a + 0x150 + sel * 16, 0);   // SkinnedPhysicsMeshPositions[sel]
+                    const int nSk = twkI(a + 0x150 + sel * 16, 8);
+                    const int u = d.weld[pwI];
+                    float aim = -1.0f, gap = -1.0f;
+                    if (sk && u >= 0 && u < nSk) {
+                        float st[3] = { sk[u*3], sk[u*3+1], sk[u*3+2] }, sc[3];
+                        if (useXf) MatXfmPos(simMat, st, sc); else { sc[0] = st[0]; sc[1] = st[1]; sc[2] = st[2]; }
+                        aim = sqrtf((sc[0]-tgt[0])*(sc[0]-tgt[0]) + (sc[1]-tgt[1])*(sc[1]-tgt[1]) + (sc[2]-tgt[2])*(sc[2]-tgt[2]));
+                        gap = sqrtf((sc[0]-pwPt[0])*(sc[0]-pwPt[0]) + (sc[1]-pwPt[1])*(sc[1]-pwPt[1]) + (sc[2]-pwPt[2])*(sc[2]-pwPt[2]));
+                    }
+                    // FClothCollisionData at +0x68/+0xa8/+0xe8: spheres, capsules, convexes, boxes (Num at +8 each)
+                    char ag[40], ex[40], xt[40];
+                    char* outs[3] = { ag, ex, xt };
+                    const int bases[3] = { 0x68, 0xa8, 0xe8 };
+                    for (int c = 0; c < 3; c++)
+                        snprintf(outs[c], 40, "%d/%d/%d/%d", twkI(a, bases[c] + 0x08), twkI(a, bases[c] + 0x18),
+                                 twkI(a, bases[c] + 0x28), twkI(a, bases[c] + 0x38));
+                    TwkLog("[probe]   slot %d actor: its own target is %.1f cm from ours, the particle %.1f cm from its "
+                           "target | collisions (spheres/capsules/convexes/boxes) aggregated %s, external %s, extracted %s "
+                           "| component flags 8c0=%02x 8c1=%02x", slot, aim, gap, ag, ex, xt,
+                           *(uint8_t*)((uint8_t*)comp + 0x8c0), *(uint8_t*)((uint8_t*)comp + 0x8c1));
+                }
+            } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        }
+        for (int b = 0; b < d.nBones; b++)
+            if (d.boneOk[b]) memcpy(s_prevMats[slot] + b*12, d.boneMats + b*12, 12 * sizeof(float));
+        s_prevOk[slot] = true;
     }
     static int reported[kSimSlots] = {};
     if (!reported[slot]) { reported[slot] = 1;
@@ -2328,6 +2881,14 @@ void  ClothSim_SetTravelCm(float v)    { ClothSim_MaxTravel = v; ClothSim_Rebuil
 void  ClothSim_SetHemPushMm(float v)   { ClothSim_HemPush = v / 10.0f; ClothSim_Rebuild(); TwkMarkDirty(); }
 void  ClothSim_SetHemPushBandPct(float v) { ClothSim_HemPushBand = v / 100.0f; ClothSim_Rebuild(); TwkMarkDirty(); }
 void  ClothSim_SetCuffGripPct(float v) { ClothSim_HemGripLower = 1.0f - v / 100.0f; ClothSim_Rebuild(); TwkMarkDirty(); }
+// Read by the drawing every frame, so no rebuild.
+float ClothSim_SettleTime()            { return g_settleTime; }
+void  ClothSim_SetSettleTime(float v)  { g_settleTime = v < 0.0f ? 0.0f : v > 2.0f ? 2.0f : v; TwkMarkDirty(); }
+float ClothSim_SpikePasses()           { return (float)g_spikeIters; }
+void  ClothSim_SetSpikePasses(float v) {
+    int n = (int)(v + 0.5f); if (n < 0) n = 0; else if (n > 30) n = 30;
+    g_spikeIters = n; TwkMarkDirty();
+}
 // Turning cloth off hands every garment back exactly as it shipped; turning it on rebuilds on the
 // next frame. Both take effect immediately -- no reload, nothing left half-applied.
 void ClothSim_SetEnabled(bool on) {
@@ -2738,7 +3299,7 @@ void ClothSim_PumpFrame() {
                     if (RebuildIfDriven(comp, mesh, slot)) { ok = true; }
                     else {
                         *(uint8_t*)((uint8_t*)comp + SMC_DISABLECLOTH) = 0;
-                        if (g_recreate) g_recreate(comp);
+                        RecreateActors(comp);
                         ok = true;
                     }
                 } else if (nowSec >= nextTry[slot] && tries[slot] < 5) {
@@ -2791,6 +3352,9 @@ void ClothSim_PumpFrame() {
             }
             if (g_direct && nAct > 0 && ClothMerge_GarmentWantsDirect(mesh)) {
                 __try { DirectDrive(comp, mesh, slot); }
+                __except (EXCEPTION_EXECUTE_HANDLER) {}
+            } else if (g_boundProbe && nAct > 0) {
+                __try { BoundProbe(comp, mesh, slot); }
                 __except (EXCEPTION_EXECUTE_HANDLER) {}
             }
             if (sim) {
@@ -2930,6 +3494,13 @@ void ClothSim_DrawMenu(const OmpMenuApi* api) {
     bool on = g_on != 0;
     if (api->Checkbox("Cloth quad flag (phase B test)", &on)) { g_on = on ? 1 : 0; TwkMarkDirty(); }
     api->SameLine(); api->TextDisabled("(hand-built cloth on the un-merged shirt; re-dress to apply)");
+    // The F1 twin of the pause menu's Clothing > Spike guard passes (563/564). Live, no rebuild.
+    float sp = (float)g_spikeIters;
+    if (api->SliderFloat("Spike guard passes", &sp, 0.0f, 30.0f, "%.0f")) ClothSim_SetSpikePasses(sp);
+    api->SameLine(); api->TextDisabled("(holds cloth in line with its neighbours: more = firmer, 0 = off)");
+    float st = g_settleTime;
+    if (api->SliderFloat("Settle time (s)", &st, 0.0f, 1.5f, "%.2f")) ClothSim_SetSettleTime(st);
+    api->SameLine(); api->TextDisabled("(a held pose settles onto the garment's own shape: lower = sooner, 0 = off)");
     snprintf(b, sizeof(b), "solver: %s", g_status);
     api->TextDisabled(b);
 }

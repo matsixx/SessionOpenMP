@@ -36,6 +36,7 @@
 #include "grind_rock.h"
 #include "grind_lean.h"       // the single-foot lean rides this module's PhysGrinding hook
 #include "board_stance.h"     // the landing lean rides the same board read
+#include "rtflip.h"           // a real-time flip's spin rides it too
 #include "ui/menu_ext.h"
 #include "grind_pop.h"       // GrindPop_NameOfFName -- it owns the FName::ToString address
 #include "catch_tweaks.h"    // CatchTweaks_Skater() -- remote players keep vanilla
@@ -401,7 +402,7 @@ static void* __fastcall hkLocalQuat(void* self, void* out) {
     float* roll = nullptr;  float ownR = 0.0f, wroteR = 0.0f;
     if (g_ok && self) {
         // The rock's pitch, plus grind_lean's foot pressure tilt on a 50-50 style grind (516), same read.
-        const float pAdd = ((self == s_comp) ? s_apply : 0.0f) + GrindLean_BoardPitch(self);
+        const float pAdd = ((self == s_comp) ? s_apply : 0.0f) + GrindLean_BoardPitch(self) + RtFlip_BoardPitch(self);
         if (pAdd != 0.0f) {
             __try {
                 pitch = (float*)((uint8_t*)self + MC_LOCAL_PITCH);
@@ -415,7 +416,7 @@ static void* __fastcall hkLocalQuat(void* self, void* out) {
         // The single-foot lean's roll rides the same read (grind_lean decides it, 0 when not leaning), and so
         // does the landing lean on the trucks (board_stance, 0 outside a landing off a drop).
         const float land = Stance_LandingRoll(self);
-        const float add = GrindLean_BoardRoll(self) + land;
+        const float add = GrindLean_BoardRoll(self) + land + RtFlip_BoardRoll(self);
         static bool s_saidLand = false;
         if (land != 0.0f && !s_saidLand) { s_saidLand = true; TwkLog("[stance] the landing lean reaches the board (through GetLocalAnimatorBoardQuat)"); }
         if (add != 0.0f) {

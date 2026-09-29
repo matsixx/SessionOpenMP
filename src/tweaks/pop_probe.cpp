@@ -152,6 +152,15 @@ static int g_crankVisSmoothMs = 250; // PopProbeCrankVisSmoothMs -- time constan
                                   // ease toward the stick's depth (raw 1:1 tracking read as
                                   // jerky/mechanical on slow pulls; field report). 0 = raw. The
                                   // POP depth is untouched -- this shapes only the pose
+// The flick pop (PopProbeInject=5, see its machine above PopProbe_TickSticks).
+static int g_flickHoldMs  = 200;  // PopFlickHoldMs -- how long a quick let-go keeps the crouch
+static int g_flickStartPct = 45;  // PopFlickStartPct -- a flick back this far pops (the lowest pop)
+static int g_flickFullPct  = 95;  // PopFlickFullPct -- a flick back this far pops full height
+static int g_flickSlowMs  = 80;   // PopFlickSlowMs -- the slowest flick back that pops; slower is
+                                  // just crouching again
+static int g_flickMinPct  = 20;   // PopFlickMinPct -- the lowest pop, at PopFlickStartPct
+static int g_flickLetGoMs = 60;   // PopFlickLetGoMs (ini only) -- crouch depth to let go within this
+                                  // is a quick let-go; slower is an ordinary release
 static int g_stances = 1;         // PopProbeStances -- the scheme on every stance/pop family:
                                   // regular nollie = RS up crouches, switch ollie = RS down,
                                   // switch nollie = LS up (fakie = regular inputs, no mapping
@@ -165,6 +174,15 @@ static short g_lsRelease = (short)(-0.25f * 32767);
 enum { IH_RAW_LEFT = 0x24, IH_RAW_RIGHT = 0x2c };           // scoop_speed's measured offsets
 static const float kInjectGate = 0.60f;
 
+static void PopProbe_ClampFlick() {
+    if (g_flickHoldMs < 60) g_flickHoldMs = 60; else if (g_flickHoldMs > 500) g_flickHoldMs = 500;
+    if (g_flickStartPct < 35) g_flickStartPct = 35; else if (g_flickStartPct > 85) g_flickStartPct = 85;
+    if (g_flickFullPct < g_flickStartPct + 10) g_flickFullPct = g_flickStartPct + 10;
+    if (g_flickFullPct > 100) g_flickFullPct = 100;
+    if (g_flickSlowMs < 10) g_flickSlowMs = 10; else if (g_flickSlowMs > 300) g_flickSlowMs = 300;
+    if (g_flickMinPct < 0) g_flickMinPct = 0; else if (g_flickMinPct > 100) g_flickMinPct = 100;
+    if (g_flickLetGoMs < 10) g_flickLetGoMs = 10; else if (g_flickLetGoMs > 200) g_flickLetGoMs = 200;
+}
 void PopProbe_ReadConfig(const char* buf) {
     g_on   = TwkIniInt(buf, "PopProbe", 1);
     g_scan = TwkIniInt(buf, "PopProbeScanAlpha", 0);
@@ -172,7 +190,13 @@ void PopProbe_ReadConfig(const char* buf) {
     g_force = TwkIniInt(buf, "PopProbeForceCrank", -1);
     if (g_force > 100) g_force = 100;
     g_inject = TwkIniInt(buf, "PopProbeInject", 0);
-    if (g_inject < 0 || g_inject > 4) g_inject = 0;
+    if (g_inject < 0 || g_inject > 5) g_inject = 0;
+#if !TWK_FLICK_POP
+    if (g_inject == 5) {
+        g_inject = 4;
+        TwkLog("[pop] flick pop is disabled for now -- the pop control scheme instead");
+    }
+#endif
     if (g_inject == 3) {
         // The pad-level path is superseded: it only sees XInput controllers, and every ini
         // that enabled the scheme before 3.19.75 says 3. Upgraded on read; the save writes 4.
@@ -214,7 +238,18 @@ void PopProbe_ReadConfig(const char* buf) {
     g_crankVisSmoothMs = TwkIniInt(buf, "PopProbeCrankVisSmoothMs", 250);
     if (g_crankVisSmoothMs < 0) g_crankVisSmoothMs = 0; else if (g_crankVisSmoothMs > 1000) g_crankVisSmoothMs = 1000;
     g_stances = TwkIniInt(buf, "PopProbeStances", 1);
-    if (SchemeOn() && g_inject != 0)
+    g_flickHoldMs  = TwkIniInt(buf, "PopFlickHoldMs", 200);
+    g_flickStartPct = TwkIniInt(buf, "PopFlickStartPct", 45);
+    g_flickFullPct  = TwkIniInt(buf, "PopFlickFullPct", 95);
+    g_flickSlowMs  = TwkIniInt(buf, "PopFlickSlowMs", 80);
+    g_flickMinPct  = TwkIniInt(buf, "PopFlickMinPct", 20);
+    g_flickLetGoMs = TwkIniInt(buf, "PopFlickLetGoMs", 60);
+    PopProbe_ClampFlick();
+    if (g_inject == 5)
+        TwkLog("[pop] config: FLICK POP on | let-go window %d ms, flick back %d%% = lowest pop (%d%%), %d%% = full, "
+               "slowest flick %d ms, quick let-go within %d ms", g_flickHoldMs, g_flickStartPct, g_flickMinPct,
+               g_flickFullPct, g_flickSlowMs, g_flickLetGoMs);
+    else if (SchemeOn() && g_inject != 0)
         TwkLog("[pop] config: pop control scheme ON | trick window %d ms, crouch gate %d%%, "
                "crouch visual %d-%d ms smoothed %d ms, stick speed as at %d fps, held crouch hidden "
                "%d ms + fade %d ms%s%s", g_windowMs,
@@ -250,6 +285,14 @@ void PopProbe_SaveConfig(char* buf, size_t cap) {
     TwkIniSetInt(buf, cap, "PopProbeCrankVisMinMs", g_crankVisMin);
     TwkIniSetInt(buf, cap, "PopProbeCrankVisSmoothMs", g_crankVisSmoothMs);
     TwkIniSetInt(buf, cap, "PopProbeStances", g_stances);
+#if TWK_FLICK_POP
+    TwkIniSetInt(buf, cap, "PopFlickHoldMs", g_flickHoldMs);
+    TwkIniSetInt(buf, cap, "PopFlickStartPct", g_flickStartPct);
+    TwkIniSetInt(buf, cap, "PopFlickFullPct", g_flickFullPct);
+    TwkIniSetInt(buf, cap, "PopFlickSlowMs", g_flickSlowMs);
+    TwkIniSetInt(buf, cap, "PopFlickMinPct", g_flickMinPct);
+    TwkIniSetInt(buf, cap, "PopFlickLetGoMs", g_flickLetGoMs);
+#endif
 }
 void PopProbe_ResetDefaults() {
     g_on = 1; g_scan = 0; g_log = 0; g_force = -1;
@@ -260,6 +303,7 @@ void PopProbe_ResetDefaults() {
     g_lsRelease = (short)(-(21 * 32767) / 100);
     g_manualGate = 1; g_landSettleMs = 250; g_stances = 1;
     g_crankVis = 1; g_crankVisTime = 950; g_crankVisMin = 400; g_crankVisSmoothMs = 250;
+    g_flickHoldMs = 200; g_flickStartPct = 45; g_flickFullPct = 95; g_flickSlowMs = 80; g_flickMinPct = 20; g_flickLetGoMs = 60;
 }
 
 // ------------------------------------------------------------------ the sample ring
@@ -331,6 +375,8 @@ static volatile long      g_visPubBits = 0;        // the smoothed clock, as flo
 static volatile long long g_visPubTick = 0;        // GetTickCount64 at the last publish
 static volatile long g_padArmed    = 0;           // hook: pop armed (trick window open)
 static volatile long g_padArmedDepthBits = 0;     // hook: depth FROZEN at the RS flick
+static volatile long g_flickFiring = 0;           // flick pop: its ollie flick is going out
+static volatile long g_flickRatioBits = 0;        // ...and its pop height, 0..1
 // LEAK EVIDENCE ring. Four rounds of manual fixes went in on theory; this ends that. The hook
 // records every sample the game is actually SHOWN with a manual-capable component in it while the
 // scheme's context is live: the crouch stick's down half visible in the idle branch (nose-manual
@@ -823,6 +869,21 @@ void PopProbe_PumpFrame() {
         if (t - saidAt2 > 1.0) { saidAt2 = t;
             TwkLogDev("[pop] depth-pop: crouch %.0f%% -> clock %.3fs (expect popRatio %.2f)%s",
                    depth * 100.0f, held, depth, g_padArmed ? " [ARMED]" : "");
+        }
+    }
+
+    // ---- THE FLICK POP'S HEIGHT: the crank clock written from the flick back, every tick its ollie
+    // flick is going out. The pump runs after the machine and before the game's own tick, so the clock
+    // is in place when the game takes the flick.
+    if (g_inject == 5 && g_flickFiring && g_force < 0 && crank) {
+        static long saidNoFth = 0;
+        if (ResolveFth()) {
+            const float r = BitsToF(g_flickRatioBits);
+            __try { *(float*)((uint8_t*)g_fth + FTH_CRANK_CLOCK) = kRatio0 + r * kRatioSpan; }
+            __except (EXCEPTION_EXECUTE_HANDLER) {}
+        } else if (saidNoFth++ == 0) {
+            TwkLog("[pop] flick pop: the pop height could not be set yet -- the trick handler is learned "
+                   "from the first trick, so this pop is at the game's own height");
         }
     }
 
@@ -1796,8 +1857,182 @@ static void* const g_padStubs[kPadTargets] = { (void*)&hkPad0, (void*)&hkPad1, (
 // scoop_speed's existing InputHandler::Tick hook, immediately before the original; the buffer is
 // only touched inside the call (never stored), and the capture is the exact physical read the
 // game itself made, which is what PhysSticks hands the flick trackers.
+// ------------------------------------------------------------------ mode 5: the flick pop
+// The crouch is the game's own: the crank stick held toward the crouch, vanilla visual and timing.
+// Letting that stick go QUICKLY does not stand the skater up -- the game keeps reading the stick where
+// it last crouched, for up to PopFlickHoldMs. Flicking it back the same way inside that time pops: the
+// game is handed the base ollie input (the other stick full the opposite way, the ~80 ms plain-pop
+// flick mode 4 synthesizes) and the pump writes the crank clock. POP HEIGHT = HOW FAR THE FLICK BACK
+// GOES: past PopFlickStartPct it counts (the lowest pop, PopFlickMinPct), at PopFlickFullPct it is a
+// full pop. Speed was measured first and could not be controlled: every flick back came in at 3-23 ms,
+// and at ~122 controller reports a second that is 1-3 reports, mostly noise. The pop fires when the
+// stick reaches full, or stops moving out (on the controller's clock when the sampler has it), and the
+// height keeps following the stick until the game actually pops. A flick back slower than
+// PopFlickSlowMs (let-go radius to where it stopped) is not a pop: the crouch just carries on. Not
+// flicked back in time = the release reaches the game and the skater stands; a slow let-go is an
+// ordinary release at once. The other stick is never touched except for that one flick, so every
+// vanilla trick still pops the vanilla way. No stance mapping: the crank stick is whichever stick the
+// game cranked on, and the ollie flick is always the OTHER stick, the opposite way (ollie: crank down,
+// flick up; nollie: crank up, flick down; switch swaps sticks).
+static const float kFpZone  = 0.60f;   // crouch depth: at or past it, inside the crouch cone
+static const float kFpLetGo = 0.30f;   // under this the stick has been let go
+static const float kFpOther = 0.50f;   // the other stick must be under this for a crouch to be taken
+static int       s_lastFpStick = -1;       // the last flick pop's crank stick, and when it fired
+static long long s_lastFpQpc = 0;
+bool PopProbe_LastFlickPop(int* crankStick, double* ageSec) {
+    if (s_lastFpStick < 0 || !s_lastFpQpc) return false;
+    LARGE_INTEGER f, q; QueryPerformanceFrequency(&f); QueryPerformanceCounter(&q);
+    if (crankStick) *crankStick = s_lastFpStick;
+    if (ageSec) *ageSec = (double)(q.QuadPart - s_lastFpQpc) / (double)f.QuadPart;
+    return true;
+}
+static float FlickPopRatio(float depth) {
+    const float lo = (float)g_flickStartPct / 100.0f, hi = (float)g_flickFullPct / 100.0f;
+    float f = (depth - lo) / (hi - lo);
+    if (f < 0.0f) f = 0.0f; else if (f > 1.0f) f = 1.0f;
+    const float mn = (float)g_flickMinPct / 100.0f;
+    return mn + (1.0f - mn) * f;
+}
+static void FlickPopMachine(float* s) {
+    static long long freq = 0;
+    if (!freq) { LARGE_INTEGER f; QueryPerformanceFrequency(&f); freq = f.QuadPart; }
+    LARGE_INTEGER q; QueryPerformanceCounter(&q);
+    const long long now = q.QuadPart;
+    auto ms = [&](long long d) { return (float)((double)d * 1000.0 / (double)freq); };
+    enum { IDLE, CROUCH, HOLD, RISE, FIRE };
+    static int   st = IDLE;
+    static int   cs = 0;                   // the crank stick: 0 = left, 1 = right
+    static float dir = -1.0f;              // its crouch direction: -1 down, +1 up
+    static float hx = 0.0f, hy = 0.0f;     // where it last crouched -- what the game keeps reading
+    static long long deepAt = 0, letGoAt = 0, lowAt = 0, riseAt = 0, peakAt = 0, fireAt = 0;
+    static float letGoMs = 0.0f, peak = 0.0f;
+    const bool ok = g_padAllow && g_padCrank && !g_padGrind && !g_padAir && !g_inManual &&
+                    (now - g_padStamp) < freq / 6;
+    auto mag = [&](int k) { return sqrtf(s[k*2] * s[k*2] + s[k*2+1] * s[k*2+1]); };
+    // How far stick k is pushed toward d inside the crouch pocket's 50-degree cone (the scheme's
+    // inCone); 0 anywhere else.
+    auto depthTo = [&](int k, float d) {
+        const float x = s[k*2], y = s[k*2+1];
+        return (y * d > 0.0f && fabsf(x) <= 1.19f * fabsf(y)) ? mag(k) : 0.0f;
+    };
+    auto hold = [&]() { s[cs*2] = hx; s[cs*2+1] = hy; };
+    auto ollie = [&]() { hold(); s[(1 - cs)*2] = 0.0f; s[(1 - cs)*2+1] = -dir; };
+
+    if (st != IDLE && !ok) {
+        if (st == FIRE)
+            TwkLog("[pop] flick pop: %s %.0f ms after firing, the flick back reached %.0f%% -> pop %.0f%%",
+                   (!g_padCrank || g_padAir) ? "the game popped" : "cut short (grind, manual or a menu)",
+                   ms(now - fireAt), peak * 100.0f, FlickPopRatio(peak) * 100.0f);
+        else if (st == HOLD || st == RISE)
+            TwkLog("[pop] flick pop: the crouch ended %.0f ms into the let-go, before any flick back (%s)",
+                   ms(now - letGoAt), g_padCrank ? "off the ground, a grind or a menu" : "the game uncrouched or popped a trick");
+        g_flickFiring = 0; st = IDLE;
+        return;                                  // the sticks go out as they came in
+    }
+    if (st == IDLE) {
+        if (!ok) return;
+        for (int k = 0; k < 2; ++k) {
+            const float d = s[k*2+1] < 0.0f ? -1.0f : 1.0f;
+            if (depthTo(k, d) >= kFpZone && mag(1 - k) < kFpOther) {
+                cs = k; dir = d; hx = s[k*2]; hy = s[k*2+1]; deepAt = now; st = CROUCH;
+                break;
+            }
+        }
+        return;
+    }
+    if (st == CROUCH) {
+        if (depthTo(cs, dir) >= kFpZone) { hx = s[cs*2]; hy = s[cs*2+1]; deepAt = now; return; }
+        const float m = mag(cs);
+        if (m >= kFpZone) { st = IDLE; return; }   // swept off the cone at full reach: a scoop, the game's
+        // Coming off crouch depth: the game keeps reading the last crouch until it is decided, so a
+        // quick let-go never shows it a half-released stick.
+        const float sinceDeep = ms(now - deepAt);
+        if (m < kFpLetGo) {
+            if (sinceDeep <= (float)g_flickLetGoMs) {
+                st = HOLD; letGoAt = now; lowAt = now; letGoMs = sinceDeep;
+                hold();
+                return;
+            }
+            st = IDLE;                           // a slow let-go: the ordinary release
+            return;
+        }
+        if (sinceDeep > (float)g_flickLetGoMs) { st = IDLE; return; }   // easing out: the game's again
+        hold();
+        return;
+    }
+    const float start = (float)g_flickStartPct / 100.0f, full = (float)g_flickFullPct / 100.0f;
+    if (st == HOLD) {
+        if (mag(cs) < kFpLetGo) lowAt = now;
+        const float d = depthTo(cs, dir);
+        if (d >= start) {                        // on its way back in: follow it to where it stops
+            st = RISE; riseAt = now; peak = d; peakAt = now;
+        } else if (ms(now - letGoAt) > (float)g_flickHoldMs) {
+            TwkLog("[pop] flick pop: let go and not flicked back within %d ms -- the crouch is released",
+                   g_flickHoldMs);
+            st = IDLE;                           // this read goes out raw: the game sees the release
+            return;
+        } else { hold(); return; }
+    }
+    if (st == RISE) {
+        const float d = depthTo(cs, dir);
+        if (d < kFpLetGo) { st = HOLD; hold(); return; }       // came straight back out: still waiting
+        if (d > peak + 0.005f) { peak = d; peakAt = now; }
+        // Stopped: on the controller's clock, no outward progress over the last 10 ms (a report or
+        // more); without the sampler, this read got no further than the last.
+        bool stopped = peakAt != now, pad = false;
+        {
+            const double tn = PadSampler_Now();
+            float x0, y0, x1, y1;
+            if (PadSampler_StickAt(cs == 1, tn, &x0, &y0) && PadSampler_StickAt(cs == 1, tn - 0.010, &x1, &y1)) {
+                stopped = sqrtf(x0 * x0 + y0 * y0) - sqrtf(x1 * x1 + y1 * y1) < 0.02f;
+                pad = true;
+            }
+        }
+        const bool late = ms(now - riseAt) > (float)g_flickSlowMs + 20.0f;
+        if (!(peak >= full || stopped || late)) { hold(); return; }
+        // How long the flick back took: from leaving the let-go radius to 90% of where it got.
+        float took = ms(peakAt - lowAt);
+        double tLo = 0.0, tHi = 0.0;
+        const double since = PadSampler_Now() - (double)(now - letGoAt) / (double)freq - 0.02;
+        if (PadSampler_OutwardCrossing(cs == 1, kFpLetGo, since, &tLo, nullptr) &&
+            PadSampler_OutwardCrossing(cs == 1, 0.9f * peak, since, &tHi, nullptr) && tHi >= tLo)
+            took = (float)((tHi - tLo) * 1000.0);
+        const float gap = ms(now - letGoAt);
+        if (took > (float)g_flickSlowMs) {
+            TwkLog("[pop] flick pop: pushed back to %.0f%% %.0f ms after letting go, but it took %.0f ms -- "
+                   "slower than %d ms, so the crouch just carries on", peak * 100.0f, gap, took, g_flickSlowMs);
+            hx = s[cs*2]; hy = s[cs*2+1]; deepAt = now; st = CROUCH;
+            return;
+        }
+        g_flickRatioBits = FToBits(FlickPopRatio(peak)); g_flickFiring = 1;
+        st = FIRE; fireAt = now;
+        s_lastFpStick = cs; s_lastFpQpc = now;
+        TwkLog("[pop] flick pop: let go in %.0f ms, flicked back %.0f ms later to %.0f%% in %.0f ms (fired %s) -> pop %.0f%%",
+               letGoMs, gap, peak * 100.0f, took,
+               peak >= full ? "at full" : late ? "on the time limit" : pad ? "when it stopped" : "when it stopped, game frames",
+               FlickPopRatio(peak) * 100.0f);
+        ollie();
+        return;
+    }
+    // FIRE: the crouch held, the other stick full the opposite way -- the base game's ollie input. The
+    // height keeps following the stick until the game pops (the pump writes it every tick).
+    if (ms(now - fireAt) > 1000.0f / 12.0f) {
+        TwkLog("[pop] flick pop: the ollie flick ran %.0f ms and the game never popped", ms(now - fireAt));
+        g_flickFiring = 0; st = IDLE;
+        return;
+    }
+    const float d = depthTo(cs, dir);
+    if (d > peak) { peak = d; g_flickRatioBits = FToBits(FlickPopRatio(peak)); }
+    ollie();
+}
+
 void PopProbe_TickSticks(float* sticks) {
-    if (g_inject != 4 || !g_on || !sticks) return;
+    if (!g_on || !sticks) return;
+    if (g_inject == 5) {
+        __try { FlickPopMachine(sticks); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+        return;
+    }
+    if (g_inject != 4) return;
     __try {
         PadState st = {};
         st.Gamepad.sThumbLX = PadClampS((int)(sticks[0] * 32767.0f));
@@ -1929,8 +2164,31 @@ void PopProbe_DrawMenu(const OmpMenuApi* api) {
     if (!api) return;
     api->TextDisabled((g_inject == 3 || g_inject == 4)
         ? "Pop control scheme: ON (settings on the Session Tweaks pause-menu page)"
+        : g_inject == 5 ? "Flick pop: ON"
         : g_on ? "Pop probe: measuring (see [pop] lines in SessionTweaks.log)"
                : "Pop probe: off");
+#if !TWK_FLICK_POP
+    return;
+#endif
+    bool fp = g_inject == 5;
+    if (api->Checkbox("Flick pop", &fp)) PopProbe_SetFlickPop(fp);
+    api->SameLine(); api->TextDisabled("(crouch, let the stick go, flick it straight back: the further it goes, the higher the pop)");
+    if (g_inject != 5) return;
+    float v = (float)g_flickHoldMs;
+    if (api->SliderFloat("Let-go window (ms)", &v, 60.0f, 500.0f, "%.0f")) PopProbe_SetFlickHoldMs(v);
+    api->SameLine(); api->TextDisabled("(how long the crouch waits for the flick back)");
+    v = (float)g_flickStartPct;
+    if (api->SliderFloat("Shortest flick back (%)", &v, 35.0f, 85.0f, "%.0f")) PopProbe_SetFlickStartPct(v);
+    api->SameLine(); api->TextDisabled("(a flick back this far pops, at the lowest height)");
+    v = (float)g_flickFullPct;
+    if (api->SliderFloat("Full pop at (%)", &v, 45.0f, 100.0f, "%.0f")) PopProbe_SetFlickFullPct(v);
+    api->SameLine(); api->TextDisabled("(a flick back this far pops full height)");
+    v = (float)g_flickSlowMs;
+    if (api->SliderFloat("Slowest flick (ms)", &v, 10.0f, 300.0f, "%.0f")) PopProbe_SetFlickSlowMs(v);
+    api->SameLine(); api->TextDisabled("(a slower push back just crouches again)");
+    v = (float)g_flickMinPct;
+    if (api->SliderFloat("Lowest pop (%)", &v, 0.0f, 100.0f, "%.0f")) PopProbe_SetFlickMinPct(v);
+    api->SameLine(); api->TextDisabled("(how high the shortest flick back pops)");
 }
 
 // ------------------------------------------------------------------ pause-menu accessors
@@ -1943,6 +2201,25 @@ float PopProbe_CrouchDepth01() {
 }
 bool PopProbe_SchemeEnabled()           { return g_inject == 3 || g_inject == 4; }
 void PopProbe_SetSchemeEnabled(bool on) { g_inject = on ? 4 : 0; TwkMarkDirty(); }
+// The flick pop is its own input mode, so it and the scheme are one or the other.
+bool  PopProbe_FlickPop()               { return g_inject == 5; }
+void  PopProbe_SetFlickPop(bool on) {
+#if !TWK_FLICK_POP
+    on = false;                                     // disabled: nothing can turn it on
+#endif
+    if (!on && g_inject != 5) return;
+    g_inject = on ? 5 : 0; g_flickFiring = 0; TwkMarkDirty();
+}
+float PopProbe_FlickHoldMs()            { return (float)g_flickHoldMs; }
+void  PopProbe_SetFlickHoldMs(float v)  { g_flickHoldMs = (int)(v + 0.5f); PopProbe_ClampFlick(); TwkMarkDirty(); }
+float PopProbe_FlickStartPct()          { return (float)g_flickStartPct; }
+void  PopProbe_SetFlickStartPct(float v){ g_flickStartPct = (int)(v + 0.5f); PopProbe_ClampFlick(); TwkMarkDirty(); }
+float PopProbe_FlickFullPct()           { return (float)g_flickFullPct; }
+void  PopProbe_SetFlickFullPct(float v) { g_flickFullPct = (int)(v + 0.5f); PopProbe_ClampFlick(); TwkMarkDirty(); }
+float PopProbe_FlickSlowMs()            { return (float)g_flickSlowMs; }
+void  PopProbe_SetFlickSlowMs(float v)  { g_flickSlowMs = (int)(v + 0.5f); PopProbe_ClampFlick(); TwkMarkDirty(); }
+float PopProbe_FlickMinPct()            { return (float)g_flickMinPct; }
+void  PopProbe_SetFlickMinPct(float v)  { g_flickMinPct = (int)(v + 0.5f); PopProbe_ClampFlick(); TwkMarkDirty(); }
 // (No stances accessor: all stances is simply how the scheme works. PopProbeStances stays as an
 // ini-only dev fallback, never surfaced in the menu.)
 float PopProbe_TrickWindowMs() { return (float)g_windowMs; }

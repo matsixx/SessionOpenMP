@@ -884,6 +884,7 @@ static int   s_scRaw = 0, s_scHid = 0; // ticks the check would file a scoop: fr
 static float s_scRawMax = 0.0f, s_scHidMax = 0.0f;
 static int   s_ckReads = 0, s_ckNone = 0; // crank reads at the held direction / of them with no crank found
 static int   s_ckHit[3] = { 0, 0, 0 };    // cranks found shown held / mirrored / as is (532)
+static int   s_nQuick = 0;                // quick shove releases held a tick for the scoop check
 static float s_flickT[2] = { -1.0f, -1.0f };   // input time the OTHER stick last flicked, per held stick (533)
 static float s_shownFlickT[2] = { -1.0f, -1.0f }; // the flick a shown scoop was last counted for
 static float s_ckMaxDeg = 0.0f;           // the furthest lean they covered
@@ -929,9 +930,9 @@ static void LogWindow() {
     s_n++;
     TwkLog("[lean] the game's scoop check during that lean: read a scoop on %d ticks (up to %.0f deg) as the stick was -> %d (up to %.0f deg) with the lean hidden"
            " | crank read at the held direction %d times (lean up to %.0f deg), no crank on %d | scoops shown with a flick %d, reinputs %d"
-           " | lean held still by %d fast swings for %.2f s | cranks found: held %d, mirrored %d, as is %d",
+           " | lean held still by %d fast swings for %.2f s | cranks found: held %d, mirrored %d, as is %d | quick shove releases %d",
            s_scRaw, s_scRawMax, s_scHid, s_scHidMax, s_ckReads, s_ckMaxDeg, s_ckNone, s_nShown, s_nReinput, s_nHold, s_holdSec,
-           s_ckHit[0], s_ckHit[1], s_ckHit[2]);
+           s_ckHit[0], s_ckHit[1], s_ckHit[2], s_nQuick);
 }
 
 static void FlushFlick(int stick);
@@ -950,7 +951,7 @@ static void UpdateWindow(void* ih) {
             s_flickT[0] = s_flickT[1] = s_shownFlickT[0] = s_shownFlickT[1] = -1.0f;
             s_winLetT[0] = s_winLetT[1] = 1e30f;
             s_scRaw = s_scHid = 0; s_scRawMax = s_scHidMax = 0.0f;
-            s_ckReads = s_ckNone = 0; s_ckMaxDeg = 0.0f; s_ckHit[0] = s_ckHit[1] = s_ckHit[2] = 0;
+            s_ckReads = s_ckNone = 0; s_ckMaxDeg = 0.0f; s_ckHit[0] = s_ckHit[1] = s_ckHit[2] = 0; s_nQuick = 0;
         }
         s_winT1 = now; s_winLive = true;
         s_winTwo = TwoStick(s_leanOrient);             // a mid-grind switch can change it
@@ -1087,6 +1088,69 @@ static void TraceFlick(const uint8_t* data, int n, int off, int offOther, int st
            bound > 0.0f ? "" : "(none -- no fast swing within 0.25 s)", s_scoopPeak);
     if (bound > 0.0f) TwkLog("[lean]   ... the swing starts %.0f ms before the flick", (nowT - bound) * 1000.0f);
 }
+// ---- QUICK SHOVES: the scoop, then the release -------------------------------------------------------------
+// A quick shove is the held stick's own scoop and then letting it go, no other stick (the game's defs: crank,
+// EighthCircle, Released). The history hiding above shows a scoop only around the other stick's flick, and a
+// release shows it too late: the game files a scoop only while the stick is still out past its circle radius,
+// and the release's first sample inside that radius restarts the sum. So when a held stick drops inside the
+// radius fast, straight after a fast swing (the same test a flick uses: ScoopStart), that tick shows the game
+// the stick where it was and the swing as it was -- the scoop gets filed -- and the release goes through on
+// the next tick. A lean eased out of, or let go of while still, is not a swing and is left alone.
+static bool  s_quickArm[2] = { false, false };   // the scoop check this tick shows the swing (the release held)
+static bool QuickSwing(int k, float* startMs, float* deg) {
+    void* ih = CatchTweaks_LocalInputHandler();
+    uint8_t* arr = ih ? (uint8_t*)twkP(ih, IH_BUFFERED) : nullptr;
+    uint8_t* data = arr ? *(uint8_t**)arr : nullptr;
+    const int n = arr ? *(const int*)(arr + 8) : 0;
+    if (!data || n < 3 || n > 4096) return false;
+    const int off = k ? FID_RSTICK : FID_LSTICK;
+    const float tNow = HT(data, n - 1);
+    const float b = ScoopStart(data, n, off, tNow);
+    if (b <= 0.0f) return false;
+    int i = n - 1;
+    while (i > 0 && HT(data, i - 1) >= b) i--;
+    const float* s0 = HV(data, i, off); const float* s1 = HV(data, n - 1, off);
+    float d = (atan2f(s1[1], s1[0]) - atan2f(s0[1], s0[0])) * 57.29578f;
+    if (d > 180.0f) d -= 360.0f; else if (d < -180.0f) d += 360.0f;
+    *startMs = (tNow - b) * 1000.0f; *deg = fabsf(d);
+    return true;
+}
+void GrindLean_TickSticks(float* d) {
+    static float prev[2][2] = {}, prevM[2] = { 0.0f, 0.0f };
+    static bool  held[2] = { false, false };
+    if (!d) return;
+    __try {
+        void* ih = CatchTweaks_LocalInputHandler();
+        const float* set = ih ? ScoopSettings(ih) : nullptr;
+        float rMin = set ? set[IS_CIRC_MIN / 4] : 0.8f;
+        if (!(rMin > 0.1f && rMin < 1.0f)) rMin = 0.8f;
+        for (int k = 0; k < 2; k++) {
+            float* v = d + k * 2;
+            const float m = sqrtf(v[0] * v[0] + v[1] * v[1]);
+            if (held[k]) {                                // the release goes through now
+                held[k] = false;
+            } else if (g_on && g_hideScoop && s_winLive && s_winHas[k] && prevM[k] >= rMin && m < rMin &&
+                       m < prevM[k] - 0.15f) {           // out past the radius last tick, dropping fast now
+                float ms = 0.0f, deg = 0.0f;
+                if (QuickSwing(k, &ms, &deg)) {
+                    v[0] = prev[k][0]; v[1] = prev[k][1];
+                    held[k] = true; s_quickArm[k] = true; s_nQuick++;
+                    static int s_nq = 0;
+                    if (s_nq < 200) {
+                        s_nq++;
+                        TwkLog("[lean] quick shove? %s stick let go right after a %.0f deg swing (began %.0f ms ago, peak %.0f deg/s)"
+                               " -- held out one tick so the game sees the scoop before the release",
+                               k ? "R" : "L", deg, ms, s_scoopPeak);
+                    }
+                    prevM[k] = sqrtf(v[0] * v[0] + v[1] * v[1]);
+                    continue;
+                }
+            }
+            prev[k][0] = v[0]; prev[k][1] = v[1]; prevM[k] = m;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+}
+
 // The neutral at a grind's start, per stick (the relative-angle hook fills it first; Lean takes it from there).
 static float    s_entryDir[2][2];
 static bool     s_entryOk[2] = { false, false }, s_entryPre[2] = { false, false };
@@ -1148,9 +1212,14 @@ static void SnapHistory(int stick, void* ih) {
     // that flick is shown as it was -- from where it started, rotated onto the neutral (531's continuity).
     const float nowT = *(const float*)((const uint8_t*)ih + IH_TIME);
     const int offOther = stick ? FID_LSTICK : FID_RSTICK;
-    bool newFlick = false;
+    bool newFlick = false, byRelease = false;
     if (OtherFlicking(data, n, offOther)) {
         newFlick = s_flickT[stick] < 0.0f || nowT - s_flickT[stick] > kFlickShowSec;
+        s_flickT[stick] = nowT;
+    }
+    if (s_quickArm[stick]) {                             // a quick shove's release, held this tick (above)
+        s_quickArm[stick] = false;
+        newFlick = true; byRelease = true;
         s_flickT[stick] = nowT;
     }
     float bound = -1.0f;
@@ -1159,7 +1228,7 @@ static void SnapHistory(int stick, void* ih) {
     if (newFlick) {
         FlushFlick(stick);
         s_flOpen[stick] = true; s_flArc[stick] = 0.0f; s_flFiled[stick] = s_flTicks[stick] = 0;
-        TraceFlick(data, n, off, offOther, stick, bound, nowT);
+        if (!byRelease) TraceFlick(data, n, off, offOther, stick, bound, nowT);
     } else if (s_flOpen[stick] && nowT - s_flickT[stick] > kFlickShowSec) FlushFlick(stick);
     const bool haveBound = bound >= s_winT0 && bound <= s_winT1 + 0.01f;
     if (haveBound && s_shownFlickT[stick] != s_flickT[stick]) { s_shownFlickT[stick] = s_flickT[stick]; s_nShown++; }

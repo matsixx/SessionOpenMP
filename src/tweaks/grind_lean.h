@@ -22,6 +22,10 @@ void GrindLean_Install();
 void GrindLean_DrawMenu(const OmpMenuApi* api);   // RENDER THREAD (menu_ext contract)
 // Called from grind_rock's PhysGrinding hook every physics step on a grind (it owns that hook).
 void GrindLean_OnPhysGrinding(void* boardMoveComp, float dt);
+// GAME THREAD, from scoop_speed's InputHandler::Tick hook, before the game's tick: a held stick let go
+// straight after a fast scoop is held out one tick, so the game sees the scoop before the release (the
+// quick shove's own input order).
+void GrindLean_TickSticks(float* sticks);
 
 // The pause-menu accessors run on the GAME THREAD (the other menu_ext contract).
 bool  GrindLean_Enabled();   void GrindLean_SetEnabled(bool on);

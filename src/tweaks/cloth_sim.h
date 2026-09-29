@@ -52,3 +52,5 @@ float ClothSim_HemPushMm();        void ClothSim_SetHemPushMm(float v);
 // garment rather than just its rim.
 float ClothSim_HemPushBandPct();   void ClothSim_SetHemPushBandPct(float v);
 float ClothSim_CuffGripPct();      void ClothSim_SetCuffGripPct(float v);
+float ClothSim_SpikePasses();      void ClothSim_SetSpikePasses(float v);   // spike guard passes, 0 = off
+float ClothSim_SettleTime();       void ClothSim_SetSettleTime(float v);    // seconds, 0 = off

@@ -1255,6 +1255,9 @@ static void GameThreadFrame() {
             noteWorldChange();
             ghosts::Frame(g_ownPawn, us, ms, &logLine);
         }
+        // ...and Select Map on a custom map, which is a solo matter as much as a session one.
+        refreshOwnPawn(ms);
+        game::maps::TickTransitManager(g_ownPawn);
         inFrame = false; return;
     }
 
@@ -1333,6 +1336,8 @@ static void GameThreadFrame() {
     // the wire was already pumped in MpPump (same thread, same run); just drive the frame.
     session::Frame(g_ownPawn, us, ms, &game::GatherOwnState);
     ghosts::Frame(g_ownPawn, us, ms, &logLine);      // a saved replay loaded while in a session
+    game::maps::TickTransitManager(g_ownPawn);      // Select Map on a custom map (see custom_maps.h)
+    game::audio::SampleVoices(liveWorld());         // the voice budget, measured (see audio.h)
 
     // After the frame, so a plate is placed on where its skater was just put rather than a frame behind.
     publishNameplates();
@@ -1421,6 +1426,7 @@ static void GameThreadFrame() {
                      a.played, a.playStarted, a.playStopped, a.notifyMuted, a.localMuted,
                      a.unresolved, a.faults);
             logLine(m);
+            if (game::audio::VoiceReport(m, sizeof(m))) logLine(m);
             // The floating names. `show` is the local on/off-board fade target; `plated` is how many
             // reached the render thread. plated=0 with peers alive says which step lost them:
             // viewport 0x0 = no view resolved, noName = their cosmetics packet has not landed,

@@ -30,6 +30,14 @@ void CatchTweaks_SetEnabled(bool on);
 // verdict bails it (CatchManualFlipAngleThreshold on every flip def; the defs ship 120). Degrees.
 float CatchTweaks_ManualTolDeg();       void CatchTweaks_SetManualTolDeg(float deg);
 float CatchTweaks_OverBailDeg();        void CatchTweaks_SetOverBailDeg(float deg);
+// The catch settings in one read (rtflip.cpp: a real-time flip's catch keeps the same rules).
+struct CatchTweaksParams {
+    float manualTolDeg, overBailDeg, snapMs, snapMaxDeg, snapMaxBoost, overMs, minSpinDeg, descendDeg;
+    bool  footDescends, holdPose, clickToCatch;
+};
+void  CatchTweaks_Params(CatchTweaksParams* out);
+// The last stick click (click-to-catch): which stick (1 left, 2 right) and its QPC stamp; false = none yet.
+bool  CatchTweaks_LastClick(int* which, long long* qpc);
 bool  CatchTweaks_ShoveStopHold();      // a shove stopped where it was caught, catch still live
 float CatchTweaks_ShoveBailBandDeg();   void CatchTweaks_SetShoveBailBandDeg(float deg);
 bool  CatchTweaks_ShoveFixes();         void CatchTweaks_SetShoveFixes(bool on);   // the shove-axis master
@@ -51,6 +59,11 @@ bool  CatchTweaks_MakeName(const char* s, bool add, unsigned long long* out);   
 // Airtime counters cannot be used for this: _inAirTime and _inAirPopTime both read 0 through
 // popped-trick airs, so the height is measured from geometry instead.
 float CatchTweaks_RecentMaxZ();
+// Seconds since the LOCAL skater's CanCatchOrient last ran (1e9 = never). Goes stale while a replay
+// is being scrubbed, because the InAirHandler does not run then.
+double CatchTweaks_LocalCatchAgeSec();
+// How many catches have engaged on the local skater so far (one per engage edge).
+long CatchTweaks_EngageCount();
 // The true travel velocity right now, derived from POSITION deltas over the last ~0.2 s of samples.
 // `UMovementComponent::Velocity` is FROZEN while skating (custom movement mode) and holds the
 // mount-time direction, so momentum must come from position history, which cannot go stale.

@@ -261,7 +261,13 @@ float     g_stopHold = 0.28f;                  // EmoteStopHoldMs
 // THE MARKER REMEMBERS THE BOARD TAP: set your marker with the board up in the tap pose and coming back to
 // that marker puts it back up. Where the marker is, whether the tap was up when it was set, the goto flag as
 // it was last seen, and the countdown that waits for the graph reset a return leaves behind.
-int       g_mkTapOn = 1; float g_mkDelay = 0.35f;      // EmoteTapMarker, EmoteTapMarkerMs
+// The return puts it back up AT ONCE and already in place (no blend, the board resting): EmoteTapMarkerWaitMs
+// (0) is how long it waits first. It watches g_mkGuard seconds for the return's graph reset knocking it back
+// down, and puts it straight back up if it does.
+int       g_mkTapOn = 1; float g_mkDelay = 0.0f;       // EmoteTapMarker, EmoteTapMarkerWaitMs
+bool      g_tapSnap = false;                           // the next tap Begin starts fully in the pose
+float     g_mkGuard = 0.0f, g_mkT = 0.0f;              // watching for a knock-down / time since the return
+bool      g_mkUp = false;
 bool      g_mkSeen = false, g_mkHasTap = false, g_mkFound = false, g_mkPosOk = false;
 V3        g_mkLoc = { 0.0f, 0.0f, 0.0f }, g_mkPos = { 0.0f, 0.0f, 0.0f };
 float     g_mkWait = -1.0f, g_mkTry = 0.0f;
@@ -1801,6 +1807,10 @@ bool Begin(int id, void* sk) {
         g_visSay = true;
         __try { MeasureBoard(sk, mesh, true); } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; }
     }
+    if (id == EM_TAP && g_tapSnap) {                 // a marker return: already in the pose, the board resting
+        g_w = 1.0f; g_tapLift = 0.0f; g_tapVel = 0.0f; g_tapDown = true;
+    }
+    g_tapSnap = false;
     if (id == EM_RAGE) {
             g_rng ^= (unsigned)GetTickCount64();
         g_rageAimSet = false; g_rageLastT = 0.0f; g_rageTwist = 0.0f;   // WHERE it goes is the camera's to say (AimRage), all through the wind-up
@@ -2075,7 +2085,7 @@ void PumpMarker(void* sk, float dt) {
     static void* mkFor = nullptr;
     if (sk != mkFor) {
         mkFor = sk; g_mkSeen = false; g_mkHasTap = false; g_mkPosOk = false;
-        g_mkWait = -1.0f; g_mkTry = 0.0f; g_mkSaid = 0;
+        g_mkWait = -1.0f; g_mkTry = 0.0f; g_mkSaid = 0; g_mkGuard = 0.0f; g_mkUp = false; g_tapSnap = false;
     }
     __try {
         void* pc  = twkP(sk, PAWN_CONTROLLER);
@@ -2102,7 +2112,7 @@ void PumpMarker(void* sk, float dt) {
                 if (moved > 300.0f) {
                     const float d = g_mkSeen ? len(sub(now, g_mkLoc)) : -1.0f;
                     if (g_mkHasTap && MarkerLanded(d)) {
-                        g_mkWait = g_mkDelay; g_mkTry = 1.5f;
+                        g_mkWait = g_mkDelay; g_mkTry = 1.5f; g_mkGuard = 0.0f; g_mkT = 0.0f; g_mkUp = false;
                         TwkLog("[emote] marker return (a %.0f cm jump, landing %.0f cm from the marker): the board goes back up", moved, d);
                     } else if (g_mkSaid++ < 8) {
                         TwkLog("[emote] a %.0f cm jump, %.0f cm from the marker%s -- left as it is", moved, d,
@@ -2112,6 +2122,7 @@ void PumpMarker(void* sk, float dt) {
             }
             g_mkPos = now; g_mkPosOk = true;
         }
+        if (g_mkWait >= 0.0f || g_mkGuard > 0.0f) g_mkT += dt;
         if (g_mkWait > 0.0f) {
             g_mkWait -= dt;
             if (g_mkWait <= 0.0f) g_mkWait = 0.0f;           // ...the wait is up: from here it tries
@@ -2120,10 +2131,24 @@ void PumpMarker(void* sk, float dt) {
         if (g_mkWait == 0.0f && g_mkTry > 0.0f) {
             g_mkTry -= dt;
             if (g_id == EM_NONE && g_req == EM_NONE && !g_tapBtn && Sit_BoardInHand(sk)) {
+                g_tapSnap = true;                            // straight into the pose, not blended up to it
                 Emote_TapButton(true); Emote_TapButton(false);     // through the button's own gates, not round them
-                if (g_id != EM_NONE || g_req != EM_NONE) { g_mkWait = -1.0f; g_mkTry = 0.0f; TwkLog("[emote] marker return: the board is up again"); }
+                if (g_id != EM_NONE || g_req != EM_NONE) {
+                    g_mkWait = -1.0f; g_mkTry = 0.0f;
+                    if (!g_mkUp) { g_mkUp = true; g_mkGuard = 0.5f; }
+                    TwkLog("[emote] marker return: the board is up again, %.0f ms after the return", g_mkT * 1000.0f);
+                } else g_tapSnap = false;
             }
-            if (g_mkTry <= 0.0f) { g_mkWait = -1.0f; TwkLog("[emote] marker return: the board could not go back up just now"); }
+            if (g_mkTry <= 0.0f && g_mkWait == 0.0f) { g_mkWait = -1.0f; g_tapSnap = false; TwkLog("[emote] marker return: the board could not go back up just now"); }
+        }
+        // Knocked back down by the return's own reset (dropped outright, not put away): straight back up.
+        if (g_mkGuard > 0.0f) {
+            g_mkGuard -= dt;
+            if (g_id == EM_NONE && g_req == EM_NONE) {
+                g_mkGuard = 0.0f;
+                g_mkWait = 0.0f; g_mkTry = 0.5f;
+                TwkLog("[emote] marker return: the board was knocked down %.0f ms after the return -- putting it back up", g_mkT * 1000.0f);
+            } else if (g_ending) g_mkGuard = 0.0f;           // put away on purpose: yours
         }
     } __except (EXCEPTION_EXECUTE_HANDLER) { g_faults++; }
 }
@@ -2332,7 +2357,7 @@ void Emote_SaveConfig(char* buf, size_t cap) {
     TwkIniSetInt(buf, cap, "EmoteDanceBpm",   (int)(g_danceBpm + 0.5f));
     TwkIniSetInt(buf, cap, "EmoteStopHoldMs", (int)(g_stopHold * 1000.0f + 0.5f));
     TwkIniSetInt(buf, cap, "EmoteTapMarker",   g_mkTapOn);
-    TwkIniSetInt(buf, cap, "EmoteTapMarkerMs", (int)(g_mkDelay * 1000.0f + 0.5f));
+    TwkIniSetInt(buf, cap, "EmoteTapMarkerWaitMs", (int)(g_mkDelay * 1000.0f + 0.5f));
     TwkIniSetInt(buf, cap, "EmoteTapHandTwistDeg",  (int)g_tapHandTwist);
     TwkIniSetInt(buf, cap, "EmoteTapHandPitchDeg",  (int)g_tapHandPitch);
     TwkIniSetInt(buf, cap, "EmoteTapHandRollDeg",   (int)g_tapHandRoll);
@@ -2360,7 +2385,7 @@ void Emote_ReadConfig(const char* buf) {
     { const int bpm = TwkIniIntQuiet(buf, "EmoteDanceBpm", 120);   g_danceBpm = (float)(bpm < 50 ? 50 : bpm > 220 ? 220 : bpm); }
     { const int ms  = TwkIniIntQuiet(buf, "EmoteStopHoldMs", 280); g_stopHold = (float)(ms < 80 ? 80 : ms > 1500 ? 1500 : ms) * 0.001f; }
     g_mkTapOn = TwkIniIntQuiet(buf, "EmoteTapMarker", 1) ? 1 : 0;
-    { const int ms = TwkIniIntQuiet(buf, "EmoteTapMarkerMs", 350); g_mkDelay = (float)(ms < 0 ? 0 : ms > 3000 ? 3000 : ms) * 0.001f; }
+    { const int ms = TwkIniIntQuiet(buf, "EmoteTapMarkerWaitMs", 0); g_mkDelay = (float)(ms < 0 ? 0 : ms > 3000 ? 3000 : ms) * 0.001f; }
     g_on = TwkIniIntQuiet(buf, "EmotesEnabled", 1) ? 1 : 0;
     g_tapVolume = clampf((float)TwkIniIntQuiet(buf, "EmoteTapVolumePct", 250), 0.0f, 400.0f) / 100.0f;
     // HOW FAST A PULL COUNTS AS HARD, in tenths of a trigger-unit per second (15 = 1.5/s, a deliberate

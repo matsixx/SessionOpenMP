@@ -77,6 +77,21 @@ struct Tuning {
     // Attached sounds only: a world spawn is judged by proximity, and muting one of those risks
     // silencing the LOCAL player's own sound, which is far worse than hearing one of theirs.
     bool  suppressProxyLocal = true;
+    // Raise MaxCount on the local cues' OWN concurrency groups (the old 1.0.0 fix for peers' rolling
+    // stealing ours). OFF: every peer sound now plays in a group of its own (see audio.cpp), so nothing of
+    // theirs shares a group with ours, and widening only changed how OUR sounds behave -- the stock limit
+    // is what swaps the rolling variants (idle / flat-spot / manual...) cleanly; raised, they overlapped
+    // and ducked each other (field: the local rolling "cutting in and out" in lobbies, still there with
+    // peers' loops already separated; solo, where nothing is widened, never did it).
+    bool  widenStockConcurrency = false;
+    // Peers' sounds start at this fraction of their cue's own priority. The engine plays 32 voices and,
+    // past that, ranks every sound by priority x volume and drops the lowest (FWaveInstance::
+    // GetVolumeWeightedPriority); concurrency groups do not enter into it. At equal priority a lobby's
+    // louder peer sounds outranked the local rolling (a quiet, speed-scaled loop), which lost its voice
+    // and got it back frame to frame -- "cutting in and out". At 1/100 a peer's sound can only take a
+    // voice from one of ours 40 dB quieter than itself, so everything heard solo keeps its voice and the
+    // peers share the rest, loudest first as before. 1 = stock ranking.
+    float peerPriorityScale = 0.01f;
     // Say NOTHING at all while the local player is in their replay editor. Tried and reverted as a
     // default: it does stop a scrub being broadcast, but it also means a peer watching you scrub
     // hears silence, and the skating audio of a replay is worth hearing. The actual defect was the
@@ -130,6 +145,10 @@ void ForceNames();
 // scrubbing a timeline, not of a skater in the shared world. See the definition for what a peer heard
 // without this.
 void SetInLocalReplay(bool on);
+// THE VOICE BUDGET, measured (no behaviour change). Sampled every frame off the world's audio device;
+// VoiceReport formats the window since the last call and starts a new one (false = nothing sampled).
+void SampleVoices(void* world);
+bool VoiceReport(char* out, int cap);
 
 // ---- receiver side ----------------------------------------------------------------------------------
 // Every playback runs with an "this is a replay" flag set, so our own capture hooks ignore the sounds

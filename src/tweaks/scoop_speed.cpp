@@ -33,6 +33,8 @@
 #include "catch_tweaks.h"    // CatchTweaks_LocalInputHandler: whose tick is this
 #include "pad_sampler.h"     // the controller on its own clock: the preferred measure
 #include "radial.h"          // Radial_TickSticks: the same tick buffer, for the radial menu
+#include "grind_lean.h"      // GrindLean_TickSticks: quick shoves out of a leaned grind
+#include "rtflip.h"          // RtFlip_TickSticks: the real-time flip's stick
 #include <cmath>
 #include "MinHook.h"
 
@@ -448,6 +450,10 @@ static void* hkInputTick(void* self, double a, double b, void* d) {
         // Mode 4: `d` is the tick's stick buffer (see PopProbe_TickSticks) -- rewritten in place,
         // within this call only, before the game derives anything from it.
         PopProbe_TickSticks((float*)d);
+        // Real-time flips: after a flick pop, the other stick's sideways flick spins the board (hidden from the game).
+        RtFlip_TickSticks((float*)d);
+        // Quick shoves out of grinds: a held stick let go right after a scoop is held out one tick.
+        GrindLean_TickSticks((float*)d);
         // The radial menu: the right stick points at an entry, and is zero to the game while it is open.
         Radial_TickSticks((float*)d);
     }

@@ -371,6 +371,8 @@ if(EXISTS "${UE4SS_LIB}")
             src/tweaks/foot_place.cpp
             src/tweaks/board_stance.cpp
             src/tweaks/foot_steer.cpp
+            src/tweaks/carve.cpp
+            src/tweaks/rtflip.cpp
             src/tweaks/grind_pop.cpp
             src/tweaks/grind_rock.cpp
             src/tweaks/grind_lean.cpp

@@ -237,6 +237,12 @@ static int  g_tintGain = 200;        // ClothTintGainPct -- the tint MULTIPLIES 
 // through a merge, and every attempt at that has ended in a render-thread crash. With it off, changing
 // clothes keeps the previous garment's textures -- wrong, but stable, which is where this was before.
 static int  g_driveMulti = 1;        // ClothDriveMultiSection
+// EVERY garment is drawn by the mod (561). The engine's cloth renderer draws the solver's points as they
+// are, and the solver lets a free point at a folded elbow sit 4-5 cm off its pinned neighbours (the
+// fabric's straight-arm rest lengths push it out; its ~0.2 cm travel does not hold) -- the elbow spikes
+// on AMXX_GEN_UB_LS. Drawn by us it gets 556's "unsimulated garment + cloth movement" and the spike
+// guard. 0 = cloth-capable tops go back to the engine's renderer.
+static int  g_driveAll = 1;
 static int  g_recapture = 0;         // ClothRecapture
 static int  g_matSwap = 1;           // ClothMaterialSwap -- drive a non-cloth garment through a
                                      // cloth-capable master, carrying its own textures across
@@ -505,6 +511,14 @@ void ClothMerge_ReadConfig(const char* buf) {
 // them spent on the stock _UB_/_LB_ patterns -- and exclusions have their own twelve. Running out
 // used to mean the tick simply sprang back with no reason given, which is a control that lies.
 static char g_wornNote[128] = {};
+// An F1 tick asks the pump for the closet/shop's re-dress (552). The menu draws on the RENDER thread and
+// a dress must run on the game thread, so it only raises this; a burst of ticks is one re-dress.
+static volatile LONG      g_wornRedress   = 0;
+static volatile ULONGLONG g_wornRedressMs = 0;
+static void RequestWornRedress() {
+    g_wornRedressMs = GetTickCount64();
+    InterlockedExchange(&g_wornRedress, 1);
+}
 const char* ClothMerge_WornNote() { return g_wornNote[0] ? g_wornNote : nullptr; }
 int  ClothMerge_TagsUsed()  { return g_nTags; }
 int  ClothMerge_TagsMax()   { return kMaxGarments; }
@@ -743,6 +757,14 @@ static void hkDoMerge(void* self, void* refPose) {
         void* mine = CatchTweaks_Skater();
         const bool ours = IsSkaterSite(ret) && mine && t_dressing == mine;
         skaterSiteSeen = ours;
+        // 553: a merge inside a dress WE published that did not count as ours -- the F1 re-dress lead.
+        if (t_dressing && !ours) {
+            static int s_nx = 0;
+            if (s_nx++ < 20)
+                TwkLog("[cloth] a merge during a dress of %p was NOT taken as ours: exe+0x%llx (%s), local skater %p",
+                       t_dressing, (unsigned long long)((const uint8_t*)ret - (const uint8_t*)GetModuleHandleW(nullptr)),
+                       IsSkaterSite(ret) ? "a skater site" : "not a known site", mine);
+        }
         if (g_unmerge && g_okBuild && ours && data && num > 1 && num <= 64) {
             char nm[64];
             // The body among the sources, found BEFORE anything is stripped: it is what every garment
@@ -1330,6 +1352,7 @@ int ClothMerge_GarmentMaterialIndex(void* mesh) {
 // fabric, which is generated inside their own shader. So those garments keep their material and take
 // the simulation through their vertices instead.
 bool ClothMerge_GarmentWantsDirect(void* mesh) {
+    if (g_driveAll) return true;
     mesh = SourceOfOwn(mesh);
     int idx = -1;
     void* m = ClothMerge_ConfiguredMaterial(mesh, &idx);
@@ -1920,6 +1943,209 @@ static void* OwnGarmentMesh(void* src) {
     return copy;
 }
 
+// =============================================================================================
+// THE BODY'S BIND POSE ON OUR COPY (3.19.550)
+//
+// The merge skins every garment against the BODY's bind pose: a shared bone keeps the body's pose and
+// the garment's own root is dropped (FSkeletalMeshMerge::BuildReferenceSkeleton). Separated, a garment
+// skins against its OWN. A custom one exported with its Blender armature as a x100 root (Tee_Watches:
+// root 'AMXX_GEN_UB_Tshirt_E', scale 100, every bone under it in metres) carries 1/100 in every inverse
+// bind matrix, so each vertex is pulled 100x onto the bones it rides -- the white V between the
+// clavicles and neck, the line down the spine. Bone POSITIONS still agree, which is why the direct
+// driver's translation-only check reported "agrees, worst 0.00 cm" (jeansbutter's "thin strips" too).
+// So our copy takes the merged body's pose, bone for bone by name, and skins exactly as the merge drew
+// it -- the render, the cloth's skinned targets and the direct driver all read these arrays. Our copy
+// only: the shared asset is never edited.
+enum { RS_RAWINFO = 0x00, RS_RAWPOSE = 0x10, RS_FINALPOSE = 0x30,   // FReferenceSkeleton (PDB)
+       SM_REFBASESINV = 0x308,     // USkeletalMesh::RefBasesInvMatrix (TArray<FMatrix>, PDB)
+       SM_COMPOSEDREF = 0x380,     // USkeletalMesh::CachedComposedRefPoseMatrices (PDB)
+       BONE_SZ = 12, XF_SZ = 48, FMAT_SZ = 64 };
+static int g_bodyBind = 1;         // 0 = separated garments keep their own bind pose (pre-550)
+
+struct Xf { double q[4], t[3], s[3]; };   // FTransform: quat XYZW, translation, scale
+static void XfRead(const uint8_t* p, Xf& x) {
+    const float* f = (const float*)p;
+    for (int i = 0; i < 4; i++) x.q[i] = f[i];
+    for (int i = 0; i < 3; i++) { x.t[i] = f[4 + i]; x.s[i] = f[8 + i]; }
+    const double n = sqrt(x.q[0]*x.q[0] + x.q[1]*x.q[1] + x.q[2]*x.q[2] + x.q[3]*x.q[3]);
+    if (n > 1e-9) for (int i = 0; i < 4; i++) x.q[i] /= n;
+    else { x.q[0] = x.q[1] = x.q[2] = 0.0; x.q[3] = 1.0; }
+}
+static void QMul(const double* a, const double* b, double* o) {      // a*b: b first, then a (FQuat)
+    const double x = a[3]*b[0] + a[0]*b[3] + a[1]*b[2] - a[2]*b[1];
+    const double y = a[3]*b[1] - a[0]*b[2] + a[1]*b[3] + a[2]*b[0];
+    const double z = a[3]*b[2] + a[0]*b[1] - a[1]*b[0] + a[2]*b[3];
+    const double w = a[3]*b[3] - a[0]*b[0] - a[1]*b[1] - a[2]*b[2];
+    o[0] = x; o[1] = y; o[2] = z; o[3] = w;
+}
+static void QRot(const double* q, const double* v, double* o) {
+    const double tx = 2*(q[1]*v[2] - q[2]*v[1]), ty = 2*(q[2]*v[0] - q[0]*v[2]), tz = 2*(q[0]*v[1] - q[1]*v[0]);
+    o[0] = v[0] + q[3]*tx + (q[1]*tz - q[2]*ty);
+    o[1] = v[1] + q[3]*ty + (q[2]*tx - q[0]*tz);
+    o[2] = v[2] + q[3]*tz + (q[0]*ty - q[1]*tx);
+}
+// local * parent (FTransform::Multiply): the child's component-space pose.
+static void XfCompose(const Xf& l, const Xf& p, Xf& o) {
+    const double st[3] = { l.t[0]*p.s[0], l.t[1]*p.s[1], l.t[2]*p.s[2] };
+    double r[3]; QRot(p.q, st, r);
+    for (int i = 0; i < 3; i++) { o.t[i] = r[i] + p.t[i]; o.s[i] = l.s[i]*p.s[i]; }
+    QMul(p.q, l.q, o.q);
+}
+// The local that composes onto `p` to give `cs`.
+static void XfRelative(const Xf& cs, const Xf& p, Xf& o) {
+    const double pi[4] = { -p.q[0], -p.q[1], -p.q[2], p.q[3] };
+    const double d[3] = { cs.t[0]-p.t[0], cs.t[1]-p.t[1], cs.t[2]-p.t[2] };
+    double r[3]; QRot(pi, d, r);
+    for (int i = 0; i < 3; i++) {
+        const double ps = fabs(p.s[i]) > 1e-9 ? p.s[i] : 1.0;
+        o.t[i] = r[i] / ps; o.s[i] = cs.s[i] / ps;
+    }
+    QMul(pi, cs.q, o.q);
+}
+static void XfMatrix(const Xf& x, double m[4][4]) {                 // FTransform::ToMatrixWithScale
+    const double X = x.q[0], Y = x.q[1], Z = x.q[2], W = x.q[3];
+    const double x2 = X+X, y2 = Y+Y, z2 = Z+Z;
+    const double xx = X*x2, yy = Y*y2, zz = Z*z2, yz = Y*z2, wx = W*x2, xy = X*y2, wz = W*z2, xz = X*z2, wy = W*y2;
+    m[0][0] = (1-(yy+zz))*x.s[0]; m[0][1] = (xy+wz)*x.s[0];     m[0][2] = (xz-wy)*x.s[0];     m[0][3] = 0;
+    m[1][0] = (xy-wz)*x.s[1];     m[1][1] = (1-(xx+zz))*x.s[1]; m[1][2] = (yz+wx)*x.s[1];     m[1][3] = 0;
+    m[2][0] = (xz+wy)*x.s[2];     m[2][1] = (yz-wx)*x.s[2];     m[2][2] = (1-(xx+yy))*x.s[2]; m[2][3] = 0;
+    m[3][0] = x.t[0];             m[3][1] = x.t[1];             m[3][2] = x.t[2];             m[3][3] = 1;
+}
+static bool MatInvAffine(const double m[4][4], double o[4][4]) {    // row vectors: p' = p*M + T
+    const double a = m[0][0], b = m[0][1], c = m[0][2], d = m[1][0], e = m[1][1], f = m[1][2],
+                 g = m[2][0], h = m[2][1], i = m[2][2];
+    const double A = e*i - f*h, B = -(d*i - f*g), C = d*h - e*g, det = a*A + b*B + c*C;
+    if (fabs(det) < 1e-12) return false;
+    const double r = 1.0 / det;
+    o[0][0] = A*r; o[0][1] = -(b*i - c*h)*r; o[0][2] = (b*f - c*e)*r;
+    o[1][0] = B*r; o[1][1] =  (a*i - c*g)*r; o[1][2] = -(a*f - c*d)*r;
+    o[2][0] = C*r; o[2][1] = -(a*h - b*g)*r; o[2][2] =  (a*e - b*d)*r;
+    for (int k = 0; k < 3; k++) {
+        o[k][3] = 0;
+        o[3][k] = -(m[3][0]*o[0][k] + m[3][1]*o[1][k] + m[3][2]*o[2][k]);
+    }
+    o[3][3] = 1;
+    return true;
+}
+static void MatStore(uint8_t* dst, const double m[4][4]) {
+    float* f = (float*)dst;
+    for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++) f[r*4 + c] = (float)m[r][c];
+}
+
+// `src` supplies the garment's own locals (never edited), so this is idempotent: it re-runs on every
+// reuse against whichever body is current, and writes nothing when the copy already matches.
+static void RebindToBody(void* copy, void* src, void* body) {
+    if (!copy || !src || !body || copy == src || !g_bodyBind) return;
+    char nm[64] = "?";
+    CatchSound_ObjName(src, nm, sizeof(nm));
+    uint8_t* crs = (uint8_t*)copy + SM_REFSKEL_M;
+    uint8_t* srs = (uint8_t*)src  + SM_REFSKEL_M;
+    uint8_t* brs = (uint8_t*)body + SM_REFSKEL_M;
+    const int n = twkI(crs, RS_RAWINFO + 8), bn = twkI(brs, RS_RAWINFO + 8);
+    const uint8_t* cInfo = (const uint8_t*)twkP(crs, RS_RAWINFO);
+    const uint8_t* sInfo = (const uint8_t*)twkP(srs, RS_RAWINFO);
+    const uint8_t* bInfo = (const uint8_t*)twkP(brs, RS_RAWINFO);
+    uint8_t*       cPose = (uint8_t*)twkP(crs, RS_RAWPOSE);
+    uint8_t*       cFin  = (uint8_t*)twkP(crs, RS_FINALPOSE);
+    const uint8_t* sPose = (const uint8_t*)twkP(srs, RS_RAWPOSE);
+    const uint8_t* bPose = (const uint8_t*)twkP(brs, RS_RAWPOSE);
+    uint8_t*       cInv  = (uint8_t*)twkP(copy, SM_REFBASESINV);
+    uint8_t*       cCmp  = (uint8_t*)twkP(copy, SM_COMPOSEDREF);
+    if (n <= 0 || n > 512 || bn <= 0 || bn > 512 || !cInfo || !sInfo || !bInfo || !cPose || !sPose ||
+        !bPose || !cInv || twkI(srs, RS_RAWINFO + 8) != n || twkI(crs, RS_RAWPOSE + 8) != n ||
+        twkI(srs, RS_RAWPOSE + 8) != n || twkI(brs, RS_RAWPOSE + 8) != bn ||
+        twkI(copy, SM_REFBASESINV + 8) != n) {
+        TwkLog("[own] '%s': bind pose left as built -- skeleton arrays do not line up (bones %d, body %d)",
+               nm, n, bn);
+        return;
+    }
+    // The copy was merged from `src` alone, so its bones must be src's, in order.
+    for (int b = 0; b < n; b++)
+        if (memcmp(cInfo + (size_t)b*BONE_SZ, sInfo + (size_t)b*BONE_SZ, BONE_SZ) != 0) {
+            TwkLog("[own] '%s': bind pose left as built -- bone %d differs from the source", nm, b);
+            return;
+        }
+
+    Xf* buf = (Xf*)malloc(sizeof(Xf) * ((size_t)bn + 3 * (size_t)n));
+    if (!buf) return;
+    Xf* bcs = buf; Xf* scs = bcs + bn; Xf* ncs = scs + n; Xf* nloc = ncs + n;
+    for (int j = 0; j < bn; j++) {
+        Xf l; XfRead(bPose + (size_t)j*XF_SZ, l);
+        const int p = twkI(bInfo + (size_t)j*BONE_SZ, 8);
+        if (p >= 0 && p < j) XfCompose(l, bcs[p], bcs[j]); else bcs[j] = l;
+    }
+    int moved = 0, unmatched = 0, worstB = -1;
+    double worstCm = 0.0, worstDeg = 0.0, worstScale = 1.0;
+    for (int b = 0; b < n; b++) {
+        Xf l; XfRead(sPose + (size_t)b*XF_SZ, l);
+        const int p = twkI(sInfo + (size_t)b*BONE_SZ, 8);
+        const bool hasP = p >= 0 && p < b;
+        if (hasP) XfCompose(l, scs[p], scs[b]); else scs[b] = l;
+        int j = -1;
+        for (int k = 0; k < bn; k++)
+            if (memcmp(sInfo + (size_t)b*BONE_SZ, bInfo + (size_t)k*BONE_SZ, 8) == 0) { j = k; break; }
+        // As the merge does: a shared bone is the body's; an extra bone hangs off its parent with its
+        // own local; an unknown root is the body's root.
+        if (j >= 0)    ncs[b] = bcs[j];
+        else if (hasP) { XfCompose(l, ncs[p], ncs[b]); unmatched++; }
+        else           { ncs[b] = bcs[0]; unmatched++; }
+        if (hasP) XfRelative(ncs[b], ncs[p], nloc[b]); else nloc[b] = ncs[b];
+
+        const double dx = ncs[b].t[0]-scs[b].t[0], dy = ncs[b].t[1]-scs[b].t[1], dz = ncs[b].t[2]-scs[b].t[2];
+        const double cm = sqrt(dx*dx + dy*dy + dz*dz);
+        const double dot = fabs(ncs[b].q[0]*scs[b].q[0] + ncs[b].q[1]*scs[b].q[1] +
+                                ncs[b].q[2]*scs[b].q[2] + ncs[b].q[3]*scs[b].q[3]);
+        const double deg = 2.0 * acos(dot > 1.0 ? 1.0 : dot) * 57.29577951;
+        double sc = 1.0;
+        for (int i = 0; i < 3; i++) {
+            const double a = fabs(scs[b].s[i]), c = fabs(ncs[b].s[i]);
+            if (a > 1e-9 && c > 1e-9) { const double r = a > c ? a / c : c / a; if (r > sc) sc = r; }
+        }
+        if (cm > 0.1 || deg > 0.5 || sc > 1.01) moved++;
+        if (cm > worstCm) worstCm = cm;
+        if (deg > worstDeg) worstDeg = deg;
+        if (sc > worstScale) { worstScale = sc; worstB = b; }
+    }
+
+    bool same = true;                       // already rebound against this body: touch nothing
+    for (int b = 0; b < n && same; b++) {
+        Xf cur; XfRead(cPose + (size_t)b*XF_SZ, cur);
+        for (int i = 0; i < 3 && same; i++)
+            if (fabs(cur.t[i] - nloc[b].t[i]) > 1e-3 || fabs(cur.s[i] - nloc[b].s[i]) > 1e-5) same = false;
+        if (same && fabs(cur.q[0]*nloc[b].q[0] + cur.q[1]*nloc[b].q[1] + cur.q[2]*nloc[b].q[2] +
+                         cur.q[3]*nloc[b].q[3]) < 1.0 - 1e-7) same = false;
+    }
+    if (!same) {
+        const bool finOk = cFin && twkI(crs, RS_FINALPOSE + 8) >= n;   // Final = Raw + virtual bones
+        const bool cmpOk = cCmp && twkI(copy, SM_COMPOSEDREF + 8) == n;
+        for (int b = 0; b < n; b++) {
+            float f[12] = {};
+            for (int i = 0; i < 4; i++) f[i] = (float)nloc[b].q[i];
+            for (int i = 0; i < 3; i++) { f[4 + i] = (float)nloc[b].t[i]; f[8 + i] = (float)nloc[b].s[i]; }
+            memcpy(cPose + (size_t)b*XF_SZ, f, sizeof(f));
+            if (finOk) memcpy(cFin + (size_t)b*XF_SZ, f, sizeof(f));
+            double m[4][4], inv[4][4];
+            XfMatrix(ncs[b], m);
+            if (!MatInvAffine(m, inv)) continue;
+            MatStore(cInv + (size_t)b*FMAT_SZ, inv);
+            if (cmpOk) MatStore(cCmp + (size_t)b*FMAT_SZ, m);
+        }
+    }
+    char wn[96] = "?";
+    if (worstB >= 0) CatchSound_FNameText(sInfo + (size_t)worstB*BONE_SZ, wn, sizeof(wn));
+    if (moved)
+        TwkLog("[own] '%s': bind pose %s the body's -- %d of %d bones differed (worst %.1f cm, %.1f deg, "
+               "scale x%.2f%s%s)%s", nm, same ? "already" : "re-set to", moved, n, worstCm, worstDeg,
+               worstScale, worstScale > 1.01 ? " at " : "", worstScale > 1.01 ? wn : "",
+               worstScale > 1.5 ? " -- a scaled export root; drawn with its own it would collapse onto its bones" : "");
+    else
+        TwkLog("[own] '%s': bind pose matches the body's (%d bones)", nm, n);
+    if (unmatched)
+        TwkLog("[own] '%s': %d bone(s) the body does not have (a root goes onto the body's root, the rest "
+               "keep their own place under their parent)", nm, unmatched);
+    free(buf);
+}
+
 // Which material slot on the MERGED BODY this garment occupies, so it can be hidden there.
 // Same matching the capture already relies on: a garment's real material is the one that also appears
 // on the merged body, compared by BASE material so variants and dynamic instances still line up.
@@ -2237,6 +2463,7 @@ static bool BuildOrRefreshSlave(void* skater, void* masterComp, void* garment, i
         // Our own build of the garment if we have one -- see OwnGarmentMesh. Everything downstream
         // (cloth asset, section marks, vertex writes) then happens to an object the mod owns.
         void* wear = OwnGarmentMesh(garment);
+        if (wear) RebindToBody(wear, garment, twkP(masterComp, SMC_SKELMESH_M));   // before the render state (550)
         g_setSkelMesh(g_slave[slot], wear ? wear : garment, false);
         // Left in the merge (skeleton mismatch): the body still draws it, so hide it there.
         if (g_pendHideOnBody[slot] && !g_hidOnBody[slot])
@@ -2292,6 +2519,33 @@ void ClothMerge_PumpFrame() {
             g_captureDone = false;
             InterlockedExchange(&g_capturePass, 1);
             TwkLog("[cloth] new character -- dressing from scratch");
+        }
+
+        // F1 > Clothes you are wearing: apply a tick now, as the closet/shop would (552). 0.4 s after the
+        // LAST tick, so ticking three garments is one re-dress. Held while the skater has no mesh.
+        if (g_wornRedress && GetTickCount64() - g_wornRedressMs > 400) {
+            void* mc = twkP(skater, CH_MESH);
+            if (mc && g_unmerge && g_okBuild && g_origRefresh) {
+                InterlockedExchange(&g_wornRedress, 0);
+                TwkLog("[cloth] your clothing choices changed (F1) -- re-dressing the way the closet and shop do");
+                // The closet/shop's own refresh: a real dress, published as ours, applied by the
+                // pump below exactly like one of theirs.
+                const LONG m0 = g_merges, s0 = g_pendSerial;
+                bool faulted = false;
+                void* prev = t_dressing;
+                t_dressing = skater;
+                __try { ((RefreshVisualsFn)g_origRefresh)(skater); }
+                __except (OwnMergeFilter(GetExceptionInformation())) { faulted = true; }
+                t_dressing = prev;
+                // 553: "I clicked the checkbox and nothing happened" -- say which of the three it was.
+                if (faulted)
+                    TwkLog("[cloth] F1 re-dress FAULTED -- code 0x%08lx at exe+0x%llx (read %p)", g_ownExCode,
+                           (unsigned long long)((const uint8_t*)g_ownExAddr - (const uint8_t*)GetModuleHandleW(nullptr)),
+                           g_ownExInfo);
+                else
+                    TwkLog("[cloth] F1 re-dress: %ld merge(s), %ld published as ours (skater %p, mesh comp %p)",
+                           (long)(g_merges - m0), (long)(g_pendSerial - s0), skater, mc);
+            }
         }
 
         // The load dress does NOT go through RefreshVisuals (it runs from its own path), so at spawn
@@ -2558,7 +2812,7 @@ void ClothMerge_DrawMenu(const OmpMenuApi* api) {
     if (g_nWorn <= 0) {
         api->TextDisabled("nothing seen yet -- change an item in the wardrobe and they list here");
     } else {
-        snprintf(b, sizeof(b), "ticked = given cloth physics, next time the outfit loads "
+        snprintf(b, sizeof(b), "ticked = given cloth physics; a change re-dresses you like the closet "
                  "(%d of %d slots used)", g_nTags, kMaxGarments);
         api->TextDisabled(b);
         api->Indent();
@@ -2569,14 +2823,15 @@ void ClothMerge_DrawMenu(const OmpMenuApi* api) {
                 continue;
             }
             bool inc = ClothMerge_WornIncluded(i);
-            if (api->Checkbox(g_worn[i], &inc)) ClothMerge_SetWornIncluded(i, inc);
+            if (api->Checkbox(g_worn[i], &inc) && ClothMerge_SetWornIncluded(i, inc)) RequestWornRedress();
         }
         api->Unindent();
         // A refusal has to SAY so: the tick springs back on its own, and a control that changes its
         // mind without a reason reads as broken rather than as full.
         if (g_wornNote[0]) { api->TextWrapped(g_wornNote); }
-        if (api->version >= 2 && api->Button && api->Button("Forget my clothing choices"))
-            ClothMerge_ForgetClothingChoices();
+        if (api->version >= 2 && api->Button && api->Button("Forget my clothing choices")) {
+            ClothMerge_ForgetClothingChoices(); RequestWornRedress();
+        }
     }
     api->Separator();
     bool on = g_unmerge != 0;

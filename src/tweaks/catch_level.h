@@ -39,4 +39,5 @@ bool  CatchLevel_Enabled();
 void  CatchLevel_SetEnabled(bool on);
 // The ease's time constant in ms (how fast the board eases flat), 20..200.
 float CatchLevel_ResponseMs();
+float CatchLevel_TargetDeg();            // the pitch it levels to (-999 = the trick's authored one)
 void  CatchLevel_SetResponseMs(float ms);

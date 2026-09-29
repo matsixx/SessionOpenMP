@@ -54,6 +54,7 @@
 #include "ui/menu_ext.h"
 #include "foot_place.h"
 #include "foot_steer.h"       // shares this hook: only one detour may exist on UpdateFootAnchors
+#include "rtflip.h"           // the real-time flip holds the feet clear of the spin
 #include "catch_tweaks.h"     // CatchTweaks_Skater() -- the live skater, without a hook of our own
 #include "catch_level.h"      // CatchLevel_PostPhysAssert() -- the post-physics level re-assert
 #include "body_feel.h"       // BodyFeel_PostPhysApply() -- per-body blend-weight scaling
@@ -341,6 +342,7 @@ static void hkUpdateFootAnchors(void* self, double dt, void* a, void* b) {
     if (mine) CatchTweaks_PostPhysHold();   // the scoop-foot hold (same surviving write point)
     // The stance's own rotation comes back out before the original reads the sockets (it slerps from
     // their previous value; see Stance_PreAnchors).
+    if (mine && self) { __try { RtFlip_PreAnchors(self); } __except (EXCEPTION_EXECUTE_HANDLER) {} }
     if (mine && self) { __try { Stance_PreAnchors(self); } __except (EXCEPTION_EXECUTE_HANDLER) {} }
     unsigned char savedAA = 0;
     bool suppressed = false;
@@ -383,8 +385,10 @@ static void hkUpdateFootAnchors(void* self, double dt, void* a, void* b) {
 
         float dL[3] = { 0.0f, 0.0f, 0.0f };
         float dR[3] = { 0.0f, 0.0f, 0.0f };
+        RtFlip_PreSteer(self, dL, dR);                  // a real-time flip: the deck's spin out of the foot targets
         FootSteer_AddOffset(self, realDt, dL, dR);      // false = nothing of its own to add
         Stance_AddOffset(self, SuppressWanted(self), realDt, dL, dR);   // the rolling idle's stance
+        RtFlip_AddOffset(self, realDt, dL, dR);         // a real-time flip: the feet clear of the spin
         // ---- the sole lift (FootFixSoleLiftMm): both feet along the deck's normal, riding only --
         // the same states the suppression covers. Per foot, weighted by the game's own IK alpha the
         // way foot_steer is: a zeroed socket plus a delta is not an offset.

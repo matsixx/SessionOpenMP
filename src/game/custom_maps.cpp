@@ -40,14 +40,21 @@ void logv(const char* fmt, ...) {
     g_logf(m);
 }
 
-// ---- the scan's result, handed over once ----------------------------------------------------------
+// ---- the scan's result, handed over whole ---------------------------------------------------------
 // The scan runs on its own thread (it reads every level's header, which is real disk time with many
-// maps installed) and PUBLISHES a finished list exactly once. The game thread only ever reads a
-// published list, so there is nothing to lock: the pointer is written once and never freed.
+// maps installed) and PUBLISHES a finished list. The game thread only ever reads a published list, so
+// there is nothing to lock: a published list is never changed and never freed. A folder change
+// publishes a NEW list and bumps the generation; the old one is left alone (a few KB, once per
+// install) so whoever is still reading it keeps a valid list.
 std::vector<Entry>* volatile g_ready = nullptr;
-HANDLE g_scanDone = nullptr;              // signalled when g_ready is published
+volatile LONG g_gen = 0;                  // bumped by every publish; 0 = nothing published yet
+HANDLE g_scanDone = nullptr;              // signalled when the first list is published
 
 const std::vector<Entry>* readyList() { return g_ready; }
+void publish(std::vector<Entry>* list) {
+    InterlockedExchangePointer((void* volatile*)&g_ready, list);
+    InterlockedIncrement(&g_gen);
+}
 
 #ifdef _WIN32
 // ---- file access without MAX_PATH -------------------------------------------------------------------
@@ -238,12 +245,13 @@ struct ScanState {
     std::vector<Entry> maps;
     std::vector<DirId> stack;          // the folders on the current path, to refuse a link loop
     int levels = 0, skipped = 0;
+    bool quiet = false;                // a re-read: the start-up read already said all of this
 };
 // One line per level left out, up to a point: an install folder full of demo scenes or sub-levels
 // must not bury the log. The count of the rest is said once at the end.
 void notListed(ScanState& st, const char* fmt, ...) {
     st.skipped++;
-    if (st.skipped > 50) return;
+    if (st.skipped > 50 || st.quiet) return;
     char m[900];
     va_list ap; va_start(ap, fmt); vsnprintf(m, sizeof(m), fmt, ap); va_end(ap);
     logv("%s", m);
@@ -277,7 +285,7 @@ void consider(ScanState& st, const std::wstring& relDirW, const std::wstring& fi
         notListed(st, "[maps]   not listed: '%s' (not a Session map -- the level does not use Session's game mode; a demo scene or a sub-level)", e.name.c_str());
         return;
     }
-    if (!session)
+    if (!session && !st.quiet)
         logv("[maps]   '%s' does not name Session's game mode, but the mod manager installed it as a map (%s) -- listed",
              e.name.c_str(), own->asset.c_str());
     e.label  = (own && !own->custom.empty()) ? own->custom : e.name;
@@ -292,7 +300,7 @@ void walk(ScanState& st, const std::wstring& relDirW) {
     if (dirIdentity(abs, &id)) {
         for (const auto& a : st.stack)
             if (a.vol == id.vol && a.hi == id.hi && a.lo == id.lo) {
-                logv("[maps]   skipped a folder link that loops back on itself: CustomMaps\\%s", narrow(relDirW).c_str());
+                if (!st.quiet) logv("[maps]   skipped a folder link that loops back on itself: CustomMaps\\%s", narrow(relDirW).c_str());
                 return;
             }
         st.stack.push_back(id);
@@ -331,34 +339,138 @@ void disambiguate(std::vector<Entry>& maps) {
         if (mark[i]) maps[i].label = (maps[i].label.substr(0, maps[i].label.rfind(" (")) + " (" + maps[i].dir + ")");
 }
 
-DWORD WINAPI scanThread(void*) {
+// One full read of the folder. The start-up read says what it found; a re-read (quiet) only says
+// what CHANGED, after comparing with the list it replaces. Null = no Content folder.
+std::vector<Entry>* scanOnce(bool quiet) {
     const ULONGLONG t0 = GetTickCount64();
-    auto* out = new std::vector<Entry>();
     ScanState st;
+    st.quiet = quiet;
     if (!contentRoot(&st.root)) {
-        logv("[maps] could not locate the Content folder");
-    } else {
-        st.recs = loadRecords(st.root);
+        if (!quiet) logv("[maps] could not locate the Content folder");
+        return nullptr;
+    }
+    st.recs = loadRecords(st.root);
+    if (!quiet) {
         int installs = 0;
         for (const auto& r : st.recs) if (!r.asset.empty()) installs++;
         if (!st.recs.empty()) logv("[maps] mod manager records: %d (%d from an installed archive)", (int)st.recs.size(), installs);
-        walk(st, L"");
-        if (st.skipped > 50) logv("[maps]   ...and %d more level file(s) not listed", st.skipped - 50);
-        disambiguate(st.maps);
-        std::sort(st.maps.begin(), st.maps.end(),
-                  [](const Entry& a, const Entry& b) { return _stricmp(a.label.c_str(), b.label.c_str()) < 0; });
+    }
+    walk(st, L"");
+    if (st.skipped > 50 && !quiet) logv("[maps]   ...and %d more level file(s) not listed", st.skipped - 50);
+    disambiguate(st.maps);
+    std::sort(st.maps.begin(), st.maps.end(),
+              [](const Entry& a, const Entry& b) { return _stricmp(a.label.c_str(), b.label.c_str()) < 0; });
+    if (!quiet) {
         if (st.maps.empty()) {
-            logv("[maps] no custom maps under Content\\CustomMaps (%d level file(s) checked) -- the Select Map screen is unchanged", st.levels);
+            logv("[maps] no custom maps under Content\\CustomMaps (%d level file(s) checked) -- watching for any installed later", st.levels);
         } else {
-            logv("[maps] %d custom map(s) under Content\\CustomMaps (%d level file(s) checked in %llu ms; read at start-up --"
-                 " a map installed while the game runs appears after a restart):",
+            logv("[maps] %d custom map(s) under Content\\CustomMaps (%d level file(s) checked in %llu ms; the folder is"
+                 " watched -- a map installed while the game runs appears the next time Select Map opens):",
                  (int)st.maps.size(), st.levels, (unsigned long long)(GetTickCount64() - t0));
             for (const auto& e : st.maps) logv("[maps]   '%s' -> %s", e.label.c_str(), e.path.c_str());
         }
-        *out = std::move(st.maps);
     }
-    g_ready = out;                    // published once; never freed, never written again
+    return new std::vector<Entry>(std::move(st.maps));
+}
+
+bool sameEntry(const Entry& a, const Entry& b) { return a.rel == b.rel && a.label == b.label; }
+bool inList(const std::vector<Entry>* l, const Entry& e) {
+    if (l) for (const auto& o : *l) if (sameEntry(o, e)) return true;
+    return false;
+}
+
+// A re-read after the folder changed: published only when the list is really different, and the
+// difference is what gets logged.
+void rescan() {
+    const ULONGLONG t0 = GetTickCount64();
+    std::vector<Entry>* fresh = scanOnce(true);
+    if (!fresh) return;
+    const std::vector<Entry>* cur = readyList();
+    bool same = cur && cur->size() == fresh->size();
+    for (size_t i = 0; same && i < fresh->size(); i++) same = sameEntry((*cur)[i], (*fresh)[i]);
+    if (same) { delete fresh; return; }
+    int added = 0, removed = 0;
+    for (const auto& e : *fresh) if (!inList(cur, e)) added++;
+    if (cur) for (const auto& e : *cur) if (!inList(fresh, e)) removed++;
+    logv("[maps] the custom maps folder changed: %d map(s) now (%d new, %d gone; re-read in %llu ms) -- Select Map"
+         " shows them the next time it opens", (int)fresh->size(), added, removed,
+         (unsigned long long)(GetTickCount64() - t0));
+    int said = 0;
+    for (const auto& e : *fresh) if (!inList(cur, e) && said++ < 20) logv("[maps]   + '%s' -> %s", e.label.c_str(), e.path.c_str());
+    if (cur) for (const auto& e : *cur) if (!inList(fresh, e) && said++ < 40) logv("[maps]   - '%s'", e.label.c_str());
+    publish(fresh);
+}
+
+// ---- WATCHING THE FOLDER --------------------------------------------------------------------------
+// The mod manager writes a map into Content\CustomMaps and its record into Content\MapSwitcherMetaData;
+// either may not exist before the first install, so the watch is on Content itself (the whole tree)
+// and only those two are listened to. An install writes many files over seconds, so the re-read waits
+// until nothing there has changed for kQuietMs -- which also keeps it from reading a half-copied level.
+bool relevantChange(const FILE_NOTIFY_INFORMATION* fn) {
+    const std::wstring name(fn->FileName, fn->FileNameLength / sizeof(WCHAR));
+    auto under = [&](const wchar_t* dir) {
+        const size_t n = wcslen(dir);
+        return name.size() >= n && !_wcsnicmp(name.c_str(), dir, n) && (name.size() == n || name[n] == L'\\');
+    };
+    return under(L"CustomMaps") || under(L"MapSwitcherMetaData");
+}
+
+void watchLoop() {
+    std::wstring root;
+    if (!contentRoot(&root)) return;
+    HANDLE dir = CreateFileW(longPath(root).c_str(), FILE_LIST_DIRECTORY,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, nullptr);
+    if (dir == INVALID_HANDLE_VALUE) { logv("[maps] could not watch the Content folder -- new maps appear after a restart"); return; }
+    OVERLAPPED ov{};
+    ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    static DWORD buf[16384];                              // 64 KB, DWORD-aligned as the API requires
+    const DWORD filter = FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME |
+                         FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE;
+    const ULONGLONG kQuietMs = 2000;
+    ULONGLONG lastChange = 0;                             // 0 = nothing waiting to be re-read
+    bool reading = false;
+    for (;;) {
+        if (!reading) {
+            ResetEvent(ov.hEvent);
+            if (!ReadDirectoryChangesW(dir, buf, sizeof(buf), TRUE, filter, nullptr, &ov, nullptr)) {
+                logv("[maps] watching the Content folder stopped (error %lu) -- new maps appear after a restart", GetLastError());
+                break;
+            }
+            reading = true;
+        }
+        const DWORD r = WaitForSingleObject(ov.hEvent, lastChange ? 500 : INFINITE);
+        if (r == WAIT_OBJECT_0) {
+            reading = false;
+            DWORD bytes = 0;
+            if (!GetOverlappedResult(dir, &ov, &bytes, FALSE)) continue;
+            bool hit = (bytes == 0);                      // the buffer overflowed: assume the worst
+            for (const BYTE* p = (const BYTE*)buf; !hit && bytes;) {
+                const auto* fn = (const FILE_NOTIFY_INFORMATION*)p;
+                if (relevantChange(fn)) hit = true;
+                if (!fn->NextEntryOffset) break;
+                p += fn->NextEntryOffset;
+            }
+            if (hit) lastChange = GetTickCount64();
+        } else if (r != WAIT_TIMEOUT) {
+            break;
+        }
+        if (lastChange && GetTickCount64() - lastChange >= kQuietMs) {
+            lastChange = 0;
+            rescan();
+        }
+    }
+    CancelIo(dir);
+    CloseHandle(ov.hEvent);
+    CloseHandle(dir);
+}
+
+// The start-up read, then (param non-null) the watch, on the same background thread.
+DWORD WINAPI scanThread(void* watch) {
+    std::vector<Entry>* first = scanOnce(false);
+    publish(first ? first : new std::vector<Entry>());
     if (g_scanDone) SetEvent(g_scanDone);
+    if (watch) watchLoop();
     return 0;
 }
 #endif // _WIN32
@@ -425,15 +537,37 @@ int findCity(const TArrayHdr* cities, uint64_t prefix) {
 
 // Called inside hkOpen's __try: no object with a destructor may live in this frame's caller, and none
 // is created here -- the list is read through a pointer.
-void Inject(uint8_t* asset, const std::vector<Entry>* maps) {
-    if (!asset || !maps || maps->empty()) return;
+// `gen` is the list's generation. An asset already carrying this generation is left alone; one
+// carrying an older list has that list's spots taken out and the new ones put in.
+void Inject(uint8_t* asset, const std::vector<Entry>* maps, LONG gen) {
+    if (!asset || !maps) return;
     TArrayHdr* cities = (TArrayHdr*)(asset + off::kTransitAssetCities);
     TArrayHdr* nodes  = (TArrayHdr*)(asset + off::kTransitAssetNodes);
     uint64_t prefix = 0;
     if (!makeFName(kPrefix, &prefix)) return;
-    if (findCity(cities, prefix) >= 0) return;         // already in this asset
+    // What this asset last got. The city's presence is checked too: an asset reloaded at the same
+    // address has lost it, whatever the pointer says.
+    static void* s_asset = nullptr;
+    static LONG  s_gen = 0;
+    const int have = findCity(cities, prefix);
+    if (have >= 0 && asset == s_asset && gen == s_gen) return;   // already carries this list
+    if (have < 0 && maps->empty()) return;             // nothing to add and nothing to take out
     if (cities->num <= 0 || nodes->num <= 0) return;   // nothing to borrow the look from
     const int count = (int)maps->size();
+
+    // A NEWER LIST: the spots an earlier one added come out first. Their texts are not released --
+    // a few bytes per map per install; the engine offers nothing safe to free an FText with from here.
+    int removed = 0;
+    if (have >= 0) {
+        int w = 0;
+        for (int i = 0; i < nodes->num; i++) {
+            uint8_t* src = (uint8_t*)nodes->data + (size_t)i * off::kTransitNodeStride;
+            if (*(const uint64_t*)(src + off::kTransitNodeCity) == prefix) { removed++; continue; }
+            if (w != i) memmove((uint8_t*)nodes->data + (size_t)w * off::kTransitNodeStride, src, off::kTransitNodeStride);
+            w++;
+        }
+        nodes->num = w;
+    }
 
     // The look is borrowed from "Extra Network": its map blueprint and one of its nodes' placeholder
     // image and (empty) locked-state texts. Any non-editor city and any node would do.
@@ -449,7 +583,7 @@ void Inject(uint8_t* asset, const std::vector<Entry>* maps) {
     for (int i = 0; i < nodes->num; i++)
         if (*(const uint64_t*)((const uint8_t*)nodes->data + (size_t)i * off::kTransitNodeStride + off::kTransitNodeCity) == tcPrefix) { tmplNode = i; break; }
 
-    if (!reserve(nodes, off::kTransitNodeStride, count) || !reserve(cities, off::kTransitCityStride, 1)) {
+    if (!reserve(nodes, off::kTransitNodeStride, count) || (have < 0 && !reserve(cities, off::kTransitCityStride, 1))) {
         logv("[maps] transit map: could not grow the asset's lists -- custom maps not added");
         return;
     }
@@ -481,6 +615,12 @@ void Inject(uint8_t* asset, const std::vector<Entry>* maps) {
         nodes->num++;
         added++;
     }
+    if (have >= 0) {
+        // The city stays; with no spots left the game simply does not offer it.
+        s_asset = asset; s_gen = gen;
+        logv("[maps] transit map: custom maps updated -- %d spot(s), was %d", added, removed);
+        return;
+    }
     if (!added) return;
 
     uint8_t* c = (uint8_t*)cities->data + (size_t)cities->num * off::kTransitCityStride;
@@ -493,11 +633,76 @@ void Inject(uint8_t* asset, const std::vector<Entry>* maps) {
     memcpy(c + off::kTransitCityColor, tc + off::kTransitCityColor, 16);
     *(void**)(c + off::kTransitCityMapBp) = *(void* const*)(tc + off::kTransitCityMapBp);
     cities->num++;
+    s_asset = asset; s_gen = gen;
     logv("[maps] transit map: '%s' city added with %d spot(s), map look borrowed from city '%d'", kCityName, added, tmplCity);
 }
 } // namespace
 
 int Count() { const auto* m = readyList(); return m ? (int)m->size() : 0; }
+
+// ---- SELECT MAP ON A CUSTOM MAP ------------------------------------------------------------------
+// The pause menu's Select Map reads ATransitManager::_instance and does NOTHING when it is null
+// (UPauseMenuPageContainer::OnPageSelectionConfirmed). The manager is an actor each stock level places
+// (in its *_Transit sub-level) and it registers itself in BeginPlay; custom maps do not carry one, so on
+// them the row was dead and the only way off was the apartment. So on a custom map with no manager, one
+// is spawned: the game's own Blueprint, /Game/Transit/PBP_TransitManager, whose class defaults carry the
+// transit data and the map widget -- its BeginPlay then registers it and builds the screen exactly as a
+// placed one does. The world centre/scale that place the "you are here" marker are per-level and stay
+// default, so a custom map simply shows no marker.
+bool IsCustomLevel(const char* worldName) {
+    const auto* m = readyList();
+    if (!m || !worldName || !*worldName) return false;
+    for (const auto& e : *m) if (!_stricmp(e.name.c_str(), worldName)) return true;
+    return false;
+}
+
+void TickTransitManager(void* ownPawn) {
+#ifdef _WIN32
+    const Syms& S = Get();
+    if (!ownPawn || !S.TransitInstance || !S.GetWorld || !S.SpawnActor || !S.SoftPathTryLoad || !S.FNameCtor) return;
+    static void*     s_world = nullptr;
+    static ULONGLONG s_since = 0;
+    static bool      s_done  = false;
+    void* world = nullptr;
+    __try { world = S.GetWorld(ownPawn); } __except (EXCEPTION_EXECUTE_HANDLER) { return; }
+    if (!world) return;
+    if (world != s_world) { s_world = world; s_since = GetTickCount64(); s_done = false; }
+    if (s_done) return;
+    if (*S.TransitInstance) { s_done = true; return; }          // the level brought its own
+    if (GetTickCount64() - s_since < 3000) return;              // give a streamed *_Transit level time
+    s_done = true;                                              // one decision per world, whatever it is
+    char name[64] = {0};
+    if (!LocalMapName(ownPawn, name, sizeof(name)) || !IsCustomLevel(name)) return;
+
+    void* cls = nullptr;
+    __try {
+        uint8_t path[24] = {};                                  // FSoftObjectPath {FName; FString}
+        S.FNameCtor((uint64_t*)path, "/Game/Transit/PBP_TransitManager.PBP_TransitManager_C", 1);
+        cls = S.SoftPathTryLoad(path, nullptr);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { cls = nullptr; }
+    if (!cls || !IsObjectOfClass(cls, "Class")) {
+        logv("[maps] Select Map on '%s': the game's transit manager class did not load -- the row stays inactive here", name);
+        return;
+    }
+    void* p = nullptr;
+    unsigned long xcode = 0;
+    float loc[3] = { 0, 0, 0 }, rot[3] = { 0, 0, 0 };
+    uint8_t params[0x80]; memset(params, 0, sizeof(params));    // FActorSpawnParameters, defaults
+    __try { p = S.SpawnActor(world, cls, loc, rot, params); }
+    __except (xcode = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) { p = nullptr; }
+    if (!p) {
+        logv("[maps] Select Map on '%s': spawning a transit manager %s", name, xcode ? "FAULTED" : "returned null");
+        return;
+    }
+    // Ours alone: a host's spawn must not replicate to the other players (each spawns their own).
+    __try { if (S.SetReplicates) S.SetReplicates(p, false); } __except (EXCEPTION_EXECUTE_HANDLER) {}
+    const bool registered = *S.TransitInstance == p;
+    logv("[maps] Select Map on '%s': custom map with no transit manager -- spawned the game's own (%s)",
+         name, registered ? "registered: the pause menu's Select Map works here" : "but it did NOT register -- the row stays inactive");
+#else
+    (void)ownPawn;
+#endif
+}
 
 #ifdef OMP_USE_MINHOOK
 namespace {
@@ -523,11 +728,14 @@ const std::vector<Entry>* listForOpen() {
 // UTransitMapWidget::SetOpenTransitMap -- the asset is completed BEFORE the game reads it to build
 // the city widgets and the enabled-city list.
 void hkOpen(void* widget, uintptr_t a2, uintptr_t a3, uintptr_t a4, uintptr_t a5, uintptr_t a6, uintptr_t a7, uintptr_t a8) {
+    // Generation first, then the list: a publish between the two reads pairs an older generation with
+    // a newer list, which only means the next opening injects the same list again.
+    const LONG gen = g_gen;
     const std::vector<Entry>* maps = listForOpen();
     void* asset = nullptr;
     __try {
         asset = *(void**)((uint8_t*)widget + off::kTransitWidgetAsset);
-        Inject((uint8_t*)asset, maps);
+        Inject((uint8_t*)asset, maps, gen ? gen : g_gen);
     } __except (EXCEPTION_EXECUTE_HANDLER) { logv("[maps] transit map: adding custom maps faulted -- the screen is unchanged"); }
     // AND TAKE THE NAMES WHILE THE SCREEN HAS THEM. This asset is the only place a DLC map's human
     // name is readable during play, and it is readable right here -- so the labels are copied out
@@ -548,9 +756,10 @@ void Install(void (*logf)(const char*)) {
     if (done) return;
     done = true;
     g_logf = logf;
-    // The folder is read on its own thread, so launch never waits on it however many maps are installed.
+    // The folder is read on its own thread, so launch never waits on it however many maps are installed,
+    // and the same thread then watches it for maps installed or removed while the game runs.
     g_scanDone = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    HANDLE th = CreateThread(nullptr, 0, scanThread, nullptr, 0, nullptr);
+    HANDLE th = CreateThread(nullptr, 0, scanThread, (void*)1, 0, nullptr);
     if (th) { SetThreadPriority(th, THREAD_PRIORITY_BELOW_NORMAL); CloseHandle(th); }
     else    scanThread(nullptr);                       // no thread: scan here rather than not at all
     const Syms& S = Get();
@@ -567,6 +776,15 @@ void Install(void (*logf)(const char*)) {
 #else
 // Without the hook layer (offline tools and tests): the same scan, run here and published.
 void Install(void (*logf)(const char*)) { g_logf = logf; scanThread(nullptr); }
+#endif
+
+#ifdef _WIN32
+// For offline tests: the watch on its own thread (the offline Install only scans), and the generation.
+void DebugStartWatch() {
+    HANDLE th = CreateThread(nullptr, 0, [](void*) -> DWORD { watchLoop(); return 0; }, nullptr, 0, nullptr);
+    if (th) CloseHandle(th);
+}
+int DebugGeneration() { return (int)g_gen; }
 #endif
 
 // For offline tests: the published list, entry by entry. Null past the end or before the scan is done.

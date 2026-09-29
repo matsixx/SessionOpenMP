@@ -60,6 +60,7 @@
 #include "ui/menu_ext.h"
 #include "tweaks_mod.h"
 #include "grind_pop.h"   // GrindPop_NameOfFName -- it owns the FName::ToString address
+#include "rtflip.h"      // RtFlip_TrickDef -- a real-time flip is a flip trick
 #include <cstring>
 #include <cmath>
 
@@ -708,7 +709,9 @@ bool FootSteer_AddOffset(void* a, float dt, float outL[3], float outR[3]) {
         // Latched over the air because the definition is chosen at the pop and cleared on landing.
         {
             void* sk  = twkP(a, AN_SKATER);
-            void* def = sk ? twkP(sk, SK_CUR_TRICK) : nullptr;
+            // A real-time flip in the air is a flip trick though the skater's own trick stays the ollie.
+            void* def = RtFlip_TrickDef();
+            if (!def) def = sk ? twkP(sk, SK_CUR_TRICK) : nullptr;
             if (def && def != g_lastTrickDef) {           // only on a NEW definition
                 g_lastTrickDef = def;
                 char nm[96];

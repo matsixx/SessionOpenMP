@@ -33,6 +33,9 @@ void  CatchSound_SetVolumePct(float pct);
 bool CatchSound_ObjName(const void* obj, char* out, int cap);
 // Raw-FName -> text (a bone name is an FName inside a struct, not a UObject). Same cache and rules.
 bool CatchSound_FNameText(const void* fname, char* out, int cap);
+// The catch cue now, on this skater, as the catch edge plays it (rtflip.cpp: a real-time flip's catch).
+// False when the catch sound is off or unavailable.
+bool CatchSound_PlayNow(void* skater);
 // A one-shot through UReplayAudioManager::SpawnSoundAttached (in the replay, and so to other players).
 void* CatchSound_SpawnAttached(void* cue, void* attachTo, float vol, float pitch);
 void* CatchSound_FindSound(const char* shortName);

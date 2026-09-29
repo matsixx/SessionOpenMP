@@ -22,10 +22,12 @@
 //
 //   * at start-up, every *.umap under Content/CustomMaps is found, one entry per level, its package
 //     path derived from where it sits ("/Game/CustomMaps/<author>/<map>/<Map>"), its label from the
-//     file name or the mod manager's CustomName, hidden ones honoured;
+//     file name or the mod manager's CustomName, hidden ones honoured -- and the folder (with the mod
+//     manager's records) is then WATCHED: a map installed, removed, renamed or hidden while the game
+//     runs is re-read once the folder goes quiet, and published as a new list;
 //   * when the transit map is about to open, one "Custom Maps" city and one node per level are
-//     appended to that asset (idempotent: the city's prefix is looked for first). The city borrows
-//     the "Extra Network" city's map blueprint, the nodes borrow an Extra node's placeholder image.
+//     appended to that asset; an asset that carries an older list has its custom spots replaced. The
+//     city borrows the "Extra Network" city's map blueprint, the nodes an Extra node's placeholder image.
 //
 // The game then draws, pages, selects and travels on its own: OpenLevel with a full package path
 // loads the loose level directly. No files are copied, no console command is run. A level name
@@ -37,4 +39,8 @@
 namespace omp::game::maps {
 void Install(void (*logf)(const char*));   // start-up: scan the folder, hook the transit map opening
 int  Count();                              // how many custom levels were found
+bool IsCustomLevel(const char* worldName); // is this world one of the listed custom maps?
+// GAME THREAD, every frame with the local pawn: on a custom map that has no ATransitManager (they never
+// do), spawn the game's own after 3 s so the pause menu's Select Map works there. One decision per world.
+void TickTransitManager(void* ownPawn);
 } // namespace omp::game::maps

@@ -22,6 +22,9 @@
 // crank/grounded via foot_place's anim instance) and per trick from grind_pop's drain, where the
 // trick name is already resolved and the pop values already read.
 #pragma once
+// FLICK POP (injection mode 5) is disabled and hidden for now: no menu row, the ini cannot turn it on (a saved
+// PopProbeInject=5 falls back to the pop control scheme). 1 brings it back.
+#define TWK_FLICK_POP 0
 struct OmpMenuApi;
 void PopProbe_ReadConfig(const char* iniText);
 void PopProbe_SaveConfig(char* iniText, size_t cap);
@@ -65,8 +68,17 @@ int   PopProbe_SkaterManualBits();
 // The pause-menu page's accessors (GAME THREAD, menu_ext contract): plain int reads/writes,
 // every setter marks the ini dirty. "Scheme" = pad-level injection mode 3, the shipped scheme.
 bool  PopProbe_SchemeEnabled();      void PopProbe_SetSchemeEnabled(bool on);
+// The last flick pop: which stick was the crank (0 left, 1 right) and how long ago it fired. False = none.
+bool  PopProbe_LastFlickPop(int* crankStick, double* ageSec);
 float PopProbe_TrickWindowMs();      void PopProbe_SetTrickWindowMs(float v);
 float PopProbe_CrouchGatePct();      void PopProbe_SetCrouchGatePct(float v);
 float PopProbe_CrankVisTimeMs();     void PopProbe_SetCrankVisTimeMs(float v);
 float PopProbe_CrankVisMinMs();      void PopProbe_SetCrankVisMinMs(float v);
 float PopProbe_CrankVisSmoothMs();   void PopProbe_SetCrankVisSmoothMs(float v);
+// The flick pop (input mode 5; turning it on turns the scheme off and back).
+bool  PopProbe_FlickPop();           void PopProbe_SetFlickPop(bool on);
+float PopProbe_FlickHoldMs();        void PopProbe_SetFlickHoldMs(float v);
+float PopProbe_FlickStartPct();      void PopProbe_SetFlickStartPct(float v);
+float PopProbe_FlickFullPct();       void PopProbe_SetFlickFullPct(float v);
+float PopProbe_FlickSlowMs();        void PopProbe_SetFlickSlowMs(float v);
+float PopProbe_FlickMinPct();        void PopProbe_SetFlickMinPct(float v);

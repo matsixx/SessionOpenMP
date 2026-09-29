@@ -144,6 +144,7 @@ bool  CatchLevel_Enabled()             { return g_on != 0; }
 // looking enabled while nothing happened.
 void  CatchLevel_SetEnabled(bool on)   { g_on = on ? 1 : 0; if (on) g_ok = 1; TwkMarkDirty(); }
 float CatchLevel_ResponseMs()          { return g_responseMs; }
+float CatchLevel_TargetDeg()            { return g_targetDeg; }
 void  CatchLevel_SetResponseMs(float ms) {
     if (ms < 20.0f) ms = 20.0f;
     if (ms > 200.0f) ms = 200.0f;

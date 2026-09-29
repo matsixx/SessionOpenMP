@@ -62,6 +62,7 @@ enum {
     OBJ_NAME            = 0x18,   // UObjectBase::NamePrivate (FName) -- how anything gets a name
     COMP_OWNER          = 0xa0,   // UActorComponent::OwnerPrivate -- MeshComp -> the skater
     NTF_SOUND           = 0x38,   // UAnimNotify_PlaySound::Sound -- the catch cue, learned here
+    CONC_SETTINGS       = 0x28,   // USoundConcurrency::Concurrency (FSoundConcurrencySettings, 40 B)
     SK_ROOT_COMP        = 0x130,  // AActor::RootComponent -- what the self-spawn attaches to
     // ASkaterCharacterBase
     SK_AUDIO_DATA       = 0x4e8,  // USkaterAudioData* _audioData
@@ -153,7 +154,16 @@ static const char* SIG_RAM_SPAWN_ATT =
     "48 8B C4 48 89 58 10 48 89 70 18 55 41 54 41 55 41 56 41 57 48 8D 68 B8 48 81 EC 20 01 00 00 "
     "48 8B 75 70";
 
+// StaticConstructObject_Internal -- copied verbatim from cloth_merge.cpp (dual-exe verified there).
+// ANCHORED MID-FUNCTION: UE4SS detours this function's head at load, so the pattern sits 0x30 in and
+// the entry is the hit minus that.
+static const int  kScoAnchorOff = 0x30;
+static const char* SIG_SCO =
+    "00 00 48 8B 39 4C 8D 25 ?? ?? ?? ?? 4C 8B 79 08 48 8B D9 8B 71 18 4C 8B 71 28 F7 87 CC 00 00 00 "
+    "80 00 00 10";
+
 typedef void* (*PlayCatchFn)(void*, void*);
+typedef void* (*ScoFn)(const void* params);
 typedef void  (*FNameToStrFn)(const void*, void*);
 typedef void* (*StaticFindFn)(void* cls, void* outer, const wchar_t* name, int exactClass);
 // 13 args, measured (game_syms.h). This one is CALLED, so the compiler lays out the ABI -- the arity
@@ -165,6 +175,7 @@ static void* g_origPlay = nullptr, *g_startPlay = nullptr;
 static FNameToStrFn    g_fnameToStr = nullptr;
 static StaticFindFn    g_staticFind = nullptr;
 static SpawnAttachedFn g_spawnAtt   = nullptr;
+static ScoFn           g_sco        = nullptr;
 static void* g_catchCue = nullptr;   // the cue, learned from a real notify -- correct by construction
 static void* g_lastNotifySkater = nullptr;
 
@@ -360,9 +371,64 @@ void* CatchSound_SpawnAttached(void* cue, void* attachTo, float vol, float pitch
                           nullptr, nullptr, true /*autoDestroy: a one-shot*/);
     } __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
 }
+// ---- THE CATCH SOUND'S OWN CONCURRENCY GROUP. The catch cue is SCU_FootOnBoard, the game's shared
+// "foot hits the board" sound: every landing and every board mount, for EVERY skater. All its copies
+// share one concurrency group, which in a lobby is the busiest in the game, and a group's rules -- a
+// retrigger time, volume scaling of older copies -- let a peer's landing that started just before a
+// catch refuse or duck it. OpenMP raises that group's MaxCount; neither of those rules is a count.
+// Field: solo, every catch heard; six players, `played` logged and about one in ten silent, while the
+// pop -- a cue nothing else shares -- never dropped.
+// So the catch is spawned with a USoundConcurrency of its OWN: built once, rooted (never collected,
+// survives map changes), and its group only ever holds our catches. Engine defaults otherwise.
+static void* g_ownConc = nullptr;
+static bool  g_concTried = false;
+static void* OwnConcurrency() {
+    if (g_ownConc || g_concTried) return g_ownConc;
+    g_concTried = true;
+    if (!g_sco || !g_staticFind) {
+        TwkLog("[csnd] no object constructor -- the catch sound shares the landing sound's group, as before");
+        return nullptr;
+    }
+    void* cls = nullptr; void* outer = nullptr;
+    __try {
+        cls   = g_staticFind(nullptr, nullptr, L"/Script/Engine.SoundConcurrency", 0);
+        outer = g_staticFind(nullptr, nullptr, L"/Engine/Transient", 0);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { cls = outer = nullptr; }
+    char cn[32];
+    if (!cls || !outer || !NameOf(twkP(cls, OBJ_CLASS), cn, sizeof(cn)) || strcmp(cn, "Class") != 0) {
+        TwkLog("[csnd] SoundConcurrency class or the transient package not found -- the catch sound shares the"
+               " landing sound's group, as before");
+        return nullptr;
+    }
+    uint8_t params[64] = {};                               // FStaticConstructObjectParameters
+    *(void**)(params + 0x00)    = cls;
+    *(void**)(params + 0x08)    = outer;
+    *(uint64_t*)(params + 0x10) = 0;                       // NAME_None: the engine names it
+    *(uint32_t*)(params + 0x18) = 0x40 | 0x80;             // RF_Transient | RF_MarkAsRootSet
+    void* o = nullptr;
+    __try { o = g_sco(params); } __except (EXCEPTION_EXECUTE_HANDLER) { o = nullptr; }
+    if (!o) { TwkLog("[csnd] building the catch sound's concurrency failed -- it shares the landing sound's group, as before"); return nullptr; }
+    __try {
+        uint8_t* c = (uint8_t*)o + CONC_SETTINGS;          // FSoundConcurrencySettings
+        *(int32_t*)(c + 0x00) = 32;                        // MaxCount: never the limit
+        *(int32_t*)(c + 0x04) = 0;                         // bLimitToOwner
+        *(float*)  (c + 0x0c) = 0.0f;                      // RetriggerTime: none
+        *(float*)  (c + 0x10) = 1.0f;                      // VolumeScale: older copies are not ducked
+        TwkLog("[csnd] the catch sound has a concurrency group of its own now (%p): room for %d, rule %d,"
+               " retrigger %.2f s, volume scale %.2f -- other skaters' landings can no longer refuse or duck it",
+               o, *(int32_t*)c, (int)*(uint8_t*)(c + 0x08), *(float*)(c + 0x0c), *(float*)(c + 0x10));
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        TwkLog("[csnd] could not set the catch sound's concurrency -- it shares the landing sound's group, as before");
+        return nullptr;
+    }
+    g_ownConc = o;
+    return o;
+}
+
 // Attached to the skater's root, through the REPLAY wrapper: recorded into the replay, captured by
 // OpenMP's funnel for peer sync, audible locally -- one call, all three.
-static bool PlayCatchCue(void* skater) {
+static bool PlayCatchCue(void* skater, void** compOut) {
+    if (compOut) *compOut = nullptr;
     if (!g_okSelfPlay || !g_spawnAtt || !skater) return false;
     void* cue = ResolveCue();
     if (!cue) return false;
@@ -372,10 +438,13 @@ static bool PlayCatchCue(void* skater) {
     if (vol > 4.0f) vol = 4.0f;                        // never drive the mixer into clipping
     const float zero[3] = { 0.0f, 0.0f, 0.0f };
     __try {
-        g_spawnAtt(cue, root, 0 /*NAME_None*/, zero, zero, 0 /*KeepRelativeOffset*/,
-                   false /*stopWhenDetached*/, vol, 1.0f, 0.0f,
-                   nullptr /*attenuation: the cue's own*/, nullptr /*concurrency: the cue's own*/,
-                   true /*autoDestroy -- a one-shot, same as the notify stages*/);
+        // The component handed back is kept for the log: null means nothing was spawned -- the
+        // engine refused it, or a hook on the way (co-op's proxy mute) swallowed it.
+        void* comp = g_spawnAtt(cue, root, 0 /*NAME_None*/, zero, zero, 0 /*KeepRelativeOffset*/,
+                                false /*stopWhenDetached*/, vol, 1.0f, 0.0f,
+                                nullptr /*attenuation: the cue's own*/, OwnConcurrency() /*a group of its own*/,
+                                true /*autoDestroy -- a one-shot, same as the notify stages*/);
+        if (compOut) *compOut = comp;
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         // Most likely a STALE CUE (GC'd with an old level). Drop the cache so the next attempt
         // re-resolves by name instead of writing the feature off for the session -- the pawn-change
@@ -391,6 +460,12 @@ static bool PlayCatchCue(void* skater) {
         return false;
     }
     return true;
+}
+
+bool CatchSound_PlayNow(void* skater) {
+    if (!g_on || !skater) return false;
+    void* comp = nullptr;
+    return PlayCatchCue(skater, &comp) && comp;
 }
 
 // ------------------------------------------------------------------ the catch edge -> the sound
@@ -447,10 +522,12 @@ void CatchSound_PumpFrame() {
 
         // ---- REPLAY-PLAYBACK GUARD. The sound now lives in the replay recording, so during
         // playback the recorder replays it; a self-play on top would double it. "In playback" is
-        // detected by the catch system going quiet: CatchTweaks_RecentMaxZ() returns -999999 when
-        // the CanCatchOrient hook has seen no calls for ~1.5 s, and the InAirHandler does not run
-        // while a replay is being scrubbed. Live skating keeps it fresh every frame.
-        const bool catchSystemLive = CatchTweaks_RecentMaxZ() > -999998.0f;
+        // the LOCAL skater's catch system going quiet: the InAirHandler does not run while a replay
+        // is being scrubbed. This read the position sampler's max-Z until 3.19.565 -- which counted
+        // peers' positions, and threw every sample away on a map placing the skater over 1 km out
+        // on -X, which silenced every catch for the whole session there (a lobby field report).
+        const bool catchSystemLive = CatchTweaks_LocalCatchAgeSec() < 1.5;
+        static double s_edgeAt = -1.0;       // when this watch last saw a catch edge
 
         // ---- the edge. One rising _catchOrientState edge = one real catch (post-2.67 guarantees).
         if (g_okEdge && skater && catchSystemLive) {
@@ -462,9 +539,30 @@ void CatchSound_PumpFrame() {
                 e.trickDef = twkP(skater, SK_CUR_FLIP_DEF);   // captured NOW; judged later (see above)
                 e.catchMode = twkB(skater, SK_CATCH_MODE);
                 e.live = true;
+                s_edgeAt = now;
                 InterlockedIncrement(&g_uiEdges);
             }
             if (st >= 0) g_lastCatchSt = st;
+        }
+
+        // ---- A CATCH THIS WATCH MISSED. The catch logic counts every engage on the local skater;
+        // one with no edge here within 0.3 s was silent, and the line says which gate held it.
+        {
+            static long   s_seen = -1;
+            static double s_pendingAt = -1.0;
+            static int    s_said = 0;
+            const long eng = CatchTweaks_EngageCount();
+            if (s_seen < 0) s_seen = eng;
+            if (eng != s_seen) { s_seen = eng; s_pendingAt = now; }
+            if (s_pendingAt > 0.0 && s_edgeAt >= s_pendingAt - 0.3) s_pendingAt = -1.0;
+            else if (s_pendingAt > 0.0 && now - s_pendingAt > 0.3) {
+                s_pendingAt = -1.0;
+                if (s_said++ < 30)
+                    TwkLog("[csnd] a catch engaged but the sound's watch did not see it -- skater %s, catch system %s"
+                           " (local check %.1f s ago), edge watch %s",
+                           skater ? "known" : "UNKNOWN", catchSystemLive ? "live" : "NOT live",
+                           CatchTweaks_LocalCatchAgeSec(), g_okEdge ? "on" : "OFF");
+            }
         }
 
         // ---- the sound, after the short grace so it lands with the pose rather than ahead of it.
@@ -476,14 +574,16 @@ void CatchSound_PumpFrame() {
             const int verdict = DerivedVerdict(e.skater, e.trickDef);
             if (verdict == 1) { InterlockedIncrement(&g_uiBlacklisted); continue; }   // ollies: by design
             if (verdict < 0)  InterlockedIncrement(&g_uiUnreadable);                  // play anyway
-            const bool played = PlayCatchCue(e.skater);
+            void* comp = nullptr;
+            const bool played = PlayCatchCue(e.skater, &comp) && comp;
             if (played) InterlockedIncrement(&g_uiPlayed);
             if (g_diag) {
                 char trick[64];
                 if (!e.trickDef || !NameOf(e.trickDef, trick, sizeof(trick)))
                     strcpy(trick, e.trickDef ? "?" : "none");
                 TwkLog("[csnd] catch -> %s (trick='%s' mode=%s%s)",
-                       played ? "played" : "NOT played (cue unavailable)",
+                       played ? "played" : !ResolveCue() ? "NOT played (cue unavailable)"
+                                         : "NOT played (the spawn handed back no sound -- refused or muted on the way)",
                        trick, IsManual(e.catchMode) ? "manual" : "auto",
                        verdict < 0 ? ", blacklist unreadable" : "");
             }
@@ -509,6 +609,8 @@ void CatchSound_Install() {
     if (!g_fnameToStr) TwkLog("[csnd] FName::ToString not found -- log lines will be unnamed");
     g_staticFind = (StaticFindFn)TwkScanExe(SIG_STATIC_FIND);
     g_spawnAtt   = (SpawnAttachedFn)TwkScanExe(SIG_RAM_SPAWN_ATT);
+    { uint8_t* scoAnchor = TwkScanExe(SIG_SCO);
+      g_sco = scoAnchor ? (ScoFn)(scoAnchor - kScoAnchorOff) : nullptr; }
     if (!g_staticFind || !g_spawnAtt) {
         // Without the spawn, muting the game's sound would leave EVERY catch silent -- fail safe to
         // the game's own (inconsistent) sound rather than to none at all.

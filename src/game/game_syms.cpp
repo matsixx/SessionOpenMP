@@ -333,7 +333,20 @@ static const SigEntry kSigs[] = {
     // UTransitMapWidget::SetOpenTransitMap                              Epic 0x1192890 / Steam 0x1153070
     // HOOKED (custom_maps.cpp), never called: the Select Map screen opening, where the custom maps
     // are added to its data. Optional: without it they simply do not appear.
+    // UWorld::GetAudioDeviceRaw  Epic 0x30b0380 / Steam 0x3072ef0 (sigmake) -- the world's FAudioDevice, for
+    // the voice-budget sample in audio.cpp (measurement only).
+    { "WorldAudioDevice",      "40 53 48 83 EC 20 48 8D 99 60 01 00 00 48 8B CB E8 ?? ?? ?? ?? 84 C0 ?? ?? 48 8B CB 48 83 C4 20 5B E9 ?? ?? ?? ?? 48 8B 0D ?? ?? ?? ??", false },
+    // FAudioDevice::GetMaxChannels  Epic 0x2a817c0 / Steam 0x2a44000 (sigmake) -- the EFFECTIVE voice limit:
+    // MaxChannels, or the au.SetAudioChannelCount override when set, x the scale, capped at MaxSources.
+    { "AudioGetMaxChannels",   "40 53 48 83 EC 30 0F 29 74 24 20 48 8B D9 E8 ?? ?? ?? ?? 84 C0 ?? ?? F3 0F 10 B3 9C 00 00 00 ?? ?? F3 0F 10 B3 A0 00 00 00", false },
     { "TransitOpenMap",        "48 8B C4 55 56 48 8B EC 48 83 EC 78 48 89 58 10 48 89 78 18 48 8B F9 48 8B 0D ?? ?? ?? ?? 4C 89 68 E8", false },
+    // DATA-REFERENCE SITES for the static ATransitManager::_instance (Epic 0x4d89830) -- what the pause
+    // menu's Select Map reads, and does nothing when it is null (see custom_maps.cpp). Decoded like the
+    // dropper singleton: RIP displacements wildcarded, both must agree.
+    // ATransitManager::BeginPlay (Epic 0x1173de0 / Steam 0x1134500): `mov [rip+disp],rbx` at +0x1d.
+    { "TransitInstSetSite",    "48 89 5C 24 10 48 89 6C 24 18 56 57 41 56 48 83 EC 30 48 8B D9 E8 ?? ?? ?? ?? 48 8B CB 48 89 1D ?? ?? ?? ?? E8 ?? ?? ?? ?? 8B 83 28 02 00 00", false },
+    // ATransitManager::EndPlay (site Epic 0x117a7c7 / Steam 0x113aee7): `mov qword [rip+disp],0` at +0x16.
+    { "TransitInstClearSite",  "48 8D 8B C0 05 00 00 48 8B D7 E8 ?? ?? ?? ?? 48 8B 0D ?? ?? ?? ?? 48 C7 05 ?? ?? ?? ?? 00 00 00 00 48 8B 01 FF 90 D0 01 00 00", false },
     // UActorComponent::DestroyComponent(bool bPromoteChildren)          Epic 0x2ae3280 / Steam 0x2aa5ac0
     // A proxy's looping sounds are spawned with bAutoDestroy off (they are updated while they play),
     // so stopping one left the component attached to the actor for the life of the world: one more
@@ -1104,19 +1117,24 @@ const Syms& Resolve(void (*logf)(const char*)) {
                  hits[i], hits[i] > 1 ? "  *** AMBIGUOUS -- sig needs lengthening" : "");
         say(m);
     }
-    // bind (order matches the table)
-    int i = 0;
-    // THIS BLOCK IS POSITIONAL: `found[]` is indexed in kSigs ORDER, so a table entry inserted
-    // somewhere other than where its assignment sits shifts every later symbol onto the wrong
-    // address -- and nothing downstream notices, because every sig still resolves 1-hit. It happened:
-    // two entries added ahead of AudioSetVolume in the table but after it here left the board-wear
-    // write calling an audio volume setter and the voice volume call writing over an audio
-    // component. So each line NAMES the table entry it expects, and a mismatch stops the binding
-    // dead at that point instead of quietly scrambling the rest.
-    const char* takeBad = nullptr;
+    // bind -- BY NAME. This block was positional (a cursor walking the table), so an entry placed in
+    // the table somewhere other than where its assignment sits broke every later symbol. It happened
+    // twice: two entries ahead of AudioSetVolume once left the board-wear write calling an audio volume
+    // setter, and WorldAudioDevice ahead of TransitOpenMap (1.3.2 dev) nulled 36 symbols -- the news
+    // panel lost its text call and the what's-new notes fell back to the update popup, re-shown every
+    // second. Each line names its table entry, and the name is what is looked up now: order no longer
+    // matters, and the check below still says out loud when a name is missing or an entry is unbound.
+    int i = 0;                                   // distinct table entries bound
+    bool taken[kSigN] = {};
+    const char* takeBad = nullptr;               // the first name the table does not have
     auto take = [&](const char* want) -> void* {
-        if (i >= kSigN || strcmp(kSigs[i].name, want) != 0) { if (!takeBad) takeBad = want; return nullptr; }
-        return found[i++];
+        for (int k = 0; k < kSigN; k++)
+            if (!strcmp(kSigs[k].name, want)) {
+                if (!taken[k]) { taken[k] = true; i++; }
+                return found[k];
+            }
+        if (!takeBad) takeBad = want;
+        return nullptr;
     };
     g_syms.SpawnActor         = (SpawnActorFn)      take("SpawnActor");
     g_syms.GetWorld           = (GetWorldFn)        take("GetWorld");
@@ -1303,6 +1321,34 @@ const Syms& Resolve(void (*logf)(const char*)) {
     g_syms.GrindBlendSpace    =                     take("GrindBlendSpace");      // hooked, never called
     g_syms.IsFacingMoveDir    =                     take("IsFacingMoveDir");      // hooked, never called
     g_syms.TransitOpenMap     =                     take("TransitOpenMap");       // hooked, never called
+    g_syms.WorldAudioDevice   = (WorldAudioDevFn)   take("WorldAudioDevice");
+    g_syms.AudioGetMaxChannels= (AudioMaxChFn)      take("AudioGetMaxChannels");
+    // ATransitManager::_instance, decoded from the two sites (see their table note) and used only when
+    // they agree. The set site's `48 89 1D disp32` sits 0x1d into its pattern (7 bytes); the clear
+    // site's `48 C7 05 disp32 imm32` 0x16 into its pattern (11 bytes).
+    {
+        const uint8_t* a = (const uint8_t*)take("TransitInstSetSite");
+        const uint8_t* b = (const uint8_t*)take("TransitInstClearSite");
+        void** ga = nullptr; void** gb = nullptr;
+        if (a && a[0x1d] == 0x48 && a[0x1e] == 0x89 && a[0x1f] == 0x1D) {
+            int32_t d = 0; memcpy(&d, a + 0x20, 4); ga = (void**)(a + 0x1d + 7 + d);
+        }
+        if (b && b[0x16] == 0x48 && b[0x17] == 0xC7 && b[0x18] == 0x05) {
+            int32_t d = 0; memcpy(&d, b + 0x19, 4); gb = (void**)(b + 0x16 + 11 + d);
+        }
+        char m[220];
+        if (ga && gb && ga == gb) {
+            g_syms.TransitInstance = ga;
+            snprintf(m, sizeof(m), "[sym] %-22s -> exe+%p (decoded, both sites agree)",
+                     "TransitInstance", (void*)((uint8_t*)ga - base));
+        } else if (ga || gb) {
+            snprintf(m, sizeof(m), "[sym] %-22s !! SITES DISAGREE (%p vs %p) -- Select Map on custom maps stays off",
+                     "TransitInstance", (void*)ga, (void*)gb);
+        } else {
+            snprintf(m, sizeof(m), "[sym] %-22s !! NOT DECODED -- Select Map on custom maps stays off", "TransitInstance");
+        }
+        say(m);
+    }
     g_syms.CompDestroy        = (CompDestroyFn)     take("CompDestroy");
     g_syms.WidgetCreate       = (WidgetCreateFn)    take("WidgetCreate");
     g_syms.WidgetAddToViewport= (WidgetAddViewFn)   take("WidgetAddToViewport");
@@ -1355,18 +1401,17 @@ const Syms& Resolve(void (*logf)(const char*)) {
     g_syms.PlayerInputKeyValue= (KeyValueFn)       take("PlayerInputKeyValue");
     g_syms.WidgetSetFocus     = (WidgetVoidFn)     take("WidgetSetKeyboardFocus");
 
-    // LOCKSTEP CHECK. The block above is POSITIONAL, and a table entry added without its assignment --
-    // or vice versa -- shifts every later symbol onto the wrong address SILENTLY: sigs still resolve
-    // 1-hit, symcheck still passes, and the mod hooks whatever happens to sit at the shifted index.
-    // `i` has consumed exactly one slot per assignment, so comparing it to kSigN catches a missing or
-    // extra assignment; `takeBad` names the first line whose expected entry was not the one the table
-    // had there, which is the reordering case. Either way it is loud, at startup, before anything runs.
+    // COMPLETENESS CHECK. A name the table does not have (a typo, or a table entry removed) binds that one
+    // symbol to null; a table entry nobody takes is dead weight or a forgotten assignment. Neither can
+    // shift anything any more, but both are mistakes, and both are said loudly at startup.
     if (i != kSigN || takeBad) {
-        char mm[260];
+        const char* unbound = nullptr;
+        for (int k = 0; k < kSigN && !unbound; k++) if (!taken[k]) unbound = kSigs[k].name;
+        char mm[300];
         snprintf(mm, sizeof(mm),
-                 "[sym] *** SIG TABLE/BINDING MISMATCH: %d assignments for %d table entries%s%s -- every"
-                 " symbol from there on is bound to the WRONG address. Fix before trusting anything.",
-                 i, kSigN, takeBad ? ", first bad: " : "", takeBad ? takeBad : "");
+                 "[sym] *** SIG TABLE/BINDING INCOMPLETE: %d of %d table entries bound%s%s%s%s -- fix before shipping.",
+                 i, kSigN, takeBad ? ", name not in the table: " : "", takeBad ? takeBad : "",
+                 unbound ? ", first unbound entry: " : "", unbound ? unbound : "");
         say(mm);
     }
 

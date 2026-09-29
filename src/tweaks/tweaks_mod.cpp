@@ -50,6 +50,8 @@
 #include "foot_place.h"
 #include "board_stance.h"
 #include "foot_steer.h"
+#include "carve.h"
+#include "rtflip.h"
 #include "grind_pop.h"
 #include "grind_rock.h"
 #include "grind_lean.h"
@@ -69,7 +71,7 @@
 #include "ue4ss_abi.h"
 #include "ui/menu_ext.h"
 
-#define TWEAKS_VERSION "3.19.549"
+#define TWEAKS_VERSION "3.19.604"
 #define TWK_WIDEN(x) STR(x)   // STR() prepends L before the macro expands; expand first
 
 // ------------------------------------------------------------------ log (own file, fresh per launch)
@@ -109,6 +111,8 @@ static void saveSettings() {
     PitchRange_SaveConfig(buf, sizeof(buf));
     FootPlace_SaveConfig(buf, sizeof(buf));
     FootSteer_SaveConfig(buf, sizeof(buf));
+    Carve_SaveConfig(buf, sizeof(buf));
+    RtFlip_SaveConfig(buf, sizeof(buf));
     Stance_SaveConfig(buf, sizeof(buf));
     GrindPop_SaveConfig(buf, sizeof(buf));
     GrindRock_SaveConfig(buf, sizeof(buf));
@@ -157,6 +161,8 @@ static void readConfig(const char* dir) {
     PitchRange_ReadConfig(buf);
     FootPlace_ReadConfig(buf);
     FootSteer_ReadConfig(buf);
+    Carve_ReadConfig(buf);
+    RtFlip_ReadConfig(buf);
     Stance_ReadConfig(buf);
     GrindPop_ReadConfig(buf);
     GrindRock_ReadConfig(buf);
@@ -197,6 +203,8 @@ static void resetAllDefaults() {
     PitchRange_ResetDefaults();
     FootPlace_ResetDefaults();
     FootSteer_ResetDefaults();
+    Carve_ResetDefaults();
+    RtFlip_ResetDefaults();
     Stance_ResetDefaults();
     GrindPop_ResetDefaults();
     GrindRock_ResetDefaults();
@@ -239,8 +247,9 @@ static void drawSection(const OmpMenuApi* api, void*) {
     };
 
     typedef void (*DrawFn)(const OmpMenuApi*);
-    static DrawFn const kPop[]    = { PopProbe_DrawMenu };
-    static DrawFn const kBoard[]  = { FlipSpeed_DrawMenu, ScoopSpeed_DrawMenu, PitchRange_DrawMenu };
+    static DrawFn const kPop[]    = { PopProbe_DrawMenu, RtFlip_DrawMenu };
+    static DrawFn const kBoard[]  = { FlipSpeed_DrawMenu, ScoopSpeed_DrawMenu, PitchRange_DrawMenu, Carve_DrawMenu,
+                                      Carve_DrawLandMenu };
     static DrawFn const kCatch[]  = { CatchTweaks_DrawMenu, CatchLevel_DrawMenu, CatchSound_DrawMenu,
                                       RunOut_DrawMenu };
     static DrawFn const kGrind[]  = { GrindPop_DrawMenu, GrindRock_DrawMenu, GrindLean_DrawMenu };
@@ -312,6 +321,8 @@ static const char* const kTwkClothMove = "TwkClothMove";
 static const char* const kTwkClothHem  = "TwkClothHemLift";
 static const char* const kTwkClothHemUp = "TwkClothHemLiftReach";
 static const char* const kTwkClothCuff = "TwkClothCuffGrip";
+static const char* const kTwkClothSpike = "TwkClothSpikePasses";
+static const char* const kTwkClothSettle = "TwkClothSettle";
 static const char* const kTwkCamFollow    = "TwkCamFollow";
 static const char* const kTwkCamPitchDrop = "TwkCamPitchDrop";
 static const char* const kTwkCamPitch  = "TwkCamPitch";
@@ -411,6 +422,17 @@ static const char* const kTwkPopGate   = "TwkPopGate";
 static const char* const kTwkPopVisLo  = "TwkPopVisStart";
 static const char* const kTwkPopVisHi  = "TwkPopVisBottom";
 static const char* const kTwkPopVisSm  = "TwkPopVisSmooth";
+static const char* const kTwkPopFlick  = "TwkPopFlick";
+static const char* const kTwkCarve     = "TwkCarve";
+static const char* const kTwkCarveLean = "TwkCarveLean";
+static const char* const kTwkCarveCurv = "TwkCarveCurve";
+static const char* const kTwkCarveFlow = "TwkCarveFlow";
+static const char* const kTwkLandGive  = "TwkLandGive";
+static const char* const kTwkPopFlHold = "TwkPopFlickHold";
+static const char* const kTwkPopFlStart = "TwkPopFlickStart";
+static const char* const kTwkPopFlFull = "TwkPopFlickFull";
+static const char* const kTwkPopFlSlow = "TwkPopFlickSlow";
+static const char* const kTwkPopFlMin  = "TwkPopFlickMin";
 static const char* const kTwkReset    = "TwkResetDefaults";
 
 // An ACTION row on the page: pressed, not adjusted.
@@ -455,9 +477,52 @@ static int pageGetSitCam(const char* key, int* oi, float* of) {
     else return 0;
     return 1;
 }
+static bool pageValuePop(const char* key, int iv, float fv) {
+    if      (!strcmp(key, kTwkPop))       PopProbe_SetSchemeEnabled(iv != 0);
+    else if (!strcmp(key, kTwkPopWin))    PopProbe_SetTrickWindowMs(fv);
+    else if (!strcmp(key, kTwkPopGate))   PopProbe_SetCrouchGatePct(fv);
+    else if (!strcmp(key, kTwkPopVisLo))  PopProbe_SetCrankVisMinMs(fv);
+    else if (!strcmp(key, kTwkPopVisHi))  PopProbe_SetCrankVisTimeMs(fv);
+    else if (!strcmp(key, kTwkPopVisSm))  PopProbe_SetCrankVisSmoothMs(fv);
+    else if (!strcmp(key, kTwkPopFlick))  PopProbe_SetFlickPop(iv != 0);
+    else if (!strcmp(key, kTwkPopFlHold)) PopProbe_SetFlickHoldMs(fv);
+    else if (!strcmp(key, kTwkPopFlStart)) PopProbe_SetFlickStartPct(fv);
+    else if (!strcmp(key, kTwkPopFlFull)) PopProbe_SetFlickFullPct(fv);
+    else if (!strcmp(key, kTwkPopFlSlow)) PopProbe_SetFlickSlowMs(fv);
+    else if (!strcmp(key, kTwkPopFlMin))  PopProbe_SetFlickMinPct(fv);
+    else if (!strcmp(key, kTwkCarve))     Carve_SetEnabled(iv != 0);
+    else if (!strcmp(key, kTwkCarveLean)) Carve_SetLeanMs(fv);
+    else if (!strcmp(key, kTwkCarveCurv)) Carve_SetCurvePct(fv);
+    else if (!strcmp(key, kTwkCarveFlow)) Carve_SetFlowPct(fv);
+    else if (!strcmp(key, kTwkLandGive))  Carve_SetLandGive(iv != 0);
+    else return false;
+    return true;
+}
+static int pageGetPop(const char* key, int* oi, float* of) {
+    if      (!strcmp(key, kTwkPop))       *oi = PopProbe_SchemeEnabled() ? 1 : 0;
+    else if (!strcmp(key, kTwkPopWin))    *of = PopProbe_TrickWindowMs();
+    else if (!strcmp(key, kTwkPopGate))   *of = PopProbe_CrouchGatePct();
+    else if (!strcmp(key, kTwkPopVisLo))  *of = PopProbe_CrankVisMinMs();
+    else if (!strcmp(key, kTwkPopVisHi))  *of = PopProbe_CrankVisTimeMs();
+    else if (!strcmp(key, kTwkPopVisSm))  *of = PopProbe_CrankVisSmoothMs();
+    else if (!strcmp(key, kTwkPopFlick))  *oi = PopProbe_FlickPop() ? 1 : 0;
+    else if (!strcmp(key, kTwkPopFlHold)) *of = PopProbe_FlickHoldMs();
+    else if (!strcmp(key, kTwkPopFlStart)) *of = PopProbe_FlickStartPct();
+    else if (!strcmp(key, kTwkPopFlFull)) *of = PopProbe_FlickFullPct();
+    else if (!strcmp(key, kTwkPopFlSlow)) *of = PopProbe_FlickSlowMs();
+    else if (!strcmp(key, kTwkPopFlMin))  *of = PopProbe_FlickMinPct();
+    else if (!strcmp(key, kTwkCarve))     *oi = Carve_Enabled() ? 1 : 0;
+    else if (!strcmp(key, kTwkCarveLean)) *of = Carve_LeanMs();
+    else if (!strcmp(key, kTwkCarveCurv)) *of = Carve_CurvePct();
+    else if (!strcmp(key, kTwkCarveFlow)) *of = Carve_FlowPct();
+    else if (!strcmp(key, kTwkLandGive))  *oi = Carve_LandGive() ? 1 : 0;
+    else return 0;
+    return 1;
+}
 static void pageValue(const char* key, int iv, float fv, void*) {
     if (!key) return;
     if (pageValueSitCam(key, iv, fv)) return;
+    if (pageValuePop(key, iv, fv)) return;
     if      (!strcmp(key, kTwkScoop))  ScoopSpeed_SetEnabled(iv != 0);
     else if (!strcmp(key, kTwkCatch))  CatchTweaks_SetEnabled(iv != 0);
     else if (!strcmp(key, kTwkRunOut)) RunOut_SetEnabled(iv != 0);
@@ -510,6 +575,8 @@ static void pageValue(const char* key, int iv, float fv, void*) {
     else if (!strcmp(key, kTwkClothHem))  ClothSim_SetHemPushMm(fv);
     else if (!strcmp(key, kTwkClothHemUp)) ClothSim_SetHemPushBandPct(fv);
     else if (!strcmp(key, kTwkClothCuff)) ClothSim_SetCuffGripPct(fv);
+    else if (!strcmp(key, kTwkClothSpike)) ClothSim_SetSpikePasses(fv);
+    else if (!strcmp(key, kTwkClothSettle)) ClothSim_SetSettleTime(fv);
     else if (!strcmp(key, kTwkCamFollow))    CameraHeight_SetFollowEnabled(iv != 0);
     else if (!strcmp(key, kTwkCamPitchDrop)) CameraHeight_SetPitchOnDropEnabled(iv != 0);
     else if (!strcmp(key, kTwkCamPitch))  CameraHeight_SetPitchDeg(fv);
@@ -568,17 +635,12 @@ static void pageValue(const char* key, int iv, float fv, void*) {
     else if (!strcmp(key, kTwkTorsoLean))  BodyFeel_SetTorsoLeanPct(fv);
     else if (!strcmp(key, kTwkHeadLoose))  BodyFeel_SetHeadLoosePct(fv);
     else if (!strcmp(key, kTwkHeadLag))    BodyFeel_SetHeadLagPct(fv);
-    else if (!strcmp(key, kTwkPop))       PopProbe_SetSchemeEnabled(iv != 0);
-    else if (!strcmp(key, kTwkPopWin))    PopProbe_SetTrickWindowMs(fv);
-    else if (!strcmp(key, kTwkPopGate))   PopProbe_SetCrouchGatePct(fv);
-    else if (!strcmp(key, kTwkPopVisLo))  PopProbe_SetCrankVisMinMs(fv);
-    else if (!strcmp(key, kTwkPopVisHi))  PopProbe_SetCrankVisTimeMs(fv);
-    else if (!strcmp(key, kTwkPopVisSm))  PopProbe_SetCrankVisSmoothMs(fv);
 }
 // ...and what it is set to RIGHT NOW, so a row opens showing the truth instead of a default.
 static int pageGet(const char* key, int* oi, float* of, void*) {
     if (!key) return 0;
     if (pageGetSitCam(key, oi, of)) return 1;
+    if (pageGetPop(key, oi, of)) return 1;
     if      (!strcmp(key, kTwkScoop))  { *oi = ScoopSpeed_Enabled()  ? 1 : 0; return 1; }
     else if (!strcmp(key, kTwkCatch))  { *oi = CatchTweaks_Enabled() ? 1 : 0; return 1; }
     else if (!strcmp(key, kTwkRunOut)) { *oi = RunOut_Enabled()      ? 1 : 0; return 1; }
@@ -627,6 +689,8 @@ static int pageGet(const char* key, int* oi, float* of, void*) {
     else if (!strcmp(key, kTwkClothHem))  { *of = ClothSim_HemPushMm();           return 1; }
     else if (!strcmp(key, kTwkClothHemUp)) { *of = ClothSim_HemPushBandPct();     return 1; }
     else if (!strcmp(key, kTwkClothCuff)) { *of = ClothSim_CuffGripPct();         return 1; }
+    else if (!strcmp(key, kTwkClothSpike)) { *of = ClothSim_SpikePasses();        return 1; }
+    else if (!strcmp(key, kTwkClothSettle)) { *of = ClothSim_SettleTime();        return 1; }
     else if (!strcmp(key, kTwkCamFollow))    { *oi = CameraHeight_FollowEnabled()      ? 1 : 0; return 1; }
     else if (!strcmp(key, kTwkCamPitchDrop)) { *oi = CameraHeight_PitchOnDropEnabled() ? 1 : 0; return 1; }
     else if (!strcmp(key, kTwkCamPitch))  { *of = CameraHeight_PitchDeg();            return 1; }
@@ -689,12 +753,6 @@ static int pageGet(const char* key, int* oi, float* of, void*) {
     else if (!strcmp(key, kTwkTorsoLean))  { *of = BodyFeel_TorsoLeanPct();   return 1; }
     else if (!strcmp(key, kTwkHeadLoose))  { *of = BodyFeel_HeadLoosePct();   return 1; }
     else if (!strcmp(key, kTwkHeadLag))    { *of = BodyFeel_HeadLagPct();     return 1; }
-    else if (!strcmp(key, kTwkPop))       { *oi = PopProbe_SchemeEnabled()  ? 1 : 0;   return 1; }
-    else if (!strcmp(key, kTwkPopWin))    { *of = PopProbe_TrickWindowMs();            return 1; }
-    else if (!strcmp(key, kTwkPopGate))   { *of = PopProbe_CrouchGatePct();            return 1; }
-    else if (!strcmp(key, kTwkPopVisLo))  { *of = PopProbe_CrankVisMinMs();            return 1; }
-    else if (!strcmp(key, kTwkPopVisHi))  { *of = PopProbe_CrankVisTimeMs();           return 1; }
-    else if (!strcmp(key, kTwkPopVisSm))  { *of = PopProbe_CrankVisSmoothMs();         return 1; }
     return 0;
 }
 // Every slider's units are chosen so its INTEGER readout is meaningful -- the pause menu's progress
@@ -705,7 +763,7 @@ static int pageGet(const char* key, int* oi, float* of, void*) {
 // one registration each, keep every page readable at a glance, and grow indefinitely.
 static const OmpPageItem2 kTwkRootItems[] = {
     { OMP_ITEM_PAGE, "Pop control",    "Pop control",     "Crouch to any depth and pop from it -- deeper means higher" },
-    { OMP_ITEM_PAGE, "Board & tricks", "Board & tricks",  "Scoop and flip speed, board pitch control" },
+    { OMP_ITEM_PAGE, "Board & tricks", "Board & tricks",  "Scoop and flip speed, board pitch control, carving" },
     { OMP_ITEM_PAGE, "Catch & bail",   "Catch & bail",    "Catch window, catch sound, running out of a bail" },
     { OMP_ITEM_PAGE, "Grinds",         "Grinds",          "Pitch control and pop swing coming out of a grind" },
     { OMP_ITEM_PAGE, "Feet",           "Feet",            "Move your feet with the sticks while you are in the air" },
@@ -739,6 +797,14 @@ static const OmpPageItem2 kTwkBoardItems[] = {
     { OMP_ITEM_TOGGLE, kTwkPitch,    "Wider board pitch control", "Spreads board pitch over the whole flick instead of its first third" },
     { OMP_ITEM_SLIDER, kTwkPitchAmt, "  Pitch spread (deg)",  "65 = stock; higher means full pitch needs a bigger flick",
       nullptr, nullptr, 65.0f, 89.0f, 1.0f },
+    { OMP_ITEM_TOGGLE, kTwkCarve,     "Carve turning",          "Your lean builds into the turn with weight and flows back out, instead of snapping to the trigger" },
+    { OMP_ITEM_SLIDER, kTwkCarveLean, "  Lean-in time (ms)",     "How long it takes to lean all the way into a turn",
+      nullptr, nullptr, 60.0f, 1200.0f, 20.0f },
+    { OMP_ITEM_SLIDER, kTwkCarveCurv, "  Trigger curve (%)",     "100 = as pulled; higher = gentle at first, and the end of the pull tightens the carve",
+      nullptr, nullptr, 100.0f, 300.0f, 10.0f },
+    { OMP_ITEM_SLIDER, kTwkCarveFlow, "  Flow (%)",              "Lower swings through more when you let off the trigger; 100 and up settles without it",
+      nullptr, nullptr, 30.0f, 150.0f, 5.0f },
+    { OMP_ITEM_TOGGLE, kTwkLandGive,  "Landing give",           "For a moment after a landing your trucks are looser, so the board can tip and turn you the way looser trucks do. Steer out of it" },
 };
 static const OmpPageItem2 kTwkCatchItems[] = {
     { OMP_ITEM_TOGGLE, kTwkCatch,  "Wider manual catch",      "Widens the catch window while Catch Mode is manual" },
@@ -826,6 +892,10 @@ static const OmpPageItem2 kTwkClothItems[] = {
       nullptr, nullptr, 0.0f, 30.0f, 1.0f },
     { OMP_ITEM_SLIDER, kTwkClothHemUp,"  Hem lift reach (%)", "How far up the shirt the lift reaches. Low only lifts the bottom edge; higher flares more of the garment",
       nullptr, nullptr, 10.0f, 80.0f, 5.0f },
+    { OMP_ITEM_SLIDER, kTwkClothSpike,"  Spike guard passes", "How hard cloth is held in line with its neighbours -- stops points poking out at the elbows. More = firmer, 0 = off",
+      nullptr, nullptr, 0.0f, 30.0f, 1.0f },
+    { OMP_ITEM_SLIDER, kTwkClothSettle,"  Settle time (s)",   "A held pose settles onto the garment's own shape; only movement shows. Lower = sooner, 0 = off",
+      nullptr, nullptr, 0.0f, 1.5f, 0.05f },
 };
 static const OmpPageItem2 kTwkPhysItems[] = {
     { OMP_ITEM_TOGGLE, kTwkBodyFeel, "Reactive body",
@@ -1015,6 +1085,26 @@ static const OmpPageItem2 kTwkPopItems[] = {
       "How heavily the body follows the stick. Higher is lazier and smoother, 0 tracks your thumb "
       "exactly",
       nullptr, nullptr, 0.0f, 400.0f, 10.0f },
+#if TWK_FLICK_POP
+    { OMP_ITEM_TOGGLE, kTwkPopFlick,  "Flick pop",
+      "Crouch as normal, let the stick go and flick it straight back to pop: the further it goes, "
+      "the higher the pop. Takes the place of the pop control scheme while on" },
+    { OMP_ITEM_SLIDER, kTwkPopFlHold, "  Let-go window (ms)",
+      "How long the crouch waits for the flick back after you let go. Past it you stand up",
+      nullptr, nullptr, 60.0f, 500.0f, 10.0f },
+    { OMP_ITEM_SLIDER, kTwkPopFlStart, "  Shortest flick back (%)",
+      "How far the stick has to come back to pop. A flick back this far pops at the lowest height",
+      nullptr, nullptr, 35.0f, 85.0f, 5.0f },
+    { OMP_ITEM_SLIDER, kTwkPopFlFull, "  Full pop at (%)",
+      "A flick back this far pops full height",
+      nullptr, nullptr, 45.0f, 100.0f, 5.0f },
+    { OMP_ITEM_SLIDER, kTwkPopFlSlow, "  Slowest flick (ms)",
+      "The slowest push back that still pops. Slower just crouches again",
+      nullptr, nullptr, 10.0f, 300.0f, 5.0f },
+    { OMP_ITEM_SLIDER, kTwkPopFlMin,  "  Lowest pop (%)",
+      "How high the shortest flick back pops",
+      nullptr, nullptr, 0.0f, 100.0f, 5.0f },
+#endif
 };
 // The Camera page (524): first person, then ON BOARD (the riding camera) and OFF BOARD (walking around,
 // which the game gives no settings for) as their own pages.
@@ -1248,6 +1338,8 @@ public:
         GrindPop_Install();
         GrindRock_Install();
         GrindLean_Install();
+        Carve_Install();
+        RtFlip_Install();
         CameraHeight_Install();
         Upscale_Install();
         Sit_Install();

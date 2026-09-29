@@ -41,6 +41,12 @@ struct Release { const char* version; const char* notes; };
 // instead of anything else (field 2026-09-20, at 1600). `show` measures and trims, but keep the source
 // short enough that trimming never has to happen: budget ~300 characters a release, three releases.
 static const Release kReleases[] = {
+    { "1.3.3",
+      "- SessionTweaks: carve turning -- the triggers lean you into turns, and\n"
+      "  landings on tighter trucks give a little lean. Adjust in F1 -> Board.\n"
+      "- New custom maps appear without restarting, and Select Map works on them.\n"
+      "- Your catch sound plays reliably in lobbies.\n"
+      "- SessionTweaks: smoother cloth; quick shoves out of grinds work again." },
     { "1.3.2",
       "- SessionTweaks: flicks, scoops and pop control read the controller directly,\n"
       "  so they no longer change with your frame rate or a busy lobby.\n"

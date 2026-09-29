@@ -25,7 +25,17 @@ kReplayMgrInputCtl             AReplayManager::_replayInputController
 kInputCtlCamera                AReplayInputController::_replayCamera
 kReplayCamLookAt               AReplayCamera::_lookAtTarget
 kSoundConcMaxCount             FSoundConcurrencySettings::MaxCount
+kSoundConcToOwner              FSoundConcurrencySettings::bLimitToOwner
+kSoundConcRetrigger            FSoundConcurrencySettings::RetriggerTime
+kSoundConcVolScale             FSoundConcurrencySettings::VolumeScale
+kConcurrencySettings           USoundConcurrency::Concurrency
+kAudDevMaxSources              FAudioDevice::MaxSources
+kAudDevMaxChannels             FAudioDevice::MaxChannels
+kAudDevSources                 FAudioDevice::Sources
+kAudDevFreeSources             FAudioDevice::FreeSources
+kAudDevActiveSounds            FAudioDevice::ActiveSounds
 kSoundBaseDuration             USoundBase::Duration
+kSoundBasePriority             USoundBase::Priority
 kWidgetMyWidget                UWidget::MyWidget
 kAirReplayAddAllBones          UAnimInstanceReplayComponent::_addAllBones
 kAirReplayUpdated              UAnimInstanceReplayComponent::_updatedBones

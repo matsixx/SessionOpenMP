@@ -357,7 +357,19 @@ static bool muteProxyNotify(void* attachTo, const float* loc, void* ret) {
     // produces rolling/push sound that nobody asked for and that the owner is already sending us.
     // ATTACHED ONLY -- see the note on suppressProxyLocal for why a world spawn is left alone.
     if (!g_tun.suppressProxyLocal || !attachTo) return false;
-    const bool mute = proxyOwns(attachTo);
+    bool mute = proxyOwns(attachTo);
+    if (mute) {
+        // NEVER OUR OWN. The proxy registry answering "theirs" for a component of OUR board or pawn
+        // would silence the local player's sound (a stale entry at a reused address is how it could).
+        // Refused, and said loudly, rather than trusted.
+        void* own = ownerOf(attachTo);
+        if (attachTo == g_board || attachTo == g_pawn || (own && (own == g_board || own == g_pawn))) {
+            mute = false;
+            static int said = 0;
+            if (said++ < 10 && g_logf)
+                g_logf("[audio] !! a sound on OUR OWN board/skater was about to be muted as a proxy's -- let through");
+        }
+    }
     if (mute) g_st.localMuted++;
     return mute;
 }
@@ -511,7 +523,7 @@ static void* hkSndAtLoc(void* wc, void* sound, const float* loc, const float* ro
                         float vol, float pitch, float start, void* att, void* conc, bool autoDestroy) {
     void* ret = _ReturnAddress();
     if (muteProxyNotify(nullptr, loc, ret)) return nullptr;   // a proxy's own notify: the wire has it
-    if (g_tun.enabled) widenConcurrency(sound);          // BEFORE the spawn -- see widenConcurrency
+    if (g_tun.enabled && g_tun.widenStockConcurrency) widenConcurrency(sound);   // BEFORE the spawn
     g_inFunnel++;
     void* r = o_SndAtLoc(wc, sound, loc, rot, vol, pitch, start, att, conc, autoDestroy);
     g_inFunnel--;
@@ -523,7 +535,7 @@ static void* hkSndAtt(void* sound, void* attachTo, uint64_t point, const float* 
                       void* att, void* conc, bool autoDestroy) {
     void* ret = _ReturnAddress();
     if (muteProxyNotify(attachTo, loc, ret)) return nullptr;
-    if (g_tun.enabled) widenConcurrency(sound);          // BEFORE the spawn -- see widenConcurrency
+    if (g_tun.enabled && g_tun.widenStockConcurrency) widenConcurrency(sound);   // BEFORE the spawn
     g_inFunnel++;
     void* r = o_SndAtt(sound, attachTo, point, loc, rot, locType, stopDetach, vol, pitch, start,
                        att, conc, autoDestroy);
@@ -637,6 +649,46 @@ static void clearLive() {
     for (int i = 0; i < g_nPend; i++) g_pend[i].left = 0;   // one-shots mid-repeat: stop resending
     g_nPend = 0;
 }
+// ---- THE VOICE BUDGET (measurement) -----------------------------------------------------------------
+// The engine plays at most MaxChannels voices; past that, the lowest-ranked sounds are dropped each audio
+// frame. Suspected for the local rolling "cutting in and out" in lobbies once every concurrency rule was
+// ruled out (peers in groups of their own, local groups stock, no mute on our board -- and still there).
+// Per frame: voices in use (Sources - FreeSources), and the active sounds wanting one. Read-only; the
+// arrays belong to the audio thread, so only their counts are read, as a statistic.
+static uint32_t g_vFrames = 0, g_vSat = 0, g_vPeak = 0, g_actPeak = 0;
+static int32_t  g_vMaxCh = 0, g_vMaxSrc = 0, g_vSrc = 0;
+void SampleVoices(void* world) {
+    const Syms& S = Get();
+    if (!world || !S.WorldAudioDevice) return;
+#ifdef _WIN32
+    __try {
+        const uint8_t* dev = (const uint8_t*)S.WorldAudioDevice(world);
+        if (!dev) return;
+        // The EFFECTIVE limit (the au.SetAudioChannelCount override applies here), not the raw field.
+        const int32_t maxCh = S.AudioGetMaxChannels ? S.AudioGetMaxChannels((void*)dev)
+                                                    : *(const int32_t*)(dev + off::kAudDevMaxChannels);
+        const int32_t src   = *(const int32_t*)(dev + off::kAudDevSources + 8);
+        const int32_t freeN = *(const int32_t*)(dev + off::kAudDevFreeSources + 8);
+        const int32_t act   = *(const int32_t*)(dev + off::kAudDevActiveSounds + 8);
+        if (src < 0 || src > 4096 || freeN < 0 || freeN > src || act < 0 || act > 100000) return;
+        const uint32_t used = (uint32_t)(src - freeN);
+        g_vFrames++;
+        if (used > g_vPeak) g_vPeak = used;
+        if ((uint32_t)act > g_actPeak) g_actPeak = (uint32_t)act;
+        if (maxCh > 0 && used >= (uint32_t)maxCh) g_vSat++;
+        g_vMaxCh = maxCh; g_vMaxSrc = *(const int32_t*)(dev + off::kAudDevMaxSources); g_vSrc = src;
+    } __except (EXCEPTION_EXECUTE_HANDLER) {}
+#endif
+}
+bool VoiceReport(char* out, int cap) {
+    if (!out || cap <= 0 || !g_vFrames) return false;
+    snprintf(out, (size_t)cap, "[audio] voices: peak %u in use of %d (sources %d, MaxSources %d), FULL on %u of %u"
+             " frames | sounds wanting a voice: peak %u", g_vPeak, g_vMaxCh, g_vSrc, g_vMaxSrc, g_vSat, g_vFrames,
+             g_actPeak);
+    g_vFrames = g_vSat = g_vPeak = g_actPeak = 0;
+    return true;
+}
+
 void SetInLocalReplay(bool on) {
     if (on == g_inLocalReplay) return;
     g_inLocalReplay = on;
@@ -792,7 +844,7 @@ static void* resolveCue(const char* cue) {
         }
         return nullptr;                                  // same path as "not present": counted, silent
     }
-    if (o) widenConcurrency(o);      // before the spawn: concurrency is evaluated when a sound starts
+    if (o && g_tun.widenStockConcurrency) widenConcurrency(o);   // before the spawn (off: see Tuning)
     if (!o) {
         g_st.unresolved++;
         if (g_tun.inventoryLog && g_logf && listAdd(g_invMiss, g_nMiss, cue)) {
@@ -849,12 +901,105 @@ static void applyParams(void* comp, const AudioLoop& l) {
     }
 }
 
+// ---- PEERS' SOUNDS IN GROUPS OF THEIR OWN ------------------------------------------------------------
+// Session's sound assets are authored for one skater: a cue's concurrency group carries a count limit, a
+// retrigger time and volume scaling of older copies, and a peer's sound sharing a group with ours lets
+// either refuse, steal or duck the other. Field: the catch sound (SCU_FootOnBoard, shared by every
+// landing) silent about one in ten in lobbies, and the local rolling cutting in and out. So EVERY peer
+// sound plays in a group of its own -- one for their one-shots, one for their loops -- and the local
+// player's sounds keep the stock groups untouched, exactly as solo (hence Tuning::widenStockConcurrency
+// off). Decided here on the receiving side, so it works with whatever build the sender runs.
+// A USoundConcurrency of our own, built in the transient package and rooted (never collected; survives
+// level changes): room for `maxCount`, no retrigger, no volume scaling, and the engine's default rule --
+// past the limit the FARTHEST goes first, so the peers nearest you always sound. `what` names who plays
+// in it, for the log. Null = could not be built, and those sounds keep the cue's own group as before.
+//
+// THE LIMIT IS THE VOICE BUDGET, MEASURED. The engine plays 32 voices; past that it drops the lowest-ranked
+// sounds every audio frame. Field log (the [audio] voices line): solo peaks at 17 in use and is never full;
+// with 5-8 peers it sat at 40 of 32, FULL on 43-74% of frames, 77 sounds wanting a voice -- the local
+// rolling loop was being dropped and picked back up ("cutting in and out"). The caps here (loops 8 +
+// one-shots 6) bound how much the peers ask for; WHO keeps a voice when it is still full is priority,
+// not grouping -- see lowerPriority.
+static void* buildConcurrency(const char* what, int maxCount) {
+    const Syms& S = Get();
+    if (!S.StaticConstructObject || !S.StaticFindObject) return nullptr;
+#ifdef _WIN32
+    char m[240];
+    void* cls = nullptr; void* outer = nullptr;
+    __try {
+        cls   = S.StaticFindObject(nullptr, nullptr, L"/Script/Engine.SoundConcurrency", 0);
+        outer = S.StaticFindObject(nullptr, nullptr, L"/Engine/Transient", 0);
+    } __except (EXCEPTION_EXECUTE_HANDLER) { cls = outer = nullptr; }
+    if (!cls || !outer) {
+        if (g_logf) { snprintf(m, sizeof(m), "[audio] SoundConcurrency class or /Engine/Transient not found -- %s keep the cue's group", what); g_logf(m); }
+        return nullptr;
+    }
+    uint8_t params[64]; memset(params, 0, sizeof(params));        // FStaticConstructObjectParameters
+    *(void**)(params + 0x00)    = cls;
+    *(void**)(params + 0x08)    = outer;
+    *(uint64_t*)(params + 0x10) = 0;                               // NAME_None: the engine names it
+    *(uint32_t*)(params + 0x18) = 0x40 | 0x80;                     // RF_Transient | RF_MarkAsRootSet
+    void* o = nullptr;
+    __try { o = S.StaticConstructObject(params); } __except (EXCEPTION_EXECUTE_HANDLER) { o = nullptr; }
+    if (!o || !IsObjectOfClass(o, "SoundConcurrency")) {
+        if (g_logf) { snprintf(m, sizeof(m), "[audio] building a concurrency for %s failed -- they keep the cue's group", what); g_logf(m); }
+        return nullptr;
+    }
+    __try {
+        uint8_t* c = (uint8_t*)o + off::kConcurrencySettings;
+        *(int32_t*)(c + off::kSoundConcMaxCount)  = maxCount;
+        *(int32_t*)(c + off::kSoundConcToOwner)   = 0;
+        *(float*)  (c + off::kSoundConcRetrigger) = 0.0f;
+        *(float*)  (c + off::kSoundConcVolScale)  = 1.0f;
+    } __except (EXCEPTION_EXECUTE_HANDLER) { return nullptr; }
+    if (g_logf) { snprintf(m, sizeof(m), "[audio] %s play in a group of their own: the nearest %d at once, no retrigger, no volume scaling", what, maxCount); g_logf(m); }
+    return o;
+#else
+    (void)what; (void)maxCount;
+    return nullptr;
+#endif
+}
+static void* peerShotConcurrency() {
+    static void* s_conc = nullptr;
+    static bool  s_tried = false;
+    if (!s_conc && !s_tried) { s_tried = true; s_conc = buildConcurrency("peers' one-shot sounds (catches, landings, pops...)", 6); }
+    return s_conc;
+}
+// Separate from the one-shot group so neither crowds the other (see PEERS' SOUNDS above).
+static void* peerLoopConcurrency() {
+    static void* s_conc = nullptr;
+    static bool  s_tried = false;
+    if (!s_conc && !s_tried) { s_tried = true; s_conc = buildConcurrency("peers' looping sounds (rolling, grinding, flipping)", 8); }
+    return s_conc;
+}
+
+// Starts a peer's sound below everything heard solo (see Tuning::peerPriorityScale): lowers the cue's
+// priority for the length of one spawn and returns the field to put back, null = left alone. Nothing
+// else can see it: the engine reads USoundBase::Priority only while starting a sound, on the game
+// thread (PlayInternal, PlaySound2D, PlaySoundAtLocation, the Slate device) -- the thread this runs on.
+static float* lowerPriority(void* cue, float* was) {
+    const float k = g_tun.peerPriorityScale;
+    if (!(k >= 0.0f && k < 1.0f)) return nullptr;
+    float* p = (float*)((uint8_t*)cue + off::kSoundBasePriority);
+    *was = *p;
+    static bool s_said = false;
+    if (!s_said && g_logf) {
+        s_said = true;
+        char m[200];
+        snprintf(m, sizeof(m), "[audio] peers' sounds start at %gx their cue's priority (first: %g -> %g), below everything heard solo", k, *was, *was * k);
+        g_logf(m);
+    }
+    *p = *was * k;                                 // last: nothing after it can fault with the field lowered
+    return p;
+}
+
 void* PlayLoop(const AudioLoop& l, void* actor, void* board, const float* bodyPos) {
     const Syms& S = Get();
     if (!g_tun.enabled || !actor) return nullptr;
     void* cue = resolveCue(l.cue);
     if (!cue) return nullptr;
     void* comp = nullptr;
+    float* prio = nullptr; float prioWas = 0.0f;
     g_inReplay++;
 #ifdef _WIN32
     __try {
@@ -862,21 +1007,24 @@ void* PlayLoop(const AudioLoop& l, void* actor, void* board, const float* bodyPo
         float loc[3] = { l.rel[0], l.rel[1], l.rel[2] };
         float rot[3] = { 0, 0, 0 };
         void* att = attachOn(l.attach, actor, board);
+        void* conc = peerLoopConcurrency();       // null = the cue's own (see peerLoopConcurrency)
+        prio = lowerPriority(cue, &prioWas);
         // Play through the ENGINE functions, NOT UReplayAudioManager's wrappers. The wrappers
         // BROADCAST to the replay recorder's _onPlaySound, so replaying a peer's sound through them
         // writes that sound into the LOCAL player's replay recording as if they had made it.
         if (att && S.GsSpawnAttached) {
-            // Location as a relative OFFSET, matching how it was captured. Attenuation/concurrency are
-            // left null so the cue's own settings apply -- which is what the game's own callers rely on.
+            // Location as a relative OFFSET, matching how it was captured. Attenuation is left null so
+            // the cue's own applies; the concurrency is the peers' own group (see peerLoopConcurrency).
             comp = S.GsSpawnAttached(cue, att, 0ull, loc, rot, 0 /*KeepRelativeOffset*/, false,
-                                     l.vol, l.pitch, 0.f, nullptr, nullptr, false);
+                                     l.vol, l.pitch, 0.f, nullptr, conc, false);
         } else if (S.GsSpawnAtLoc) {
             float w[3] = { bodyPos[0] + l.rel[0], bodyPos[1] + l.rel[1], bodyPos[2] + l.rel[2] };
-            comp = S.GsSpawnAtLoc(actor, cue, w, rot, l.vol, l.pitch, 0.f, nullptr, nullptr, false);
+            comp = S.GsSpawnAtLoc(actor, cue, w, rot, l.vol, l.pitch, 0.f, nullptr, conc, false);
         }
 #ifdef _WIN32
     } __except (EXCEPTION_EXECUTE_HANDLER) { g_st.faults++; comp = nullptr; }
 #endif
+    if (prio) *prio = prioWas;
     if (comp) { applyParams(comp, l); g_st.playStarted++; }
     g_inReplay--;
     return comp;
@@ -894,6 +1042,7 @@ void PlayOneShot(const AudioEvent& e, void* actor, void* board, const float* bod
     if (!g_tun.enabled || !actor) return;
     void* cue = resolveCue(e.cue);
     if (!cue) return;
+    float* prio = nullptr; float prioWas = 0.0f;
     g_inReplay++;
 #ifdef _WIN32
     __try {
@@ -901,17 +1050,20 @@ void PlayOneShot(const AudioEvent& e, void* actor, void* board, const float* bod
         float loc[3] = { e.rel[0], e.rel[1], e.rel[2] };
         float rot[3] = { 0, 0, 0 };
         void* att = attachOn(e.attach, actor, board);
+        void* conc = peerShotConcurrency();       // null = the cue's own (see PEERS' SOUNDS above)
+        prio = lowerPriority(cue, &prioWas);
         if (att && S.GsSpawnAttached) {          // engine, not the funnel -- see PlayLoop's note
             S.GsSpawnAttached(cue, att, 0ull, loc, rot, 0, false,
-                              e.vol, e.pitch, e.start, nullptr, nullptr, true);
+                              e.vol, e.pitch, e.start, nullptr, conc, true);
         } else if (S.GsSpawnAtLoc) {
             float w[3] = { bodyPos[0] + e.rel[0], bodyPos[1] + e.rel[1], bodyPos[2] + e.rel[2] };
-            S.GsSpawnAtLoc(actor, cue, w, rot, e.vol, e.pitch, e.start, nullptr, nullptr, true);
+            S.GsSpawnAtLoc(actor, cue, w, rot, e.vol, e.pitch, e.start, nullptr, conc, true);
         }
         g_st.played++;
 #ifdef _WIN32
     } __except (EXCEPTION_EXECUTE_HANDLER) { g_st.faults++; }
 #endif
+    if (prio) *prio = prioWas;
     g_inReplay--;
 }
 
