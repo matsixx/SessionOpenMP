@@ -27,5 +27,3 @@ bool  Carve_Enabled();      void Carve_SetEnabled(bool on);
 float Carve_LeanMs();       void Carve_SetLeanMs(float ms);      // time to lean all the way in
 float Carve_CurvePct();     void Carve_SetCurvePct(float pct);   // trigger response, 100 = as pulled
 float Carve_FlowPct();      void Carve_SetFlowPct(float pct);    // damping of the lean, lower = more swing
-bool  Carve_LandGive();     void Carve_SetLandGive(bool on);     // looser trucks for a moment after a landing
-void  Carve_DrawLandMenu(const OmpMenuApi* api);                 // RENDER THREAD: the landing give's F1 rows

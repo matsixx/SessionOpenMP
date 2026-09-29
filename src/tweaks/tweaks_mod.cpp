@@ -71,7 +71,7 @@
 #include "ue4ss_abi.h"
 #include "ui/menu_ext.h"
 
-#define TWEAKS_VERSION "3.19.604"
+#define TWEAKS_VERSION "3.19.606"
 #define TWK_WIDEN(x) STR(x)   // STR() prepends L before the macro expands; expand first
 
 // ------------------------------------------------------------------ log (own file, fresh per launch)
@@ -248,8 +248,7 @@ static void drawSection(const OmpMenuApi* api, void*) {
 
     typedef void (*DrawFn)(const OmpMenuApi*);
     static DrawFn const kPop[]    = { PopProbe_DrawMenu, RtFlip_DrawMenu };
-    static DrawFn const kBoard[]  = { FlipSpeed_DrawMenu, ScoopSpeed_DrawMenu, PitchRange_DrawMenu, Carve_DrawMenu,
-                                      Carve_DrawLandMenu };
+    static DrawFn const kBoard[]  = { FlipSpeed_DrawMenu, ScoopSpeed_DrawMenu, PitchRange_DrawMenu, Carve_DrawMenu };
     static DrawFn const kCatch[]  = { CatchTweaks_DrawMenu, CatchLevel_DrawMenu, CatchSound_DrawMenu,
                                       RunOut_DrawMenu };
     static DrawFn const kGrind[]  = { GrindPop_DrawMenu, GrindRock_DrawMenu, GrindLean_DrawMenu };
@@ -427,7 +426,6 @@ static const char* const kTwkCarve     = "TwkCarve";
 static const char* const kTwkCarveLean = "TwkCarveLean";
 static const char* const kTwkCarveCurv = "TwkCarveCurve";
 static const char* const kTwkCarveFlow = "TwkCarveFlow";
-static const char* const kTwkLandGive  = "TwkLandGive";
 static const char* const kTwkPopFlHold = "TwkPopFlickHold";
 static const char* const kTwkPopFlStart = "TwkPopFlickStart";
 static const char* const kTwkPopFlFull = "TwkPopFlickFull";
@@ -494,7 +492,6 @@ static bool pageValuePop(const char* key, int iv, float fv) {
     else if (!strcmp(key, kTwkCarveLean)) Carve_SetLeanMs(fv);
     else if (!strcmp(key, kTwkCarveCurv)) Carve_SetCurvePct(fv);
     else if (!strcmp(key, kTwkCarveFlow)) Carve_SetFlowPct(fv);
-    else if (!strcmp(key, kTwkLandGive))  Carve_SetLandGive(iv != 0);
     else return false;
     return true;
 }
@@ -515,7 +512,6 @@ static int pageGetPop(const char* key, int* oi, float* of) {
     else if (!strcmp(key, kTwkCarveLean)) *of = Carve_LeanMs();
     else if (!strcmp(key, kTwkCarveCurv)) *of = Carve_CurvePct();
     else if (!strcmp(key, kTwkCarveFlow)) *of = Carve_FlowPct();
-    else if (!strcmp(key, kTwkLandGive))  *oi = Carve_LandGive() ? 1 : 0;
     else return 0;
     return 1;
 }
@@ -804,7 +800,6 @@ static const OmpPageItem2 kTwkBoardItems[] = {
       nullptr, nullptr, 100.0f, 300.0f, 10.0f },
     { OMP_ITEM_SLIDER, kTwkCarveFlow, "  Flow (%)",              "Lower swings through more when you let off the trigger; 100 and up settles without it",
       nullptr, nullptr, 30.0f, 150.0f, 5.0f },
-    { OMP_ITEM_TOGGLE, kTwkLandGive,  "Landing give",           "For a moment after a landing your trucks are looser, so the board can tip and turn you the way looser trucks do. Steer out of it" },
 };
 static const OmpPageItem2 kTwkCatchItems[] = {
     { OMP_ITEM_TOGGLE, kTwkCatch,  "Wider manual catch",      "Widens the catch window while Catch Mode is manual" },

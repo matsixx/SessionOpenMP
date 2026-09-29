@@ -659,7 +659,7 @@ static uint32_t g_vFrames = 0, g_vSat = 0, g_vPeak = 0, g_actPeak = 0;
 static int32_t  g_vMaxCh = 0, g_vMaxSrc = 0, g_vSrc = 0;
 void SampleVoices(void* world) {
     const Syms& S = Get();
-    if (!world || !S.WorldAudioDevice) return;
+    if (!g_tun.voiceBudgetLog || !world || !S.WorldAudioDevice) return;
 #ifdef _WIN32
     __try {
         const uint8_t* dev = (const uint8_t*)S.WorldAudioDevice(world);

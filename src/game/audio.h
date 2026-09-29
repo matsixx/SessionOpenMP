@@ -92,6 +92,9 @@ struct Tuning {
     // voice from one of ours 40 dB quieter than itself, so everything heard solo keeps its voice and the
     // peers share the rest, loudest first as before. 1 = stock ranking.
     float peerPriorityScale = 0.01f;
+    // The once-a-second [audio] voices line (SampleVoices / VoiceReport): how full the engine's voice budget
+    // is. Measurement only -- off unless diagnosing sound dropouts in lobbies.
+    bool  voiceBudgetLog = false;
     // Say NOTHING at all while the local player is in their replay editor. Tried and reverted as a
     // default: it does stop a scrub being broadcast, but it also means a peer watching you scrub
     // hears silence, and the skating audio of a replay is worth hearing. The actual defect was the

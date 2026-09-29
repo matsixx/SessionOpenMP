@@ -46,42 +46,27 @@ enum {
 };
 
 static int   g_on      = 1;       // Carve
-static float g_curve   = 160.0f;  // CarveCurvePct -- the trigger's response: 100 = as pulled, higher = progressive
-static float g_leanMs  = 320.0f;  // CarveLeanMs -- time to lean all the way in
-static float g_flow    = 70.0f;   // CarveFlowPct -- damping: lower swings through more, 100 settles without it
-static int   g_log     = 1;       // CarveLog (ini)
-static int   g_landProbe = 1;     // CarveLandProbe (ini) -- the landing probe below
-// LANDING GIVE: for a moment after each touchdown the trucks are as loose as g_giveTight, so the game's own
-// physics tips the board on the landing and the tip turns you -- the lean a looser setup gives that you have to
-// steer out of. The board's lean is held by a PID whose gains ApplyForceOnBoard blends from PIDSettingsBanking-
-// TruckMin (P 1750) to Max (P 25000) by tightness, every step; tight trucks damp the tip before it can turn you.
-static int   g_give     = 1;       // CarveLandGive
-static float g_giveTight = 50.0f;  // CarveLandGiveTightPct -- the trucks' tightness right after a landing (%)
-static float g_giveMs   = 700.0f;  // CarveLandGiveMs -- back to your own tightness over this
+static float g_curve   = 170.0f;  // CarveCurvePct -- the trigger's response: 100 = as pulled, higher = progressive
+static float g_leanMs  = 190.0f;  // CarveLeanMs -- time to lean all the way in
+static float g_flow    = 150.0f;  // CarveFlowPct -- damping: lower swings through more, 100 settles without it
+static int   g_log     = 0;       // CarveLog (ini) -- once a second while leaning
 static int   g_ok      = 1;
 static void* g_orig    = nullptr;
 
 static void Clamp() {
-    if (g_giveTight < 0.0f) g_giveTight = 0.0f; else if (g_giveTight > 100.0f) g_giveTight = 100.0f;
-    if (g_giveMs < 100.0f) g_giveMs = 100.0f; else if (g_giveMs > 2000.0f) g_giveMs = 2000.0f;
     if (g_curve < 100.0f) g_curve = 100.0f; else if (g_curve > 300.0f) g_curve = 300.0f;
     if (g_leanMs < 60.0f) g_leanMs = 60.0f; else if (g_leanMs > 1200.0f) g_leanMs = 1200.0f;
     if (g_flow < 30.0f) g_flow = 30.0f; else if (g_flow > 150.0f) g_flow = 150.0f;
 }
 void Carve_ReadConfig(const char* buf) {
     g_on     = TwkIniInt(buf, "Carve", 1) ? 1 : 0;
-    g_curve  = (float)TwkIniInt(buf, "CarveCurvePct", 160);
-    g_leanMs = (float)TwkIniInt(buf, "CarveLeanMs", 320);
-    g_flow   = (float)TwkIniInt(buf, "CarveFlowPct", 70);
-    g_log    = TwkIniInt(buf, "CarveLog", 1);
-    g_landProbe = TwkIniInt(buf, "CarveLandProbe", 1) ? 1 : 0;
-    g_give      = TwkIniInt(buf, "CarveLandGive", 1) ? 1 : 0;
-    g_giveTight = (float)TwkIniInt(buf, "CarveLandGiveTightPct", 50);
-    g_giveMs    = (float)TwkIniInt(buf, "CarveLandGiveMs", 700);
+    g_curve  = (float)TwkIniInt(buf, "CarveCurvePct", 170);
+    g_leanMs = (float)TwkIniInt(buf, "CarveLeanMs", 190);
+    g_flow   = (float)TwkIniInt(buf, "CarveFlowPct", 150);
+    g_log    = TwkIniInt(buf, "CarveLog", 0);
     Clamp();
-    TwkLog("[carve] config: %s | trigger curve %.2f, lean-in %.0f ms, flow (damping) %.2f | landing give %s: "
-           "trucks at %.0f%% after a landing, back over %.0f ms",
-           g_on ? "ON" : "off", g_curve / 100.0f, g_leanMs, g_flow / 100.0f, g_give ? "ON" : "off", g_giveTight, g_giveMs);
+    TwkLog("[carve] config: %s | trigger curve %.2f, lean-in %.0f ms, flow (damping) %.2f",
+           g_on ? "ON" : "off", g_curve / 100.0f, g_leanMs, g_flow / 100.0f);
 }
 void Carve_SaveConfig(char* buf, size_t cap) {
     TwkIniSetInt(buf, cap, "Carve", g_on);
@@ -89,12 +74,8 @@ void Carve_SaveConfig(char* buf, size_t cap) {
     TwkIniSetInt(buf, cap, "CarveLeanMs", (int)lroundf(g_leanMs));
     TwkIniSetInt(buf, cap, "CarveFlowPct", (int)lroundf(g_flow));
     TwkIniSetInt(buf, cap, "CarveLog", g_log);
-    TwkIniSetInt(buf, cap, "CarveLandGive", g_give);
-    TwkIniSetInt(buf, cap, "CarveLandGiveTightPct", (int)lroundf(g_giveTight));
-    TwkIniSetInt(buf, cap, "CarveLandGiveMs", (int)lroundf(g_giveMs));
 }
-void Carve_ResetDefaults() { g_on = 1; g_curve = 160.0f; g_leanMs = 320.0f; g_flow = 70.0f; g_log = 1;
-                             g_give = 1; g_giveTight = 50.0f; g_giveMs = 700.0f; }
+void Carve_ResetDefaults() { g_on = 1; g_curve = 170.0f; g_leanMs = 190.0f; g_flow = 150.0f; g_log = 0; }
 
 // ---- the lean
 static double NowS() {
@@ -149,91 +130,12 @@ static bool Lean(void* comp, float dt, float* rawOut) {
     }
     return true;
 }
-// ---- LANDING PROBE (measurement, CarveLandProbe): for 0.8 s after each touchdown, every ~40 ms, the trucks'
-// tightness, the trigger, the lean the game holds (before carve writes it), carve's own, and the deck's real roll
-// and heading -- how the lean a landing leaves behind turns the board, at each tightness.
-static double s_landT = -1.0, s_probeLastT = 0.0, s_probeLogT = 0.0;
-static float  s_yaw0 = 0.0f;
-static bool DeckAngles(void* comp, float* roll, float* yaw) {
-    void* bd = twkP(comp, MC_BOARD);
-    void* fl = bd ? twkP(bd, 0x4e8) : nullptr;                         // ASkateboardEx::_flipper, the deck
-    float q[4];
-    if (!fl || !TwkCompQuat(fl, q)) return false;
-    const float X[3] = { 1.0f, 0.0f, 0.0f }, Y[3] = { 0.0f, 1.0f, 0.0f }, Z[3] = { 0.0f, 0.0f, 1.0f };
-    float f[3], sd[3], up[3];
-    TwkQuatRotate(q, X, f); TwkQuatRotate(q, Y, sd); TwkQuatRotate(q, Z, up);
-    const float d = f[2];
-    const float r[3] = { -f[0] * d, -f[1] * d, 1.0f - f[2] * d };        // world up, the long axis taken out
-    const float l = sqrtf(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
-    if (l < 0.05f) return false;
-    *roll = atan2f((sd[0] * r[0] + sd[1] * r[1] + sd[2] * r[2]) / l, (up[0] * r[0] + up[1] * r[1] + up[2] * r[2]) / l) * 57.2957795f;
-    *yaw = atan2f(f[1], f[0]) * 57.2957795f;
-    return true;
-}
-// Our board's riding steps: a gap of 0.15 s (in the air, off the board) then a step = a touchdown.
-static bool Touchdown(void* comp) {
-    void* sk = twkP(comp, MC_SKATER);
-    if (!sk || sk != CatchTweaks_Skater()) return false;
-    const double now = NowS();
-    if (now - s_probeLastT > 0.15) {
-        float roll = 0.0f, yaw = 0.0f;
-        DeckAngles(comp, &roll, &yaw);
-        s_landT = now; s_yaw0 = yaw; s_probeLogT = 0.0;
-    }
-    s_probeLastT = now;
-    return true;
-}
-static void LandProbe(void* comp) {
-    const double now = NowS();
-    float roll = 0.0f, yaw = 0.0f;
-    const bool deck = DeckAngles(comp, &roll, &yaw);
-    if (s_landT < 0.0 || now - s_landT > 0.8 || now - s_probeLogT < 0.04) return;
-    s_probeLogT = now;
-    void* bd = twkP(comp, MC_BOARD);
-    const float tight = bd ? 0.5f * (twkF(bd, BOARD_TIGHT_F) + twkF(bd, BOARD_TIGHT_B)) : -1.0f;
-    float dy = yaw - s_yaw0;
-    while (dy > 180.0f) dy -= 360.0f; while (dy < -180.0f) dy += 360.0f;
-    TwkLog("[carve] land +%3.0f ms trucks %.2f | trigger %+.2f  game lean %+.2f  carve %+.2f | deck roll %+5.1f  turned %+6.1f%s",
-           (now - s_landT) * 1000.0, tight, twkF(comp, MC_BANK_TGT), twkF(comp, MC_BANK_CUR), s_x, roll, dy,
-           deck ? "" : " (no deck)");
-}
-
-// The give's envelope: all of it for the first third, then eased back to the rider's own trucks.
-static float GiveNow() {
-    if (!g_give || s_landT < 0.0) return 0.0f;
-    const float t = (float)(NowS() - s_landT), T = g_giveMs / 1000.0f, hold = T / 3.0f;
-    if (t >= T) return 0.0f;
-    if (t <= hold) return 1.0f;
-    const float k = (t - hold) / (T - hold);
-    return 1.0f - k * k * (3.0f - 2.0f * k);
-}
 static void __fastcall hkPhysSkate(void* comp, float dt, uint64_t a3, uint64_t a4) {
     bool wrote = false; float raw = 0.0f;
-    bool mine = false;
-    if (g_ok && comp) { __try { mine = Touchdown(comp); } __except (EXCEPTION_EXECUTE_HANDLER) { mine = false; } }
-    if (mine && g_landProbe) { __try { LandProbe(comp); } __except (EXCEPTION_EXECUTE_HANDLER) { g_landProbe = 0; } }
     if (g_on && g_ok && comp) {
         __try { wrote = Lean(comp, dt, &raw); } __except (EXCEPTION_EXECUTE_HANDLER) { wrote = false; g_ok = 0; TwkLog("[carve] caught a fault -- carving off for this session"); }
     }
-    // The landing give, around this step only (carve's own spring above read the rider's real trucks).
-    float* tf = nullptr; float keep[2] = { 0.0f, 0.0f };
-    if (mine) {
-        __try {
-            const float env = GiveNow();
-            void* bd = env > 0.0f ? twkP(comp, MC_BOARD) : nullptr;
-            if (bd) {
-                tf = (float*)((uint8_t*)bd + BOARD_TIGHT_F);
-                keep[0] = tf[0]; keep[1] = tf[1];
-                const float soft = g_giveTight / 100.0f;
-                bool any = false;
-                for (int i = 0; i < 2; i++)
-                    if (keep[i] > soft && keep[i] <= 1.0f) { tf[i] = keep[i] - (keep[i] - soft) * env; any = true; }
-                if (!any) tf = nullptr;
-            }
-        } __except (EXCEPTION_EXECUTE_HANDLER) { tf = nullptr; }
-    }
     ((PhysSkateFn)g_orig)(comp, dt, a3, a4);
-    if (tf) { __try { tf[0] = keep[0]; tf[1] = keep[1]; } __except (EXCEPTION_EXECUTE_HANDLER) {} }
     if (wrote) {
         __try {
             float* tgt = (float*)((uint8_t*)comp + MC_BANK_TGT);
@@ -270,18 +172,6 @@ void Carve_DrawMenu(const OmpMenuApi* api) {
     if (api->SliderFloat("Flow (%)", &v, 30.0f, 150.0f, "%.0f")) Carve_SetFlowPct(v);
     api->SameLine(); api->TextDisabled("(lower swings through more when you let off; 100+ settles without it)");
 }
-void Carve_DrawLandMenu(const OmpMenuApi* api) {
-    if (!api) return;
-    bool gv = g_give != 0;
-    if (api->Checkbox("Landing give", &gv)) Carve_SetLandGive(gv);
-    api->SameLine(); api->TextDisabled("(for a moment after a landing the trucks are looser, so the board can tip and turn you like looser trucks do)");
-    if (!g_give) return;
-    float v = g_giveTight / 10.0f;
-    if (api->SliderFloat("Trucks after a landing", &v, 0.0f, 10.0f, "%.1f")) { g_giveTight = v * 10.0f; Clamp(); TwkMarkDirty(); }
-    api->SameLine(); api->TextDisabled("(the game's tightness scale; no effect on trucks already this loose)");
-    v = g_giveMs;
-    if (api->SliderFloat("Back to your trucks over (ms)", &v, 100.0f, 2000.0f, "%.0f")) { g_giveMs = v; Clamp(); TwkMarkDirty(); }
-}
 
 bool  Carve_Enabled()            { return g_on != 0; }
 void  Carve_SetEnabled(bool on)  { g_on = on ? 1 : 0; TwkMarkDirty(); }
@@ -291,5 +181,3 @@ float Carve_CurvePct()           { return g_curve; }
 void  Carve_SetCurvePct(float p) { g_curve = p; Clamp(); TwkMarkDirty(); }
 float Carve_FlowPct()            { return g_flow; }
 void  Carve_SetFlowPct(float p)  { g_flow = p; Clamp(); TwkMarkDirty(); }
-bool  Carve_LandGive()           { return g_give != 0; }
-void  Carve_SetLandGive(bool on) { g_give = on ? 1 : 0; TwkMarkDirty(); }
