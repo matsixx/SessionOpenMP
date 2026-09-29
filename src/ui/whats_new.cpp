@@ -42,8 +42,8 @@ struct Release { const char* version; const char* notes; };
 // short enough that trimming never has to happen: budget ~300 characters a release, three releases.
 static const Release kReleases[] = {
     { "1.3.3",
-      "- SessionTweaks: carve turning -- the triggers lean you into turns more\n"
-      "  naturally. Adjust it in F1 -> Board.\n"
+      "- SessionTweaks: new carve turning -- the triggers lean you into turns more\n"
+      "  naturally. Off by default; turn it on in F1 -> Board.\n"
       "- New custom maps appear without restarting, and Select Map works on them.\n"
       "- Your catch sound plays reliably in lobbies.\n"
       "- SessionTweaks: smoother cloth; quick shoves out of grinds work again." },

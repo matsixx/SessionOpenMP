@@ -45,7 +45,7 @@ enum {
     BOARD_TIGHT_F = 0x4a0, BOARD_TIGHT_B = 0x4a4,   // FSkateboardSettings truck tightness
 };
 
-static int   g_on      = 1;       // Carve
+static int   g_on      = 0;       // Carve -- off by default; F1 / pause menu turn it on
 static float g_curve   = 170.0f;  // CarveCurvePct -- the trigger's response: 100 = as pulled, higher = progressive
 static float g_leanMs  = 190.0f;  // CarveLeanMs -- time to lean all the way in
 static float g_flow    = 150.0f;  // CarveFlowPct -- damping: lower swings through more, 100 settles without it
@@ -59,7 +59,7 @@ static void Clamp() {
     if (g_flow < 30.0f) g_flow = 30.0f; else if (g_flow > 150.0f) g_flow = 150.0f;
 }
 void Carve_ReadConfig(const char* buf) {
-    g_on     = TwkIniInt(buf, "Carve", 1) ? 1 : 0;
+    g_on     = TwkIniInt(buf, "Carve", 0) ? 1 : 0;
     g_curve  = (float)TwkIniInt(buf, "CarveCurvePct", 170);
     g_leanMs = (float)TwkIniInt(buf, "CarveLeanMs", 190);
     g_flow   = (float)TwkIniInt(buf, "CarveFlowPct", 150);
@@ -75,7 +75,7 @@ void Carve_SaveConfig(char* buf, size_t cap) {
     TwkIniSetInt(buf, cap, "CarveFlowPct", (int)lroundf(g_flow));
     TwkIniSetInt(buf, cap, "CarveLog", g_log);
 }
-void Carve_ResetDefaults() { g_on = 1; g_curve = 170.0f; g_leanMs = 190.0f; g_flow = 150.0f; g_log = 0; }
+void Carve_ResetDefaults() { g_on = 0; g_curve = 170.0f; g_leanMs = 190.0f; g_flow = 150.0f; g_log = 0; }
 
 // ---- the lean
 static double NowS() {
